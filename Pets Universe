@@ -6144,7 +6144,7 @@ function Library:LoadInfiniteYield(): boolean
 
     pcall(function()
         local function OpenCommunity()
-            local Invite = tostring(Library.DiscordInvite or "https://discord.gg/AMspFCqDP")
+            local Invite = tostring(Library.DiscordInvite or "https://discord.gg/KTyTtuKkq4")
             Library:CopyToClipboard(Invite, "Discord invite copied")
             local Code = string.match(Invite, "([%w%-]+)/?$")
             if Code then
@@ -16450,8 +16450,8 @@ do
                 local Button = New("TextButton", {
                     AutoButtonColor = false,
                     BackgroundColor3 = "MainColor",
-                    Position = UDim2.new(Column / Columns, Column * ChoiceGap / Columns, 0, Row * (ChoiceHeight + ChoiceGap) + 2),
-                    Size = UDim2.new(1 / Columns, -(Columns - 1) * ChoiceGap / Columns - 2, 0, ChoiceHeight),
+                    Position = UDim2.new(Column / Columns, Column * ChoiceGap / Columns + 3 - Column * 6 / Columns, 0, Row * (ChoiceHeight + ChoiceGap) + 3),
+                    Size = UDim2.new(1 / Columns, -(Columns - 1) * ChoiceGap / Columns - 6 / Columns, 0, ChoiceHeight),
                     Text = "",
                     ZIndex = 3,
                     Parent = Choices,
@@ -16574,7 +16574,7 @@ do
                 end
             end
             local Rows = math.ceil(#(Step.Choices or {}) / Columns)
-            Choices.CanvasSize = UDim2.fromOffset(0, Rows * (ChoiceHeight + ChoiceGap) + 4)
+            Choices.CanvasSize = UDim2.fromOffset(0, Rows * (ChoiceHeight + ChoiceGap) + 6)
             Choices.CanvasPosition = Vector2.zero
             PaintChoices()
         end
@@ -16864,6 +16864,423 @@ do
         Visit(Library.Toggles)
         Visit(Library.Options)
         return true, Applied
+    end
+
+    local function GroupDigits(Value: number?): string
+        if typeof(Value) ~= "number" then
+            return "?"
+        end
+        local Text = tostring(math.floor(Value))
+        local Out = string.reverse(Text)
+        Out = string.gsub(Out, "(%d%d%d)", "%1,")
+        Out = string.reverse(Out)
+        if string.sub(Out, 1, 1) == "," then
+            Out = string.sub(Out, 2)
+        end
+        return Out
+    end
+
+    local CommunityState = { Fetching = false, Fetched = false, Listeners = {} }
+    Library.CommunityState = CommunityState
+
+    local function FetchCommunity(Code: string?)
+        if not Code or CommunityState.Fetching or CommunityState.Fetched then
+            return
+        end
+        CommunityState.Fetching = true
+        task.spawn(function()
+            local Data = HttpRequestJSON(string.format("https://discord.com/api/v10/invites/%s?with_counts=true", Code))
+            CommunityState.Fetching = false
+            if typeof(Data) ~= "table" or Library.Unloaded then
+                return
+            end
+            CommunityState.Fetched = true
+            CommunityState.Online = tonumber(Data.approximate_presence_count)
+            CommunityState.Members = tonumber(Data.approximate_member_count)
+            if typeof(Data.guild) == "table" and typeof(Data.guild.name) == "string" then
+                CommunityState.Name = Data.guild.name
+            end
+            for _, Listener in CommunityState.Listeners do
+                task.spawn(Listener)
+            end
+        end)
+    end
+
+    function Funcs:AddCommunityStrip(Idx, Info)
+        if self.Destroyed then return nil end
+
+        if typeof(Idx) == "table" and Info == nil then
+            Info = Idx
+            Idx = nil
+        end
+        Info = Info or {}
+
+        local Groupbox = self
+        local Container = Groupbox.Container
+        local Blurple = Color3.fromRGB(88, 101, 242)
+        local Invite, Code = ParseDiscordInvite(Info.Invite or Library.DiscordInvite)
+
+        local Strip = { Type = "CommunityStrip", Destroyed = false, Visible = true, Invite = Invite, Code = Code }
+
+        local Holder = New("Frame", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 58),
+            Parent = Container,
+        })
+        local Base = Holder.ZIndex
+        local Card = New("Frame", {
+            BackgroundColor3 = "MainColor",
+            BackgroundTransparency = 0.1,
+            Size = UDim2.fromScale(1, 1),
+            Parent = Holder,
+        })
+        New("UICorner", {
+            CornerRadius = UDim.new(0, 10),
+            Parent = Card,
+        })
+        New("UIStroke", {
+            Color = Blurple,
+            Transparency = 0.55,
+            Parent = Card,
+        })
+        local Tint = New("Frame", {
+            BackgroundColor3 = Blurple,
+            BackgroundTransparency = 0.72,
+            Size = UDim2.fromScale(0.7, 1),
+            ZIndex = Base + 1,
+            Parent = Card,
+        })
+        New("UICorner", {
+            CornerRadius = UDim.new(0, 10),
+            Parent = Tint,
+        })
+        New("UIGradient", {
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0),
+                NumberSequenceKeypoint.new(1, 1),
+            }),
+            Parent = Tint,
+        })
+        local Avatar = New("Frame", {
+            AnchorPoint = Vector2.new(0, 0.5),
+            BackgroundColor3 = Blurple,
+            Position = UDim2.new(0, 10, 0.5, 0),
+            Size = UDim2.fromOffset(38, 38),
+            ZIndex = Base + 2,
+            Parent = Card,
+        })
+        New("UICorner", {
+            CornerRadius = UDim.new(1, 0),
+            Parent = Avatar,
+        })
+        local Logo = New("ImageLabel", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            BackgroundTransparency = 1,
+            Position = UDim2.fromScale(0.5, 0.5),
+            ScaleType = Enum.ScaleType.Fit,
+            Size = UDim2.fromOffset(26, 26),
+            ZIndex = Base + 3,
+            Parent = Avatar,
+        })
+        WidgetIcon(Logo, Info.Logo or "corvus", Color3.new(1, 1, 1))
+        local Title = New("TextLabel", {
+            BackgroundTransparency = 1,
+            FontFace = GetBoldFont,
+            Position = UDim2.fromOffset(58, 10),
+            Size = UDim2.new(1, -128, 0, 18),
+            Text = tostring(Info.Title or "Community"),
+            TextSize = 14,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            ZIndex = Base + 3,
+            Parent = Card,
+        })
+        local Stats = New("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(58, 29),
+            Size = UDim2.new(1, -128, 0, 16),
+            Text = tostring(Info.Description or "Join the community"),
+            TextSize = 12,
+            TextTransparency = 0.3,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            ZIndex = Base + 3,
+            Parent = Card,
+        })
+        local Join = New("TextButton", {
+            AnchorPoint = Vector2.new(1, 0.5),
+            BackgroundColor3 = Blurple,
+            FontFace = GetBoldFont,
+            Position = UDim2.new(1, -10, 0.5, 0),
+            Size = UDim2.fromOffset(62, 30),
+            Text = "Join",
+            TextColor3 = Color3.new(1, 1, 1),
+            TextSize = 13,
+            ZIndex = Base + 3,
+            Parent = Card,
+        })
+        New("UICorner", {
+            CornerRadius = UDim.new(0, 8),
+            Parent = Join,
+        })
+        Strip.JoinButton = Join
+        Strip.StatsLabel = Stats
+
+        local function Paint()
+            if Strip.Destroyed then
+                return
+            end
+            if CommunityState.Name and not Info.Title then
+                Title.Text = CommunityState.Name
+            end
+            if CommunityState.Online or CommunityState.Members then
+                Stats.Text = string.format('<font color="#60d696">\u{25CF}</font> %s online <font transparency="0.4">\u{00B7}</font> %s members', GroupDigits(CommunityState.Online), GroupDigits(CommunityState.Members))
+            end
+        end
+        table.insert(CommunityState.Listeners, Paint)
+        Paint()
+
+        Join.MouseButton1Click:Connect(function()
+            if Strip.Invite then
+                Library:CopyToClipboard(Strip.Invite, "Discord invite copied")
+            end
+            if Strip.Code then
+                task.spawn(Library.OpenDiscordInvite, Library, Strip.Code)
+            end
+            Join.Text = "Copied"
+            task.delay(1.6, function()
+                if not Strip.Destroyed then
+                    Join.Text = "Join"
+                end
+            end)
+        end)
+
+        function Strip:SetVisible(Visible: boolean)
+            Strip.Visible = Visible
+            Holder.Visible = Visible
+            Groupbox:Resize()
+        end
+
+        FetchCommunity(Code)
+        Strip.Holder = Holder
+        table.insert(Groupbox.Elements, Strip)
+        Groupbox:Resize()
+        if Idx then
+            Options[Idx] = Strip
+        end
+        return Strip
+    end
+
+    function Funcs:AddDonateBoard(Idx, Info)
+        if self.Destroyed then return nil end
+
+        if typeof(Idx) == "table" and Info == nil then
+            Info = Idx
+            Idx = nil
+        end
+        Info = Info or {}
+
+        local Groupbox = self
+        local Container = Groupbox.Container
+        local Methods = Info.Methods or {}
+        local Labels = {}
+        local ById = {}
+        for _, Method in Methods do
+            table.insert(Labels, tostring(Method.Id))
+            ById[tostring(Method.Id)] = Method
+        end
+
+        local Board = {
+            Type = "DonateBoard",
+            Destroyed = false,
+            Visible = true,
+            Selected = if Library.DonateSelected and ById[Library.DonateSelected] then Library.DonateSelected else Labels[1],
+        }
+
+        local Holder = New("Frame", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 118),
+            Parent = Container,
+        })
+        local Base = Holder.ZIndex
+
+        local Card = New("Frame", {
+            BackgroundColor3 = "MainColor",
+            BackgroundTransparency = 0.1,
+            Position = UDim2.fromOffset(0, 32),
+            Size = UDim2.new(1, 0, 0, 62),
+            Parent = Holder,
+        })
+        New("UICorner", {
+            CornerRadius = UDim.new(0, 10),
+            Parent = Card,
+        })
+        local Stroke = New("UIStroke", {
+            Color = Color3.new(1, 1, 1),
+            Transparency = 0.55,
+            Parent = Card,
+        })
+        local Tint = New("Frame", {
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BackgroundTransparency = 0.78,
+            Size = UDim2.fromScale(0.7, 1),
+            ZIndex = Base + 1,
+            Parent = Card,
+        })
+        New("UICorner", {
+            CornerRadius = UDim.new(0, 10),
+            Parent = Tint,
+        })
+        New("UIGradient", {
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0),
+                NumberSequenceKeypoint.new(1, 1),
+            }),
+            Parent = Tint,
+        })
+        local Coin = New("Frame", {
+            AnchorPoint = Vector2.new(0, 0.5),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            Position = UDim2.new(0, 10, 0.5, 0),
+            Size = UDim2.fromOffset(34, 34),
+            ZIndex = Base + 2,
+            Parent = Card,
+        })
+        New("UICorner", {
+            CornerRadius = UDim.new(1, 0),
+            Parent = Coin,
+        })
+        local CoinText = New("TextLabel", {
+            BackgroundTransparency = 1,
+            FontFace = GetBoldFont,
+            Size = UDim2.fromScale(1, 1),
+            Text = "",
+            TextColor3 = Color3.new(1, 1, 1),
+            TextSize = 11,
+            ZIndex = Base + 3,
+            Parent = Coin,
+        })
+        local Name = New("TextLabel", {
+            BackgroundTransparency = 1,
+            FontFace = GetBoldFont,
+            Position = UDim2.fromOffset(54, 10),
+            Size = UDim2.new(1, -140, 0, 17),
+            Text = "",
+            TextSize = 14,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            ZIndex = Base + 3,
+            Parent = Card,
+        })
+        local Address = New("TextLabel", {
+            BackgroundTransparency = 1,
+            FontFace = Font.fromEnum(Enum.Font.RobotoMono),
+            Position = UDim2.fromOffset(54, 30),
+            Size = UDim2.new(1, -140, 0, 16),
+            Text = "",
+            TextSize = 12,
+            TextTransparency = 0.2,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            ZIndex = Base + 3,
+            Parent = Card,
+        })
+        local Copy = New("TextButton", {
+            AnchorPoint = Vector2.new(1, 0.5),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            FontFace = GetBoldFont,
+            Position = UDim2.new(1, -10, 0.5, 0),
+            Size = UDim2.fromOffset(70, 30),
+            Text = "Copy",
+            TextColor3 = Color3.fromRGB(14, 14, 20),
+            TextSize = 13,
+            ZIndex = Base + 3,
+            Parent = Card,
+        })
+        New("UICorner", {
+            CornerRadius = UDim.new(0, 8),
+            Parent = Copy,
+        })
+        local Note = New("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(2, 98),
+            Size = UDim2.new(1, -4, 0, 16),
+            Text = "",
+            TextSize = 12,
+            TextTransparency = 0.45,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = Holder,
+        })
+        Board.CopyButton = Copy
+        Board.AddressLabel = Address
+
+        local function Shorten(Text: string): string
+            if #Text <= 26 or string.find(Text, "paypal", 1, true) then
+                return Text
+            end
+            return string.sub(Text, 1, 12) .. "\u{2026}" .. string.sub(Text, -10)
+        end
+
+        local function Paint()
+            local Method = ById[Board.Selected]
+            if not Method then
+                return
+            end
+            local Color = WidgetColor(Method.Color, Library.Scheme.AccentColor)
+            Stroke.Color = Color
+            Tint.BackgroundColor3 = Color
+            Coin.BackgroundColor3 = Color
+            Copy.BackgroundColor3 = Color:Lerp(Color3.new(1, 1, 1), 0.25)
+            CoinText.Text = tostring(Method.Symbol or string.sub(tostring(Method.Id), 1, 3))
+            Name.Text = string.format('%s  <font transparency="0.45">%s</font>', WidgetEscape(Method.Name or Method.Id), WidgetEscape(Method.Network or ""))
+            Address.Text = WidgetEscape(Shorten(tostring(Method.Display or Method.Address or "")))
+            Note.Text = tostring(Method.Note or "")
+        end
+
+        Board.Picker = Library:CreateSegmented(Holder, Labels, Board.Selected, function(Value)
+            Board.Selected = Value
+            Library.DonateSelected = Value
+            Copy.Text = "Copy"
+            Paint()
+        end, { Height = 24, TextSize = 12 })
+
+        Copy.MouseButton1Click:Connect(function()
+            local Method = ById[Board.Selected]
+            if not Method or not Method.Address then
+                return
+            end
+            Library:CopyToClipboard(Method.Address, string.format("%s %s copied", tostring(Method.Name or Method.Id), if Method.Link then "link" else "address"))
+            Copy.Text = "Copied"
+            task.delay(1.6, function()
+                if not Board.Destroyed then
+                    Copy.Text = "Copy"
+                end
+            end)
+        end)
+
+        function Board:Select(Id: string)
+            if ById[Id] then
+                Board.Selected = Id
+                Board.Picker:Set(Id)
+                Paint()
+            end
+        end
+
+        function Board:SetVisible(Visible: boolean)
+            Board.Visible = Visible
+            Holder.Visible = Visible
+            Groupbox:Resize()
+        end
+
+        Paint()
+        Board.Holder = Holder
+        table.insert(Groupbox.Elements, Board)
+        Groupbox:Resize()
+        if Idx then
+            Options[Idx] = Board
+        end
+        return Board
     end
 
     function Funcs:AddThemeGallery(Info)
@@ -29418,7 +29835,7 @@ local LocalPlayer = Players.LocalPlayer
 local Options = Library.Options
 local Toggles = Library.Toggles
 
-local Discord = "https://discord.gg/AMspFCqDP"
+local Discord = "https://discord.gg/KTyTtuKkq4"
 local CorvusConfig = {
 	FeedbackWebhook = "",
 	LoaderUrl = "",
@@ -38194,6 +38611,32 @@ Tabs.Settings = Window:AddSettingsTab({
 	Folder = "PetsUniverse",
 	MenuKeybind = "Z",
 })
+
+UI.DonateMethods = {
+	{ Id = "PayPal", Symbol = "PP", Name = "PayPal", Network = "paypal.me", Address = "https://paypal.me/KrystianKujawski73", Display = "KrystianKujawski73", Link = true, Color = "#0070e0", Note = "Paste the link in your browser and pick any amount" },
+	{ Id = "BTC", Symbol = "BTC", Name = "Bitcoin", Network = "Bitcoin network", Address = "bc1q787972ksk3auu2d37gju8m6je0kx9mmskglsvh", Color = "#f7931a", Note = "Only send BTC on the Bitcoin network" },
+	{ Id = "ETH", Symbol = "ETH", Name = "Ethereum", Network = "ERC20", Address = "0xBa0e07FdDB15fe3c9B7CE42F76cef8F09FEdAB64", Color = "#627eea", Note = "Only send ETH or ERC20 tokens on Ethereum" },
+	{ Id = "SOL", Symbol = "SOL", Name = "Solana", Network = "Solana", Address = "4UriDCT4iBsLAuzLdowpSEL4mZq7Ecrxs4pNrV5ztHxW", Color = "#9945ff", Note = "Only send SOL or Solana tokens" },
+	{ Id = "BNB", Symbol = "BNB", Name = "BNB", Network = "BNB Smart Chain", Address = "0xBa0e07FdDB15fe3c9B7CE42F76cef8F09FEdAB64", Color = "#f0b90b", Note = "Only send on BNB Smart Chain (BEP20)" },
+}
+pcall(function()
+	local old = Tabs.Info.Groupboxes and Tabs.Info.Groupboxes.Community
+	if old then
+		old:SetVisible(false)
+	end
+end)
+for _, tab in ipairs({ Tabs.Info, Tabs.Farm, Tabs.Rewards, Tabs.Eggs, Tabs.Items, Tabs.Upgrades, Tabs.Stats, Tabs.Analytics, Tabs.Misc, Tabs.Settings }) do
+	pcall(function()
+		local left = tab:AddLeftGroupbox("Community", "users")
+		left:AddCommunityStrip({ Invite = Discord, Title = "Corvus Community", Description = "Updates, support and new codes" })
+		left:AddLabel({ Text = '<font color="#60d696">All Corvus scripts are keyless and free.</font> <font transparency="0.35">Want your own script for any game? We make custom paid scripts on request, open a ticket on our Discord.</font>', DoesWrap = true })
+		local right = tab:AddRightGroupbox("Support Corvus", "heart")
+		right:AddDonateBoard({ Methods = UI.DonateMethods })
+		right:AddLabel({ Text = '<font transparency="0.35">Donations are 100% voluntary, nothing is locked behind them. They help keep Corvus updated.</font>', DoesWrap = true })
+		left.BoxHolder.LayoutOrder = -100
+		right.BoxHolder.LayoutOrder = -100
+	end)
+end
 
 Tabs.Farm:Show()
 
