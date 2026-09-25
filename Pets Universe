@@ -15086,6 +15086,1786 @@ do
         return Bars
     end
 
+    local function WidgetColor(Value: any, Fallback: Color3?): Color3
+        if typeof(Value) == "Color3" then
+            return Value
+        end
+        if typeof(Value) == "string" and Value ~= "" then
+            local Ok, Parsed = pcall(Color3.fromHex, Value)
+            if Ok and typeof(Parsed) == "Color3" then
+                return Parsed
+            end
+        end
+        return Fallback or Library.Scheme.AccentColor
+    end
+    Library.WidgetColor = WidgetColor
+
+    local function WidgetIcon(Target: ImageLabel, Image: any, Tint: Color3?)
+        if typeof(Image) == "Instance" then
+            Library:ApplyValueVisual(Target, { Model = Image })
+            Target.ImageColor3 = Color3.new(1, 1, 1)
+            Target.Visible = true
+            return
+        end
+        Library:ApplyValueVisual(Target, nil)
+        local Data = if typeof(Image) == "string" and Image ~= "" then Library:GetCustomIcon(Image) else nil
+        if Data then
+            Library:ApplyLucideIcon(Target, Data)
+            Target.ImageColor3 = if Data.IconName then (Tint or Library.Scheme.AccentColor) else Color3.new(1, 1, 1)
+            Target.Visible = true
+        else
+            Target.Visible = false
+        end
+    end
+    Library.WidgetIcon = WidgetIcon
+
+    local function WidgetAge(At: number?): string
+        if typeof(At) ~= "number" then
+            return ""
+        end
+        local Age = math.max(0, os.clock() - At)
+        if Age < 5 then
+            return "now"
+        elseif Age < 60 then
+            return string.format("%ds ago", math.floor(Age))
+        elseif Age < 3600 then
+            return string.format("%dm ago", math.floor(Age / 60))
+        end
+        return string.format("%dh ago", math.floor(Age / 3600))
+    end
+    Library.WidgetAge = WidgetAge
+
+    local function WidgetEscape(Text: any): string
+        return (string.gsub(tostring(Text or ""), "[<>&]", { ["<"] = "&lt;", [">"] = "&gt;", ["&"] = "&amp;" }))
+    end
+
+    local function WidgetWidth(Frame: GuiObject, Fallback: number): number
+        local Scale = math.max(Library.DPIScale, 0.01)
+        local Width = Frame.AbsoluteSize.X / Scale
+        if Width < 40 then
+            return Fallback
+        end
+        return Width
+    end
+
+    local function WidgetTween(Object: Instance, Time: number, Goal: any, Style: Enum.EasingStyle?, Direction: Enum.EasingDirection?)
+        if Library.Animations == false then
+            for Key, Value in Goal do
+                Object[Key] = Value
+            end
+            return
+        end
+        TweenService:Create(Object, TweenInfo.new(Time, Style or Enum.EasingStyle.Quint, Direction or Enum.EasingDirection.Out), Goal):Play()
+    end
+
+    function Funcs:AddFeed(Idx, Info)
+        if self.Destroyed then return nil end
+
+        if typeof(Idx) == "table" and Info == nil then
+            Info = Idx
+            Idx = nil
+        end
+        Info = Info or {}
+
+        local Groupbox = self
+        local Container = Groupbox.Container
+        local RowHeight = Info.RowHeight or 40
+        local MaxRows = Info.MaxRows or 6
+        local Gap = 5
+
+        local Feed = {
+            Type = "Feed",
+            Destroyed = false,
+            Visible = true,
+            Rows = {},
+            Seen = {},
+            Primed = false,
+            Count = 0,
+        }
+
+        local Holder = New("Frame", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, RowHeight),
+            Parent = Container,
+        })
+        local Base = Holder.ZIndex
+
+        local EmptyLabel = New("TextLabel", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, RowHeight),
+            Text = Info.EmptyText or "Nothing yet",
+            TextSize = 13,
+            TextTransparency = 0.45,
+            TextWrapped = true,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = Holder,
+        })
+
+        local function MakeRow(Index: number)
+            local Row = {}
+            Row.Frame = New("Frame", {
+                BackgroundColor3 = "MainColor",
+                BackgroundTransparency = 0.15,
+                ClipsDescendants = true,
+                Position = UDim2.fromOffset(0, (Index - 1) * (RowHeight + Gap)),
+                Size = UDim2.new(1, 0, 0, RowHeight),
+                Parent = Holder,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(0, 8),
+                Parent = Row.Frame,
+            })
+            Row.Stroke = New("UIStroke", {
+                Color = "OutlineColor",
+                Transparency = 0.35,
+                Parent = Row.Frame,
+            })
+            Row.Tint = New("Frame", {
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                BackgroundTransparency = 0.82,
+                Size = UDim2.fromScale(0.6, 1),
+                ZIndex = Base + 1,
+                Parent = Row.Frame,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(0, 8),
+                Parent = Row.Tint,
+            })
+            New("UIGradient", {
+                Transparency = NumberSequence.new({
+                    NumberSequenceKeypoint.new(0, 0),
+                    NumberSequenceKeypoint.new(1, 1),
+                }),
+                Parent = Row.Tint,
+            })
+            Row.Flash = New("Frame", {
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                BackgroundTransparency = 1,
+                Size = UDim2.fromScale(1, 1),
+                ZIndex = Base + 1,
+                Parent = Row.Frame,
+            })
+            Row.Bar = New("Frame", {
+                AnchorPoint = Vector2.new(0, 0.5),
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                Position = UDim2.new(0, 0, 0.5, 0),
+                Size = UDim2.new(0, 3, 1, -14),
+                ZIndex = Base + 2,
+                Parent = Row.Frame,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(1, 0),
+                Parent = Row.Bar,
+            })
+            Row.IconBack = New("Frame", {
+                AnchorPoint = Vector2.new(0, 0.5),
+                BackgroundColor3 = "BackgroundColor",
+                Position = UDim2.new(0, 10, 0.5, 0),
+                Size = UDim2.fromOffset(30, 30),
+                ZIndex = Base + 2,
+                Parent = Row.Frame,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(0, 7),
+                Parent = Row.IconBack,
+            })
+            Row.IconStroke = New("UIStroke", {
+                Color = Color3.new(1, 1, 1),
+                Thickness = 1.5,
+                Transparency = 0.2,
+                Parent = Row.IconBack,
+            })
+            Row.IconScale = New("UIScale", {
+                Scale = 1,
+                Parent = Row.IconBack,
+            })
+            Row.Icon = New("ImageLabel", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                BackgroundTransparency = 1,
+                Position = UDim2.fromScale(0.5, 0.5),
+                ScaleType = Enum.ScaleType.Fit,
+                Size = UDim2.fromOffset(24, 24),
+                ZIndex = Base + 3,
+                Parent = Row.IconBack,
+            })
+            Row.Title = New("TextLabel", {
+                BackgroundTransparency = 1,
+                FontFace = GetBoldFont,
+                Position = UDim2.fromOffset(48, 5),
+                Size = UDim2.new(1, -164, 0, 17),
+                Text = "",
+                TextSize = 14,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                ZIndex = Base + 3,
+                Parent = Row.Frame,
+            })
+            Row.Badge = New("TextLabel", {
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                FontFace = GetBoldFont,
+                Position = UDim2.fromOffset(48, 6),
+                Size = UDim2.fromOffset(34, 15),
+                Text = "",
+                TextColor3 = Color3.fromRGB(12, 12, 18),
+                TextSize = 10,
+                Visible = false,
+                ZIndex = Base + 4,
+                Parent = Row.Frame,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(1, 0),
+                Parent = Row.Badge,
+            })
+            Row.Sub = New("TextLabel", {
+                BackgroundTransparency = 1,
+                Position = UDim2.fromOffset(48, 22),
+                Size = UDim2.new(1, -164, 0, 14),
+                Text = "",
+                TextSize = 12,
+                TextTransparency = 0.4,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                ZIndex = Base + 3,
+                Parent = Row.Frame,
+            })
+            Row.Right = New("TextLabel", {
+                AnchorPoint = Vector2.new(1, 0),
+                BackgroundTransparency = 1,
+                FontFace = GetBoldFont,
+                Position = UDim2.new(1, -10, 0, 5),
+                Size = UDim2.fromOffset(108, 17),
+                Text = "",
+                TextSize = 13,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                TextXAlignment = Enum.TextXAlignment.Right,
+                ZIndex = Base + 3,
+                Parent = Row.Frame,
+            })
+            Row.Time = New("TextLabel", {
+                AnchorPoint = Vector2.new(1, 0),
+                BackgroundTransparency = 1,
+                Position = UDim2.new(1, -10, 0, 22),
+                Size = UDim2.fromOffset(108, 14),
+                Text = "",
+                TextSize = 11,
+                TextTransparency = 0.5,
+                TextXAlignment = Enum.TextXAlignment.Right,
+                ZIndex = Base + 3,
+                Parent = Row.Frame,
+            })
+            return Row
+        end
+
+        local function Resize()
+            local Count = math.max(Feed.Count, 1)
+            Holder.Size = UDim2.new(1, 0, 0, Count * RowHeight + (Count - 1) * Gap)
+            Groupbox:Resize()
+        end
+
+        function Feed:SetData(List)
+            List = List or {}
+            local Count = math.min(#List, MaxRows)
+            local Seen = {}
+            for Index = 1, Count do
+                local Entry = List[Index]
+                local Row = Feed.Rows[Index]
+                if not Row then
+                    Row = MakeRow(Index)
+                    Feed.Rows[Index] = Row
+                end
+                local Color = WidgetColor(Entry.Color, Library.Scheme.AccentColor)
+                Row.Bar.BackgroundColor3 = Color
+                Row.Tint.BackgroundColor3 = Color
+                Row.IconStroke.Color = Color
+                WidgetIcon(Row.Icon, Entry.Image, Color)
+                local Title = WidgetEscape(Entry.Title or "")
+                if typeof(Entry.Count) == "number" and Entry.Count > 1 then
+                    Title ..= string.format('  <font transparency="0.35">x%d</font>', Entry.Count)
+                end
+                Row.Title.Text = Title
+                Row.Sub.Text = tostring(Entry.Sub or "")
+                Row.Right.Text = string.format('<font color="#%s">%s</font>', Color:ToHex(), WidgetEscape(Entry.Right or ""))
+                Row.Time.Text = WidgetAge(Entry.At)
+                if Entry.Badge and Entry.Badge ~= "" then
+                    local BadgeColor = WidgetColor(Entry.BadgeColor, Library.Scheme.AccentColor)
+                    local TitleWidth = Library:GetTextBounds(Title, GetBoldFont(), 14)
+                    local Room = WidgetWidth(Row.Frame, 260) - 164
+                    local BadgeWidth = Library:GetTextBounds(tostring(Entry.Badge), GetBoldFont(), 10) + 12
+                    Row.Badge.Text = tostring(Entry.Badge)
+                    Row.Badge.BackgroundColor3 = BadgeColor
+                    Row.Badge.Size = UDim2.fromOffset(BadgeWidth, 15)
+                    Row.Badge.Position = UDim2.fromOffset(48 + math.min(TitleWidth, math.max(Room - BadgeWidth - 8, 0)) + 8, 6)
+                    Row.Title.Size = UDim2.new(1, -164 - BadgeWidth - 6, 0, 17)
+                    Row.Badge.Visible = true
+                else
+                    Row.Badge.Visible = false
+                    Row.Title.Size = UDim2.new(1, -164, 0, 17)
+                end
+                local Key = Entry.Id
+                if Key ~= nil then
+                    Seen[Key] = true
+                end
+                if Key ~= nil and Feed.Primed and not Feed.Seen[Key] then
+                    Row.Flash.BackgroundColor3 = Color
+                    Row.Flash.BackgroundTransparency = 0.45
+                    WidgetTween(Row.Flash, 1.1, { BackgroundTransparency = 1 })
+                    Row.IconScale.Scale = 0.55
+                    WidgetTween(Row.IconScale, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)
+                end
+                Row.Frame.Visible = true
+            end
+            for Index = Count + 1, #Feed.Rows do
+                Feed.Rows[Index].Frame.Visible = false
+            end
+            Feed.Seen = Seen
+            Feed.Primed = true
+            Feed.Count = Count
+            EmptyLabel.Visible = Count == 0
+            Resize()
+        end
+
+        function Feed:SetVisible(Visible: boolean)
+            Feed.Visible = Visible
+            Holder.Visible = Visible
+            Groupbox:Resize()
+        end
+
+        Feed.Holder = Holder
+        Resize()
+        table.insert(Groupbox.Elements, Feed)
+        if Idx then
+            Options[Idx] = Feed
+        end
+        return Feed
+    end
+
+    function Funcs:AddIconGrid(Idx, Info)
+        if self.Destroyed then return nil end
+
+        if typeof(Idx) == "table" and Info == nil then
+            Info = Idx
+            Idx = nil
+        end
+        Info = Info or {}
+
+        local Groupbox = self
+        local Container = Groupbox.Container
+        local TileSize = Info.TileSize or 54
+        local TileHeight = TileSize + 16
+        local Gap = 6
+        local RowsPerPage = Info.Rows or 3
+
+        local Grid = {
+            Type = "IconGrid",
+            Destroyed = false,
+            Visible = true,
+            Items = {},
+            Tiles = {},
+            Page = 1,
+            Pages = 1,
+            Columns = 4,
+            Filter = Info.Filter or (Info.Filters and Info.Filters[1]) or nil,
+            Selected = nil,
+        }
+
+        local Holder = New("Frame", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 100),
+            Parent = Container,
+        })
+        local Base = Holder.ZIndex
+        local Top = 0
+
+        if Info.Filters and #Info.Filters > 1 then
+            Grid.FilterPicker = Library:CreateSegmented(Holder, Info.Filters, Grid.Filter, function(Value)
+                Grid.Filter = Value
+                Grid.Page = 1
+                Grid.Selected = nil
+                if Info.Changed then
+                    Library:SafeCallback(Info.Changed, Value)
+                end
+            end, { Height = 24, TextSize = 12 })
+            Top += 32
+        end
+
+        local Summary = New("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(0, Top),
+            Size = UDim2.new(1, -90, 0, 20),
+            Text = "",
+            TextSize = 13,
+            TextTransparency = 0.3,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = Holder,
+        })
+        local Pager = New("Frame", {
+            AnchorPoint = Vector2.new(1, 0),
+            BackgroundTransparency = 1,
+            Position = UDim2.new(1, 0, 0, Top),
+            Size = UDim2.fromOffset(86, 20),
+            Visible = false,
+            Parent = Holder,
+        })
+        local function PagerButton(Text: string, X: number)
+            local Button = New("TextButton", {
+                BackgroundColor3 = "MainColor",
+                FontFace = GetBoldFont,
+                Position = UDim2.fromOffset(X, 0),
+                Size = UDim2.fromOffset(22, 20),
+                Text = Text,
+                TextSize = 14,
+                Parent = Pager,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(0, 5),
+                Parent = Button,
+            })
+            New("UIStroke", {
+                Color = "OutlineColor",
+                Transparency = 0.3,
+                Parent = Button,
+            })
+            return Button
+        end
+        local PrevButton = PagerButton("\u{2039}", 0)
+        local PageLabel = New("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(22, 0),
+            Size = UDim2.fromOffset(42, 20),
+            Text = "1/1",
+            TextSize = 12,
+            TextTransparency = 0.3,
+            Parent = Pager,
+        })
+        local NextButton = PagerButton("\u{203A}", 64)
+        Top += 26
+
+        local TilesFrame = New("Frame", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(0, Top),
+            Size = UDim2.new(1, 0, 0, TileHeight),
+            Parent = Holder,
+        })
+        local EmptyLabel = New("TextLabel", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 34),
+            Text = Info.EmptyText or "Nothing here",
+            TextSize = 13,
+            TextTransparency = 0.45,
+            TextWrapped = true,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Visible = false,
+            Parent = TilesFrame,
+        })
+        local Detail = New("TextLabel", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 30),
+            Text = Info.DetailText or "",
+            TextSize = 12,
+            TextTransparency = 0.25,
+            TextWrapped = true,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            Visible = Info.Detail ~= false,
+            Parent = Holder,
+        })
+
+        local function MakeTile()
+            local Tile = {}
+            Tile.Button = New("TextButton", {
+                BackgroundColor3 = "MainColor",
+                BackgroundTransparency = 0.1,
+                Text = "",
+                Size = UDim2.fromOffset(TileSize, TileHeight),
+                ZIndex = Base + 2,
+                Parent = TilesFrame,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(0, 9),
+                Parent = Tile.Button,
+            })
+            Tile.Stroke = New("UIStroke", {
+                Color = Color3.new(1, 1, 1),
+                Thickness = 1,
+                Transparency = 0.5,
+                Parent = Tile.Button,
+            })
+            Tile.Glow = New("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                BackgroundColor3 = Library.Scheme.AccentColor,
+                BackgroundTransparency = 1,
+                Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.new(1, 6, 1, 6),
+                ZIndex = Base + 1,
+                Parent = Tile.Button,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(0, 12),
+                Parent = Tile.Glow,
+            })
+            Tile.Tint = New("Frame", {
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                BackgroundTransparency = 0.88,
+                Size = UDim2.new(1, 0, 0.62, 0),
+                ZIndex = Base + 2,
+                Parent = Tile.Button,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(0, 9),
+                Parent = Tile.Tint,
+            })
+            New("UIGradient", {
+                Rotation = 90,
+                Transparency = NumberSequence.new({
+                    NumberSequenceKeypoint.new(0, 0),
+                    NumberSequenceKeypoint.new(1, 1),
+                }),
+                Parent = Tile.Tint,
+            })
+            Tile.Icon = New("ImageLabel", {
+                AnchorPoint = Vector2.new(0.5, 0),
+                BackgroundTransparency = 1,
+                Position = UDim2.new(0.5, 0, 0, 6),
+                ScaleType = Enum.ScaleType.Fit,
+                Size = UDim2.fromOffset(TileSize - 18, TileSize - 18),
+                ZIndex = Base + 3,
+                Parent = Tile.Button,
+            })
+            Tile.Caption = New("TextLabel", {
+                AnchorPoint = Vector2.new(0, 1),
+                BackgroundTransparency = 1,
+                FontFace = GetBoldFont,
+                Position = UDim2.new(0, 2, 1, -4),
+                Size = UDim2.new(1, -4, 0, 13),
+                Text = "",
+                TextSize = 11,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                ZIndex = Base + 3,
+                Parent = Tile.Button,
+            })
+            Tile.Mark = New("Frame", {
+                AnchorPoint = Vector2.new(1, 0),
+                BackgroundColor3 = Library.Scheme.AccentColor,
+                Position = UDim2.new(1, 4, 0, -4),
+                Size = UDim2.fromOffset(16, 16),
+                Visible = false,
+                ZIndex = Base + 5,
+                Parent = Tile.Button,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(1, 0),
+                Parent = Tile.Mark,
+            })
+            Tile.MarkIcon = New("ImageLabel", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                BackgroundTransparency = 1,
+                Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.fromOffset(10, 10),
+                ZIndex = Base + 6,
+                Parent = Tile.Mark,
+            })
+            Tile.Button.MouseButton1Click:Connect(function()
+                local Item = Tile.Item
+                if not Item then
+                    return
+                end
+                Grid.Selected = Item.Id
+                if Item.Detail then
+                    Detail.Text = tostring(Item.Detail)
+                end
+                if Info.Clicked then
+                    Library:SafeCallback(Info.Clicked, Item)
+                end
+                Grid:Render()
+            end)
+            return Tile
+        end
+
+        local function Layout()
+            local Width = WidgetWidth(Holder, 260)
+            Grid.Columns = math.max(3, math.floor((Width + Gap) / (TileSize + Gap)))
+        end
+
+        function Grid:Render()
+            Layout()
+            local Columns = Grid.Columns
+            local PerPage = Columns * RowsPerPage
+            local Total = #Grid.Items
+            Grid.Pages = math.max(1, math.ceil(Total / PerPage))
+            Grid.Page = math.clamp(Grid.Page, 1, Grid.Pages)
+            local First = (Grid.Page - 1) * PerPage
+            local Shown = math.min(PerPage, math.max(Total - First, 0))
+            local Pulse = false
+            for Slot = 1, math.max(Shown, #Grid.Tiles) do
+                local Item = if Slot <= Shown then Grid.Items[First + Slot] else nil
+                local Tile = Grid.Tiles[Slot]
+                if Item and not Tile then
+                    Tile = MakeTile()
+                    Grid.Tiles[Slot] = Tile
+                end
+                if Tile then
+                    Tile.Item = Item
+                    if Item then
+                        local Column = (Slot - 1) % Columns
+                        local Row = math.floor((Slot - 1) / Columns)
+                        Tile.Button.Position = UDim2.new(Column / Columns, Column * Gap / Columns, 0, Row * (TileHeight + Gap))
+                        Tile.Button.Size = UDim2.new(1 / Columns, -(Columns - 1) * Gap / Columns, 0, TileHeight)
+                        local Color = WidgetColor(Item.Color, Library.Scheme.OutlineColor)
+                        WidgetIcon(Tile.Icon, Item.Image, Color)
+                        Tile.Icon.ImageTransparency = if Item.Dim then 0.55 else 0
+                        Tile.Tint.BackgroundColor3 = Color
+                        Tile.Caption.Text = tostring(Item.Caption or "")
+                        Tile.Caption.TextTransparency = if Item.Dim then 0.6 else 0.15
+                        local Selected = Grid.Selected ~= nil and Grid.Selected == Item.Id
+                        if Item.Highlight then
+                            Pulse = true
+                            Tile.Stroke.Color = Library.Scheme.AccentColor
+                            Tile.Stroke.Thickness = 2
+                            Tile.Stroke.Transparency = 0
+                            Tile.Glow.BackgroundColor3 = Library.Scheme.AccentColor
+                            if not Tile.Pulsing then
+                                Tile.Pulsing = true
+                                Tile.Glow.BackgroundTransparency = 0.6
+                                if Library.Animations ~= false then
+                                    Tile.PulseTween = TweenService:Create(Tile.Glow, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { BackgroundTransparency = 0.9 })
+                                    Tile.PulseTween:Play()
+                                end
+                            end
+                        else
+                            Tile.Stroke.Color = if Selected then Library.Scheme.FontColor else Color
+                            Tile.Stroke.Thickness = if Selected then 1.5 else 1
+                            Tile.Stroke.Transparency = if Selected then 0.2 elseif Item.Dim then 0.75 else 0.45
+                            if Tile.Pulsing then
+                                Tile.Pulsing = false
+                                if Tile.PulseTween then
+                                    pcall(Tile.PulseTween.Cancel, Tile.PulseTween)
+                                    Tile.PulseTween = nil
+                                end
+                            end
+                            Tile.Glow.BackgroundTransparency = 1
+                        end
+                        local Mark = Item.Mark
+                        if Mark then
+                            Tile.Mark.BackgroundColor3 = WidgetColor(Item.MarkColor, Library.Scheme.AccentColor)
+                            WidgetIcon(Tile.MarkIcon, Mark, Color3.fromRGB(12, 12, 18))
+                            Tile.Mark.Visible = true
+                        else
+                            Tile.Mark.Visible = false
+                        end
+                        Tile.Button.Visible = true
+                    else
+                        Tile.Button.Visible = false
+                        if Tile.PulseTween then
+                            pcall(Tile.PulseTween.Cancel, Tile.PulseTween)
+                            Tile.PulseTween = nil
+                        end
+                        Tile.Pulsing = false
+                    end
+                end
+            end
+            Grid.Pulsing = Pulse
+            local RowsShown = math.max(1, math.ceil(Shown / Columns))
+            local TilesHeight = if Shown > 0 then RowsShown * TileHeight + (RowsShown - 1) * Gap else 34
+            TilesFrame.Size = UDim2.new(1, 0, 0, TilesHeight)
+            EmptyLabel.Visible = Shown == 0
+            Pager.Visible = Grid.Pages > 1
+            PageLabel.Text = string.format("%d/%d", Grid.Page, Grid.Pages)
+            PrevButton.TextTransparency = if Grid.Page > 1 then 0 else 0.7
+            NextButton.TextTransparency = if Grid.Page < Grid.Pages then 0 else 0.7
+            local DetailHeight = if Detail.Visible and Detail.Text ~= "" then 34 else 0
+            Detail.Position = UDim2.fromOffset(0, Top + TilesHeight + 8)
+            Holder.Size = UDim2.new(1, 0, 0, Top + TilesHeight + (if DetailHeight > 0 then 8 + DetailHeight else 0))
+            Groupbox:Resize()
+        end
+
+        PrevButton.MouseButton1Click:Connect(function()
+            if Grid.Page > 1 then
+                Grid.Page -= 1
+                Grid:Render()
+            end
+        end)
+        NextButton.MouseButton1Click:Connect(function()
+            if Grid.Page < Grid.Pages then
+                Grid.Page += 1
+                Grid:Render()
+            end
+        end)
+
+        function Grid:SetItems(Items)
+            Grid.Items = Items or {}
+            Grid:Render()
+        end
+
+        function Grid:SetSummary(Text: string)
+            Summary.Text = tostring(Text or "")
+        end
+
+        function Grid:SetDetail(Text: string)
+            Detail.Text = tostring(Text or "")
+            Grid:Render()
+        end
+
+        function Grid:SetFilter(Value: string)
+            Grid.Filter = Value
+            if Grid.FilterPicker then
+                Grid.FilterPicker:Set(Value)
+            end
+        end
+
+        function Grid:ShowItem(Id: any)
+            local Columns = Grid.Columns
+            local PerPage = Columns * RowsPerPage
+            for Index, Item in Grid.Items do
+                if Item.Id == Id then
+                    Grid.Page = math.floor((Index - 1) / PerPage) + 1
+                    Grid:Render()
+                    return true
+                end
+            end
+            return false
+        end
+
+        function Grid:SetVisible(Visible: boolean)
+            Grid.Visible = Visible
+            Holder.Visible = Visible
+            Groupbox:Resize()
+        end
+
+        local LastColumns = 0
+        Grid.SizeConnection = Holder:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            Layout()
+            if Grid.Columns ~= LastColumns then
+                LastColumns = Grid.Columns
+                Grid:Render()
+            end
+        end)
+
+        Grid.Holder = Holder
+        Grid.Detail = Detail
+        Grid.TilesFrame = TilesFrame
+        Grid:Render()
+        table.insert(Groupbox.Elements, Grid)
+        if Idx then
+            Options[Idx] = Grid
+        end
+        return Grid
+    end
+
+    function Funcs:AddGoals(Idx, Info)
+        if self.Destroyed then return nil end
+
+        if typeof(Idx) == "table" and Info == nil then
+            Info = Idx
+            Idx = nil
+        end
+        Info = Info or {}
+
+        local Groupbox = self
+        local Container = Groupbox.Container
+        local CardHeight = Info.CardHeight or 72
+        local RingSize = Info.RingSize or 56
+        local TickCount = Info.Ticks or 40
+        local Gap = 6
+
+        local Goals = {
+            Type = "Goals",
+            Destroyed = false,
+            Visible = true,
+            Cards = {},
+            Count = 0,
+        }
+
+        local Holder = New("Frame", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 40),
+            Parent = Container,
+        })
+        local Base = Holder.ZIndex
+
+        local EmptyLabel = New("TextLabel", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 40),
+            Text = Info.EmptyText or "No goals yet",
+            TextSize = 13,
+            TextTransparency = 0.45,
+            TextWrapped = true,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = Holder,
+        })
+
+        local function PaintRing(Card, Progress: number)
+            local Filled = math.clamp(math.floor(Progress * TickCount + 0.5), 0, TickCount)
+            if Progress > 0 and Filled == 0 then
+                Filled = 1
+            end
+            local Color = Card.Color or Library.Scheme.AccentColor
+            local Empty = Library.Scheme.OutlineColor
+            local Bright = Color:Lerp(Color3.new(1, 1, 1), 0.45)
+            for Index, Tick in Card.Ticks do
+                if Index <= Filled then
+                    Tick.BackgroundColor3 = if Index == Filled and Filled < TickCount then Bright else Color:Lerp(Color3.new(0, 0, 0), 0.22 * (1 - Index / TickCount))
+                    Tick.BackgroundTransparency = 0
+                else
+                    Tick.BackgroundColor3 = Empty
+                    Tick.BackgroundTransparency = 0.25
+                end
+            end
+            Card.Shown = Progress
+        end
+
+        local function AnimateRing(Card, Target: number)
+            Card.Target = Target
+            local From = Card.Shown or 0
+            if Library.Animations == false or math.abs(Target - From) < 0.004 then
+                PaintRing(Card, Target)
+                return
+            end
+            Card.Token = (Card.Token or 0) + 1
+            local Token = Card.Token
+            task.spawn(function()
+                local Steps = 18
+                for Step = 1, Steps do
+                    if Card.Token ~= Token or Goals.Destroyed then
+                        return
+                    end
+                    local Alpha = 1 - (1 - Step / Steps) ^ 3
+                    PaintRing(Card, From + (Target - From) * Alpha)
+                    task.wait(0.025)
+                end
+            end)
+        end
+
+        local function MakeCard(Index: number)
+            local Card = { Ticks = {} }
+            Card.Frame = New("Frame", {
+                BackgroundColor3 = "MainColor",
+                BackgroundTransparency = 0.12,
+                Position = UDim2.fromOffset(0, (Index - 1) * (CardHeight + Gap)),
+                Size = UDim2.new(1, 0, 0, CardHeight),
+                Parent = Holder,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(0, 10),
+                Parent = Card.Frame,
+            })
+            Card.Stroke = New("UIStroke", {
+                Color = Library.Scheme.OutlineColor,
+                Transparency = 0.3,
+                Parent = Card.Frame,
+            })
+            Card.Ring = New("Frame", {
+                AnchorPoint = Vector2.new(0, 0.5),
+                BackgroundTransparency = 1,
+                Position = UDim2.new(0, 9, 0.5, 0),
+                Size = UDim2.fromOffset(RingSize, RingSize),
+                ZIndex = Base + 1,
+                Parent = Card.Frame,
+            })
+            local Radius = RingSize / 2 - 4
+            for Tick = 1, TickCount do
+                local Angle = (Tick - 0.5) / TickCount * math.pi * 2
+                local Frame = New("Frame", {
+                    AnchorPoint = Vector2.new(0.5, 0.5),
+                    BackgroundColor3 = Library.Scheme.OutlineColor,
+                    Position = UDim2.new(0.5, math.sin(Angle) * Radius, 0.5, -math.cos(Angle) * Radius),
+                    Rotation = math.deg(Angle),
+                    Size = UDim2.fromOffset(3, 8),
+                    ZIndex = Base + 2,
+                    Parent = Card.Ring,
+                })
+                New("UICorner", {
+                    CornerRadius = UDim.new(1, 0),
+                    Parent = Frame,
+                })
+                Card.Ticks[Tick] = Frame
+            end
+            Card.Disc = New("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                BackgroundTransparency = 0.86,
+                Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.fromOffset(RingSize - 24, RingSize - 24),
+                ZIndex = Base + 2,
+                Parent = Card.Ring,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(1, 0),
+                Parent = Card.Disc,
+            })
+            Card.Icon = New("ImageLabel", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                BackgroundTransparency = 1,
+                Position = UDim2.fromScale(0.5, 0.5),
+                ScaleType = Enum.ScaleType.Fit,
+                Size = UDim2.fromOffset(20, 20),
+                ZIndex = Base + 3,
+                Parent = Card.Ring,
+            })
+            local TextLeft = RingSize + 20
+            Card.Title = New("TextLabel", {
+                BackgroundTransparency = 1,
+                FontFace = GetBoldFont,
+                Position = UDim2.fromOffset(TextLeft, 10),
+                Size = UDim2.new(1, -TextLeft - 78, 0, 17),
+                Text = "",
+                TextSize = 14,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                ZIndex = Base + 2,
+                Parent = Card.Frame,
+            })
+            Card.Value = New("TextLabel", {
+                BackgroundTransparency = 1,
+                Position = UDim2.fromOffset(TextLeft, 29),
+                Size = UDim2.new(1, -TextLeft - 12, 0, 15),
+                Text = "",
+                TextSize = 13,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                ZIndex = Base + 2,
+                Parent = Card.Frame,
+            })
+            Card.Note = New("TextLabel", {
+                BackgroundTransparency = 1,
+                Position = UDim2.fromOffset(TextLeft, 46),
+                Size = UDim2.new(1, -TextLeft - 12, 0, 14),
+                Text = "",
+                TextSize = 12,
+                TextTransparency = 0.45,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                ZIndex = Base + 2,
+                Parent = Card.Frame,
+            })
+            Card.Percent = New("TextLabel", {
+                AnchorPoint = Vector2.new(1, 0),
+                BackgroundTransparency = 1,
+                FontFace = GetBoldFont,
+                Position = UDim2.new(1, -32, 0, 8),
+                Size = UDim2.fromOffset(52, 20),
+                Text = "",
+                TextSize = 17,
+                TextXAlignment = Enum.TextXAlignment.Right,
+                ZIndex = Base + 2,
+                Parent = Card.Frame,
+            })
+            Card.Remove = New("ImageButton", {
+                AnchorPoint = Vector2.new(1, 0),
+                BackgroundTransparency = 1,
+                Position = UDim2.new(1, -9, 0, 11),
+                Size = UDim2.fromOffset(14, 14),
+                ImageTransparency = 0.5,
+                ZIndex = Base + 3,
+                Parent = Card.Frame,
+            })
+            WidgetIcon(Card.Remove, "x", Library.Scheme.FontColor)
+            Card.Remove.MouseEnter:Connect(function()
+                Card.Remove.ImageTransparency = 0
+            end)
+            Card.Remove.MouseLeave:Connect(function()
+                Card.Remove.ImageTransparency = 0.5
+            end)
+            Card.Remove.MouseButton1Click:Connect(function()
+                if Card.Id ~= nil and Info.Removed then
+                    Library:SafeCallback(Info.Removed, Card.Id)
+                end
+            end)
+            return Card
+        end
+
+        local function Resize()
+            local Count = Goals.Count
+            if Count == 0 then
+                Holder.Size = UDim2.new(1, 0, 0, 40)
+            else
+                Holder.Size = UDim2.new(1, 0, 0, Count * CardHeight + (Count - 1) * Gap)
+            end
+            Groupbox:Resize()
+        end
+
+        function Goals:SetData(List)
+            List = List or {}
+            local Count = #List
+            for Index = 1, Count do
+                local Entry = List[Index]
+                local Card = Goals.Cards[Index]
+                if not Card then
+                    Card = MakeCard(Index)
+                    Goals.Cards[Index] = Card
+                end
+                local Color = WidgetColor(Entry.Color, Library.Scheme.AccentColor)
+                local Changed = Card.Id ~= Entry.Id
+                Card.Id = Entry.Id
+                Card.Color = Color
+                Card.Disc.BackgroundColor3 = Color
+                WidgetIcon(Card.Icon, Entry.Icon, Color)
+                Card.Title.Text = WidgetEscape(Entry.Title or "")
+                Card.Value.Text = tostring(Entry.Value or "")
+                Card.Note.Text = tostring(Entry.Note or "")
+                local Progress = math.clamp(tonumber(Entry.Progress) or 0, 0, 1)
+                if Entry.Done then
+                    Progress = 1
+                    Card.Percent.Text = '<font color="#60d696">\u{2713}</font>'
+                    Card.Stroke.Color = Color
+                    Card.Stroke.Transparency = 0.25
+                    if not Card.WasDone and not Changed and Library.Animations ~= false then
+                        Card.Stroke.Transparency = 0
+                        Card.Stroke.Thickness = 2
+                        TweenService:Create(Card.Stroke, TweenInfo.new(1.2, Enum.EasingStyle.Quint), { Thickness = 1, Transparency = 0.25 }):Play()
+                    end
+                else
+                    Card.Percent.Text = string.format("%d%%", math.floor(Progress * 100))
+                    Card.Stroke.Color = Library.Scheme.OutlineColor
+                    Card.Stroke.Transparency = 0.3
+                end
+                Card.WasDone = Entry.Done == true
+                if Changed then
+                    Card.Shown = 0
+                    Card.Token = (Card.Token or 0) + 1
+                    PaintRing(Card, 0)
+                end
+                AnimateRing(Card, Progress)
+                Card.Frame.Visible = true
+            end
+            for Index = Count + 1, #Goals.Cards do
+                local Card = Goals.Cards[Index]
+                Card.Frame.Visible = false
+                Card.Id = nil
+            end
+            Goals.Count = Count
+            EmptyLabel.Visible = Count == 0
+            Resize()
+        end
+
+        function Goals:SetVisible(Visible: boolean)
+            Goals.Visible = Visible
+            Holder.Visible = Visible
+            Groupbox:Resize()
+        end
+
+        Library:OnThemeChanged(function()
+            for _, Card in Goals.Cards do
+                if Card.Frame.Visible then
+                    PaintRing(Card, Card.Target or Card.Shown or 0)
+                end
+            end
+        end)
+
+        Goals.Holder = Holder
+        Resize()
+        table.insert(Groupbox.Elements, Goals)
+        if Idx then
+            Options[Idx] = Goals
+        end
+        return Goals
+    end
+
+    function Library:ShowWizard(Info)
+        Info = Info or {}
+        local Host = Library.Window and Library.Window.MainFrame
+        if not Host then
+            return nil
+        end
+        if Library.ActiveWizard then
+            pcall(Library.ActiveWizard.Close, Library.ActiveWizard, true)
+        end
+
+        local Steps = Info.Steps or {}
+        local Wizard = {
+            Step = 1,
+            Values = {},
+            Closed = false,
+            Cards = {},
+        }
+
+        for Index, Step in Steps do
+            local Key = Step.Id or Index
+            if Step.Multi then
+                local Set = {}
+                for _, Id in Step.Default or {} do
+                    Set[Id] = true
+                end
+                Wizard.Values[Key] = Set
+            else
+                Wizard.Values[Key] = if Step.Default ~= nil then Step.Default elseif Step.Choices and Step.Choices[1] then Step.Choices[1].Id else nil
+            end
+        end
+
+        local Scale = math.max(Library.DPIScale, 0.01)
+        local HostWidth = Host.AbsoluteSize.X / Scale
+        local HostHeight = Host.AbsoluteSize.Y / Scale
+        if HostWidth < 100 then
+            HostWidth = 720
+        end
+        if HostHeight < 100 then
+            HostHeight = 520
+        end
+        local Width = math.clamp(HostWidth - 36, 280, 580)
+        local Height = math.clamp(HostHeight - 36, 250, 430)
+        local Wide = Width >= 440
+
+        local Overlay = New("TextButton", {
+            AutoButtonColor = false,
+            BackgroundColor3 = "DarkColor",
+            BackgroundTransparency = 1,
+            Size = UDim2.fromScale(1, 1),
+            Text = "",
+            ZIndex = 9100,
+            Parent = Host,
+        })
+        New("UICorner", {
+            CornerRadius = UDim.new(0, Library.CornerRadius or 8),
+            Parent = Overlay,
+        })
+        WidgetTween(Overlay, 0.25, { BackgroundTransparency = 0.3 })
+
+        local Card = New("TextButton", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            AutoButtonColor = false,
+            BackgroundColor3 = "BackgroundColor",
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromOffset(Width, Height),
+            Text = "",
+            ZIndex = 1,
+            Parent = Overlay,
+        })
+        New("UICorner", {
+            CornerRadius = UDim.new(0, 12),
+            Parent = Card,
+        })
+        New("UIStroke", {
+            Color = "OutlineColor",
+            Parent = Card,
+        })
+        local CardScale = New("UIScale", {
+            Scale = 0.94,
+            Parent = Card,
+        })
+        WidgetTween(CardScale, 0.3, { Scale = 1 }, Enum.EasingStyle.Back)
+
+        local Glow = New("Frame", {
+            BackgroundColor3 = "AccentColor",
+            BackgroundTransparency = 0.82,
+            Size = UDim2.new(1, 0, 0, 90),
+            ZIndex = 1,
+            Parent = Card,
+        })
+        New("UICorner", {
+            CornerRadius = UDim.new(0, 12),
+            Parent = Glow,
+        })
+        New("UIGradient", {
+            Rotation = 90,
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0),
+                NumberSequenceKeypoint.new(1, 1),
+            }),
+            Parent = Glow,
+        })
+
+        local Visible = {}
+        local function VisibleSteps()
+            table.clear(Visible)
+            for Index, Step in Steps do
+                local Show = true
+                if typeof(Step.Visible) == "function" then
+                    local Ok, Result = pcall(Step.Visible, Wizard.Values)
+                    Show = not Ok or Result ~= false
+                end
+                if Show then
+                    table.insert(Visible, Index)
+                end
+            end
+            return Visible
+        end
+
+        local Segments = New("Frame", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(20, 16),
+            Size = UDim2.new(1, -40, 0, 4),
+            ZIndex = 2,
+            Parent = Card,
+        })
+        local StepLabel = New("TextLabel", {
+            BackgroundTransparency = 1,
+            FontFace = GetBoldFont,
+            Position = UDim2.fromOffset(20, 28),
+            Size = UDim2.new(1, -40, 0, 14),
+            Text = "",
+            TextColor3 = "AccentColor",
+            TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            ZIndex = 2,
+            Parent = Card,
+        })
+        local TitleLabel = New("TextLabel", {
+            BackgroundTransparency = 1,
+            FontFace = GetBoldFont,
+            Position = UDim2.fromOffset(20, 44),
+            Size = UDim2.new(1, -40, 0, 22),
+            Text = "",
+            TextSize = 19,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            ZIndex = 2,
+            Parent = Card,
+        })
+        local DescLabel = New("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(20, 68),
+            Size = UDim2.new(1, -40, 0, 30),
+            Text = "",
+            TextSize = 13,
+            TextTransparency = 0.35,
+            TextWrapped = true,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            ZIndex = 2,
+            Parent = Card,
+        })
+        local FooterHeight = 52
+        local Choices = New("ScrollingFrame", {
+            BackgroundTransparency = 1,
+            CanvasSize = UDim2.new(),
+            Position = UDim2.fromOffset(20, 104),
+            ScrollBarImageColor3 = "OutlineColor",
+            ScrollBarThickness = 3,
+            ScrollingDirection = Enum.ScrollingDirection.Y,
+            Size = UDim2.new(1, -34, 1, -104 - FooterHeight - 4),
+            ZIndex = 2,
+            Parent = Card,
+        })
+        New("Frame", {
+            AnchorPoint = Vector2.new(0, 1),
+            BackgroundColor3 = "OutlineColor",
+            Position = UDim2.new(0, 0, 1, -FooterHeight),
+            Size = UDim2.new(1, 0, 0, 1),
+            ZIndex = 2,
+            Parent = Card,
+        })
+
+        local function FooterButton(Text: string, Kind: string, Anchor: number, X: number, ButtonWidth: number)
+            local Primary = Kind == "Primary"
+            local Button = New("TextButton", {
+                AnchorPoint = Vector2.new(Anchor, 0.5),
+                BackgroundColor3 = if Primary then "AccentColor" elseif Kind == "Ghost" then "BackgroundColor" else "MainColor",
+                BackgroundTransparency = if Kind == "Ghost" then 1 else 0,
+                FontFace = GetBoldFont,
+                Position = UDim2.new(Anchor, X, 1, -FooterHeight / 2),
+                Size = UDim2.fromOffset(ButtonWidth, 30),
+                Text = Text,
+                TextColor3 = if Primary then "BackgroundColor" else "FontColor",
+                TextSize = 13,
+                TextTransparency = if Kind == "Ghost" then 0.4 else 0,
+                ZIndex = 3,
+                Parent = Card,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(0, 7),
+                Parent = Button,
+            })
+            if Kind == "Secondary" then
+                New("UIStroke", {
+                    Color = "OutlineColor",
+                    Parent = Button,
+                })
+            end
+            return Button
+        end
+
+        local SkipButton = FooterButton(Info.SkipText or "Skip", "Ghost", 0, 12, 70)
+        local NextButton = FooterButton("Next", "Primary", 1, -16, 96)
+        local BackButton = FooterButton("Back", "Secondary", 1, -120, 80)
+        Wizard.SkipButton, Wizard.NextButton, Wizard.BackButton = SkipButton, NextButton, BackButton
+        Wizard.Overlay = Overlay
+        Wizard.Card = Card
+
+        local function PaintChoices()
+            local Step = Steps[Wizard.Step]
+            if not Step then
+                return
+            end
+            local Key = Step.Id or Wizard.Step
+            local Value = Wizard.Values[Key]
+            for _, Entry in Wizard.Cards do
+                local Selected = if Step.Multi then (typeof(Value) == "table" and Value[Entry.Id] == true) else Value == Entry.Id
+                Entry.Stroke.Color = if Selected then Library.Scheme.AccentColor else Library.Scheme.OutlineColor
+                Entry.Stroke.Thickness = if Selected then 1.5 else 1
+                Entry.Stroke.Transparency = if Selected then 0 else 0.3
+                Entry.Fill.BackgroundTransparency = if Selected then 0.88 else 1
+                Entry.Check.Visible = Selected
+            end
+            local Ready = true
+            if Step.Multi and Step.Required and typeof(Value) == "table" then
+                Ready = next(Value) ~= nil
+            end
+            NextButton.BackgroundTransparency = if Ready then 0 else 0.6
+            Wizard.Ready = Ready
+        end
+
+        local function Show(StepIndex: number, Direction: number?)
+            Wizard.Step = StepIndex
+            local Step = Steps[StepIndex]
+            if not Step then
+                return
+            end
+            local Order = VisibleSteps()
+            local Position = table.find(Order, StepIndex) or 1
+            for _, Child in Segments:GetChildren() do
+                Child:Destroy()
+            end
+            local Count = #Order
+            for Index = 1, Count do
+                local Segment = New("Frame", {
+                    BackgroundColor3 = if Index <= Position then "AccentColor" else "OutlineColor",
+                    BackgroundTransparency = if Index <= Position then 0 else 0.2,
+                    Position = UDim2.new((Index - 1) / Count, if Index > 1 then 3 else 0, 0, 0),
+                    Size = UDim2.new(1 / Count, if Index > 1 then -3 else 0, 1, 0),
+                    ZIndex = 2,
+                    Parent = Segments,
+                })
+                New("UICorner", {
+                    CornerRadius = UDim.new(1, 0),
+                    Parent = Segment,
+                })
+            end
+            StepLabel.Text = string.format("STEP %d OF %d", Position, Count)
+            TitleLabel.Text = tostring(Step.Title or "")
+            DescLabel.Text = tostring(Step.Description or "")
+            BackButton.Visible = Position > 1
+            NextButton.Text = if Position >= Count then (Info.FinishText or "Finish") else "Next"
+
+            for _, Entry in Wizard.Cards do
+                Entry.Button:Destroy()
+            end
+            table.clear(Wizard.Cards)
+            local Columns = if Wide and not Step.SingleColumn then 2 else 1
+            local ChoiceHeight = Step.ChoiceHeight or 58
+            local ChoiceGap = 8
+            local Key = Step.Id or StepIndex
+            for Index, Choice in Step.Choices or {} do
+                local Column = (Index - 1) % Columns
+                local Row = math.floor((Index - 1) / Columns)
+                local Button = New("TextButton", {
+                    AutoButtonColor = false,
+                    BackgroundColor3 = "MainColor",
+                    Position = UDim2.new(Column / Columns, Column * ChoiceGap / Columns, 0, Row * (ChoiceHeight + ChoiceGap) + 2),
+                    Size = UDim2.new(1 / Columns, -(Columns - 1) * ChoiceGap / Columns - 2, 0, ChoiceHeight),
+                    Text = "",
+                    ZIndex = 3,
+                    Parent = Choices,
+                })
+                New("UICorner", {
+                    CornerRadius = UDim.new(0, 9),
+                    Parent = Button,
+                })
+                local Stroke = New("UIStroke", {
+                    Color = Library.Scheme.OutlineColor,
+                    Transparency = 0.3,
+                    Parent = Button,
+                })
+                local Fill = New("Frame", {
+                    BackgroundColor3 = "AccentColor",
+                    BackgroundTransparency = 1,
+                    Size = UDim2.fromScale(1, 1),
+                    ZIndex = 3,
+                    Parent = Button,
+                })
+                New("UICorner", {
+                    CornerRadius = UDim.new(0, 9),
+                    Parent = Fill,
+                })
+                local ChoiceColor = WidgetColor(Choice.Color, Library.Scheme.AccentColor)
+                local Bubble = New("Frame", {
+                    AnchorPoint = Vector2.new(0, 0.5),
+                    BackgroundColor3 = ChoiceColor,
+                    BackgroundTransparency = 0.82,
+                    Position = UDim2.new(0, 10, 0.5, 0),
+                    Size = UDim2.fromOffset(34, 34),
+                    ZIndex = 4,
+                    Parent = Button,
+                })
+                New("UICorner", {
+                    CornerRadius = UDim.new(1, 0),
+                    Parent = Bubble,
+                })
+                local Icon = New("ImageLabel", {
+                    AnchorPoint = Vector2.new(0.5, 0.5),
+                    BackgroundTransparency = 1,
+                    Position = UDim2.fromScale(0.5, 0.5),
+                    ScaleType = Enum.ScaleType.Fit,
+                    Size = UDim2.fromOffset(20, 20),
+                    ZIndex = 5,
+                    Parent = Bubble,
+                })
+                WidgetIcon(Icon, Choice.Icon, ChoiceColor)
+                New("TextLabel", {
+                    BackgroundTransparency = 1,
+                    FontFace = GetBoldFont,
+                    Position = UDim2.fromOffset(54, 9),
+                    Size = UDim2.new(1, -80, 0, 17),
+                    Text = tostring(Choice.Title or Choice.Id),
+                    TextSize = 14,
+                    TextTruncate = Enum.TextTruncate.AtEnd,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 4,
+                    Parent = Button,
+                })
+                New("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Position = UDim2.fromOffset(54, 27),
+                    Size = UDim2.new(1, -62, 0, ChoiceHeight - 32),
+                    Text = tostring(Choice.Description or ""),
+                    TextSize = 12,
+                    TextTransparency = 0.4,
+                    TextTruncate = Enum.TextTruncate.AtEnd,
+                    TextWrapped = true,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    TextYAlignment = Enum.TextYAlignment.Top,
+                    ZIndex = 4,
+                    Parent = Button,
+                })
+                local Check = New("Frame", {
+                    AnchorPoint = Vector2.new(1, 0),
+                    BackgroundColor3 = "AccentColor",
+                    Position = UDim2.new(1, -8, 0, 8),
+                    Size = UDim2.fromOffset(16, 16),
+                    Visible = false,
+                    ZIndex = 5,
+                    Parent = Button,
+                })
+                New("UICorner", {
+                    CornerRadius = UDim.new(1, 0),
+                    Parent = Check,
+                })
+                local CheckIcon = New("ImageLabel", {
+                    AnchorPoint = Vector2.new(0.5, 0.5),
+                    BackgroundTransparency = 1,
+                    Position = UDim2.fromScale(0.5, 0.5),
+                    Size = UDim2.fromOffset(11, 11),
+                    ZIndex = 6,
+                    Parent = Check,
+                })
+                WidgetIcon(CheckIcon, "check", Library.Scheme.BackgroundColor)
+                local Entry = { Id = Choice.Id, Button = Button, Stroke = Stroke, Fill = Fill, Check = Check }
+                table.insert(Wizard.Cards, Entry)
+                Button.MouseButton1Click:Connect(function()
+                    if Step.Multi then
+                        local Set = Wizard.Values[Key]
+                        if typeof(Set) ~= "table" then
+                            Set = {}
+                            Wizard.Values[Key] = Set
+                        end
+                        Set[Choice.Id] = if Set[Choice.Id] then nil else true
+                    else
+                        Wizard.Values[Key] = Choice.Id
+                    end
+                    PaintChoices()
+                end)
+                if Direction and Library.Animations ~= false then
+                    local ButtonScale = New("UIScale", {
+                        Scale = 0.92,
+                        Parent = Button,
+                    })
+                    task.delay(0.03 * (Index - 1), function()
+                        WidgetTween(ButtonScale, 0.28, { Scale = 1 }, Enum.EasingStyle.Back)
+                    end)
+                end
+            end
+            local Rows = math.ceil(#(Step.Choices or {}) / Columns)
+            Choices.CanvasSize = UDim2.fromOffset(0, Rows * (ChoiceHeight + ChoiceGap) + 4)
+            Choices.CanvasPosition = Vector2.zero
+            PaintChoices()
+        end
+        Wizard.Show = Show
+
+        function Wizard:Close(Silent: boolean?)
+            if Wizard.Closed then
+                return
+            end
+            Wizard.Closed = true
+            if Library.ActiveWizard == Wizard then
+                Library.ActiveWizard = nil
+            end
+            WidgetTween(Overlay, 0.2, { BackgroundTransparency = 1 })
+            WidgetTween(CardScale, 0.2, { Scale = 0.94 })
+            task.delay(0.22, function()
+                pcall(Overlay.Destroy, Overlay)
+            end)
+        end
+
+        local function Move(Delta: number)
+            local Order = VisibleSteps()
+            local Position = table.find(Order, Wizard.Step) or 1
+            local Target = Order[Position + Delta]
+            if Target then
+                Show(Target, Delta)
+                return true
+            end
+            return false
+        end
+
+        function Wizard:Next()
+            if not Wizard.Ready then
+                return
+            end
+            if not Move(1) then
+                Wizard:Close()
+                if Info.Finish then
+                    Library:SafeCallback(Info.Finish, Wizard.Values)
+                end
+            end
+        end
+
+        function Wizard:Back()
+            Move(-1)
+        end
+
+        NextButton.MouseButton1Click:Connect(function()
+            Wizard:Next()
+        end)
+        BackButton.MouseButton1Click:Connect(function()
+            Wizard:Back()
+        end)
+        SkipButton.MouseButton1Click:Connect(function()
+            Wizard:Close()
+            if Info.Skipped then
+                Library:SafeCallback(Info.Skipped)
+            end
+        end)
+
+        local First = VisibleSteps()[1]
+        if First then
+            Show(First)
+        end
+        if not Wizard.Closed then
+            Library.ActiveWizard = Wizard
+        end
+        return Wizard
+    end
+
+    local Base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    local Base64Lookup = {}
+    for Index = 1, 64 do
+        Base64Lookup[string.byte(Base64Alphabet, Index)] = Index - 1
+    end
+
+    function Library.Base64Encode(Data: string): string
+        local Out = {}
+        for Index = 1, #Data, 3 do
+            local A, B, C = string.byte(Data, Index, Index + 2)
+            local Number = A * 65536 + (B or 0) * 256 + (C or 0)
+            local D1 = Number // 262144 % 64
+            local D2 = Number // 4096 % 64
+            local D3 = Number // 64 % 64
+            local D4 = Number % 64
+            Out[#Out + 1] = string.sub(Base64Alphabet, D1 + 1, D1 + 1)
+                .. string.sub(Base64Alphabet, D2 + 1, D2 + 1)
+                .. (if B then string.sub(Base64Alphabet, D3 + 1, D3 + 1) else "=")
+                .. (if C then string.sub(Base64Alphabet, D4 + 1, D4 + 1) else "=")
+        end
+        return table.concat(Out)
+    end
+
+    function Library.Base64Decode(Data: string): string?
+        Data = string.gsub(tostring(Data or ""), "[^%w%+/=]", "")
+        if #Data % 4 ~= 0 then
+            return nil
+        end
+        local Out = {}
+        for Index = 1, #Data, 4 do
+            local C1, C2, C3, C4 = string.byte(Data, Index, Index + 3)
+            local V1, V2 = Base64Lookup[C1], Base64Lookup[C2]
+            local V3 = if C3 == 61 then nil else Base64Lookup[C3]
+            local V4 = if C4 == 61 then nil else Base64Lookup[C4]
+            if V1 == nil or V2 == nil or (C3 ~= 61 and V3 == nil) or (C4 ~= 61 and V4 == nil) then
+                return nil
+            end
+            local Number = V1 * 262144 + V2 * 4096 + (V3 or 0) * 64 + (V4 or 0)
+            Out[#Out + 1] = string.char(Number // 65536 % 256)
+            if V3 ~= nil then
+                Out[#Out + 1] = string.char(Number // 256 % 256)
+            end
+            if V4 ~= nil then
+                Out[#Out + 1] = string.char(Number % 256)
+            end
+        end
+        return table.concat(Out)
+    end
+
+    local ShareTypes = { Toggle = true, Slider = true, Dropdown = true, Input = true }
+
+    local function ShareEligible(Index: any, Element: any, Ignore: any): boolean
+        if typeof(Index) ~= "string" or typeof(Element) ~= "table" then
+            return false
+        end
+        if not ShareTypes[Element.Type] then
+            return false
+        end
+        if Ignore and Ignore[Index] then
+            return false
+        end
+        if Library.ShareIgnore and Library.ShareIgnore[Index] then
+            return false
+        end
+        if string.sub(Index, 1, 6) == "Corvus" or string.sub(Index, 1, 12) == "SaveManager_" then
+            return false
+        end
+        return true
+    end
+
+    local function ShareDropdownKeys(Element: any): { string }
+        local Keys = {}
+        if typeof(Element.Value) == "table" then
+            for Key, On in Element.Value do
+                if On then
+                    table.insert(Keys, tostring(Key))
+                end
+            end
+        end
+        table.sort(Keys)
+        return Keys
+    end
+
+    local function ShareDefaultKeys(Element: any): { string }
+        local Keys = {}
+        for _, Key in Element.Default or {} do
+            table.insert(Keys, tostring(Key))
+        end
+        table.sort(Keys)
+        return Keys
+    end
+
+    local function ShareSnapshot(Element: any): (any, boolean)
+        local Kind = Element.Type
+        if Kind == "Toggle" then
+            return Element.Value == true, (Element.Value == true) ~= (Element.Default == true)
+        elseif Kind == "Slider" then
+            return Element.Value, tostring(Element.Value) ~= tostring(Element.Default)
+        elseif Kind == "Input" then
+            local Value = tostring(Element.Value or "")
+            if string.find(Value, "://", 1, true) then
+                return nil, false
+            end
+            return Value, Value ~= tostring(Element.Default or "")
+        elseif Kind == "Dropdown" then
+            if Element.Multi then
+                local Keys = ShareDropdownKeys(Element)
+                return Keys, table.concat(Keys, "\0") ~= table.concat(ShareDefaultKeys(Element), "\0")
+            end
+            local Value = if Element.Value == nil then false else Element.Value
+            local Default = if Element.Default and Element.Default[1] ~= nil then Element.Default[1] else false
+            return Value, Value ~= Default
+        end
+        return nil, false
+    end
+
+    function Library:ExportShareCode(Ignore: any): (string?, any)
+        local Changed = {}
+        local Count = 0
+        local function Visit(List)
+            for Index, Element in List do
+                if ShareEligible(Index, Element, Ignore) then
+                    local Ok, Value, Differs = pcall(ShareSnapshot, Element)
+                    if Ok and Differs and Value ~= nil then
+                        Changed[Index] = Value
+                        Count += 1
+                    end
+                end
+            end
+        end
+        Visit(Library.Toggles)
+        Visit(Library.Options)
+        local Ok, Json = pcall(HttpService.JSONEncode, HttpService, { v = 1, g = game.GameId, d = Changed })
+        if not Ok then
+            return nil, "Could not encode your settings"
+        end
+        return "CORVUS-" .. Library.Base64Encode(Json), Count
+    end
+
+    function Library:ImportShareCode(Code: string, Ignore: any): (boolean, any)
+        Code = tostring(Code or "")
+        Code = string.gsub(Code, "%s", "")
+        local Body = string.match(Code, "^CORVUS%-(.+)$")
+        if not Body then
+            return false, "That is not a Corvus share code"
+        end
+        local Json = Library.Base64Decode(Body)
+        if not Json then
+            return false, "The code is damaged, copy it again"
+        end
+        local Ok, Data = pcall(HttpService.JSONDecode, HttpService, Json)
+        if not Ok or typeof(Data) ~= "table" or typeof(Data.d) ~= "table" then
+            return false, "The code is damaged, copy it again"
+        end
+        if Data.g and tonumber(Data.g) and tonumber(Data.g) ~= game.GameId then
+            return false, "This code is for a different game"
+        end
+        local Applied = 0
+        local function Apply(Element: any, Value: any)
+            local Kind = Element.Type
+            if Kind == "Toggle" then
+                Element:SetValue(Value == true)
+            elseif Kind == "Slider" then
+                local Number = tonumber(Value)
+                if Number then
+                    Element:SetValue(Number)
+                end
+            elseif Kind == "Input" then
+                Element:SetValue(tostring(Value or ""))
+            elseif Kind == "Dropdown" then
+                if Element.Multi then
+                    local Set = {}
+                    if typeof(Value) == "table" then
+                        for _, Key in Value do
+                            Set[Key] = true
+                        end
+                    end
+                    Element:SetValue(Set)
+                else
+                    Element:SetValue(if Value == false then nil else Value)
+                end
+            end
+        end
+        local function Visit(List)
+            for Index, Element in List do
+                if ShareEligible(Index, Element, Ignore) then
+                    local Value = Data.d[Index]
+                    if Value ~= nil then
+                        if pcall(Apply, Element, Value) then
+                            Applied += 1
+                        end
+                    else
+                        local Kind = Element.Type
+                        local Default
+                        if Kind == "Toggle" then
+                            Default = Element.Default == true
+                        elseif Kind == "Slider" then
+                            Default = Element.Default
+                        elseif Kind == "Input" then
+                            Default = tostring(Element.Default or "")
+                            if string.find(tostring(Element.Value or ""), "://", 1, true) then
+                                Default = nil
+                            end
+                        elseif Kind == "Dropdown" then
+                            Default = if Element.Multi then ShareDefaultKeys(Element) elseif Element.Default and Element.Default[1] ~= nil then Element.Default[1] else false
+                        end
+                        if Default ~= nil then
+                            local _, Current, Differs = pcall(ShareSnapshot, Element)
+                            if Differs and Current ~= nil then
+                                pcall(Apply, Element, Default)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        Visit(Library.Toggles)
+        Visit(Library.Options)
+        return true, Applied
+    end
+
     function Funcs:AddThemeGallery(Info)
         if self.Destroyed then return nil end
         Info = Info or {}
@@ -23451,6 +25231,128 @@ function Library:CreateWindow(WindowInfo)
         })
         local LagStat = Perf:AddStat({ Icon = "zap", Text = "Objects optimized", Value = "0", Size = 22 })
 
+        local Adaptive = {
+            Enabled = true,
+            Threshold = 25,
+            Low = 0,
+            LastAction = -1e9,
+            Started = os.clock(),
+            Focused = true,
+            Frames = 0,
+            Elapsed = 0,
+            Fps = nil,
+            Raised = nil,
+        }
+        Library.AdaptiveLag = Adaptive
+        pcall(function()
+            Library:GiveSignal(UserInputService.WindowFocusReleased:Connect(function()
+                Adaptive.Focused = false
+                Adaptive.Low = 0
+            end))
+            Library:GiveSignal(UserInputService.WindowFocused:Connect(function()
+                Adaptive.Focused = true
+                Adaptive.Low = 0
+            end))
+        end)
+        Library:GiveSignal(RunService.Heartbeat:Connect(function(Delta)
+            Adaptive.Frames += 1
+            Adaptive.Elapsed += tonumber(Delta) or 0
+        end))
+
+        function Adaptive.Sample(Fps: number)
+            Adaptive.Fps = Fps
+            if not Adaptive.Enabled or not Adaptive.Focused then
+                Adaptive.Low = 0
+                return
+            end
+            if os.clock() - Adaptive.Started < 20 then
+                return
+            end
+            local CapOption = Library.Options.CorvusFPSCap
+            local Cap = CapOption and tonumber(CapOption.Value)
+            if Cap and Cap <= Adaptive.Threshold + 5 then
+                Adaptive.Low = 0
+                return
+            end
+            local NoRender = Library.Toggles.CorvusNoRender
+            if NoRender and NoRender.Value then
+                Adaptive.Low = 0
+                return
+            end
+            if Fps < Adaptive.Threshold then
+                Adaptive.Low += 1
+            else
+                Adaptive.Low = 0
+                return
+            end
+            if os.clock() - Adaptive.LastAction < 20 then
+                return
+            end
+            local Toggle = Library.Toggles.CorvusAntiLag
+            local LevelOption = Library.Options.CorvusAntiLagLevel
+            if not Toggle then
+                return
+            end
+            if not AntiLag.Enabled and Adaptive.Low >= 8 then
+                Adaptive.LastAction = os.clock()
+                Adaptive.Low = 0
+                if LevelOption and AntiLag.Level < 2 then
+                    LevelOption:SetValue("Balanced")
+                end
+                Toggle:SetValue(true)
+                Adaptive.Raised = if LevelOption then LevelOption.Value else "Balanced"
+                Library:Notify({
+                    Title = "Adaptive anti lag",
+                    Description = string.format("FPS dropped to %d, anti lag is now on (%s)", math.floor(Fps + 0.5), tostring(Adaptive.Raised)),
+                    Time = 6,
+                })
+            elseif AntiLag.Enabled and AntiLag.Level < 3 and Adaptive.Low >= 12 and LevelOption then
+                Adaptive.LastAction = os.clock()
+                Adaptive.Low = 0
+                LevelOption:SetValue("Ultra")
+                Adaptive.Raised = "Ultra"
+                Library:Notify({
+                    Title = "Adaptive anti lag",
+                    Description = string.format("Still %d FPS, switched anti lag to Ultra", math.floor(Fps + 0.5)),
+                    Time = 6,
+                })
+            end
+        end
+
+        Perf:AddToggle("CorvusAdaptiveLag", {
+            Text = "Adaptive anti lag",
+            Description = "Turns anti lag on by itself when FPS drops",
+            Tooltip = "Watches your FPS. If it stays under the limit for about 8 seconds, anti lag turns on at Balanced, and moves to Ultra if that is not enough. It never turns anything off on its own.",
+            Default = true,
+            Callback = function(Value)
+                Adaptive.Enabled = Value
+                Adaptive.Low = 0
+            end,
+        })
+        Perf:AddDropdown("CorvusAdaptiveFPS", {
+            Text = "Kick in below",
+            Values = { "15 FPS", "20 FPS", "25 FPS", "30 FPS", "40 FPS" },
+            Default = "25 FPS",
+            Callback = function(Value)
+                Adaptive.Threshold = tonumber(string.match(tostring(Value), "%d+")) or 25
+                Adaptive.Low = 0
+            end,
+        })
+        local FpsStat = Perf:AddStat({ Icon = "gauge", Text = "FPS", Value = "-", Size = 22, ValueColor = "FontColor" })
+        task.spawn(function()
+            while not Library.Unloaded do
+                task.wait(1)
+                if Adaptive.Elapsed > 0.2 then
+                    local Fps = Adaptive.Frames / Adaptive.Elapsed
+                    Adaptive.Frames, Adaptive.Elapsed = 0, 0
+                    pcall(Adaptive.Sample, Fps)
+                    local Color = if Fps >= 50 then "#60d696" elseif Fps >= 30 then "#ffb84d" else "#ff6e8a"
+                    local Suffix = if Adaptive.Low > 0 and Adaptive.Enabled then string.format('  <font transparency="0.5">low %ds</font>', Adaptive.Low) else ""
+                    pcall(FpsStat.SetValue, FpsStat, string.format('<font color="%s">%d</font>%s', Color, math.floor(Fps + 0.5), Suffix))
+                end
+            end
+        end)
+
         local Overlay = nil
         local function BuildOverlay()
             if Overlay then
@@ -24088,6 +25990,7 @@ function Library:CreateWindow(WindowInfo)
                 "CorvusTheme",
                 "CorvusConfigName",
                 "CorvusConfigList",
+                "CorvusShareCode",
             })
             SaveManager:SetFolder(Folder)
             if Info.SubFolder then
@@ -24218,6 +26121,35 @@ function Library:CreateWindow(WindowInfo)
 
             AutoloadLabel = Configs:AddLabel('<font transparency="0.5">Autoload</font>   none')
             RefreshConfigs()
+
+            Configs:AddDivider()
+            Configs:AddInput("CorvusShareCode", {
+                Text = "Share code",
+                Placeholder = "Paste a code from a friend",
+                Default = "",
+            })
+            Configs:AddButton({
+                Text = "Copy my code",
+                Tooltip = "Makes a short code with everything you changed. Webhook links and other private text are never included.",
+                Func = function()
+                    local Code, Count = Library:ExportShareCode(SaveManager.Ignore)
+                    if not Code then
+                        ConfigNotify("Share code", tostring(Count))
+                        return
+                    end
+                    local Copied = typeof(setclipboard) == "function" and pcall(setclipboard, Code)
+                    pcall(Library.Options.CorvusShareCode.SetValue, Library.Options.CorvusShareCode, Code)
+                    ConfigNotify(if Copied then "Code copied" else "Code ready", string.format("%d changed settings%s", Count, if Copied then ", paste it anywhere" else ", copy it from the box"))
+                end,
+            }):AddButton({
+                Text = "Apply code",
+                DoubleClick = true,
+                Tooltip = "Loads the pasted code. Settings not in the code go back to their defaults.",
+                Func = function()
+                    local Ok, Result = Library:ImportShareCode(Library.Options.CorvusShareCode.Value, SaveManager.Ignore)
+                    ConfigNotify(if Ok then "Code applied" else "Code not applied", if Ok then string.format("%d settings loaded", Result) else tostring(Result))
+                end,
+            })
 
             if Info.AutoLoad ~= false then
                 task.defer(function()
@@ -27491,7 +29423,7 @@ local CorvusConfig = {
 	FeedbackWebhook = "",
 	LoaderUrl = "",
 	CodesUrl = "",
-	KnownCodes = { "Release", "Update1" },
+	KnownCodes = { "Release", "Update1", "DroverQ", "Russo", "DarkRose", "AG64", "Cupcake", "E11opoppet", "Ellopoppet", "Olopomidoro", "Ostrichh" },
 	HubVersion = "2.0",
 }
 
@@ -27709,13 +29641,14 @@ local S = {
 	autoRebirth = false,
 	rebirthStopAt = 0,
 	autoCodes = false,
-	hookEvents = { UFO = true, World = true, Rebirth = true, Special = true, Codes = true },
+	hookEvents = { UFO = true, World = true, Rebirth = true, Special = true, Codes = true, Goals = true },
 	ufoHop = false,
 	ufoHopWindow = 60,
 	ufoHopChase = false,
 	keepOnTeleport = true,
 	huntRarity = { Basic = true },
 	huntVariants = { Normal = true, Golden = true, Diamond = true },
+	skipHatchAnim = false,
 }
 
 local Stats = {
@@ -27935,6 +29868,8 @@ local Saved = {
 	lastTierAt = {},
 	luckStart = -1,
 	itemsSince = os.time(),
+	goals = {},
+	setupDone = false,
 }
 
 pcall(function()
@@ -28560,9 +30495,10 @@ end
 local HatchState = { waiting = false, lastFire = -1, status = "Off" }
 local NotifyQueue = {}
 
-local function recordHatch(list)
+local function recordHatch(list, egg)
 	if type(list) ~= "table" then return end
 	HatchState.waiting = false
+	local batch = {}
 	for _, pet in ipairs(list) do
 		local name = type(pet) == "table" and pet.Name or (type(pet) == "string" and pet) or nil
 		if name then
@@ -28572,6 +30508,12 @@ local function recordHatch(list)
 				if ok then rarity = r end
 			end
 			rarity = tostring(rarity or "Basic")
+			local known = Auto.IndexSnap
+			local fresh = if known and known[name] ~= nil then known[name] == false else Saved.hatched[name] == nil
+			if known and known[name] ~= nil then
+				known[name] = true
+			end
+			table.insert(batch, { name = name, rarity = rarity, fresh = fresh })
 			Saved.rarity[rarity] = (tonumber(Saved.rarity[rarity]) or 0) + 1
 			Session.rarity = Session.rarity or {}
 			Session.rarity[rarity] = (Session.rarity[rarity] or 0) + 1
@@ -28601,14 +30543,23 @@ local function recordHatch(list)
 			end
 		end
 	end
+	if #batch > 0 then
+		Auto.FeedRaw = Auto.FeedRaw or {}
+		table.insert(Auto.FeedRaw, { at = os.clock(), egg = egg, names = batch })
+		if #Auto.FeedRaw > 20 then
+			table.remove(Auto.FeedRaw, 1)
+		end
+	end
 end
 
 pcall(function()
 	local RE = ReplicatedStorage.Packages.Knit.Services.EggHatchService.RE
 	local Result = RE:WaitForChild("Result", 5)
-	Library:GiveSignal(Result.OnClientEvent:Connect(function(list)
-		recordHatch(list)
-	end))
+	Auto.hatchResult = Result
+	Auto.hatchHandler = function(list, _, egg)
+		recordHatch(list, if type(egg) == "string" and egg ~= "" then egg else nil)
+	end
+	Library:GiveSignal(Result.OnClientEvent:Connect(Auto.hatchHandler))
 end)
 pcall(function()
 	local RE = ReplicatedStorage.Packages.Knit.Services.ExclusiveEggsService.RE
@@ -29090,6 +31041,8 @@ local Window = Library:CreateWindow({
 	ShowCustomCursor = false,
 	ToggleKeybind = Enum.KeyCode.Z,
 })
+
+Library.ShareIgnore = { WebhookUrl = true, FeedbackText = true, CodeInput = true, GoalKind = true, GoalTarget = true, HatchEgg = true }
 
 local Tabs = {}
 
@@ -29650,6 +31603,21 @@ EggBox:AddToggle("EggAutoTravel", {
 		S.eggAutoTravel = v
 	end,
 })
+EggBox:AddToggle("SkipHatchAnim", {
+	Text = "Skip hatch animation",
+	Description = "No egg cutscene, your camera stays free",
+	Tooltip = "The server decides how fast eggs open (your Hatch Speed upgrades). Corvus already opens the next egg the moment the server answers, so this will not open eggs faster. It removes the camera lock, the screen shake and the lag from the cutscene.",
+	Default = false,
+	Callback = function(v)
+		S.skipHatchAnim = v
+		if Auto.setSkipAnim then
+			local ok, reason = Auto.setSkipAnim(v)
+			if v and not ok then
+				notify("Eggs", reason or "Your executor can not skip the animation", 5)
+			end
+		end
+	end,
+})
 EggBox:AddInput("HatchStopAfter", {
 	Text = "Stop after (eggs)",
 	Placeholder = "0 = never",
@@ -29840,6 +31808,25 @@ UI.HuntBox:AddDropdown("HuntVariants", {
 	end,
 })
 UI.HuntBox:AddLabel({ Text = '<font transparency="0.45">Golden is crafted at the Golden Machine (Birch Forest), Diamond at the Diamond Machine (Haunted House). Equipped and locked pets are never used.</font>', DoesWrap = true })
+UI.HuntBox:AddDivider()
+UI.HuntGrid = UI.HuntBox:AddIconGrid("HuntGallery", {
+	Filters = { "Normal", "Golden", "Diamond" },
+	Rows = 3,
+	TileSize = 54,
+	EmptyText = "Nothing missing here. Pick more rarities above or another variant.",
+	DetailText = '<font transparency="0.35">Tap a pet to hunt it first. Glowing pets can drop from the egg the hunter is opening right now.</font>',
+	Changed = function()
+		UI.galleryKey = nil
+		if Auto.drawLive then
+			pcall(Auto.drawLive, true)
+		end
+	end,
+	Clicked = function(item)
+		if Auto.pinPet then
+			Auto.pinPet(item)
+		end
+	end,
+})
 
 UI.HuntStatusBox = Tabs.Eggs:AddRightGroupbox("Index Progress", "book-open")
 UI.HuntEggRow = UI.HuntStatusBox:AddStat({ Icon = GameIcons.Egg, Text = "No target yet", Value = "", Size = 30 })
@@ -29847,6 +31834,13 @@ UI.HuntPetRow = UI.HuntStatusBox:AddStat({ Icon = GameIcons.Index, Text = "Pet",
 UI.HuntVariantRow = UI.HuntStatusBox:AddStat({ Icon = GameIcons.Index, Text = "Index", Value = "-", Size = 22 })
 UI.HuntLeftRow = UI.HuntStatusBox:AddStat({ Icon = GameIcons.Index, Text = "Index done", Value = "-", Size = 22, Progress = 0 })
 UI.HuntStateRow = UI.HuntStatusBox:AddStat({ Icon = GameIcons.Auto, Text = "Index Hunter", Value = "Off", Size = 22, ValueColor = "FontColor" })
+
+UI.FeedBox = Tabs.Eggs:AddRightGroupbox("Live Hatches", "radio")
+UI.Feed = UI.FeedBox:AddFeed("HatchFeed", {
+	MaxRows = 7,
+	EmptyText = "Open an egg and your pets show up here live.",
+})
+UI.FeedBox:AddLabel({ Text = '<font transparency="0.45">1 in X is the base chance from that egg, before luck boosts. NEW means the pet was missing from your index.</font>', DoesWrap = true })
 
 UI.ModeValues = { "Keep active", "Use all at once" }
 
@@ -30424,11 +32418,11 @@ UI.HookBox:AddDropdown("WebhookPets", {
 		S.webhookPets = pick
 	end,
 })
-UI.HookEventMap = { ["UFO broken"] = "UFO", ["World unlocked"] = "World", ["Moon rebirth"] = "Rebirth", ["Special upgrade"] = "Special", ["Code redeemed"] = "Codes" }
+UI.HookEventMap = { ["UFO broken"] = "UFO", ["World unlocked"] = "World", ["Moon rebirth"] = "Rebirth", ["Special upgrade"] = "Special", ["Code redeemed"] = "Codes", ["Goal reached"] = "Goals" }
 UI.HookBox:AddDropdown("WebhookEvents", {
 	Text = "Also post",
-	Values = { "UFO broken", "World unlocked", "Moon rebirth", "Special upgrade", "Code redeemed" },
-	Default = { "UFO broken", "World unlocked", "Moon rebirth", "Special upgrade", "Code redeemed" },
+	Values = { "UFO broken", "World unlocked", "Moon rebirth", "Special upgrade", "Code redeemed", "Goal reached" },
+	Default = { "UFO broken", "World unlocked", "Moon rebirth", "Special upgrade", "Code redeemed", "Goal reached" },
 	Multi = true,
 	AllowNull = true,
 	Callback = function(value)
@@ -30457,6 +32451,17 @@ UI.HookBox:AddButton({
 	end,
 })
 UI.HookSentRow = UI.HookBox:AddStat({ Icon = "send", Text = "Sent", Value = "0", Size = 22 })
+
+UI.StartBox = Tabs.Info:AddLeftGroupbox("Quick Start", "wand-sparkles")
+UI.StartBox:AddLabel({ Text = '<font transparency="0.4">Tell Corvus what to do in three taps: what to automate, which egg and how your game runs. Everything can be changed later.</font>', DoesWrap = true })
+UI.StartBox:AddButton({
+	Text = "Open quick setup",
+	Func = function()
+		if Auto.openWizard then
+			Auto.openWizard()
+		end
+	end,
+})
 
 UI.FeedbackBox = Tabs.Info:AddLeftGroupbox("Feedback", "message-square")
 UI.FeedbackBox:AddDropdown("FeedbackType", {
@@ -31539,7 +33544,10 @@ do
 										eggNeeds[egg] = need
 									end
 									need.count += 1
-									if not need.focus or percent < need.focus.percent then
+									if name == S.huntPin then
+										need.pinned = percent
+										need.focus = { name = name, rarity = entry.rarity, percent = percent, pinned = true }
+									elseif not (need.focus and need.focus.pinned) and (not need.focus or percent < need.focus.percent) then
 										need.focus = { name = name, rarity = entry.rarity, percent = percent }
 									end
 								end
@@ -31568,9 +33576,10 @@ do
 			Hunter.completed = false
 			local best, bestRank, bestCount, bestPrice = nil, nil, nil, nil
 			for egg, need in pairs(eggNeeds) do
-				local rank = if egg == Hunter.egg then 0 elseif need.world == here then 1 else 2
+				local rank = if need.pinned then -1 elseif egg == Hunter.egg then 0 elseif need.world == here then 1 else 2
 				local price = getEggPrice(egg) or math.huge
-				if not best or rank < bestRank or (rank == bestRank and (need.count > bestCount or (need.count == bestCount and price < bestPrice))) then
+				local pinA, pinB = need.pinned or 0, best and best.pinned or 0
+				if not best or rank < bestRank or (rank == bestRank and (pinA > pinB or (pinA == pinB and (need.count > bestCount or (need.count == bestCount and price < bestPrice))))) then
 					best, bestRank, bestCount, bestPrice = need, rank, need.count, price
 				end
 			end
@@ -34311,6 +36320,388 @@ do
 			Snap.hunt = hunt
 		end
 
+		Auto.setupLive = function()
+			local Live = { feed = {}, seq = 0, disabled = {}, galleryAt = -1e9, goalsAt = -1e9, skipAt = -1e9, indexCount = nil, indexTotal = nil }
+			Auto.Live = Live
+			local Prefixes = { Normal = "", Golden = "Golden ", Diamond = "Diamond " }
+
+			local function baseName(name)
+				return string.match(name, "^Golden (.+)$") or string.match(name, "^Diamond (.+)$") or name
+			end
+
+			local function eggPercent(egg, name)
+				local pets = loadEggPets()
+				local list = pets and egg and pets[egg]
+				if not list then return nil end
+				local base = baseName(name)
+				for _, pet in ipairs(list) do
+					if pet.name == base then
+						return pet.percent
+					end
+				end
+				return nil
+			end
+
+			local function oneIn(percent)
+				percent = tonumber(percent)
+				if not percent or percent <= 0 then return nil end
+				local n = 100 / percent
+				if n < 1.05 then return "every egg" end
+				if n < 10 then
+					return "1 in " .. (string.gsub(string.format("%.1f", n), "%.0$", ""))
+				end
+				return "1 in " .. (string.gsub(formatNumber(math.floor(n + 0.5)), "[kmbt]$", string.upper))
+			end
+			Auto.oneIn = oneIn
+
+			local function takeFeed()
+				local raw = Auto.FeedRaw
+				if not raw or #raw == 0 then return false end
+				Auto.FeedRaw = {}
+				for _, batch in ipairs(raw) do
+					local egg = batch.egg
+					if not egg or egg == "" then
+						egg = if S.indexHunt and Hunter.egg then Hunter.egg else S.hatchEggName
+					end
+					local groups, order = {}, {}
+					for _, pet in ipairs(batch.names) do
+						local group = groups[pet.name]
+						if not group then
+							group = { name = pet.name, rarity = pet.rarity, count = 0, fresh = false }
+							groups[pet.name] = group
+							table.insert(order, group)
+						end
+						group.count += 1
+						group.fresh = group.fresh or pet.fresh == true
+					end
+					table.sort(order, function(a, b)
+						local ra, rb = RarityRank[a.rarity] or 0, RarityRank[b.rarity] or 0
+						if ra ~= rb then return ra > rb end
+						return a.name < b.name
+					end)
+					for i = #order, 1, -1 do
+						local group = order[i]
+						Live.seq += 1
+						local variant = if string.sub(group.name, 1, 7) == "Golden " then "Golden" elseif string.sub(group.name, 1, 8) == "Diamond " then "Diamond" else nil
+						local sub = {}
+						local chance = oneIn(eggPercent(egg, group.name))
+						if chance then
+							table.insert(sub, chance)
+						end
+						if egg and egg ~= "" then
+							table.insert(sub, egg)
+						end
+						table.insert(Live.feed, 1, {
+							Id = Live.seq,
+							Title = group.name,
+							Count = group.count,
+							Image = petIcon(group.name) or petIcon(baseName(group.name)) or GameIcons.Egg,
+							Color = RarityColors[group.rarity] or RarityColors.Basic,
+							Right = group.rarity,
+							Sub = table.concat(sub, "  \u{00B7}  "),
+							At = batch.at,
+							Badge = if group.fresh then "NEW" elseif variant == "Golden" then "GOLD" elseif variant == "Diamond" then "DIAMOND" else nil,
+							BadgeColor = if group.fresh then "#7dffb3" elseif variant == "Golden" then "#ffcf4d" else "#8fe9ff",
+						})
+					end
+				end
+				while #Live.feed > 30 do
+					table.remove(Live.feed)
+				end
+				return true
+			end
+
+			local function buildGallery()
+				local catalog = petCatalog()
+				if not catalog then
+					Snap.gallery = nil
+					return
+				end
+				local pick = S.huntRarity or {}
+				local anyPick = next(pick) ~= nil
+				local known = {}
+				local lists = { Normal = {}, Golden = {}, Diamond = {} }
+				local totals = { Normal = 0, Golden = 0, Diamond = 0 }
+				local count, total = 0, 0
+				local huntEgg = if S.indexHunt then Hunter.egg else nil
+				local focus = if S.indexHunt and Hunter.focus then Hunter.focus.name else nil
+				local unlocked = {}
+				for name, entry in pairs(catalog) do
+					local best, bestEgg, locked = nil, nil, true
+					for egg, percent in pairs(entry.eggs) do
+						local world = EggWorlds[egg] or "Spawn"
+						local open = unlocked[world]
+						if open == nil then
+							open = isWorldUnlocked(world) ~= false
+							unlocked[world] = open
+						end
+						if open then
+							locked = false
+							if not best or percent > best then
+								best, bestEgg = percent, egg
+							end
+						end
+					end
+					if not best then
+						for egg, percent in pairs(entry.eggs) do
+							if not best or percent > best then
+								best, bestEgg = percent, egg
+							end
+						end
+					end
+					for variant, prefix in pairs(Prefixes) do
+						local full = prefix .. name
+						local have = indexed(full)
+						known[full] = have
+						total += 1
+						if have then
+							count += 1
+						end
+						if not anyPick or pick[entry.rarity] then
+							totals[variant] += 1
+							if not have then
+								table.insert(lists[variant], {
+									id = name,
+									name = name,
+									rarity = entry.rarity,
+									rank = RarityRank[entry.rarity] or 0,
+									percent = best,
+									egg = bestEgg,
+									locked = locked,
+									icon = petIcon(full) or petIcon(name),
+									target = if variant == "Normal" then huntEgg ~= nil and entry.eggs[huntEgg] ~= nil else Hunter.craftPending == true and focus == name,
+									focus = focus == name,
+								})
+							end
+						end
+					end
+				end
+				for _, list in pairs(lists) do
+					table.sort(list, function(a, b)
+						if a.target ~= b.target then return a.target end
+						if a.rank ~= b.rank then return a.rank < b.rank end
+						if (a.percent or 0) ~= (b.percent or 0) then return (a.percent or 0) > (b.percent or 0) end
+						return a.name < b.name
+					end)
+				end
+				Auto.IndexSnap = known
+				Live.indexCount, Live.indexTotal = count, total
+				Snap.gallery = { lists = lists, totals = totals, egg = huntEgg, focus = focus }
+				if S.huntPin and known[S.huntPin] then
+					queueToast("Index Hunter", S.huntPin .. " is in your index now, pin cleared")
+					S.huntPin = nil
+				end
+			end
+
+			local GoalMeta = {
+				Coins = { label = "Coins", icon = CurrencyIcons.Coins, color = "#e0a526", metric = "Coins" },
+				Rubies = { label = "Rubies", icon = CurrencyIcons.Rubies, color = "#e66767", metric = "Rubies" },
+				Gems = { label = "Gems", icon = CurrencyIcons.Gems, color = "#9085e9", metric = "Gems" },
+				Eggs = { label = "Eggs opened", icon = GameIcons.Egg, color = "#3ccf91", metric = "Eggs" },
+				Index = { label = "Index entries", icon = GameIcons.Index, color = "#5fb8ff" },
+			}
+			Auto.GoalMeta = GoalMeta
+
+			local function goalCurrent(kind)
+				if kind == "Eggs" then
+					return tonumber(Saved.eggs) or 0
+				elseif kind == "Index" then
+					return Live.indexCount
+				end
+				return getStat(kind)
+			end
+
+			Auto.goalSnapshot = function(check)
+				local list = {}
+				for _, goal in ipairs(Saved.goals) do
+					local meta = type(goal) == "table" and GoalMeta[goal.kind] or nil
+					local target = type(goal) == "table" and tonumber(goal.target) or nil
+					if meta and target and target > 0 then
+						local current = goalCurrent(goal.kind)
+						if check and not goal.done and type(current) == "number" and current >= target then
+							goal.done = true
+							goal.doneAt = os.time()
+							SaveDirty = true
+							local text = formatNumber(target) .. " " .. meta.label
+							queueToast("Goal reached", text)
+							pcall(Auto.postEvent, "Goals", "Goal reached", "**" .. text .. "**", 3985554)
+							if Auto.Metrics then
+								pcall(Auto.Metrics.event, "Goal", text, meta.color)
+							end
+						end
+						local entry = { id = goal.id, kind = goal.kind, meta = meta, target = target, current = current, done = goal.done == true, doneAt = tonumber(goal.doneAt) }
+						if not entry.done and type(current) == "number" and meta.metric and Auto.eta then
+							local ok, eta = pcall(Auto.eta, meta.metric, target - current)
+							entry.eta = if ok then eta else nil
+						end
+						table.insert(list, entry)
+					end
+				end
+				return list
+			end
+
+			Auto.addGoal = function(label, text)
+				local kind = nil
+				for key, meta in pairs(GoalMeta) do
+					if meta.label == label then
+						kind = key
+					end
+				end
+				if not kind then
+					notify("Goals", "Pick what you want to collect first", 4)
+					return false
+				end
+				if #Saved.goals >= 4 then
+					notify("Goals", "You can track 4 goals at once, remove one first", 4)
+					return false
+				end
+				local target = Auto.parseAmount(text)
+				if kind == "Index" and (target == nil or target <= 0) then
+					target = Live.indexTotal
+				end
+				if not target or target <= 0 then
+					notify("Goals", "Type a target like 10b, 500k or 1.5t", 4)
+					return false
+				end
+				local current = goalCurrent(kind)
+				if type(current) == "number" and current >= target then
+					notify("Goals", "You already have " .. formatNumber(current) .. ", pick a higher target", 5)
+					return false
+				end
+				table.insert(Saved.goals, { id = string.format("%d-%d", os.time(), math.random(1, 999999)), kind = kind, target = target, created = os.time() })
+				SaveDirty = true
+				notify("Goals", "Tracking " .. formatNumber(target) .. " " .. GoalMeta[kind].label, 3)
+				if Auto.drawLive then
+					pcall(Auto.drawLive, true)
+				end
+				return true
+			end
+
+			Auto.removeGoal = function(id)
+				for i = #Saved.goals, 1, -1 do
+					local goal = Saved.goals[i]
+					if type(goal) ~= "table" or goal.id == id then
+						table.remove(Saved.goals, i)
+					end
+				end
+				SaveDirty = true
+				if Auto.drawLive then
+					pcall(Auto.drawLive, true)
+				end
+			end
+
+			Auto.clearGoals = function()
+				local removed = 0
+				for i = #Saved.goals, 1, -1 do
+					local goal = Saved.goals[i]
+					if type(goal) ~= "table" or goal.done then
+						table.remove(Saved.goals, i)
+						removed += 1
+					end
+				end
+				SaveDirty = true
+				notify("Goals", if removed > 0 then "Removed " .. removed .. " reached goal" .. (if removed == 1 then "" else "s") else "No reached goals to clear", 3)
+				if Auto.drawLive then
+					pcall(Auto.drawLive, true)
+				end
+			end
+
+			Auto.setSkipAnim = function(on)
+				local remote = Auto.hatchResult
+				if not remote then
+					return false, "The egg system is not loaded yet"
+				end
+				if type(getconnections) ~= "function" then
+					return false, "Your executor can not skip the animation (no getconnections)"
+				end
+				local ok, list = pcall(getconnections, remote.OnClientEvent)
+				if not ok or type(list) ~= "table" then
+					return false, "Your executor can not skip the animation"
+				end
+				local mine = false
+				for _, conn in ipairs(list) do
+					local okFn, fn = pcall(function() return conn.Function end)
+					if okFn and fn == Auto.hatchHandler then
+						mine = true
+					end
+				end
+				if not mine then
+					return false, "Could not find Corvus' own hatch listener, nothing was changed"
+				end
+				local changed = 0
+				for _, conn in ipairs(list) do
+					local okFn, fn = pcall(function() return conn.Function end)
+					if okFn and type(fn) == "function" and fn ~= Auto.hatchHandler then
+						if on then
+							if pcall(function() conn:Disable() end) then
+								if not Live.disabled[fn] then
+									changed += 1
+								end
+								Live.disabled[fn] = true
+							end
+						elseif Live.disabled[fn] then
+							pcall(function() conn:Enable() end)
+							changed += 1
+						end
+					end
+				end
+				if not on then
+					table.clear(Live.disabled)
+				end
+				return true, changed
+			end
+			Library:OnUnload(function()
+				pcall(Auto.setSkipAnim, false)
+			end)
+
+			Auto.pinPet = function(item)
+				local grid = UI.HuntGrid
+				local filter = grid and grid.Filter or "Normal"
+				if filter == "Normal" and item and item.Id and not item.Dim then
+					S.huntPin = if S.huntPin == item.Id then nil else item.Id
+					HatchState.waiting = false
+				end
+				UI.galleryKey = nil
+				if Auto.drawLive then
+					pcall(Auto.drawLive, true)
+				end
+				if grid and Auto.galleryDetail and item then
+					pcall(grid.SetDetail, grid, Auto.galleryDetail(item.Pet, filter))
+				end
+			end
+
+			Auto.collectLive = function()
+				local now = os.clock()
+				if takeFeed() then
+					Snap.feed = table.move(Live.feed, 1, math.min(#Live.feed, 8), 1, {})
+				end
+				local visible = Library.Toggled ~= false and Library.ActiveTab == Tabs.Eggs
+				if now - Live.galleryAt >= (if visible then 2.5 else 10) then
+					Live.galleryAt = now
+					buildGallery()
+				end
+				if now - Live.goalsAt >= 1 then
+					Live.goalsAt = now
+					Auto.goalSnapshot(true)
+				end
+				if now - (Live.priceAt or -1e9) >= 5 then
+					Live.priceAt = now
+					local prices = {}
+					for index, name in ipairs(collectEggNames()) do
+						if index > 8 then break end
+						local price, free = getEggPrice(name)
+						prices[name] = { price = price, free = free }
+					end
+					Snap.eggPrices = prices
+				end
+				if S.skipHatchAnim and now - Live.skipAt >= 10 then
+					Live.skipAt = now
+					Auto.setSkipAnim(true)
+				end
+			end
+		end
+		Auto.setupLive()
+
 		Auto.Mover = Mover
 		Auto.Hunter = Hunter
 		Auto.goToEgg = goToEgg
@@ -34549,6 +36940,7 @@ task.spawn(function()
 			safe(Auto.updateHunter, "hunter")
 			safe(collectEggs, "eggs")
 			safe(collectStats, "stats")
+			safe(Auto.collectLive, "live")
 			if shown then
 				safe(collectFarm, "farm")
 				Snap.gifts = nil
@@ -35233,6 +37625,7 @@ task.spawn(function()
 			pcall(Auto.drawRound)
 			pcall(Auto.drawExtras)
 			pcall(Auto.drawAnalytics, false)
+			pcall(Auto.drawLive, false)
 		end
 		pcall(drawQueues)
 	end
@@ -35311,6 +37704,44 @@ UI.TrendChart = UI.TrendBox:AddChart("TrendChart", {
 	end,
 })
 
+UI.GoalsBox = Tabs.Analytics:AddRightGroupbox("Goals", "target")
+UI.Goals = UI.GoalsBox:AddGoals("GoalCards", {
+	EmptyText = "No goals yet. Pick what you want to collect below and Corvus tracks it with a live ETA.",
+	Removed = function(id)
+		if Auto.removeGoal then
+			Auto.removeGoal(id)
+		end
+	end,
+})
+UI.GoalKinds = { "Coins", "Rubies", "Gems", "Eggs opened", "Index entries" }
+UI.GoalsBox:AddDropdown("GoalKind", {
+	Text = "Collect",
+	Values = UI.GoalKinds,
+	ValueImages = { Coins = CurrencyIcons.Coins, Rubies = CurrencyIcons.Rubies, Gems = CurrencyIcons.Gems, ["Eggs opened"] = GameIcons.Egg, ["Index entries"] = GameIcons.Index },
+	Default = "Coins",
+})
+UI.GoalsBox:AddInput("GoalTarget", {
+	Text = "Target",
+	Placeholder = "10b, 500k, 1.5t... (empty = full index)",
+	Default = "",
+	ClearTextOnFocus = false,
+})
+UI.GoalsBox:AddButton({
+	Text = "Add goal",
+	Func = function()
+		if Auto.addGoal and Auto.addGoal(Options.GoalKind.Value, Options.GoalTarget.Value) then
+			pcall(Options.GoalTarget.SetValue, Options.GoalTarget, "")
+		end
+	end,
+}):AddButton({
+	Text = "Clear reached",
+	Func = function()
+		if Auto.clearGoals then
+			Auto.clearGoals()
+		end
+	end,
+})
+
 UI.HatchBox = Tabs.Analytics:AddRightGroupbox("Hatches", "egg")
 UI.HatchBars = UI.HatchBox:AddBarChart({
 	Scopes = { "Session", "All time" },
@@ -35326,9 +37757,9 @@ UI.LuckBox = Tabs.Analytics:AddRightGroupbox("Luck", "clover")
 UI.LuckEggRow = UI.LuckBox:AddStat({ Icon = GameIcons.Egg, Text = "Egg", Value = "-", Size = 24, ValueColor = "FontColor" })
 UI.LuckRows = {}
 for _, tier in ipairs({ "Legendary", "Mythical", "Secret" }) do
-	UI.LuckRows[tier] = UI.LuckBox:AddStat({ Icon = GameIcons.Index, Text = tier, Value = "-", Size = 24, Progress = 0 })
+	UI.LuckRows[tier] = UI.LuckBox:AddStat({ Icon = Rarities and Rarities[tier] and Rarities[tier][2] or GameIcons.Index, Text = tier, Value = "-", Size = 24, Progress = 0, ValueColor = "FontColor" })
 end
-UI.LuckBox:AddLabel({ Text = '<font transparency="0.45">Eggs since your last hatch of that rarity or better, against the base odds of the egg you are opening. Boosts make it come sooner.</font>', DoesWrap = true })
+UI.LuckBox:AddLabel({ Text = '<font transparency="0.45">First number: eggs opened since your last pet of that rarity or better. Second: how many eggs it takes on average from this egg (K = thousand, M = million). The bar fills as you get closer. On the right: how often it happens at your egg speed. Luck boosts make it sooner.</font>', DoesWrap = true })
 
 function Auto.drawAnalytics(force)
 	local M = Auto.Metrics
@@ -35418,7 +37849,17 @@ function Auto.drawAnalytics(force)
 			local info = luck.tiers[tier]
 			local label = string.format('<font color="%s">%s</font>%s', RarityColors[tier] or "#ffffff", tier, if tier == "Secret" then "" else "+")
 			if info and info.expected then
-				setStat(row, label .. '  <font transparency="0.5">1 in ' .. formatNumber(info.expected) .. "</font>", formatNumber(info.since) .. " / " .. formatNumber(info.expected))
+				local big = string.gsub(formatNumber(info.expected), "[kmbt]$", string.upper)
+				local perHour = Auto.Metrics and Auto.Metrics.current("Eggs")
+				local every
+				if type(perHour) == "number" and perHour > 0 then
+					local hours = info.expected / perHour
+					every = if hours < 1 then string.format("every ~%dm", math.max(1, math.floor(hours * 60 + 0.5))) elseif hours < 48 then string.format("every ~%sh", (string.gsub(string.format("%.1f", hours), "%.0$", ""))) elseif hours < 24 * 365 then string.format("every ~%dd", math.floor(hours / 24 + 0.5)) else "over a year"
+				else
+					every = "1 in " .. big
+				end
+				local late = info.since > info.expected
+				setStat(row, label .. string.format('  <font transparency="0.45">%s of %s</font>', formatNumber(info.since), big), if late then '<font color="#ffb84d">' .. every .. "</font>" else every)
 				pcall(row.SetProgress, row, math.clamp(info.since / info.expected, 0, 1))
 			else
 				setStat(row, label, '<font transparency="0.5">not in this egg</font>')
@@ -35476,6 +37917,7 @@ do
 	local startedBy = tostring(Boot.CorvusStartedBy or "")
 	Boot.CorvusStartedBy = nil
 	UI.ExecStartedBy = ({ autoexec = "Auto execute", teleport = "After teleport", hop = "After a hop", reconnect = "After reconnect" })[startedBy] or "You started it"
+	UI.ExecStartedKind = startedBy
 	pcall(function()
 		Library:GiveSignal(LocalPlayer.OnTeleport:Connect(function(state)
 			if state == Enum.TeleportState.Started and S.keepOnTeleport then
@@ -35483,6 +37925,263 @@ do
 			end
 		end))
 	end)
+end
+
+function Auto.oneInShort(percent)
+	percent = tonumber(percent)
+	if not percent or percent <= 0 then return "?" end
+	local n = 100 / percent
+	if n < 1.05 then return "100%" end
+	if n < 10 then
+		return "1/" .. (string.gsub(string.format("%.1f", n), "%.0$", ""))
+	end
+	return "1/" .. (string.gsub(Library.ChartCompact(math.floor(n + 0.5)), "[kmbt]$", string.upper))
+end
+
+function Auto.galleryDetail(pet, filter)
+	if type(pet) ~= "table" then return "" end
+	local color = RarityColors[pet.rarity] or RarityColors.Basic
+	local head = string.format('<b>%s%s</b>  <font color="%s">%s</font>', if filter == "Normal" then "" else filter .. " ", pet.name, color, pet.rarity)
+	if filter ~= "Normal" then
+		return head .. string.format('<font transparency="0.35">  \u{00B7}  crafted at the %s Machine from your %s pets</font>', filter, if filter == "Golden" then "normal" else "golden")
+	end
+	local where = if pet.egg then string.format("%s, %s", pet.egg, Auto.oneIn and Auto.oneIn(pet.percent) or "?") else "no egg found"
+	local tail
+	if pet.locked then
+		tail = "unlock its world first"
+	elseif S.huntPin == pet.id then
+		tail = if S.indexHunt then "pinned, the hunter goes for it first" else "pinned, turn on Index Hunter to go for it"
+	else
+		tail = "tap to hunt it first"
+	end
+	return head .. '<font transparency="0.35">  \u{00B7}  ' .. where .. "  \u{00B7}  " .. tail .. "</font>"
+end
+
+function Auto.drawLive(force)
+	local tab = Library.ActiveTab
+	local clock = os.clock()
+	if tab == Tabs.Eggs or force == true then
+		local feed = Snap.feed
+		if UI.Feed and (feed ~= UI.feedShown or clock - (UI.feedAt or -1e9) >= 1 or force == true) then
+			UI.feedShown = feed
+			UI.feedAt = clock
+			UI.Feed:SetData(feed or {})
+		end
+		local gallery = Snap.gallery
+		local grid = UI.HuntGrid
+		if grid and gallery then
+			local filter = grid.Filter or "Normal"
+			local key = table.concat({ tostring(gallery), filter, tostring(S.huntPin), tostring(S.indexHunt) }, "|")
+			if key ~= UI.galleryKey or force == true then
+				UI.galleryKey = key
+				local list = gallery.lists[filter] or {}
+				local items = {}
+				local glowing = 0
+				for _, pet in ipairs(list) do
+					local caption
+					if filter ~= "Normal" then
+						caption = "craft"
+					elseif pet.locked then
+						caption = "locked"
+					else
+						caption = Auto.oneInShort(pet.percent)
+					end
+					if pet.target then
+						glowing += 1
+					end
+					local pinned = filter == "Normal" and S.huntPin == pet.id
+					table.insert(items, {
+						Id = pet.id,
+						Image = pet.icon or GameIcons.Index,
+						Color = RarityColors[pet.rarity] or RarityColors.Basic,
+						Caption = caption,
+						Dim = filter == "Normal" and pet.locked,
+						Highlight = pet.target,
+						Mark = if pinned then "pin" elseif pet.focus and pet.target then "crosshair" else nil,
+						MarkColor = if pinned then "#ffcf4d" else nil,
+						Detail = Auto.galleryDetail(pet, filter),
+						Pet = pet,
+					})
+				end
+				grid:SetItems(items)
+				local total = gallery.totals[filter] or 0
+				local summary = string.format("<b>%d</b> of %d missing", #list, total)
+				if glowing > 0 then
+					summary ..= string.format('  <font transparency="0.4">\u{00B7}  %d from this egg</font>', glowing)
+				elseif total > 0 and #list == 0 then
+					summary = '<font color="#60d696">All done</font>  <font transparency="0.4">\u{00B7}  ' .. total .. " " .. string.lower(filter) .. "</font>"
+				end
+				grid:SetSummary(summary)
+			end
+		end
+	end
+	if tab == Tabs.Analytics or force == true then
+		if UI.Goals and Auto.goalSnapshot and (force == true or clock - (UI.goalsAt or -1e9) >= 1) then
+			UI.goalsAt = clock
+			local entries = {}
+			for _, goal in ipairs(Auto.goalSnapshot(false)) do
+				local current = goal.current
+				local progress = if type(current) == "number" then math.clamp(current / goal.target, 0, 1) else 0
+				local note
+				if goal.done then
+					local ago = if goal.doneAt then math.max(0, os.time() - goal.doneAt) else 0
+					note = '<font color="#60d696">Reached</font>' .. (if ago >= 60 then string.format("  \u{00B7}  %s ago", Library:FormatDuration(ago)) else "")
+				elseif type(current) ~= "number" then
+					note = "Waiting for data"
+				elseif goal.eta then
+					note = goal.eta .. " at your current rate"
+				elseif goal.meta.metric then
+					note = formatNumber(goal.target - current) .. " to go  \u{00B7}  rate warming up"
+				else
+					note = formatNumber(goal.target - current) .. " to go"
+				end
+				table.insert(entries, {
+					Id = goal.id,
+					Title = goal.meta.label,
+					Icon = goal.meta.icon,
+					Color = goal.meta.color,
+					Progress = progress,
+					Done = goal.done,
+					Value = string.format("%s  <font transparency=\"0.45\">/ %s</font>", if type(current) == "number" then formatNumber(current) else "?", formatNumber(goal.target)),
+					Note = note,
+				})
+			end
+			UI.Goals:SetData(entries)
+		end
+	end
+end
+
+function Auto.applyWizard(values)
+	values = type(values) == "table" and values or {}
+	local tasks = type(values.tasks) == "table" and values.tasks or {}
+	local map = {
+		farm = { "AutoFarm" },
+		hatch = { "AutoHatch", "EggAutoTravel" },
+		index = { "IndexHunter" },
+		rewards = { "AutoGift", "AutoPartyEgg", "AutoQuests", "AutoMoonChest", "AutoGroupChest", "AutoFruitMachine", "AutoCodes" },
+		upgrades = { "AutoSpawnUpgrades", "AutoTree", "AutoSpecial" },
+		worlds = { "AutoBuyWorlds" },
+		ufo = { "AutoUfo" },
+		equip = { "AutoEquipBest" },
+	}
+	if tasks.hatch and type(values.egg) == "string" and Options.HatchEgg then
+		pcall(Options.HatchEgg.SetValue, Options.HatchEgg, values.egg)
+	end
+	for key, ids in pairs(map) do
+		for _, id in ipairs(ids) do
+			local toggle = Toggles[id]
+			if toggle and (key ~= "hatch" or id ~= "EggAutoTravel" or tasks.hatch) then
+				pcall(toggle.SetValue, toggle, tasks[key] == true)
+			end
+		end
+	end
+	local function set(id, value)
+		local element = Toggles[id] or Options[id]
+		if element then
+			pcall(element.SetValue, element, value)
+		end
+	end
+	if values.device == "phone" then
+		set("CorvusAntiLagLevel", "Balanced")
+		set("CorvusAntiLag", true)
+		set("CorvusAdaptiveLag", true)
+		set("SkipHatchAnim", true)
+	elseif values.device == "afk" then
+		set("CorvusAntiLagLevel", "Ultra")
+		set("CorvusAntiLag", true)
+		set("CorvusAdaptiveLag", true)
+		set("SkipHatchAnim", true)
+		set("CorvusAntiAFK", true)
+		set("CorvusAutoReconnect", true)
+		set("KeepOnTeleport", true)
+	else
+		set("CorvusAdaptiveLag", true)
+	end
+	Saved.setupDone = true
+	SaveDirty = true
+	saveStats(true)
+	local labels = { farm = "Farm", hatch = "Eggs", index = "Index", rewards = "Rewards", upgrades = "Upgrades", worlds = "Worlds", ufo = "UFO", equip = "Best pets" }
+	local picked = {}
+	for _, key in ipairs({ "farm", "hatch", "index", "rewards", "upgrades", "worlds", "ufo", "equip" }) do
+		if tasks[key] then
+			table.insert(picked, labels[key])
+		end
+	end
+	notify("Quick setup done", if #picked > 0 then "Running: " .. table.concat(picked, ", ") else "Nothing turned on, pick things in the tabs any time", 6)
+end
+
+function Auto.openWizard()
+	local names = collectEggNames()
+	local visuals = getEggVisuals(names)
+	local eggChoices = {}
+	for index, name in ipairs(names) do
+		if index > 8 then break end
+		local known = Snap.eggPrices and Snap.eggPrices[name]
+		local price, free = known and known.price, known and known.free
+		table.insert(eggChoices, {
+			Id = name,
+			Title = name,
+			Description = if free then "Free right now" elseif price then formatNumber(price) .. " coins each" else "Price unknown",
+			Icon = visuals[name] or GameIcons.Egg,
+			Color = "#3ccf91",
+		})
+	end
+	local defaultEgg = if S.hatchEggName ~= "" and table.find(names, S.hatchEggName) then S.hatchEggName else names[1]
+	return Library:ShowWizard({
+		SkipText = "Skip",
+		FinishText = "Start",
+		Steps = {
+			{
+				Id = "tasks",
+				Title = "What should Corvus do for you?",
+				Description = "Pick everything you want running. Tap again to unpick.",
+				Multi = true,
+				Required = true,
+				Default = { "farm", "hatch", "rewards", "equip" },
+				Choices = {
+					{ Id = "farm", Title = "Farm coins", Description = "Breaks coins and chests at full speed", Icon = "swords", Color = "#e0a526" },
+					{ Id = "hatch", Title = "Open eggs", Description = "Buys your egg whenever you can afford it", Icon = "egg", Color = "#3ccf91" },
+					{ Id = "index", Title = "Complete the index", Description = "Hunts missing pets, crafts Golden and Diamond", Icon = "book-open", Color = "#5fb8ff" },
+					{ Id = "rewards", Title = "Claim rewards", Description = "Gifts, quests, chests, party egg and codes", Icon = "gift", Color = "#ff5d8f" },
+					{ Id = "upgrades", Title = "Buy upgrades", Description = "Spawn shop, upgrade tree, special upgrades", Icon = "trending-up", Color = "#c77dff" },
+					{ Id = "worlds", Title = "Unlock worlds", Description = "Buys the next world when you have the coins", Icon = "globe", Color = "#7dffb3" },
+					{ Id = "ufo", Title = "UFO event", Description = "Joins every UFO and helps break it", Icon = "rocket", Color = "#e66767" },
+					{ Id = "equip", Title = "Equip best pets", Description = "Keeps your strongest team on", Icon = "paw-print", Color = "#ffb84d" },
+				},
+			},
+			{
+				Id = "egg",
+				Title = "Which egg should it open?",
+				Description = "Eggs in your world right now. Corvus walks to it and opens it for you.",
+				Default = defaultEgg,
+				Choices = eggChoices,
+				Visible = function(state)
+					return type(state.tasks) == "table" and state.tasks.hatch == true and #eggChoices > 0
+				end,
+			},
+			{
+				Id = "device",
+				Title = "How does your game run?",
+				Description = "Corvus tunes performance for you. Adaptive anti lag stays ready either way.",
+				Default = if Library.IsMobile then "phone" else "smooth",
+				SingleColumn = true,
+				ChoiceHeight = 54,
+				Choices = {
+					{ Id = "smooth", Title = "Runs smooth", Description = "Keep the game as it is. Anti lag steps in only if FPS drops.", Icon = "monitor", Color = "#60d696" },
+					{ Id = "phone", Title = "Phone or weak PC", Description = "Anti lag on and the hatch cutscene skipped", Icon = "smartphone", Color = "#ffb84d" },
+					{ Id = "afk", Title = "AFK for hours", Description = "Ultra anti lag, anti AFK, auto reconnect, keeps running after teleports", Icon = "moon", Color = "#9085e9" },
+				},
+			},
+		},
+		Finish = function(values)
+			Auto.applyWizard(values)
+		end,
+		Skipped = function()
+			Saved.setupDone = true
+			SaveDirty = true
+			notify("Quick setup", "Skipped. You can open it again from the Info tab.", 4)
+		end,
+	})
 end
 
 Library.RenderOverlayInfo = function()
@@ -35510,4 +38209,22 @@ end
 
 setStat(UI.ExecStartRow, nil, UI.ExecStartedBy)
 setStat(UI.ExecReloadRow, nil, if CorvusConfig.LoaderUrl ~= "" then "Loader link" elseif Auto.canReload() then "Corvus/hub.lua" else '<font color="#ffb84d">Not set</font>')
+task.spawn(function()
+	if Saved.setupDone or (UI.ExecStartedKind and UI.ExecStartedKind ~= "" and UI.ExecStartedKind ~= "loader") then
+		return
+	end
+	local ok, autoload = pcall(SaveManager.GetAutoloadConfig, SaveManager)
+	if ok and type(autoload) == "string" and autoload ~= "" and autoload ~= "none" then
+		return
+	end
+	local waited = 0
+	while waited < 90 and not Library.Unloaded and (Library.IntroPlaying or Library.Toggled == false) do
+		waited += task.wait(0.5) or 0.5
+	end
+	task.wait(1.2)
+	if Library.Unloaded or Saved.setupDone or Library.Toggled == false or Library.ActiveWizard then
+		return
+	end
+	pcall(Auto.openWizard)
+end)
 Boot.CorvusBooting = nil
