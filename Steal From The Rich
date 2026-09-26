@@ -30573,7 +30573,16 @@ end
 ---------------------------------------------------------------------------
 -- Stats
 ---------------------------------------------------------------------------
-local Session = { stolen = 0, opened = 0, placed = 0, sold = 0, earned = 0, started = os.clock(), startMoney = nil }
+local Session = { stolen = 0, opened = 0, placed = 0, sold = 0, earned = 0, started = os.clock(), startMoney = nil, rarities = {}, orbs = 0, claimed = 0, bought = 0 }
+
+-- Listeners for things worth reporting (Discord webhook); set further down
+local Events = {}
+local function emit(name, ...)
+	local fn = Events[name]
+	if fn then
+		task.spawn(pcall, fn, ...)
+	end
+end
 -- rev_STEAL_SUCCESS fires on pick-up, so "stolen" is counted when a crate is banked
 
 ---------------------------------------------------------------------------
@@ -30713,8 +30722,16 @@ end
 
 -- A stolen crate is carried home at your own run speed: from far zones the
 -- game does not accept a teleport while carrying and keeps putting you back
-local ReturnFails, LastStealArea = 0, nil
+local ReturnFails, LastStealArea, LastStealRarity = 0, nil, nil
 local Refusals = 0
+
+local function countStolen()
+	Session.stolen += 1
+	if LastStealRarity then
+		Session.rarities[LastStealRarity] = (Session.rarities[LastStealRarity] or 0) + 1
+	end
+	emit("stolen", LastStealRarity, LastStealArea)
+end
 
 -- The crate a shown steal prompt belongs to, if it passes the filters
 local function shownAllowedPrompt()
@@ -30764,7 +30781,7 @@ local function returnToSafety()
 		end
 	elseif bankedCrates() > before or LocalPlayer:GetAttribute("InSafeZone") == true then
 		ReturnFails = 0
-		Session.stolen += 1
+		countStolen()
 		setStatus("Crate brought home")
 	else
 		ReturnFails = 0
@@ -30810,7 +30827,7 @@ local function stealOnce()
 		return true
 	end
 	setStatus("Holding Steal on " .. target.rarity .. " crate")
-	LastStealArea = target.area
+	LastStealArea, LastStealRarity = target.area, target.rarity
 	local bankedBefore, successesBefore = bankedCrates(), StealSuccesses
 	local function stolen()
 		return carrying() or bankedCrates() > bankedBefore or StealSuccesses > successesBefore
@@ -30822,7 +30839,7 @@ local function stealOnce()
 		if other and other.prompt ~= target.prompt then
 			FailedCrates[target.crate.Name] = os.clock() + 20
 			target = other
-			LastStealArea = target.area
+			LastStealArea, LastStealRarity = target.area, target.rarity
 			setStatus("Holding Steal on nearby " .. target.rarity .. " crate")
 			ok = triggerPrompt(target.prompt, stolen) or stolen()
 		end
@@ -30844,7 +30861,7 @@ local function stealOnce()
 	end
 	if ok then
 		if not carrying() then
-			Session.stolen += 1
+			countStolen()
 			setStatus("Crate banked straight away")
 			return true
 		end
@@ -31082,6 +31099,7 @@ local function sellOnce(kind)
 	local result = LastSellResult
 	if type(result) == "table" and result.Ok then
 		Session.earned += tonumber(result.Total) or 0
+		emit("sold", tonumber(result.Total) or 0, result.Text)
 		return true, result
 	end
 	return false, result
@@ -31455,12 +31473,50 @@ MetaBox:AddToggle("AutoIndex", { Text = "Auto Claim Index", Default = false, Too
 MetaBox:AddToggle("AutoTrails", { Text = "Auto Buy Trails", Default = false, Tooltip = "Buys the next trail as soon as you can afford it" })
 MetaBox:AddToggle("AutoEquipTrail", { Text = "Auto Equip Best Trail", Default = true })
 
--- Stats
-local StatBox = Tabs.Stats:AddLeftGroupbox("Session", "chart-column")
-local StatLabels = {}
-for _, key in ipairs({ "Money", "Income", "Speed", "Stolen", "Placed", "Opened", "Sold", "Earned", "Time" }) do
-	StatLabels[key] = StatBox:AddLabel({ Text = key .. ": -", DoesWrap = true })
+-- Stats (same stat rows as Pets Universe, plain labels if the library has none)
+local function statRow(box, icon, text, size, color)
+	if box.AddStat then
+		local ok, stat = pcall(box.AddStat, box, { Icon = icon, Text = text, Value = "-", Size = size or 22, ValueColor = color })
+		if ok and stat then
+			return {
+				set = function(value)
+					stat:SetValue(value)
+				end,
+			}
+		end
+	end
+	local label = box:AddLabel({ Text = text .. ": -", DoesWrap = true })
+	return {
+		set = function(value)
+			label:SetText(text .. ": " .. tostring(value))
+		end,
+	}
 end
+
+local StatRows = {}
+local MoneyBox = Tabs.Stats:AddLeftGroupbox("Money", "coins")
+StatRows.Money = statRow(MoneyBox, "wallet", "Money", 28)
+StatRows.Gained = statRow(MoneyBox, "trending-up", "Made this session", 22)
+StatRows.Income = statRow(MoneyBox, "coins", "Plot income", 22, "FontColor")
+StatRows.Earned = statRow(MoneyBox, "banknote", "Earned from selling", 22)
+StatRows.Time = statRow(MoneyBox, "clock", "Session", 22, "FontColor")
+
+local RateBox = Tabs.Stats:AddLeftGroupbox("Live Rates", "activity")
+StatRows.MoneyRate = statRow(RateBox, "trending-up", "Money per hour", 26)
+StatRows.CrateRate = statRow(RateBox, "hand", "Crates per hour", 22)
+StatRows.Speed = statRow(RateBox, "gauge", "Speed level", 22, "FontColor")
+
+local CrateBox = Tabs.Stats:AddRightGroupbox("Crates", "package")
+StatRows.Stolen = statRow(CrateBox, "hand", "Crates stolen", 28)
+StatRows.Placed = statRow(CrateBox, "house", "Crates placed", 22)
+StatRows.Opened = statRow(CrateBox, "package-open", "Crates opened", 22)
+StatRows.Sold = statRow(CrateBox, "banknote", "Items sold", 22)
+StatRows.Best = statRow(CrateBox, "star", "Best crate", 22, "FontColor")
+
+local ExtraBox = Tabs.Stats:AddRightGroupbox("Extras", "sparkles")
+StatRows.Orbs = statRow(ExtraBox, "zap", "Orbs collected", 22)
+StatRows.Claimed = statRow(ExtraBox, "gift", "Rewards claimed", 22)
+StatRows.Bought = statRow(ExtraBox, "shopping-cart", "Things bought", 22)
 
 ---------------------------------------------------------------------------
 -- Hub extras shared with Pets Universe: auto execute, console commands,
@@ -31799,6 +31855,266 @@ if Library.ShowWizard then
 	})
 end
 
+-- Discord: your own webhook for crates and sales, and feedback / debug logs to Cinek
+local FeedbackWebhook = "https://discord.com/api/webhooks/1553082900688146502/rW8r0mJiDZYXFnv8O6asKsDPouxr036xA6CcOwitc_3DWjK6cV59_iO_Mpm0tjTNr3S4"
+local HttpService = game:GetService("HttpService")
+local Hook = { queue = {}, sent = 0, feedbackAt = -1e9, feedbackCount = 0 }
+
+local function httpRequest(options)
+	local fn = (typeof(syn) == "table" and syn.request) or (typeof(http) == "table" and http.request) or http_request or request
+	if type(fn) ~= "function" then
+		return nil
+	end
+	local ok, response = pcall(fn, options)
+	return if ok then response else nil
+end
+
+local function validWebhook(url)
+	return type(url) == "string" and (url:find("^https://discord%.com/api/webhooks/") or url:find("^https://discordapp%.com/api/webhooks/") or url:find("^https://canary%.discord%.com/api/webhooks/") or url:find("^https://ptb%.discord%.com/api/webhooks/")) ~= nil
+end
+
+-- payload as JSON, or as multipart with a text file attached
+local function postWebhook(url, payload, fileName, fileText)
+	local json = HttpService:JSONEncode(payload)
+	local options = { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = json }
+	if fileName and fileText then
+		local boundary = "CorvusBoundary" .. tostring(math.random(100000000, 999999999))
+		options.Headers["Content-Type"] = "multipart/form-data; boundary=" .. boundary
+		options.Body = table.concat({
+			"--" .. boundary,
+			'Content-Disposition: form-data; name="payload_json"',
+			"Content-Type: application/json",
+			"",
+			json,
+			"--" .. boundary,
+			'Content-Disposition: form-data; name="files[0]"; filename="' .. fileName .. '"',
+			"Content-Type: text/plain",
+			"",
+			fileText,
+			"--" .. boundary .. "--",
+			"",
+		}, "\r\n")
+	end
+	local response = httpRequest(options)
+	local code = response and tonumber(response.StatusCode) or 0
+	return code >= 200 and code < 300, code
+end
+
+local function playerField()
+	if Toggles.WebhookHideName and Toggles.WebhookHideName.Value then
+		return "Hidden"
+	end
+	return "||" .. LocalPlayer.Name .. "||"
+end
+
+local function queueEmbed(embed)
+	if #Hook.queue < 30 then
+		embed.footer = embed.footer or { text = "Corvus  \u{00B7}  Steal From The Rich" }
+		embed.timestamp = embed.timestamp or DateTime.now():ToIsoDate()
+		table.insert(Hook.queue, embed)
+	end
+end
+
+local function reportEmbed(title)
+	local elapsed = math.max(os.clock() - Session.started, 60)
+	return {
+		title = title,
+		color = 6344854,
+		fields = {
+			{ name = "Money", value = "$" .. formatNumber(money()), inline = true },
+			{ name = "Made", value = "+$" .. formatNumber(Session.made or 0), inline = true },
+			{ name = "Per hour", value = "$" .. formatNumber(math.floor((Session.made or 0) / elapsed * 3600)), inline = true },
+			{ name = "Crates stolen", value = formatNumber(Session.stolen), inline = true },
+			{ name = "Opened", value = formatNumber(Session.opened), inline = true },
+			{ name = "Sold", value = formatNumber(Session.sold) .. " for $" .. formatNumber(Session.earned), inline = true },
+			{ name = "Speed level", value = formatNumber(LocalPlayer:GetAttribute("SpeedLevel") or 0), inline = true },
+			{ name = "Session", value = string.format("%dh %02dm", elapsed // 3600, (elapsed % 3600) // 60), inline = true },
+			{ name = "Player", value = playerField(), inline = true },
+		},
+	}
+end
+
+Events.stolen = function(rarity, area)
+	if not (Toggles.WebhookOn and Toggles.WebhookOn.Value) or not rarity or not selected(Options.WebhookRarities, rarity) then
+		return
+	end
+	queueEmbed({
+		title = "\u{2726}  " .. rarity .. " crate stolen",
+		description = "Brought a **" .. rarity .. "** crate home from **" .. tostring(AreaById[area] and AreaById[area].DisplayName or area) .. "**.",
+		color = 16762930,
+		fields = {
+			{ name = "Crates this session", value = formatNumber(Session.stolen), inline = true },
+			{ name = "Money", value = "$" .. formatNumber(money()), inline = true },
+			{ name = "Player", value = playerField(), inline = true },
+		},
+	})
+end
+
+Events.sold = function(total)
+	if Toggles.WebhookOn and Toggles.WebhookOn.Value and Toggles.WebhookSales and Toggles.WebhookSales.Value and total > 0 then
+		queueEmbed({
+			title = "\u{2726}  Sold for $" .. formatNumber(total),
+			color = 6344854,
+			fields = {
+				{ name = "Earned this session", value = "$" .. formatNumber(Session.earned), inline = true },
+				{ name = "Money", value = "$" .. formatNumber(money()), inline = true },
+				{ name = "Player", value = playerField(), inline = true },
+			},
+		})
+	end
+end
+
+-- sender: one post every 2.5 s at most, plus the timed report
+task.spawn(function()
+	local lastReport = os.clock()
+	while alive() do
+		task.wait(2.5)
+		pcall(function()
+			local url = Options.WebhookUrl and Options.WebhookUrl.Value
+			local enabled = Toggles.WebhookOn and Toggles.WebhookOn.Value and validWebhook(url)
+			local every = (Options.WebhookReport and Options.WebhookReport.Value or 0) * 60
+			if enabled and every > 0 and os.clock() - lastReport >= every then
+				lastReport = os.clock()
+				queueEmbed(reportEmbed("\u{2726}  Farm report"))
+			end
+			if not enabled then
+				table.clear(Hook.queue)
+				return
+			end
+			local embed = table.remove(Hook.queue, 1)
+			if embed then
+				embed.author = { name = "Steal From The Rich" }
+				if postWebhook(url, { username = "Corvus", allowed_mentions = { parse = {} }, embeds = { embed } }) then
+					Hook.sent += 1
+				end
+			end
+		end)
+	end
+end)
+
+local function sendFeedback(kind, text, anonymous, withLog)
+	if os.clock() - Hook.feedbackAt < 90 then
+		notify("Feedback", "Please wait " .. math.ceil(90 - (os.clock() - Hook.feedbackAt)) .. "s before sending again", 4)
+		return
+	end
+	if Hook.feedbackCount >= 6 then
+		notify("Feedback", "You sent 6 messages this session, thanks! Use our Discord for more", 5)
+		return
+	end
+	text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if #text < 8 then
+		notify("Feedback", "Write at least a few words", 4)
+		return
+	end
+	text = text:sub(1, 1000):gsub("@", "@\u{200B}")
+	Hook.feedbackAt = os.clock()
+	Hook.feedbackCount += 1
+	notify("Feedback", "Sending...", 2)
+	task.spawn(function()
+		local executor = "Unknown"
+		pcall(function()
+			executor = table.concat({ identifyexecutor() }, " ")
+		end)
+		local logText
+		if withLog then
+			flushLog()
+			logText = table.concat(LogLines, "\n")
+			if #logText > 900000 then
+				logText = "...(older lines cut)\n" .. logText:sub(-900000)
+			end
+		end
+		local colors = { Idea = 7995310, Bug = 16739978, Question = 6275327, Other = 14146792 }
+		local ok = postWebhook(FeedbackWebhook, {
+			username = "Corvus Feedback",
+			allowed_mentions = { parse = {} },
+			embeds = {
+				{
+					title = "\u{2726}  " .. kind,
+					description = text,
+					color = colors[kind] or 14146792,
+					fields = {
+						{ name = "From", value = if anonymous then "Anonymous" else string.format("%s (@%s)", LocalPlayer.DisplayName, LocalPlayer.Name), inline = true },
+						{ name = "Game", value = "Steal From The Rich", inline = true },
+						{ name = "Executor", value = executor, inline = true },
+						{ name = "Status", value = tostring(Status):sub(1, 200), inline = false },
+					},
+					footer = { text = "Corvus feedback  \u{00B7}  made by Cinek" },
+					timestamp = DateTime.now():ToIsoDate(),
+				},
+			},
+		}, if logText then LogFile else nil, logText)
+		notify("Feedback", if ok then "Thanks! Cinek got your message." else "Could not send, try again later", 5)
+	end)
+end
+
+if Tabs.Misc then
+	pcall(function()
+		local HookBox = Tabs.Misc:AddLeftGroupbox("Discord Webhook", "webhook")
+		HookBox:AddToggle("WebhookOn", { Text = "Post to Discord", Default = false, Tooltip = "Posts good crates, sales and a timed report to your own webhook" })
+		HookBox:AddInput("WebhookUrl", { Text = "Webhook URL", Placeholder = "https://discord.com/api/webhooks/...", Finished = true, Default = "" })
+		HookBox:AddDropdown("WebhookRarities", {
+			Text = "Crate rarities",
+			Values = RarityList,
+			Default = { RarityList[#RarityList], RarityList[#RarityList - 1], RarityList[#RarityList - 2] },
+			Multi = true,
+			AllowNull = true,
+		})
+		HookBox:AddToggle("WebhookSales", { Text = "Post sales", Default = false })
+		HookBox:AddSlider("WebhookReport", { Text = "Report every", Default = 30, Min = 0, Max = 180, Rounding = 0, Suffix = " min", Tooltip = "0 turns the timed report off" })
+		HookBox:AddToggle("WebhookHideName", { Text = "Hide my username", Default = false })
+		HookBox:AddButton({
+			Text = "Send test",
+			Func = function()
+				local url = Options.WebhookUrl and Options.WebhookUrl.Value
+				if not validWebhook(url) then
+					notify("Webhook", "Paste a Discord webhook URL first", 4)
+					return
+				end
+				task.spawn(function()
+					local embed = reportEmbed("\u{2726}  Test from Corvus")
+					embed.author = { name = "Steal From The Rich" }
+					embed.footer = { text = "Corvus  \u{00B7}  Steal From The Rich" }
+					local ok, code = postWebhook(url, { username = "Corvus", allowed_mentions = { parse = {} }, embeds = { embed } })
+					notify("Webhook", if ok then "Test sent" else "Discord answered " .. tostring(code), 4)
+				end)
+			end,
+		})
+	end)
+end
+
+StatusBox:AddButton({
+	Text = "Send Debug Log to Cinek",
+	Tooltip = "Sends the debug log to the Corvus Discord so the problem can be fixed",
+	Func = function()
+		sendFeedback("Bug", "Debug log sent from the Status box. Status: " .. tostring(Status), false, true)
+	end,
+})
+
+if Tabs.Info then
+	pcall(function()
+		local StartBox = Tabs.Info:AddLeftGroupbox("Quick Start", "wand-sparkles")
+		StartBox:AddLabel({ Text = '<font transparency="0.4">Tell Corvus what to do in two taps: what to automate and where to steal. Everything can be changed later.</font>', DoesWrap = true })
+		StartBox:AddButton({
+			Text = "Open quick setup",
+			Func = function()
+				pcall(openWizard)
+			end,
+		})
+		local FeedbackBox = Tabs.Info:AddLeftGroupbox("Feedback", "message-square")
+		FeedbackBox:AddDropdown("FeedbackType", { Text = "Type", Values = { "Idea", "Bug", "Question", "Other" }, Default = "Idea" })
+		FeedbackBox:AddInput("FeedbackText", { Text = "Message", Placeholder = "Tell Cinek what to add or fix...", Finished = false, Default = "" })
+		FeedbackBox:AddToggle("FeedbackAnon", { Text = "Send anonymously", Default = false })
+		FeedbackBox:AddToggle("FeedbackLog", { Text = "Attach debug log", Default = true, Tooltip = "Helps a lot with bugs: the log shows every step the farm took" })
+		FeedbackBox:AddButton({
+			Text = "Send feedback",
+			Func = function()
+				sendFeedback(Options.FeedbackType.Value, Options.FeedbackText.Value, Toggles.FeedbackAnon.Value, Toggles.FeedbackLog.Value)
+				pcall(Options.FeedbackText.SetValue, Options.FeedbackText, "")
+			end,
+		})
+	end)
+end
+
 if Window.AddSettingsTab then
 	Tabs.Settings = Window:AddSettingsTab({
 		ThemeManager = ThemeManager,
@@ -32066,15 +32382,35 @@ task.spawn(function()
 			Session.startMoney = Session.startMoney or money()
 			local elapsed = math.floor(os.clock() - Session.started)
 			StatusLabel:SetText(Status)
-			StatLabels.Money:SetText("Money: $" .. formatNumber(money()))
-			StatLabels.Income:SetText("Income: $" .. formatNumber(LocalPlayer:GetAttribute("IncomePerSecond") or 0) .. "/s")
-			StatLabels.Speed:SetText("Speed level: " .. formatNumber(LocalPlayer:GetAttribute("SpeedLevel") or 0))
-			StatLabels.Stolen:SetText("Crates stolen: " .. Session.stolen)
-			StatLabels.Placed:SetText("Crates placed: " .. Session.placed)
-			StatLabels.Opened:SetText("Crates opened: " .. Session.opened)
-			StatLabels.Sold:SetText("Items sold: " .. Session.sold)
-			StatLabels.Earned:SetText("Earned from selling: $" .. formatNumber(Session.earned))
-			StatLabels.Time:SetText(string.format("Session: %dh %02dm %02ds", elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60))
+			-- money made counts every rise, so buying upgrades does not hide it
+			local now = money()
+			if Session.lastMoney and now > Session.lastMoney then
+				Session.made = (Session.made or 0) + (now - Session.lastMoney)
+			end
+			Session.lastMoney = now
+			local hours = math.max(elapsed, 60) / 3600
+			local best, bestRank = nil, 0
+			for rarity in pairs(Session.rarities) do
+				if (RarityRank[rarity] or 0) > bestRank then
+					best, bestRank = rarity, RarityRank[rarity] or 0
+				end
+			end
+			StatRows.Money.set("$" .. formatNumber(now))
+			StatRows.Gained.set("+$" .. formatNumber(Session.made or 0))
+			StatRows.Income.set("$" .. formatNumber(LocalPlayer:GetAttribute("IncomePerSecond") or 0) .. "/s")
+			StatRows.Earned.set("$" .. formatNumber(Session.earned))
+			StatRows.Time.set(string.format("%dh %02dm %02ds", elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60))
+			StatRows.MoneyRate.set("$" .. formatNumber(math.floor((Session.made or 0) / hours)) .. "/h")
+			StatRows.CrateRate.set(formatNumber(math.floor(Session.stolen / hours)) .. "/h")
+			StatRows.Speed.set(formatNumber(LocalPlayer:GetAttribute("SpeedLevel") or 0))
+			StatRows.Stolen.set(formatNumber(Session.stolen))
+			StatRows.Placed.set(formatNumber(Session.placed))
+			StatRows.Opened.set(formatNumber(Session.opened))
+			StatRows.Sold.set(formatNumber(Session.sold))
+			StatRows.Best.set(best and (best .. " x" .. Session.rarities[best]) or "-")
+			StatRows.Orbs.set(formatNumber(Session.orbs))
+			StatRows.Claimed.set(formatNumber(Session.claimed))
+			StatRows.Bought.set(formatNumber(Session.bought))
 		end)
 		task.wait(0.5)
 	end
