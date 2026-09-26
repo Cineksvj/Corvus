@@ -29938,6 +29938,27 @@ for _, name in ipairs({ "re_PLACE_AT", "re_PLOT_UPGRADE", "re_TREADMILL_UPGRADE"
 	Remotes[name] = ReplicatedStorage:WaitForChild(name, 10)
 end
 
+-- Runs a server call on its own thread so a server that never answers cannot
+-- block the main loop; returns nil after the timeout
+local function invokeWithTimeout(remote, timeout, ...)
+	local args = table.pack(...)
+	local done, ok, result = false, false, nil
+	task.spawn(function()
+		ok, result = pcall(function()
+			return remote:InvokeServer(table.unpack(args, 1, args.n))
+		end)
+		done = true
+	end)
+	local waited = 0
+	while not done and waited < timeout do
+		waited += task.wait(0.05) or 0.05
+	end
+	if done and ok then
+		return result
+	end
+	return nil
+end
+
 local function safeRequire(path)
 	local result, done = nil, false
 	task.spawn(function()
@@ -30068,9 +30089,6 @@ end
 local function selected(option, value)
 	local v = option and option.Value
 	if type(v) == "table" then
-		if next(v) == nil then
-			return true
-		end
 		return v[value] == true
 	end
 	return v == value
@@ -30314,7 +30332,7 @@ local function travel(target, options)
 		task.wait(0.35)
 		root = rootPart()
 		if root and (root.Position - target).Magnitude > 10 then
-			setStatus("The game moved you back, switch Travel Mode to Safe")
+			setStatus(if carrying() then "Teleport with a crate was refused, running home instead" else "The game moved you back, switch Travel Mode to Safe")
 			return false
 		end
 		return true
@@ -30323,7 +30341,7 @@ local function travel(target, options)
 	local slowdown = 1
 	local pulledBack = 0
 	local expected = nil
-	local started = os.clock()
+	local deadline = nil
 	while alive() do
 		local dt = RunService.Heartbeat:Wait()
 		root = rootPart()
@@ -30345,7 +30363,8 @@ local function travel(target, options)
 			break
 		end
 		local speed = (if fast then (Options.TravelSpeed and Options.TravelSpeed.Value or 150) else runSpeed()) * slowdown
-		if os.clock() - started > distance / math.max(speed, 1) + 15 then
+		deadline = deadline or os.clock() + distance / math.max(speed, 1) * 1.5 + 15
+		if os.clock() > deadline then
 			return false
 		end
 		local nextPosition = position + delta.Unit * math.min(distance, speed * dt)
@@ -30361,9 +30380,7 @@ end
 -- Stats
 ---------------------------------------------------------------------------
 local Session = { stolen = 0, opened = 0, placed = 0, sold = 0, earned = 0, started = os.clock(), startMoney = nil }
-onNet("STEAL_SUCCESS", function()
-	Session.stolen += 1
-end)
+-- rev_STEAL_SUCCESS fires on pick-up, so "stolen" is counted when a crate is banked
 
 ---------------------------------------------------------------------------
 -- Steal
@@ -30463,7 +30480,7 @@ local function returnToSafety()
 	end
 	waitFor(function()
 		return not carrying()
-	end, 3)
+	end, if LocalPlayer:GetAttribute("InSafeZone") == true then 3 else 0.3)
 	if carrying() then
 		ReturnFails += 1
 		setStatus("Could not reach the safe zone (" .. ReturnFails .. ")")
@@ -30478,6 +30495,7 @@ local function returnToSafety()
 		end
 	elseif bankedCrates() > before or LocalPlayer:GetAttribute("InSafeZone") == true then
 		ReturnFails = 0
+		Session.stolen += 1
 		setStatus("Crate brought home")
 	else
 		ReturnFails = 0
@@ -30618,10 +30636,8 @@ local function openCratesRemote()
 	if not remote then
 		return nil
 	end
-	local ok, list = pcall(function()
-		return remote:InvokeServer("list")
-	end)
-	if not ok or type(list) ~= "table" then
+	local list = invokeWithTimeout(remote, 5, "list")
+	if type(list) ~= "table" then
 		return nil
 	end
 	local opened = 0
@@ -30629,11 +30645,11 @@ local function openCratesRemote()
 	for _, entry in ipairs(list) do
 		if type(entry) == "table" and entry.Ready == true and entry.Uid ~= nil and (OpenedUid[entry.Uid] or 0) < now then
 			OpenedUid[entry.Uid] = now + 8
-			pcall(function()
-				remote:InvokeServer("open", entry.Uid)
-			end)
-			opened += 1
-			Session.opened += 1
+			local result = invokeWithTimeout(remote, 5, "open", entry.Uid)
+			if result ~= false then
+				opened += 1
+				Session.opened += 1
+			end
 			task.wait(0.25)
 		end
 	end
@@ -30693,9 +30709,7 @@ local function placeBest()
 	if not Remotes.rf_ITEM_LOADOUT then
 		return
 	end
-	pcall(function()
-		Remotes.rf_ITEM_LOADOUT:InvokeServer("placebest")
-	end)
+	invokeWithTimeout(Remotes.rf_ITEM_LOADOUT, 5, "placebest")
 end
 
 local function signOf(floor, name)
@@ -30718,10 +30732,8 @@ local function sellQuote()
 	if not Remotes.rf_SELL_QUOTE then
 		return nil
 	end
-	local ok, quote = pcall(function()
-		return Remotes.rf_SELL_QUOTE:InvokeServer()
-	end)
-	return ok and type(quote) == "table" and quote or nil
+	local quote = invokeWithTimeout(Remotes.rf_SELL_QUOTE, 5)
+	return type(quote) == "table" and quote or nil
 end
 
 local LastSellResult = nil
@@ -31201,7 +31213,9 @@ task.spawn(function()
 				end
 				return
 			end
-			setStatus("Idle")
+			if not on("AutoSteal") then
+				setStatus("Idle")
+			end
 		end)
 		if not ok then
 			setStatus("Error: " .. tostring(err))
@@ -31237,9 +31251,16 @@ task.spawn(function()
 				last.best = now
 				task.spawn(placeBest)
 			end
-			if floor and on("AutoBuySlot") and now - last.slot > 6 and Remotes.re_PLOT_UPGRADE then
-				last.slot = now
+			if floor and on("AutoBuySlot") and now > last.slot and Remotes.re_PLOT_UPGRADE then
+				local slots = LocalPlayer:GetAttribute("AddedSlots")
 				Remotes.re_PLOT_UPGRADE:FireServer(floor, true)
+				last.slot = now + 6
+				task.delay(2, function()
+					-- nothing bought (can't afford yet): wait a minute before asking again
+					if LocalPlayer:GetAttribute("AddedSlots") == slots then
+						last.slot = os.clock() + 60
+					end
+				end)
 			end
 			if floor and on("AutoUpgradePlot") and now - last.plot > 3 and Remotes.re_PLOT_UPGRADE then
 				if canAfford(signOf(floor, "UpgradeSignBoard")) then
