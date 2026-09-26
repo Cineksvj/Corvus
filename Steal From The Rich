@@ -29911,21 +29911,16 @@ end
 ---------------------------------------------------------------------------
 -- Game access
 ---------------------------------------------------------------------------
+-- Game modules are never required on this thread: require can drop the
+-- thread's permissions and then the UI can no longer be touched
 local Shared = ReplicatedStorage:WaitForChild("Shared", 20)
-local Network
-pcall(function()
-	Network = require(Shared.Packages.Network)
-end)
-local NetFolder = Shared and Shared:FindFirstChild("Packages") and Shared.Packages:FindFirstChild("Network")
+local NetFolder = Shared and Shared:WaitForChild("Packages", 10)
+NetFolder = NetFolder and NetFolder:WaitForChild("Network", 10)
 
 local function fire(name, ...)
 	local args = table.pack(...)
 	return pcall(function()
-		if Network then
-			Network.FireServer(name, table.unpack(args, 1, args.n))
-		else
-			NetFolder:WaitForChild("rev_" .. name, 5):FireServer(table.unpack(args, 1, args.n))
-		end
+		NetFolder:WaitForChild("rev_" .. name, 5):FireServer(table.unpack(args, 1, args.n))
 	end)
 end
 
@@ -29944,14 +29939,23 @@ for _, name in ipairs({ "re_PLACE_AT", "re_PLOT_UPGRADE", "re_TREADMILL_UPGRADE"
 end
 
 local function safeRequire(path)
-	local ok, result = pcall(function()
-		local node = ReplicatedStorage
-		for part in path:gmatch("[^%.]+") do
-			node = node:WaitForChild(part, 5)
-		end
-		return require(node)
+	local result, done = nil, false
+	task.spawn(function()
+		local ok, value = pcall(function()
+			local node = ReplicatedStorage
+			for part in path:gmatch("[^%.]+") do
+				node = node:WaitForChild(part, 5)
+			end
+			return require(node)
+		end)
+		result = ok and value or nil
+		done = true
 	end)
-	return ok and result or nil
+	local waited = 0
+	while not done and waited < 10 do
+		waited += task.wait(0.05) or 0.05
+	end
+	return result
 end
 
 local AreaData = safeRequire("Shared.Data.AreaData")
@@ -30617,6 +30621,13 @@ end
 ---------------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------------
+do
+	local setIdentity = setthreadidentity or set_thread_identity or setidentity or (syn and syn.set_thread_identity)
+	if setIdentity then
+		pcall(setIdentity, 8)
+	end
+end
+
 local Window = Library:CreateWindow({
 	Title = "Corvus",
 	Author = "Cinek",
