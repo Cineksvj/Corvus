@@ -30242,7 +30242,24 @@ local function leaveTreadmill()
 	return not onTreadmill()
 end
 
-local function travel(target)
+-- The game's own speed (LBTHDevSpeedClient): RunSpeed studs/s, and
+-- SpeedData.Modifiers.Carrying (0.82) of that while carrying a stolen crate
+local function runSpeed()
+	local run = tonumber(LocalPlayer:GetAttribute("RunSpeed")) or 0
+	if run <= 0 then
+		local hum = humanoid()
+		run = hum and hum.WalkSpeed or 16
+	end
+	if carrying() then
+		run *= 0.82
+	end
+	return math.max(run * 0.97, 12)
+end
+
+-- options.mode overrides the Travel Mode setting, options.keepGoing stops the
+-- trip early when it returns false (for example the crate was taken back)
+local function travel(target, options)
+	options = options or {}
 	local root = rootPart()
 	if not root then
 		return false
@@ -30251,7 +30268,10 @@ local function travel(target)
 		setStatus("Could not get off the treadmill")
 		return false
 	end
-	local mode = Options.TravelMode and Options.TravelMode.Value or "Teleport"
+	local keepGoing = options.keepGoing or function()
+		return true
+	end
+	local mode = options.mode or (Options.TravelMode and Options.TravelMode.Value) or "Teleport"
 	if mode == "Teleport" then
 		root.CFrame = CFrame.new(target) * root.CFrame.Rotation
 		root.AssemblyLinearVelocity = Vector3.zero
@@ -30270,7 +30290,7 @@ local function travel(target)
 	local started = os.clock()
 	while alive() do
 		root = rootPart()
-		if not root then
+		if not root or not keepGoing() then
 			return false
 		end
 		local position = root.Position
@@ -30292,8 +30312,7 @@ local function travel(target)
 		if fast then
 			speed = (Options.TravelSpeed and Options.TravelSpeed.Value or 150) * slowdown
 		else
-			local hum = humanoid()
-			speed = math.max(hum and hum.WalkSpeed or 16, 16)
+			speed = runSpeed()
 		end
 		if os.clock() - started > distance / math.max(speed, 1) + 15 then
 			return false
@@ -30389,15 +30408,29 @@ local function pickCrate()
 	return best
 end
 
+local function bankedCrates()
+	return #toolsWith("CrateUid")
+end
+
+-- A stolen crate is carried home at your own run speed: from far zones the
+-- game does not accept a teleport while carrying and keeps putting you back
 local function returnToSafety()
+	local before = bankedCrates()
+	local mode = Options.CarryMode and Options.CarryMode.Value == "Teleport" and "Teleport" or "Safe"
 	setStatus("Bringing the crate home")
-	travel(safeSpot())
-	if waitFor(function()
+	travel(safeSpot(), { mode = mode, keepGoing = carrying })
+	if mode == "Teleport" and carrying() then
+		travel(safeSpot(), { mode = "Safe", keepGoing = carrying })
+	end
+	waitFor(function()
 		return not carrying()
-	end, 4) then
-		setStatus("Crate brought home")
-	elseif not (rootPart() and rootPart().Position.X >= 2424) then
+	end, 3)
+	if carrying() then
 		setStatus("Could not reach the safe zone")
+	elseif bankedCrates() > before or (rootPart() and rootPart().Position.X >= 2424) then
+		setStatus("Crate brought home")
+	else
+		setStatus("The guard took the crate back")
 	end
 end
 
@@ -30413,7 +30446,9 @@ local function stealOnce()
 	end
 	setStatus("Stealing " .. target.rarity .. " crate in " .. (AreaById[target.area] and AreaById[target.area].DisplayName or target.area))
 	local position = promptPosition(target.prompt) or target.crate:GetPivot().Position
-	if not travel(position + Vector3.new(0, 2, 0)) then
+	local spot = position + Vector3.new(0, 2, 0)
+	if not travel(spot) and not travel(spot, { mode = "Safe" }) then
+		FailedCrates[target.crate] = os.clock() + 20
 		return true
 	end
 	if not (target.prompt.Parent and target.prompt.Enabled) then
@@ -30834,6 +30869,12 @@ MoveBox:AddDropdown("TravelMode", {
 	Values = { "Teleport", "Fast Fly", "Safe" },
 	Default = "Teleport",
 	Tooltip = "Teleport is the fastest. If the game pulls you back, use Safe (your own run speed) or Fast Fly (speed below).",
+})
+MoveBox:AddDropdown("CarryMode", {
+	Text = "Carry Crate Home",
+	Values = { "Run", "Teleport" },
+	Default = "Run",
+	Tooltip = "Run brings a stolen crate home at your own speed, which works from every zone you can escape. Teleport is only accepted from close zones.",
 })
 MoveBox:AddSlider("TravelSpeed", {
 	Text = "Fast Fly Speed",
