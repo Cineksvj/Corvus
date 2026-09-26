@@ -216,6 +216,12 @@ local function summary(def)
 		print(fmt("  %s  %s%s", c.ok and "PASS" or "FAIL", c.description, c.detail ~= nil and (" [" .. tostring(c.detail) .. "]") or ""))
 		allOk = allOk and c.ok
 	end
+	local debugLog = __Files and __Files["Corvus_SFTR_log.txt"]
+	if debugLog then
+		print("---- script debug log (Corvus_SFTR_log.txt) ----")
+		print(debugLog)
+		print("---- end of script debug log ----")
+	end
 	print("RESULT " .. def.name .. ": " .. (allOk and "PASS" or "FAIL"))
 end
 

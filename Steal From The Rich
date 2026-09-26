@@ -29917,8 +29917,69 @@ local Shared = ReplicatedStorage:WaitForChild("Shared", 20)
 local NetFolder = Shared and Shared:WaitForChild("Packages", 10)
 NetFolder = NetFolder and NetFolder:WaitForChild("Network", 10)
 
+---------------------------------------------------------------------------
+-- Debug log: every step the farm takes, saved to Corvus_SFTR_log.txt in the
+-- executor's workspace folder so a failing run can be read afterwards
+---------------------------------------------------------------------------
+local LogFile = "Corvus_SFTR_log.txt"
+local LogLines, LogSize, LogDirty = {}, 0, false
+local LogStart = os.clock()
+
+local function describe(value, depth)
+	depth = depth or 0
+	local kind = typeof(value)
+	if kind == "Instance" then
+		local ok, name = pcall(value.GetFullName, value)
+		return ok and name or tostring(value)
+	elseif kind == "Vector3" then
+		return string.format("(%.1f, %.1f, %.1f)", value.X, value.Y, value.Z)
+	elseif kind == "CFrame" then
+		local p = value.Position
+		return string.format("CF(%.1f, %.1f, %.1f)", p.X, p.Y, p.Z)
+	elseif kind == "string" then
+		return string.format("%q", #value > 160 and value:sub(1, 160) .. "..." or value)
+	elseif kind == "table" then
+		if depth >= 2 then
+			return "{...}"
+		end
+		local parts, n = {}, 0
+		for k, v in pairs(value) do
+			n += 1
+			if n > 14 then
+				table.insert(parts, "...")
+				break
+			end
+			table.insert(parts, tostring(k) .. "=" .. describe(v, depth + 1))
+		end
+		return "{" .. table.concat(parts, ", ") .. "}"
+	end
+	return tostring(value)
+end
+
+local function log(...)
+	if LogSize > 4000000 then
+		return
+	end
+	local parts = table.pack(...)
+	for i = 1, parts.n do
+		parts[i] = if type(parts[i]) == "string" then parts[i] else describe(parts[i])
+	end
+	local line = string.format("[%8.2f] %s", os.clock() - LogStart, table.concat(parts, " ", 1, parts.n))
+	LogSize += #line + 1
+	table.insert(LogLines, line)
+	LogDirty = true
+end
+
+local function flushLog()
+	if LogDirty and writefile then
+		LogDirty = false
+		pcall(writefile, LogFile, table.concat(LogLines, "\n"))
+	end
+end
+
 local function fire(name, ...)
 	local args = table.pack(...)
+	log("FIRE rev_" .. name, table.unpack(args, 1, args.n))
 	return pcall(function()
 		NetFolder:WaitForChild("rev_" .. name, 5):FireServer(table.unpack(args, 1, args.n))
 	end)
@@ -29933,9 +29994,44 @@ local function onNet(name, fn)
 	end)
 end
 
+-- Server events worth seeing in the log
+task.spawn(function()
+	for _, name in ipairs({ "STEAL_SUCCESS", "STEAL_ESCAPED", "ChaseCaught", "SellResult", "SellDialogOpen", "CRATES_HIDDEN", "TRAIL_STATE", "INDEX_STATE", "SlotUpgraded", "TREADMILL_DISMOUNT", "PlayMessage", "NotificationUpdate", "ARENA_RESET", "TeleportToPlot" }) do
+		task.spawn(onNet, name, function(...)
+			log("EVENT rev_" .. name, ...)
+		end)
+	end
+end)
+
+-- Remotes are wrapped so every call and its answer lands in the log
+local function loggedRemote(remote)
+	if not remote then
+		return nil
+	end
+	local wrapper = { Instance = remote, Name = remote.Name }
+	function wrapper:FireServer(...)
+		log("FIRE " .. remote.Name, ...)
+		return remote:FireServer(...)
+	end
+	function wrapper:InvokeServer(...)
+		log("INVOKE " .. remote.Name, ...)
+		local result = table.pack(pcall(remote.InvokeServer, remote, ...))
+		if not result[1] then
+			log("  " .. remote.Name .. " error:", tostring(result[2]))
+			error(result[2], 0)
+		end
+		log("  " .. remote.Name .. " ->", table.unpack(result, 2, math.max(result.n, 2)))
+		return table.unpack(result, 2, result.n)
+	end
+	return wrapper
+end
+
 local Remotes = {}
 for _, name in ipairs({ "re_PLACE_AT", "re_PLOT_UPGRADE", "re_TREADMILL_UPGRADE", "re_SELL_DO", "rf_SELL_QUOTE", "rf_ITEM_LOADOUT", "rf_CRATE_TIMERS" }) do
-	Remotes[name] = ReplicatedStorage:WaitForChild(name, 10)
+	Remotes[name] = loggedRemote(ReplicatedStorage:WaitForChild(name, 10))
+	if not Remotes[name] then
+		log("MISSING remote", name)
+	end
 end
 
 -- Runs a server call on its own thread so a server that never answers cannot
@@ -30195,7 +30291,12 @@ local function triggerPrompt(prompt, done)
 		prompt.RequiresLineOfSight = false
 	end)
 	PromptIssue = nil
-	for _ = 1, 2 do
+	do
+		local root = rootPart()
+		local position = promptPosition(prompt)
+		log("PROMPT start", prompt, "action=" .. tostring(prompt.ActionText), "hold=" .. tostring(prompt.HoldDuration), "dist=" .. (if root and position then string.format("%.1f", (root.Position - position).Magnitude) else "?"), "max=" .. tostring(prompt.MaxActivationDistance), "shown=" .. tostring(ShownPrompts[prompt] == true), "style=" .. tostring(prompt.Style))
+	end
+	for attempt = 1, 2 do
 		if not (prompt.Parent and prompt.Enabled) then
 			break
 		end
@@ -30223,6 +30324,7 @@ local function triggerPrompt(prompt, done)
 		end, 1)
 		c1:Disconnect()
 		c2:Disconnect()
+		log("PROMPT attempt", attempt, "shown=" .. tostring(ShownPrompts[prompt] == true), "holdBegan=" .. tostring(began), "triggered=" .. tostring(fired), "done=" .. tostring(done()))
 		if ok and done() then
 			return true
 		end
@@ -30236,16 +30338,21 @@ local function triggerPrompt(prompt, done)
 		end
 	end
 	if fireproximityprompt and prompt.Parent and prompt.Enabled then
-		pcall(fireproximityprompt, prompt)
+		local okFire, errFire = pcall(fireproximityprompt, prompt)
+		log("PROMPT fireproximityprompt", okFire, errFire)
 		if waitFor(done, 1) then
 			return true
 		end
 	end
+	log("PROMPT failed:", PromptIssue or "no reaction")
 	return false
 end
 
 local Status = "Idle"
 local function setStatus(text)
+	if Status ~= text then
+		log("STATUS", text)
+	end
 	Status = text
 end
 
@@ -30312,7 +30419,7 @@ end
 
 -- options.mode overrides the Travel Mode setting, options.keepGoing stops the
 -- trip early when it returns false (for example the crate was taken back)
-local function travel(target, options)
+local function travelRaw(target, options)
 	options = options or {}
 	local root = rootPart()
 	if not root then
@@ -30374,6 +30481,17 @@ local function travel(target, options)
 		root.AssemblyLinearVelocity = Vector3.zero
 	end
 	return true
+end
+
+local function travel(target, options)
+	local root = rootPart()
+	local from = root and root.Position
+	log("TRAVEL", (options and options.mode) or (Options.TravelMode and Options.TravelMode.Value) or "?", "from", from, "to", target, "dist", from and string.format("%.0f", (target - from).Magnitude) or "?", "carrying=" .. tostring(carrying()))
+	local started = os.clock()
+	local ok = travelRaw(target, options)
+	root = rootPart()
+	log("TRAVEL end ok=" .. tostring(ok), "at", root and root.Position, "left", root and string.format("%.1f", (target - root.Position).Magnitude) or "?", string.format("%.1fs", os.clock() - started), "onTreadmill=" .. tostring(LocalPlayer:GetAttribute("OnTreadmill")))
+	return ok
 end
 
 ---------------------------------------------------------------------------
@@ -31068,6 +31186,19 @@ SellBox:AddButton({
 
 local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 local StatusLabel = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+StatusBox:AddLabel({ Text = '<font transparency="0.35">Every step is saved to ' .. LogFile .. " in your executor's workspace folder. Send that file if something does not work.</font>", DoesWrap = true })
+StatusBox:AddButton({
+	Text = "Copy Debug Log",
+	Func = function()
+		flushLog()
+		if setclipboard then
+			pcall(setclipboard, table.concat(LogLines, "\n"))
+			notify("Debug log", "Copied " .. #LogLines .. " lines", 3)
+		else
+			notify("Debug log", "Your executor cannot copy, send " .. LogFile .. " instead", 5)
+		end
+	end,
+})
 
 -- Plot
 local PlotBox = Tabs.Plot:AddLeftGroupbox("Plot", "house")
@@ -31170,6 +31301,86 @@ end
 ---------------------------------------------------------------------------
 -- Loops
 ---------------------------------------------------------------------------
+-- Debug log: what the script sees at start, then every change that matters
+task.spawn(function()
+	local executor = "?"
+	if identifyexecutor then
+		pcall(function()
+			executor = tostring((identifyexecutor()))
+		end)
+	end
+	log("START Steal From The Rich", "PlaceId=" .. game.PlaceId, "executor=" .. executor)
+	log("capabilities", "fireproximityprompt=" .. tostring(fireproximityprompt ~= nil), "firetouchinterest=" .. tostring(firetouchinterest ~= nil), "writefile=" .. tostring(writefile ~= nil), "setclipboard=" .. tostring(setclipboard ~= nil))
+	log("player attributes", LocalPlayer:GetAttributes())
+	local hum = humanoid()
+	log("humanoid", "WalkSpeed=" .. tostring(hum and hum.WalkSpeed), "HipHeight=" .. tostring(hum and hum.HipHeight), "root=" .. describe(rootPart() and rootPart().Position))
+	local floor = myFloor()
+	log("my plot floor", floor, floor and floor.Position, floor and floor.Size)
+	local treadmills = workspace:FindFirstChild("Treadmills")
+	log("treadmills", treadmills and #treadmills:GetChildren() or "missing", "mine=" .. describe(myTreadmill()))
+	if treadmills then
+		for _, t in ipairs(treadmills:GetChildren()) do
+			log("  treadmill", t.Name, t:GetAttributes())
+		end
+	end
+	local crates = workspace:FindFirstChild("Crates")
+	log("crates folder", crates and #crates:GetChildren() or "missing")
+	if crates then
+		for index, crate in ipairs(crates:GetChildren()) do
+			if index > 12 then
+				break
+			end
+			local prompt = stealPrompt(crate)
+			log("  crate", crate.Name, crate.ClassName, crate:GetAttributes(), "prompt=" .. describe(prompt), if prompt then "enabled=" .. tostring(prompt.Enabled) .. " hold=" .. tostring(prompt.HoldDuration) .. " style=" .. tostring(prompt.Style) else "")
+		end
+	end
+	for _, name in ipairs({ "CarryingStolen", "InSafeZone", "CarryStat", "OnTreadmill", "TreadmillMountCF", "RunSpeed", "SpeedLevel", "TreadmillLevel", "AddedSlots", "UnlockedPlotSlots", "TrappedUntil", "TutorialStep", "TutorialDone" }) do
+		LocalPlayer:GetAttributeChangedSignal(name):Connect(function()
+			log("ATTR", name, LocalPlayer:GetAttribute(name))
+		end)
+	end
+	local function watchBackpack(container)
+		if not container then
+			return
+		end
+		container.ChildAdded:Connect(function(child)
+			if child:IsA("Tool") then
+				log("TOOL added to " .. container.Name, child.Name, child:GetAttributes())
+			end
+		end)
+	end
+	watchBackpack(LocalPlayer:FindFirstChild("Backpack"))
+	LocalPlayer.CharacterAdded:Connect(function()
+		log("CHARACTER respawned")
+		watchBackpack(LocalPlayer:WaitForChild("Backpack", 5))
+	end)
+	local seen = {}
+	local lastBeat = 0
+	while alive() do
+		for _, group in ipairs({ Toggles, Options }) do
+			for key, option in pairs(group) do
+				if type(option) == "table" and option.Value ~= nil then
+					local text = describe(option.Value)
+					if seen[key] ~= text then
+						if seen[key] ~= nil or option.Value == true then
+							log("OPTION", key, "=", text)
+						end
+						seen[key] = text
+					end
+				end
+			end
+		end
+		if os.clock() - lastBeat > 10 then
+			lastBeat = os.clock()
+			local root = rootPart()
+			log("BEAT", "status=" .. Status, "pos=" .. describe(root and root.Position), "carrying=" .. tostring(carrying()), "onTreadmill=" .. tostring(onTreadmill()), "inSafeZone=" .. tostring(LocalPlayer:GetAttribute("InSafeZone")), "money=" .. formatNumber(money()), "crateTools=" .. #toolsWith("CrateUid"), "itemTools=" .. #toolsWith("ItemUid"))
+		end
+		flushLog()
+		task.wait(1)
+	end
+	flushLog()
+end)
+
 -- Main worker: one task at a time so movement never fights itself
 task.spawn(function()
 	while alive() do
@@ -31219,6 +31430,7 @@ task.spawn(function()
 		end)
 		if not ok then
 			setStatus("Error: " .. tostring(err))
+			log("ERROR main loop:", tostring(err))
 		end
 		task.wait(0.25)
 	end
@@ -31228,7 +31440,7 @@ end)
 task.spawn(function()
 	local last = { index = 0, trails = 0, equip = 0, open = 0, best = 0, slot = 0, plot = 0, tread = 0 }
 	while alive() do
-		pcall(function()
+		local okBg, errBg = pcall(function()
 			local now = os.clock()
 			local floor = myFloor()
 			if on("AutoIndex") and now - last.index > 10 then
@@ -31275,6 +31487,9 @@ task.spawn(function()
 				end
 			end
 		end)
+		if not okBg then
+			log("ERROR background loop:", tostring(errBg))
+		end
 		task.wait(0.5)
 	end
 end)

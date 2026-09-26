@@ -1632,6 +1632,11 @@ end
 -- Executor globals
 ---------------------------------------------------------------------------
 local GENV = {}
+-- writefile keeps files in memory; the harness prints Corvus_SFTR_log.txt at the end
+__Files = {}
+writefile = function(name, content)
+	__Files[name] = content
+end
 getgenv = function()
 	return GENV
 end

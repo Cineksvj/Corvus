@@ -71,9 +71,10 @@ def transform_script(src):
 
     # setStatus observation hook (same line, so numbering is unchanged)
     ss = find(lambda l: l.strip() == "local function setStatus(text)", save, "setStatus()")
-    if lines[ss + 1].strip() != "Status = text":
+    body = next((i for i in range(ss + 1, min(ss + 8, len(lines))) if lines[i].strip() == "Status = text"), None)
+    if body is None:
         sys.exit("setStatus() body changed; update the hook in run_sftr.py")
-    lines[ss + 1] = lines[ss + 1] + "; if __SimOnStatus then __SimOnStatus(text) end"
+    lines[body] = lines[body] + "; if __SimOnStatus then __SimOnStatus(text) end"
 
     # the main worker's per-cycle wait (used to count main loop cycles / detect stalls)
     mw = find(lambda l: "Main worker" in l, ss, "the main worker comment")
