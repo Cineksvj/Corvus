@@ -224,6 +224,13 @@ def main():
         paths = sorted(os.path.join(scen_dir, f) for f in os.listdir(scen_dir) if f.endswith(".luau"))
 
     results = [run_one(luau, p, script_src, info, args) for p in paths]
+    # the walk map on the real place geometry (tests/realmap): routes to every crate
+    realmap = os.path.join(HERE, "realmap", "run_nav.py")
+    if not args.scenarios and args.script == DEFAULT_SCRIPT and os.path.isfile(realmap):
+        env = dict(os.environ, LUAU_BIN=luau)
+        rm = subprocess.run([sys.executable, realmap], env=env, capture_output=True, text=True)
+        print(rm.stdout.strip())
+        results.append(("realmap_routes", "PASS" if rm.returncode == 0 else "FAIL"))
     print("==== RESULTS ====")
     for name, res in results:
         print(f"  {res:5s} {name}")

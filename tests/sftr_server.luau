@@ -681,6 +681,11 @@ function Server.buildExtras()
 	for _, w in ipairs(cfg("walls") or {}) do
 		table.insert(Sim.obstacles, w)
 	end
+	-- the walls are real parts too, like in the game (the script maps them)
+	local wallFolder = make("Folder", { Name = "SimWalls" }, workspace)
+	for _, o in ipairs(Sim.obstacles) do
+		make("Part", { Name = o.name or "wall", Anchored = true, CanCollide = true, Size = V(o.x2 - o.x1, 10, o.z2 - o.z1), CFrame = CFrame.new((o.x1 + o.x2) / 2, 6, (o.z1 + o.z2) / 2) }, wallFolder)
+	end
 	-- storm: regions live in ReplicatedStorage like the real game (not raycast)
 	local admin = make("Folder", { Name = "AdminSystem" }, RS)
 	local events = make("Folder", { Name = "Events" }, admin)

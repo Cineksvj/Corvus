@@ -30589,7 +30589,363 @@ local function pathTo(from, to, exact)
 	return nil
 end
 
--- walks one planned path; "done", "stuck", "pulled" (the server moved us) or "stopped"
+-- Walk map: the live map rasterised to a 2 stud grid (every collidable part,
+-- thin fence rails and invisible walls included) and searched with A*.
+-- Roblox's own pathfinding works on 4 stud voxels and missed the thin rails of
+-- other players' fences (live: stuck at X=2504 running into a plot fence).
+-- Checked offline on the place file: all 46 crate spots are reachable from the
+-- safe zone and from the plots, through the arena opening.
+-- NAV BEGIN (tests/realmap runs this block on the real place geometry)
+local Nav = { cell = 2, minX = -1300, maxX = 2750, minZ = -1350, maxZ = -550, ready = false, search = 0 }
+do
+	-- floor: wide flat parts (3+ studs across) with a top up to 4.5; a wide part
+	-- up to STEP above the floor is a step; anything else from LOW to HEAD above
+	-- the floor blocks (fence rails and posts too: live, the upper rail of a
+	-- plot fence was taken for floor and the character walked into the fence)
+	-- (stair treads are about 2 studs deep, fence rails under 1). Walking may
+	-- climb CLIMB studs at a time: plot floors are 1.7 above the ground and are
+	-- entered by their stairs, not over the edge.
+	local STEP, LOW, HEAD, GROUND_MAX, WIDE, CLIMB = 2.2, 0.6, 5.5, 4.5, 1.5, 1.25
+	local CELL = Nav.cell
+	local NX = math.floor((Nav.maxX - Nav.minX) / CELL)
+	local NZ = math.floor((Nav.maxZ - Nav.minZ) / CELL)
+	Nav.nx, Nav.nz = NX, NZ
+	local COUNT = NX * NZ
+	-- flags: 0 free, 1 wall, 2 no floor, 3 too close to a wall
+	local flags, groundQ, stamp, gScore, cameFrom
+
+	local function cellOf(x, z)
+		return math.floor((x - Nav.minX) / CELL), math.floor((z - Nav.minZ) / CELL)
+	end
+	local function inGrid(i, j)
+		return i >= 0 and j >= 0 and i < NX and j < NZ
+	end
+	local function free(i, j)
+		return inGrid(i, j) and buffer.readu8(flags, i * NZ + j) == 0
+	end
+	local function groundAt(i, j)
+		local q = buffer.readu8(groundQ, i * NZ + j)
+		return if q == 0 then 1 else (q - 1) / 20 - 6
+	end
+
+	-- calls fn(index) for every cell under the part's oriented box (grown by
+	-- margin: half a cell for walls, none for floors); returns bottom, top, wide
+	local function footprint(part, fn, margin)
+		local cf, size = part.CFrame, part.Size
+		local p = cf.Position
+		local r, u, l = cf.RightVector, cf.UpVector, cf.LookVector
+		local sx, sy, sz = size.X / 2, size.Y / 2, size.Z / 2
+		local ex = math.abs(r.X) * sx + math.abs(u.X) * sy + math.abs(l.X) * sz
+		local ey = math.abs(r.Y) * sx + math.abs(u.Y) * sy + math.abs(l.Y) * sz
+		local ez = math.abs(r.Z) * sx + math.abs(u.Z) * sy + math.abs(l.Z) * sz
+		if fn then
+			local i0, j0 = cellOf(p.X - ex, p.Z - ez)
+			local i1, j1 = cellOf(p.X + ex, p.Z + ez)
+			i0, j0, i1, j1 = math.max(i0, 0), math.max(j0, 0), math.min(i1, NX - 1), math.min(j1, NZ - 1)
+			local m = margin or CELL / 2
+			for i = i0, i1 do
+				local dx = Nav.minX + (i + 0.5) * CELL - p.X
+				for j = j0, j1 do
+					local dz = Nav.minZ + (j + 0.5) * CELL - p.Z
+					if math.abs(dx * r.X + dz * r.Z) <= sx + m and math.abs(dx * u.X + dz * u.Z) <= sy + m and math.abs(dx * l.X + dz * l.Z) <= sz + m then
+						fn(i * NZ + j)
+					end
+				end
+			end
+		end
+		return p.Y - ey, p.Y + ey, math.min(ex, ez) * 2 >= WIDE
+	end
+
+	local function skipPart(part, crates, camera)
+		if part:IsA("Terrain") or (crates and part:IsDescendantOf(crates)) or (camera and part:IsDescendantOf(camera)) then
+			return true
+		end
+		-- characters and NPCs move; they are not walls
+		local node = part.Parent
+		while node and node ~= workspace do
+			if node:IsA("Model") and node:FindFirstChildOfClass("Humanoid") then
+				return true
+			end
+			node = node.Parent
+		end
+		return false
+	end
+
+	function Nav.build()
+		local started = os.clock()
+		flags, groundQ = buffer.create(COUNT), buffer.create(COUNT)
+		stamp, gScore, cameFrom = buffer.create(COUNT * 4), buffer.create(COUNT * 4), buffer.create(COUNT * 4)
+		local crates = workspace:FindFirstChild("Crates")
+		local treadmills = workspace:FindFirstChild("Treadmills")
+		local tall, work = {}, 0
+		local function yieldSometimes(amount)
+			work += amount
+			if work > 30000 then
+				work = 0
+				task.wait()
+			end
+		end
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d:IsA("BasePart") and d.CanCollide and not skipPart(d, crates, workspace.CurrentCamera) then
+				local cells = 0
+				local bottom, top, wide = footprint(d, nil)
+				if treadmills and d:IsDescendantOf(treadmills) then
+					-- stepping on a belt mounts it: keep off every treadmill
+					footprint(d, function(k)
+						buffer.writeu8(flags, k, 1)
+						cells += 1
+					end)
+				else
+					if wide and top <= GROUND_MAX and top > -6 then
+						local q = math.clamp(math.floor((top + 6) * 20) + 1, 1, 255)
+						footprint(d, function(k)
+							if q > buffer.readu8(groundQ, k) then
+								buffer.writeu8(groundQ, k, q)
+							end
+							cells += 1
+						end, 0)
+					end
+					if top > 1 + LOW and bottom < GROUND_MAX + HEAD then
+						table.insert(tall, d)
+					end
+				end
+				yieldSometimes(cells + 1)
+			else
+				yieldSometimes(0.2)
+			end
+		end
+		for _, d in ipairs(tall) do
+			if d.Parent then
+				local bottom, top, wide = footprint(d, nil)
+				local cells = 0
+				footprint(d, function(k)
+					local q = buffer.readu8(groundQ, k)
+					local g = if q == 0 then 1 else (q - 1) / 20 - 6
+					if bottom < g + HEAD and top > g + LOW and not (wide and top <= g + STEP) then
+						buffer.writeu8(flags, k, 1)
+					end
+					cells += 1
+				end)
+				yieldSometimes(cells + 1)
+			end
+		end
+		local walls, void = 0, 0
+		for k = 0, COUNT - 1 do
+			if buffer.readu8(flags, k) == 1 then
+				walls += 1
+			elseif buffer.readu8(groundQ, k) == 0 then
+				buffer.writeu8(flags, k, 2)
+				void += 1
+			end
+			yieldSometimes(0.5)
+		end
+		-- keep the character's width (about 2 studs) away from walls
+		for i = 0, NX - 1 do
+			for j = 0, NZ - 1 do
+				if buffer.readu8(flags, i * NZ + j) == 1 then
+					for di = -1, 1 do
+						for dj = -1, 1 do
+							local ni, nj = i + di, j + dj
+							if inGrid(ni, nj) and buffer.readu8(flags, ni * NZ + nj) == 0 then
+								buffer.writeu8(flags, ni * NZ + nj, 3)
+							end
+						end
+					end
+				end
+			end
+			yieldSometimes(NZ * 0.5)
+		end
+		Nav.ready = true
+		log("NAV walk map ready", string.format("%.1fs", os.clock() - started), "walls=" .. walls, "no floor=" .. void, "tall parts=" .. #tall)
+	end
+
+	local function nearestFree(i, j, radius)
+		for r = 0, radius do
+			for di = -r, r do
+				for dj = -r, r do
+					if math.max(math.abs(di), math.abs(dj)) == r and free(i + di, j + dj) then
+						return i + di, j + dj
+					end
+				end
+			end
+		end
+		return nil
+	end
+
+	-- straight walk between two cells stays on free cells and never climbs a ledge
+	local function lineFree(i0, j0, i1, j1)
+		local steps = math.max(math.abs(i1 - i0), math.abs(j1 - j0)) * 2
+		local last = groundAt(i0, j0)
+		for s = 1, steps do
+			local t = s / steps
+			local i = math.floor(i0 + (i1 - i0) * t + 0.5)
+			local j = math.floor(j0 + (j1 - j0) * t + 0.5)
+			if not free(i, j) then
+				return false
+			end
+			local g = groundAt(i, j)
+			if g - last > CLIMB then
+				return false
+			end
+			last = g
+		end
+		return true
+	end
+
+	-- walls the grid did not know (a new decoration, a door): learn them where we got stuck
+	function Nav.learn(position, toward)
+		if not Nav.ready then
+			return
+		end
+		local dir = Vector3.new(toward.X - position.X, 0, toward.Z - position.Z)
+		if dir.Magnitude < 0.1 then
+			return
+		end
+		local ahead = position + dir.Unit * 2.5
+		local ci, cj = cellOf(ahead.X, ahead.Z)
+		for di = -1, 1 do
+			for dj = -1, 1 do
+				if inGrid(ci + di, cj + dj) then
+					buffer.writeu8(flags, (ci + di) * NZ + cj + dj, 1)
+				end
+			end
+		end
+		log("NAV learned a wall at", ahead)
+	end
+
+	-- waypoints {Position, Action} from one point to another, or nil
+	function Nav.path(from, to)
+		if not Nav.ready then
+			return nil
+		end
+		local si, sj = cellOf(from.X, from.Z)
+		local gi, gj = cellOf(to.X, to.Z)
+		si, sj = nearestFree(si, sj, 4)
+		gi, gj = nearestFree(gi, gj, 12)
+		if not (si and gi) then
+			return nil
+		end
+		Nav.search += 1
+		local id = Nav.search
+		local startK, goalK = si * NZ + sj, gi * NZ + gj
+		local heapK, heapF = { startK }, { 0 }
+		buffer.writeu32(stamp, startK * 4, id)
+		buffer.writef32(gScore, startK * 4, 0)
+		buffer.writei32(cameFrom, startK * 4, -1)
+		local closedStamp = id + 0.5
+		local expanded, found = 0, false
+		local W = 1.6
+		while #heapK > 0 do
+			-- pop the smallest f
+			local k = heapK[1]
+			local lastK, lastF = table.remove(heapK), table.remove(heapF)
+			if #heapK > 0 then
+				heapK[1], heapF[1] = lastK, lastF
+				local c, n = 1, #heapK
+				while true do
+					local left, right, small = c * 2, c * 2 + 1, c
+					if left <= n and heapF[left] < heapF[small] then
+						small = left
+					end
+					if right <= n and heapF[right] < heapF[small] then
+						small = right
+					end
+					if small == c then
+						break
+					end
+					heapK[c], heapK[small] = heapK[small], heapK[c]
+					heapF[c], heapF[small] = heapF[small], heapF[c]
+					c = small
+				end
+			end
+			if k == goalK then
+				found = true
+				break
+			end
+			local i, j = k // NZ, k % NZ
+			local g = buffer.readf32(gScore, k * 4)
+			expanded += 1
+			if expanded % 3000 == 0 then
+				task.wait()
+			end
+			if expanded > 400000 then
+				break
+			end
+			for n = 1, 8 do
+				local di = if n == 1 or n == 5 or n == 6 then 1 elseif n == 2 or n == 7 or n == 8 then -1 else 0
+				local dj = if n == 3 or n == 5 or n == 7 then 1 elseif n == 4 or n == 6 or n == 8 then -1 else 0
+				local ni, nj = i + di, j + dj
+				if free(ni, nj) and (di == 0 or dj == 0 or (free(i + di, j) and free(i, j + dj))) and groundAt(ni, nj) - groundAt(i, j) <= CLIMB then
+					local nk = ni * NZ + nj
+					local ng = g + (if di ~= 0 and dj ~= 0 then 1.4142 else 1)
+					if buffer.readu32(stamp, nk * 4) ~= id or ng < buffer.readf32(gScore, nk * 4) then
+						buffer.writeu32(stamp, nk * 4, id)
+						buffer.writef32(gScore, nk * 4, ng)
+						buffer.writei32(cameFrom, nk * 4, k)
+						local f = ng + W * math.sqrt((ni - gi) ^ 2 + (nj - gj) ^ 2)
+						table.insert(heapK, nk)
+						table.insert(heapF, f)
+						local c = #heapK
+						while c > 1 do
+							local parent = c // 2
+							if heapF[parent] <= heapF[c] then
+								break
+							end
+							heapK[parent], heapK[c] = heapK[c], heapK[parent]
+							heapF[parent], heapF[c] = heapF[c], heapF[parent]
+							c = parent
+						end
+					end
+				end
+			end
+		end
+		if not found then
+			log("NAV no path", from, "->", to, "expanded", expanded)
+			return nil
+		end
+		local cells = {}
+		local k = goalK
+		while k >= 0 do
+			table.insert(cells, k)
+			if k == startK then
+				break
+			end
+			k = buffer.readi32(cameFrom, k * 4)
+		end
+		-- reverse and pull the string: keep a cell only where the straight line breaks
+		local ordered = table.create(#cells)
+		for index = #cells, 1, -1 do
+			table.insert(ordered, cells[index])
+		end
+		local kept = { ordered[1] }
+		local anchor = 1
+		for index = 2, #ordered do
+			local nextK = ordered[index + 1]
+			if not nextK or not lineFree(ordered[anchor] // NZ, ordered[anchor] % NZ, nextK // NZ, nextK % NZ) then
+				table.insert(kept, ordered[index])
+				anchor = index
+			end
+		end
+		local list = { { Position = from, Action = Enum.PathWaypointAction.Walk } }
+		for index = 2, #kept do
+			local kk = kept[index]
+			local ci, cj = kk // NZ, kk % NZ
+			local x, z = Nav.minX + (ci + 0.5) * CELL, Nav.minZ + (cj + 0.5) * CELL
+			table.insert(list, { Position = Vector3.new(x, groundAt(ci, cj) + 3, z), Action = Enum.PathWaypointAction.Walk })
+		end
+		return list
+	end
+end
+-- NAV END
+task.spawn(function()
+	task.wait(1)
+	local ok, err = pcall(Nav.build)
+	if not ok then
+		log("ERROR walk map:", tostring(err))
+	end
+end)
+
+-- walks one planned path; "done", "stuck" (and where to), "pulled" (the server moved us) or "stopped"
 local function followWaypoints(list, options)
 	local generation = options.generation
 	local keepGoing = options.keepGoing or function()
@@ -30632,6 +30988,11 @@ local function followWaypoints(list, options)
 			lastPos = position
 			-- close to the point, not early: cutting corners at 100 studs/s hits them
 			local distance = Vector3.new(goal.X - position.X, 0, goal.Z - position.Z).Magnitude
+			-- a ledge ahead (a plot floor is 1.7 above the ground): hop up like a player
+			local feet = position.Y - hum.HipHeight - root.Size.Y / 2
+			if goal.Y - 3 - feet > 1 and distance < 6 then
+				hum.Jump = true
+			end
 			if distance <= 2 then
 				break
 			end
@@ -30641,7 +31002,7 @@ local function followWaypoints(list, options)
 				-- a step, a fence or a ledge: jump like a player would
 				hum.Jump = true
 				if os.clock() - progressAt > 2.2 then
-					return "stuck"
+					return "stuck", goal
 				end
 			end
 			if os.clock() - issuedAt > 3 then
@@ -30675,10 +31036,18 @@ local function walkRoute(target, options)
 		if flat.Magnitude <= 3 then
 			return true
 		end
-		-- long trips are planned in legs of about 400 studs
-		local final = flat.Magnitude <= 450
-		local legGoal = if final then target else Vector3.new(position.X, target.Y, position.Z) + flat.Unit * 400
-		local list, goal = pathTo(position, legGoal, false)
+		-- the walk map plans the whole trip; without it Roblox pathfinding plans
+		-- legs of about 400 studs
+		local list, goal, final
+		if Nav.ready then
+			list, goal, final = Nav.path(position, target), target, true
+		end
+		local legGoal = target
+		if not list then
+			final = flat.Magnitude <= 450
+			legGoal = if final then target else Vector3.new(position.X, target.Y, position.Z) + flat.Unit * 400
+			list, goal = pathTo(position, legGoal, false)
+		end
 		if not list and not final then
 			for _, dz in ipairs({ 20, -20, 45, -45 }) do
 				list, goal = pathTo(position, legGoal + Vector3.new(0, 0, dz), true)
@@ -30695,7 +31064,13 @@ local function walkRoute(target, options)
 			task.wait(0.2)
 		else
 			planned = true
-			local result = followWaypoints(list, options)
+			local result, stuckAt = followWaypoints(list, options)
+			if result == "stuck" and stuckAt then
+				local here = rootPart()
+				if here then
+					Nav.learn(here.Position, stuckAt)
+				end
+			end
 			if result == "stopped" then
 				return false
 			elseif result == "done" then
@@ -30759,11 +31134,20 @@ end
 -- the plot straight at a crate pinned the player at X=2424.5 for 30 s)
 local LOBBY_X = 2424
 local function safeZoneBounds()
-	local zMin, zMax = -1030, -850
+	-- the opening is as wide as the arena floor (place file: Area parts span
+	-- Z -1012 to -868); the safe zone part itself runs the whole lobby
+	local zMin, zMax = math.huge, -math.huge
 	pcall(function()
-		local zone = workspace["Steal Map"].Lobby["safe zone"]
-		zMin, zMax = zone.Position.Z - zone.Size.Z / 2, zone.Position.Z + zone.Size.Z / 2
+		for _, area in ipairs(workspace["Steal Map"].Arena:GetChildren()) do
+			if area:IsA("BasePart") and area:GetAttribute("AreaId") then
+				zMin = math.min(zMin, area.Position.Z - area.Size.Z / 2)
+				zMax = math.max(zMax, area.Position.Z + area.Size.Z / 2)
+			end
+		end
 	end)
+	if zMin > zMax then
+		zMin, zMax = -1012, -868
+	end
 	return zMin, zMax
 end
 
@@ -30806,7 +31190,7 @@ function travel(target, options)
 		-- walk every leg (through the safe zone first when needed); a leg with
 		-- no path at all falls back to the straight run below
 		local stops = {}
-		local gate = lobbyGate(from, target)
+		local gate = not Nav.ready and lobbyGate(from, target)
 		if gate then
 			log("TRAVEL through the safe zone via", gate)
 			table.insert(stops, gate)
