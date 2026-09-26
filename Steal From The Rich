@@ -30124,9 +30124,35 @@ local function waitFor(check, seconds)
 	return check()
 end
 
--- Presses a prompt the way the game's own prompt UI does (hold begin, wait,
--- hold end), then falls back to the executor's fireproximityprompt.
--- done() tells when the game reacted, so a failed press is retried another way.
+local ProximityPromptService = game:GetService("ProximityPromptService")
+local ShownPrompts = setmetatable({}, { __mode = "k" })
+ProximityPromptService.PromptShown:Connect(function(prompt)
+	ShownPrompts[prompt] = true
+end)
+ProximityPromptService.PromptHidden:Connect(function(prompt)
+	ShownPrompts[prompt] = nil
+end)
+
+local function promptPosition(prompt)
+	local parent = prompt and prompt.Parent
+	if not parent then
+		return nil
+	elseif parent:IsA("Attachment") then
+		return parent.WorldPosition
+	elseif parent:IsA("BasePart") then
+		return parent.Position
+	elseif parent:IsA("Model") then
+		return parent:GetPivot().Position
+	end
+	return nil
+end
+
+local PromptIssue = nil
+
+-- Presses a prompt exactly like the game's crate prompt UI does
+-- (LBTHCratePromptClient): InputHoldBegin, hold for HoldDuration, InputHoldEnd.
+-- The engine ignores that unless the prompt is the one it is currently
+-- showing, so wait for PromptShown first. done() confirms the game reacted.
 local function triggerPrompt(prompt, done)
 	if not (prompt and prompt.Parent) then
 		return false
@@ -30135,27 +30161,53 @@ local function triggerPrompt(prompt, done)
 		return not (prompt.Parent and prompt.Enabled)
 	end
 	pcall(function()
+		ProximityPromptService.Enabled = true
 		prompt.RequiresLineOfSight = false
 	end)
-	pcall(function()
-		prompt:InputHoldBegin()
-		local hold = (prompt.HoldDuration or 0) + 0.15
+	PromptIssue = nil
+	for _ = 1, 2 do
+		if not (prompt.Parent and prompt.Enabled) then
+			break
+		end
+		if not waitFor(function()
+			return ShownPrompts[prompt] == true
+		end, 1.5) then
+			PromptIssue = "the game did not show the prompt (too far or another prompt is closer)"
+		end
+		local began, fired = false, false
+		local c1 = prompt.PromptButtonHoldBegan:Connect(function()
+			began = true
+		end)
+		local c2 = prompt.Triggered:Connect(function()
+			fired = true
+		end)
+		pcall(prompt.InputHoldBegin, prompt)
 		local held = 0
-		while held < hold do
+		local hold = (prompt.HoldDuration or 0) + 0.2
+		while held < hold and prompt.Parent do
 			held += task.wait(0.05) or 0.05
 		end
-		prompt:InputHoldEnd()
-	end)
-	if waitFor(done, 0.8) then
-		return true
-	end
-	if fireproximityprompt then
-		pcall(fireproximityprompt, prompt)
-		if waitFor(done, 0.8) then
+		pcall(prompt.InputHoldEnd, prompt)
+		local ok = waitFor(function()
+			return fired or done()
+		end, 1)
+		c1:Disconnect()
+		c2:Disconnect()
+		if ok and done() then
 			return true
 		end
-		pcall(fireproximityprompt, prompt, 1, true)
-		if waitFor(done, 0.8) then
+		if waitFor(done, 0.6) then
+			return true
+		end
+		if fired then
+			PromptIssue = "the prompt fired but the server refused it"
+		elseif not began and (prompt.HoldDuration or 0) > 0 then
+			PromptIssue = PromptIssue or "the prompt did not start holding"
+		end
+	end
+	if fireproximityprompt and prompt.Parent and prompt.Enabled then
+		pcall(fireproximityprompt, prompt)
+		if waitFor(done, 1) then
 			return true
 		end
 	end
@@ -30199,7 +30251,7 @@ local function travel(target)
 		setStatus("Could not get off the treadmill")
 		return false
 	end
-	local mode = Options.TravelMode and Options.TravelMode.Value or "Safe"
+	local mode = Options.TravelMode and Options.TravelMode.Value or "Teleport"
 	if mode == "Teleport" then
 		root.CFrame = CFrame.new(target) * root.CFrame.Rotation
 		root.AssemblyLinearVelocity = Vector3.zero
@@ -30360,17 +30412,19 @@ local function stealOnce()
 		return false
 	end
 	setStatus("Stealing " .. target.rarity .. " crate in " .. (AreaById[target.area] and AreaById[target.area].DisplayName or target.area))
-	local part = target.prompt.Parent
-	local position = part:IsA("BasePart") and part.Position or target.crate:GetPivot().Position
-	travel(position + Vector3.new(0, 2.5, 0))
+	local position = promptPosition(target.prompt) or target.crate:GetPivot().Position
+	if not travel(position + Vector3.new(0, 2, 0)) then
+		return true
+	end
 	if not (target.prompt.Parent and target.prompt.Enabled) then
 		return true
 	end
+	setStatus("Holding Steal on " .. target.rarity .. " crate")
 	if triggerPrompt(target.prompt, carrying) or carrying() then
 		returnToSafety()
 	else
 		FailedCrates[target.crate] = os.clock() + 20
-		setStatus("Could not steal that crate, trying another one")
+		setStatus("Could not steal: " .. (PromptIssue or "the server refused it") .. ". Trying another crate")
 	end
 	return true
 end
@@ -30495,9 +30549,9 @@ local function openCrates()
 		if not alive() then
 			break
 		end
-		local part = prompt.Parent
-		if part and part:IsA("BasePart") then
-			travel(part.Position + Vector3.new(0, 3, 0))
+		local position = promptPosition(prompt)
+		if position then
+			travel(position + Vector3.new(0, 2, 0))
 		end
 		if triggerPrompt(prompt) then
 			Session.opened += 1
@@ -30777,9 +30831,9 @@ StealBox:AddButton({
 local MoveBox = Tabs.Main:AddLeftGroupbox("Movement", "plane")
 MoveBox:AddDropdown("TravelMode", {
 	Text = "Travel Mode",
-	Values = { "Safe", "Fast Fly", "Teleport" },
-	Default = "Safe",
-	Tooltip = "Safe flies at your own run speed so the game never pulls you back. Fast Fly uses the speed below.",
+	Values = { "Teleport", "Fast Fly", "Safe" },
+	Default = "Teleport",
+	Tooltip = "Teleport is the fastest. If the game pulls you back, use Safe (your own run speed) or Fast Fly (speed below).",
 })
 MoveBox:AddSlider("TravelSpeed", {
 	Text = "Fast Fly Speed",
