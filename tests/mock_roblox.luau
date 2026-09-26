@@ -1260,7 +1260,7 @@ defClass("Tool", "Instance", {
 })
 
 defClass("Humanoid", "Instance", {
-	props = { WalkSpeed = 16, JumpPower = 50, JumpHeight = 7.2, AutoRotate = true, Health = 100, MaxHealth = 100, HipHeight = 2, Sit = false, PlatformStand = false },
+	props = { WalkSpeed = 16, JumpPower = 50, JumpHeight = 7.2, AutoRotate = true, Health = 100, MaxHealth = 100, HipHeight = 2, Sit = false, PlatformStand = false, Jump = false },
 	events = { "Died", "MoveToFinished", "StateChanged", "Running" },
 	methods = {
 		EquipTool = function(self, tool)
@@ -1289,7 +1289,11 @@ defClass("Humanoid", "Instance", {
 			end
 		end,
 		MoveTo = function(self, pos)
-			Sim.note("Humanoid:MoveTo called (not simulated) -> " .. tostring(pos))
+			Sim.moveTargets[self] = { pos = pos, t = Sim.now }
+			Sim.count("MoveTo")
+			if true then
+				return
+			end
 		end,
 		ChangeState = function() end,
 		GetState = function()
@@ -1297,6 +1301,14 @@ defClass("Humanoid", "Instance", {
 		end,
 		LoadAnimation = function()
 			return { Play = function() end, Stop = function() end }
+		end,
+	},
+})
+
+defClass("PathfindingService", "Instance", {
+	methods = {
+		CreatePath = function(self, params)
+			return Sim.newPath(params)
 		end,
 	},
 })
@@ -1736,6 +1748,7 @@ function Sim.createDataModel()
 	service("RunService")
 	service("ProximityPromptService")
 	service("StarterGui")
+	service("PathfindingService")
 	for _, n in ipairs({ "Lighting", "SoundService", "UserInputService", "TweenService", "HttpService", "CoreGui", "VirtualUser", "TeleportService", "TextChatService", "Debris", "MarketplaceService", "GuiService", "Stats", "ContentProvider" }) do
 		service("GenericService", n)
 	end
@@ -1946,6 +1959,244 @@ function Sim.count(name, n)
 	Sim.counters[name] = (Sim.counters[name] or 0) + (n or 1)
 end
 
+-- Humanoid:MoveTo walking: WalkSpeed toward the target on the ground, gives up
+-- after 8 s like Roblox; walls are enforced by the sim server (Sim.obstacles)
+Sim.moveTargets = setmetatable({}, { __mode = "k" })
+local WalkRay
+local function walkStep(dt)
+	for hum, move in pairs(Sim.moveTargets) do
+		local char = hum.Parent
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if not root or root.Anchored then
+			Sim.moveTargets[hum] = nil
+		else
+			local pos = root.Position
+			local flat = Vector3.new(move.pos.X - pos.X, 0, move.pos.Z - pos.Z)
+			local d = flat.Magnitude
+			if d <= 0.3 then
+				Sim.moveTargets[hum] = nil
+				fireEvent(hum, "MoveToFinished", true)
+			elseif Sim.now - move.t > 8 then
+				Sim.moveTargets[hum] = nil
+				fireEvent(hum, "MoveToFinished", false)
+			else
+				local stepLen = math.min(d, hum.WalkSpeed * dt)
+				local nextPos = pos + flat.Unit * stepLen
+				WalkRay = WalkRay or RaycastParams.new()
+				WalkRay.FilterType = Enum.RaycastFilterType.Exclude
+				WalkRay.FilterDescendantsInstances = { char }
+				-- a Humanoid steps up about 3 studs, 7.5 with a jump; anything
+				-- taller blocks it like a wall
+				local lift = root.Size.Y / 2 + hum.HipHeight
+				local feet = pos.Y - lift
+				local climb = if hum.Jump then 7.5 else 3
+				local hit = workspace:Raycast(Vector3.new(nextPos.X, feet + climb + 0.1, nextPos.Z), Vector3.new(0, -80, 0), WalkRay)
+				local y = if hit then hit.Position.Y + lift else pos.Y
+				hum.Jump = false
+				root.CFrame = CFrame.new(nextPos.X, y, nextPos.Z) * root.CFrame.Rotation
+			end
+		end
+	end
+end
+
+-- PathfindingService: grid A* (4 stud cells) around Sim.obstacles, the same
+-- rectangles the sim server uses as walls
+Sim.obstacles = {}
+local function obstacleAt(x, z, pad)
+	for _, o in ipairs(Sim.obstacles) do
+		if x > o.x1 - pad and x < o.x2 + pad and z > o.z1 - pad and z < o.z2 + pad then
+			return o
+		end
+	end
+	return nil
+end
+Sim.obstacleAt = obstacleAt
+
+local function segmentClear(a, b, pad)
+	local d = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+	local n = math.max(1, math.ceil(d.Magnitude))
+	for i = 0, n do
+		local p = a + d * (i / n)
+		if obstacleAt(p.X, p.Z, pad) then
+			return false
+		end
+	end
+	return true
+end
+
+function Sim.findPath(from, to, radius)
+	local pad = (radius or 2) + 0.5
+	if obstacleAt(to.X, to.Z, pad) then
+		return nil, "FailFinishNotEmpty"
+	end
+	if segmentClear(from, to, pad) then
+		return { from, to }
+	end
+	local cell = 4
+	local minX, maxX = math.min(from.X, to.X) - 80, math.max(from.X, to.X) + 80
+	local minZ, maxZ = math.min(from.Z, to.Z) - 80, math.max(from.Z, to.Z) + 80
+	local nx, nz = math.ceil((maxX - minX) / cell) + 1, math.ceil((maxZ - minZ) / cell) + 1
+	if nx * nz > 250000 then
+		return nil, "NoPath"
+	end
+	local function center(i, j)
+		return minX + i * cell, minZ + j * cell
+	end
+	local function cellOf(x, z)
+		return math.clamp(math.floor((x - minX) / cell + 0.5), 0, nx - 1), math.clamp(math.floor((z - minZ) / cell + 0.5), 0, nz - 1)
+	end
+	local si, sj = cellOf(from.X, from.Z)
+	local gi, gj = cellOf(to.X, to.Z)
+	local function key(i, j)
+		return i * 100000 + j
+	end
+	local blockedCache = {}
+	local function blocked(i, j)
+		local k = key(i, j)
+		local b = blockedCache[k]
+		if b == nil then
+			local x, z = center(i, j)
+			b = obstacleAt(x, z, pad) ~= nil
+			blockedCache[k] = b
+		end
+		return b
+	end
+	local heap, gScore, came, closed = {}, {}, {}, {}
+	local function push(item)
+		table.insert(heap, item)
+		local c = #heap
+		while c > 1 do
+			local parent = c // 2
+			if heap[parent].f <= heap[c].f then
+				break
+			end
+			heap[parent], heap[c] = heap[c], heap[parent]
+			c = parent
+		end
+	end
+	local function pop()
+		local top = heap[1]
+		local last = table.remove(heap)
+		if #heap > 0 then
+			heap[1] = last
+			local c = 1
+			while true do
+				local l, r, smallest = c * 2, c * 2 + 1, c
+				if heap[l] and heap[l].f < heap[smallest].f then
+					smallest = l
+				end
+				if heap[r] and heap[r].f < heap[smallest].f then
+					smallest = r
+				end
+				if smallest == c then
+					break
+				end
+				heap[c], heap[smallest] = heap[smallest], heap[c]
+				c = smallest
+			end
+		end
+		return top
+	end
+	local function h(i, j)
+		return math.sqrt((i - gi) ^ 2 + (j - gj) ^ 2)
+	end
+	gScore[key(si, sj)] = 0
+	push({ i = si, j = sj, f = h(si, sj) })
+	local found = false
+	local expanded = 0
+	while #heap > 0 do
+		local node = pop()
+		local k = key(node.i, node.j)
+		if not closed[k] then
+			closed[k] = true
+			expanded += 1
+			if node.i == gi and node.j == gj then
+				found = true
+				break
+			end
+			for di = -1, 1 do
+				for dj = -1, 1 do
+					if di ~= 0 or dj ~= 0 then
+						local ni, nj = node.i + di, node.j + dj
+						if ni >= 0 and ni < nx and nj >= 0 and nj < nz and not blocked(ni, nj) and not (di ~= 0 and dj ~= 0 and (blocked(node.i + di, node.j) or blocked(node.i, node.j + dj))) then
+							local nk = key(ni, nj)
+							local g = gScore[k] + (if di ~= 0 and dj ~= 0 then 1.4142 else 1)
+							if not closed[nk] and (gScore[nk] == nil or g < gScore[nk]) then
+								gScore[nk] = g
+								came[nk] = k
+								push({ i = ni, j = nj, f = g + h(ni, nj) })
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	Sim.count("pathExpanded", expanded)
+	if not found then
+		return nil, "NoPath"
+	end
+	local cells = {}
+	local k = key(gi, gj)
+	while k do
+		table.insert(cells, 1, k)
+		k = came[k]
+	end
+	local points = { from }
+	for index = 2, #cells - 1 do
+		local c = cells[index]
+		local x, z = center(c // 100000, c % 100000)
+		table.insert(points, Vector3.new(x, from.Y, z))
+	end
+	table.insert(points, to)
+	-- string pulling: drop points that the previous kept point can see past
+	local pulled = { points[1] }
+	local anchor = 1
+	for index = 2, #points do
+		if index == #points or not segmentClear(points[anchor], points[index + 1], pad) then
+			table.insert(pulled, points[index])
+			anchor = index
+		end
+	end
+	return pulled
+end
+
+function Sim.newPath(params)
+	params = params or {}
+	local path = { Status = Enum.PathStatus.NoPath, __waypoints = {} }
+	function path:ComputeAsync(from, to)
+		Sim.count("pathComputes")
+		task.wait()
+		local points, why = Sim.findPath(from, to, params.AgentRadius)
+		if not points then
+			self.Status = Enum.PathStatus[why or "NoPath"]
+			self.__waypoints = {}
+			return
+		end
+		local spacing = params.WaypointSpacing or 4
+		local list = {}
+		for index, point in ipairs(points) do
+			if index > 1 then
+				local prev = points[index - 1]
+				local seg = Vector3.new(point.X - prev.X, 0, point.Z - prev.Z)
+				local n = math.max(1, math.ceil(seg.Magnitude / spacing))
+				for step = 1, n do
+					local p = prev + seg * (step / n)
+					table.insert(list, { Position = Vector3.new(p.X, point.Y, p.Z), Action = Enum.PathWaypointAction.Walk, Label = "" })
+				end
+			else
+				table.insert(list, { Position = point, Action = Enum.PathWaypointAction.Walk, Label = "" })
+			end
+		end
+		self.__waypoints = list
+		self.Status = Enum.PathStatus.Success
+	end
+	function path:GetWaypoints()
+		return table.clone(self.__waypoints)
+	end
+	return path
+end
+
 function Sim.step()
 	Sim.now += Sim.dt
 	Sim.frame += 1
@@ -1965,6 +2216,7 @@ function Sim.step()
 		Sim.clientPin()
 	end
 	fireEvent(RS, "Stepped", Sim.now - Sim.T0, Sim.dt)
+	walkStep(Sim.dt)
 	if Sim.serverStep then
 		Sim.serverStep(Sim.dt)
 	end

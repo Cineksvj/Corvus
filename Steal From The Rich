@@ -30549,6 +30549,169 @@ local function travelRaw(target, options)
 	return true
 end
 
+-- Safe mode walks like a player: PathfindingService plans the way around walls
+-- and houses (live: running in a straight line kept hitting walls), the
+-- Humanoid walks it with MoveTo at the game's own WalkSpeed
+local PathfindingService = game:GetService("PathfindingService")
+local PathAgent = { AgentRadius = 2.5, AgentHeight = 5.5, AgentCanJump = true, AgentCanClimb = false, WaypointSpacing = 10 }
+-- the goal itself, then free spots around it (a crate's own model fills its spot)
+local GoalOffsets = {
+	Vector3.zero,
+	Vector3.new(6, 0, 0), Vector3.new(-6, 0, 0), Vector3.new(0, 0, 6), Vector3.new(0, 0, -6),
+	Vector3.new(5, 0, 5), Vector3.new(-5, 0, 5), Vector3.new(5, 0, -5), Vector3.new(-5, 0, -5),
+	Vector3.new(10, 0, 0), Vector3.new(-10, 0, 0), Vector3.new(0, 0, 10), Vector3.new(0, 0, -10),
+}
+
+local function computePath(from, to)
+	local list
+	pcall(function()
+		local path = PathfindingService:CreatePath(PathAgent)
+		path:ComputeAsync(from, to)
+		if path.Status == Enum.PathStatus.Success then
+			list = path:GetWaypoints()
+		end
+	end)
+	return if list and #list > 0 then list else nil
+end
+
+local function pathTo(from, to, exact)
+	for index, offset in ipairs(GoalOffsets) do
+		if exact and index > 1 then
+			break
+		end
+		local list = computePath(from, to + offset)
+		if list then
+			return list, to + offset
+		end
+	end
+	return nil
+end
+
+-- walks one planned path; "done", "stuck", "pulled" (the server moved us) or "stopped"
+local function followWaypoints(list, options)
+	local generation = options.generation
+	local keepGoing = options.keepGoing or function()
+		return true
+	end
+	local root = rootPart()
+	local lastPos = root and root.Position
+	for i = 2, #list do
+		local waypoint = list[i]
+		local goal = waypoint.Position
+		local hum = humanoid()
+		if not hum then
+			return "stopped"
+		end
+		if waypoint.Action == Enum.PathWaypointAction.Jump then
+			hum.Jump = true
+		end
+		hum:MoveTo(goal)
+		local best, progressAt, issuedAt = math.huge, os.clock(), os.clock()
+		while true do
+			RunService.Heartbeat:Wait()
+			if generation ~= TravelGeneration or not alive() or not keepGoing() then
+				return "stopped"
+			end
+			if onTreadmill() then
+				if options.toTreadmill then
+					return "done"
+				end
+				leaveTreadmill()
+				return "stuck"
+			end
+			root = rootPart()
+			if not root then
+				return "stopped"
+			end
+			local position = root.Position
+			if lastPos and (position - lastPos).Magnitude > 14 then
+				return "pulled"
+			end
+			lastPos = position
+			-- close to the point, not early: cutting corners at 100 studs/s hits them
+			local distance = Vector3.new(goal.X - position.X, 0, goal.Z - position.Z).Magnitude
+			if distance <= 2 then
+				break
+			end
+			if distance < best - 0.4 then
+				best, progressAt = distance, os.clock()
+			elseif os.clock() - progressAt > 0.7 then
+				-- a step, a fence or a ledge: jump like a player would
+				hum.Jump = true
+				if os.clock() - progressAt > 2.2 then
+					return "stuck"
+				end
+			end
+			if os.clock() - issuedAt > 3 then
+				-- MoveTo gives up after 8 s on its own
+				issuedAt = os.clock()
+				hum:MoveTo(goal)
+			end
+		end
+	end
+	return "done"
+end
+
+-- nil when no path could be planned at all (the caller then goes straight)
+local function walkRoute(target, options)
+	local hum, root = humanoid(), rootPart()
+	if not (hum and root) or root.Anchored or hum.PlatformStand then
+		return nil
+	end
+	if not leaveTreadmill() then
+		return false
+	end
+	local failures, planned = 0, false
+	local deadline = os.clock() + (root.Position - target).Magnitude / math.max(hum.WalkSpeed, 8) * 2.5 + 20
+	while alive() and os.clock() < deadline do
+		root = rootPart()
+		if not root then
+			return false
+		end
+		local position = root.Position
+		local flat = Vector3.new(target.X - position.X, 0, target.Z - position.Z)
+		if flat.Magnitude <= 3 then
+			return true
+		end
+		-- long trips are planned in legs of about 400 studs
+		local final = flat.Magnitude <= 450
+		local legGoal = if final then target else Vector3.new(position.X, target.Y, position.Z) + flat.Unit * 400
+		local list, goal = pathTo(position, legGoal, false)
+		if not list and not final then
+			for _, dz in ipairs({ 20, -20, 45, -45 }) do
+				list, goal = pathTo(position, legGoal + Vector3.new(0, 0, dz), true)
+				if list then
+					break
+				end
+			end
+		end
+		if not list then
+			failures += 1
+			if failures >= 3 then
+				return if planned then false else nil
+			end
+			task.wait(0.2)
+		else
+			planned = true
+			local result = followWaypoints(list, options)
+			if result == "stopped" then
+				return false
+			elseif result == "done" then
+				if final or options.toTreadmill and onTreadmill() then
+					return true
+				end
+			else
+				failures += 1
+				log("PATH " .. result .. " at", rootPart() and rootPart().Position, "going to", goal)
+				if failures >= 5 then
+					return false
+				end
+			end
+		end
+	end
+	return false
+end
+
 -- A waypoint beside the player's own treadmill when the straight path runs over
 -- its belt (it sits between the safe zone and the plot)
 local function beltDetour(from, target)
@@ -30634,7 +30797,35 @@ local function travel(target, options)
 	options.generation = TravelGeneration
 	local mode = options.mode or (Options.MoveMode and Options.MoveMode.Value) or "Safe"
 	local ok = true
-	if from and mode ~= "Teleport" then
+	local walked = false
+	-- the treadmill is mounted by landing on its belt, which the straight run
+	-- does (live logs); every other Safe trip walks
+	if from and mode == "Safe" and not options.toTreadmill then
+		-- walk every leg (through the safe zone first when needed); a leg with
+		-- no path at all falls back to the straight run below
+		local stops = {}
+		local gate = lobbyGate(from, target)
+		if gate then
+			log("TRAVEL through the safe zone via", gate)
+			table.insert(stops, gate)
+		end
+		table.insert(stops, target)
+		walked = true
+		for _, stop in ipairs(stops) do
+			local result = walkRoute(stop, options)
+			if result == nil then
+				log("TRAVEL no path, running straight to", stop)
+				result = options.generation == TravelGeneration and travelRaw(stop, options)
+			end
+			if not result then
+				ok = false
+				break
+			end
+		end
+	end
+	if walked then
+		-- done above
+	elseif from and mode ~= "Teleport" then
 		local stops = {}
 		local gate = lobbyGate(from, target)
 		if gate then
@@ -30659,7 +30850,9 @@ local function travel(target, options)
 			travelRaw(waypoint, options)
 		end
 	end
-	ok = ok and options.generation == TravelGeneration and travelRaw(target, options)
+	if not walked then
+		ok = ok and options.generation == TravelGeneration and travelRaw(target, options)
+	end
 	root = rootPart()
 	log("TRAVEL end ok=" .. tostring(ok), "at", root and root.Position, "left", root and string.format("%.1f", (target - root.Position).Magnitude) or "?", string.format("%.1fs", os.clock() - started), "onTreadmill=" .. tostring(LocalPlayer:GetAttribute("OnTreadmill")))
 	return ok
@@ -31595,6 +31788,15 @@ local function mountTreadmill()
 		return false
 	end
 	setStatus("Going on the treadmill")
+	local root = rootPart()
+	if root then
+		-- walk up to it (around walls), then step onto the belt
+		local away = Vector3.new(root.Position.X - belt.Position.X, 0, root.Position.Z - belt.Position.Z)
+		if away.Magnitude > 30 then
+			local near = belt.Position + away.Unit * 14
+			travel(Vector3.new(near.X, root.Position.Y, near.Z))
+		end
+	end
 	travel(belt.Position + Vector3.new(0, belt.Size.Y / 2 + 3, 0), { toTreadmill = true })
 	for _, d in ipairs(treadmill:GetDescendants()) do
 		if d:IsA("ProximityPrompt") and d.Enabled then
@@ -31602,7 +31804,7 @@ local function mountTreadmill()
 			break
 		end
 	end
-	local root = rootPart()
+	root = rootPart()
 	if firetouchinterest and root then
 		pcall(firetouchinterest, root, belt, 0)
 		task.wait()
@@ -32297,7 +32499,7 @@ MoveBox:AddDropdown("MoveMode", {
 	Text = "Travel Mode",
 	Values = { "Safe", "Fast Fly", "Teleport" },
 	Default = "Safe",
-	Tooltip = "Safe runs at your own speed and always works. The server undoes teleports a few seconds later, so Teleport and Fast Fly waste time and make steals fail.",
+	Tooltip = "Safe walks like a player: it finds the way around walls and houses and runs at your own speed. The server undoes teleports a few seconds later, so Teleport and Fast Fly waste time and make steals fail.",
 })
 MoveBox:AddDropdown("CarryMode", {
 	Text = "Carry Crate Home",

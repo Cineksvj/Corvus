@@ -671,6 +671,16 @@ function Server.buildExtras()
 	local RS = Sim.services.ReplicatedStorage
 	local WS = Sim.services.Workspace
 	local player = Sim.player
+	-- walls: the lobby is joined to the arena only through the safe zone
+	local zone = Server.safeZone
+	local zMin, zMax = zone.Position.Z - zone.Size.Z / 2, zone.Position.Z + zone.Size.Z / 2
+	Sim.obstacles = {
+		{ name = "lobby wall south", x1 = SAFE_X - 0.5, x2 = SAFE_X + 0.5, z1 = -1600, z2 = zMin },
+		{ name = "lobby wall north", x1 = SAFE_X - 0.5, x2 = SAFE_X + 0.5, z1 = zMax, z2 = -500 },
+	}
+	for _, w in ipairs(cfg("walls") or {}) do
+		table.insert(Sim.obstacles, w)
+	end
 	-- storm: regions live in ReplicatedStorage like the real game (not raycast)
 	local admin = make("Folder", { Name = "AdminSystem" }, RS)
 	local events = make("Folder", { Name = "Events" }, admin)
@@ -844,20 +854,20 @@ function Sim.serverStep(dt)
 	end
 	local pos = root.Position
 
-	-- the lobby wall: between the lobby (X >= 2424) and the arena the only way is
-	-- through the safe zone (live log: pinned 30 s at X=2424.5, Z=-1063 running
-	-- from the plot straight at a crate)
-	local prev = Server.wallLast
-	if prev and (prev.X >= SAFE_X) ~= (pos.X >= SAFE_X) and pos.X ~= prev.X then
-		local zone = Server.safeZone
-		local zMin, zMax = zone.Position.Z - zone.Size.Z / 2, zone.Position.Z + zone.Size.Z / 2
-		local t = (SAFE_X - prev.X) / (pos.X - prev.X)
-		local z = prev.Z + (pos.Z - prev.Z) * t
-		if z < zMin or z > zMax then
-			pos = V(if prev.X >= SAFE_X then SAFE_X + 0.6 else SAFE_X - 0.6, pos.Y, pos.Z)
-			root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
-			stats.wallHits += 1
+	-- walls (Sim.obstacles): the lobby wall south and north of the safe zone (live
+	-- log: pinned 30 s at X=2424.5, Z=-1063) and any walls a scenario adds. The
+	-- character cannot be inside one; it stays where it was.
+	local wall = Sim.obstacleAt(pos.X, pos.Z, 1)
+	if wall then
+		if stats.wallHits < 5 or stats.wallHits % 200 == 0 then
+			slog(fmt("WALL HIT %s at (%.1f, %.1f)", tostring(wall.name), pos.X, pos.Z))
 		end
+		local back = Server.wallLast or pos
+		if not Sim.obstacleAt(back.X, back.Z, 1) then
+			pos = V(back.X, pos.Y, back.Z)
+			root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
+		end
+		stats.wallHits += 1
 	end
 	Server.wallLast = pos
 
