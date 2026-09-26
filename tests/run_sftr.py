@@ -33,7 +33,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DEFAULT_SCRIPT = os.path.join(ROOT, "Steal From The Rich")
+DEFAULT_SCRIPT = os.path.join(ROOT, "src", "Steal From The Rich.luau")
+BUILT_SCRIPT = os.path.join(ROOT, "Steal From The Rich")
 SCRIPT_NAME = "Steal From The Rich"
 FALLBACK_LUAU = [
     os.path.join(HERE, "bin", "luau"),
@@ -59,9 +60,10 @@ def transform_script(src):
                 return i
         sys.exit(f"could not find {what} in the script")
 
-    lib = find(lambda l: l.startswith("local Library = (function()"), what="the inlined library start")
-    theme = find(lambda l: l.startswith("local ThemeManager = "), lib, "the ThemeManager line")
-    save = find(lambda l: l.startswith("local SaveManager = "), theme, "the SaveManager line")
+    flat = lambda l: re.sub(r"\s", "", l)
+    lib = find(lambda l: flat(l).startswith("localLibrary=(function()"), what="the inlined library start")
+    theme = find(lambda l: flat(l).startswith("localThemeManager="), lib, "the ThemeManager line")
+    save = find(lambda l: flat(l).startswith("localSaveManager="), theme, "the SaveManager line")
     lines[lib] = "local Library = __MockLibrary"
     for i in range(lib + 1, theme):
         lines[i] = ""
@@ -70,17 +72,18 @@ def transform_script(src):
     info["library_lines"] = (lib + 1, theme)
 
     # setStatus observation hook (same line, so numbering is unchanged)
-    ss = find(lambda l: l.strip() == "local function setStatus(text)", save, "setStatus()")
-    body = next((i for i in range(ss + 1, min(ss + 8, len(lines))) if lines[i].strip() == "Status = text"), None)
+    ss = find(lambda l: flat(l) == "localfunctionsetStatus(text)", save, "setStatus()")
+    body = next((i for i in range(ss + 1, min(ss + 8, len(lines))) if flat(lines[i]) == "Status=text"), None)
     if body is None:
         sys.exit("setStatus() body changed; update the hook in run_sftr.py")
     lines[body] = lines[body] + "; if __SimOnStatus then __SimOnStatus(text) end"
 
     # the main worker's per-cycle wait (used to count main loop cycles / detect stalls)
-    mw = find(lambda l: "Main worker" in l, ss, "the main worker comment")
+    # works on the source and on the compact build (no comments or indentation there)
+    mw = find(lambda l: 'setStatus("Waiting for character")' in l, ss, "the main worker")
     wait_line = None
-    for i in range(mw, min(mw + 200, len(lines))):
-        if lines[i] == "\t\ttask.wait(0.25)":
+    for i in range(mw, min(mw + 250, len(lines))):
+        if lines[i].strip() == "task.wait(0.25)":
             wait_line = i + 1
             break
     if not wait_line:
@@ -195,6 +198,13 @@ def main():
     args = ap.parse_args()
 
     luau = find_luau(args.luau)
+    # the paste-ready file must be the build of the current source
+    builder = os.path.join(ROOT, "tools", "build_sftr.py")
+    if os.path.isfile(builder):
+        res = subprocess.run([sys.executable, builder, "--check"], env=dict(os.environ, LUAU_BIN=luau), capture_output=True, text=True)
+        print((res.stdout or res.stderr).strip())
+        if res.returncode != 0:
+            sys.exit(2)
     # Executors compile without optimisations: at -O0 every local takes a
     # register, and a function with more than 200 fails to compile, so the hub
     # does not start at all (live: "nie executuje sie w ogole"). Check that first.
@@ -226,7 +236,7 @@ def main():
     results = [run_one(luau, p, script_src, info, args) for p in paths]
     # the walk map on the real place geometry (tests/realmap): routes to every crate
     realmap = os.path.join(HERE, "realmap", "run_nav.py")
-    if not args.scenarios and args.script == DEFAULT_SCRIPT and os.path.isfile(realmap):
+    if not args.scenarios and args.script in (DEFAULT_SCRIPT, BUILT_SCRIPT) and os.path.isfile(realmap):
         env = dict(os.environ, LUAU_BIN=luau)
         rm = subprocess.run([sys.executable, realmap], env=env, capture_output=True, text=True)
         print(rm.stdout.strip())

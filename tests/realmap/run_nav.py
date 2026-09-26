@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 from run_sftr import find_luau  # noqa: E402
 
 data = json.load(open(os.path.join(HERE, "realmap.json")))
-src = open(os.path.join(ROOT, "Steal From The Rich"), encoding="utf-8").read()
+src = open(os.path.join(ROOT, "src", "Steal From The Rich.luau"), encoding="utf-8").read()
 nav = src[src.index("-- NAV BEGIN"):src.index("-- NAV END")]
 
 PRELUDE = r'''
