@@ -30113,25 +30113,53 @@ local function sellerSpot()
 	return part and (part.Position + Vector3.new(-4, 1, 0)) or Vector3.new(2433, 5, -864)
 end
 
-local function triggerPrompt(prompt)
+local function waitFor(check, seconds)
+	local waited = 0
+	while waited < seconds do
+		if check() then
+			return true
+		end
+		waited += task.wait(0.05) or 0.05
+	end
+	return check()
+end
+
+-- Presses a prompt the way the game's own prompt UI does (hold begin, wait,
+-- hold end), then falls back to the executor's fireproximityprompt.
+-- done() tells when the game reacted, so a failed press is retried another way.
+local function triggerPrompt(prompt, done)
 	if not (prompt and prompt.Parent) then
 		return false
+	end
+	done = done or function()
+		return not (prompt.Parent and prompt.Enabled)
 	end
 	pcall(function()
 		prompt.RequiresLineOfSight = false
 	end)
+	pcall(function()
+		prompt:InputHoldBegin()
+		local hold = (prompt.HoldDuration or 0) + 0.15
+		local held = 0
+		while held < hold do
+			held += task.wait(0.05) or 0.05
+		end
+		prompt:InputHoldEnd()
+	end)
+	if waitFor(done, 0.8) then
+		return true
+	end
 	if fireproximityprompt then
-		local ok = pcall(fireproximityprompt, prompt)
-		if ok then
+		pcall(fireproximityprompt, prompt)
+		if waitFor(done, 0.8) then
+			return true
+		end
+		pcall(fireproximityprompt, prompt, 1, true)
+		if waitFor(done, 0.8) then
 			return true
 		end
 	end
-	local ok = pcall(function()
-		prompt:InputHoldBegin()
-		task.wait((prompt.HoldDuration or 0) + 0.1)
-		prompt:InputHoldEnd()
-	end)
-	return ok
+	return false
 end
 
 local Status = "Idle"
@@ -30146,15 +30174,20 @@ local function onTreadmill()
 	return LocalPlayer:GetAttribute("OnTreadmill") == true
 end
 
+-- While OnTreadmill is set the game pins the character to the treadmill every
+-- frame, so nothing can move it until the server lets the player off
 local function leaveTreadmill()
-	if not onTreadmill() then
-		return
+	for _ = 1, 3 do
+		if not onTreadmill() then
+			return true
+		end
+		fire("TREADMILL_DISMOUNT")
+		local waited = 0
+		while onTreadmill() and waited < 1.5 do
+			waited += task.wait(0.1) or 0.1
+		end
 	end
-	fire("TREADMILL_DISMOUNT")
-	local waited = 0
-	while onTreadmill() and waited < 2 do
-		waited += task.wait(0.1) or 0.1
-	end
+	return not onTreadmill()
 end
 
 local function travel(target)
@@ -30162,36 +30195,61 @@ local function travel(target)
 	if not root then
 		return false
 	end
-	leaveTreadmill()
-	local mode = Options.TravelMode and Options.TravelMode.Value or "Fly"
+	if not leaveTreadmill() then
+		setStatus("Could not get off the treadmill")
+		return false
+	end
+	local mode = Options.TravelMode and Options.TravelMode.Value or "Safe"
 	if mode == "Teleport" then
 		root.CFrame = CFrame.new(target) * root.CFrame.Rotation
 		root.AssemblyLinearVelocity = Vector3.zero
-		task.wait(0.15)
+		task.wait(0.35)
+		root = rootPart()
+		if root and (root.Position - target).Magnitude > 10 then
+			setStatus("The game moved you back, switch Travel Mode to Safe")
+			return false
+		end
 		return true
 	end
-	local speed = Options.TravelSpeed and Options.TravelSpeed.Value or 350
+	local fast = mode == "Fast Fly"
+	local slowdown = 1
+	local pulledBack = 0
+	local expected = nil
 	local started = os.clock()
-	local limit = (target - root.Position).Magnitude / math.max(speed, 1) + 6
-	while alive() and os.clock() - started < limit do
+	while alive() do
 		root = rootPart()
 		if not root then
 			return false
 		end
 		local position = root.Position
+		if expected and (position - expected).Magnitude > 6 then
+			pulledBack += 1
+			if fast then
+				slowdown *= 0.6
+			end
+			if pulledBack >= 4 then
+				setStatus(if fast then "The game keeps moving you back, lower Fast Fly Speed" else "The game keeps moving you back")
+			end
+		end
 		local delta = target - position
 		local distance = delta.Magnitude
 		if distance < 1.5 then
 			break
 		end
+		local speed
+		if fast then
+			speed = (Options.TravelSpeed and Options.TravelSpeed.Value or 150) * slowdown
+		else
+			local hum = humanoid()
+			speed = math.max(hum and hum.WalkSpeed or 16, 16)
+		end
+		if os.clock() - started > distance / math.max(speed, 1) + 15 then
+			return false
+		end
 		local dt = RunService.Heartbeat:Wait()
 		local step = math.min(distance, speed * dt)
-		root.CFrame = CFrame.new(position + delta.Unit * step) * root.CFrame.Rotation
-		root.AssemblyLinearVelocity = Vector3.zero
-	end
-	root = rootPart()
-	if root then
-		root.CFrame = CFrame.new(target) * root.CFrame.Rotation
+		expected = position + delta.Unit * step
+		root.CFrame = CFrame.new(expected) * root.CFrame.Rotation
 		root.AssemblyLinearVelocity = Vector3.zero
 	end
 	return true
@@ -30240,6 +30298,8 @@ local function zoneAllowed(areaId)
 	return false
 end
 
+local FailedCrates = setmetatable({}, { __mode = "k" })
+
 local function pickCrate()
 	local folder = workspace:FindFirstChild("Crates")
 	local root = rootPart()
@@ -30249,7 +30309,7 @@ local function pickCrate()
 	local best, bestScore
 	local priority = Options.StealPriority and Options.StealPriority.Value or "Best Rarity"
 	for _, crate in ipairs(folder:GetChildren()) do
-		if crate:GetAttribute("IsCrate") ~= false and crate:IsA("Model") then
+		if crate:GetAttribute("IsCrate") ~= false and crate:IsA("Model") and (FailedCrates[crate] or 0) < os.clock() then
 			local area, rarity = crateInfo(crate)
 			if area and rarity and zoneAllowed(area) and selected(Options.StealRarities, rarity) then
 				local prompt = stealPrompt(crate)
@@ -30280,9 +30340,12 @@ end
 local function returnToSafety()
 	setStatus("Bringing the crate home")
 	travel(safeSpot())
-	local waited = 0
-	while carrying() and waited < 4 do
-		waited += task.wait(0.1) or 0.1
+	if waitFor(function()
+		return not carrying()
+	end, 4) then
+		setStatus("Crate brought home")
+	elseif not (rootPart() and rootPart().Position.X >= 2424) then
+		setStatus("Could not reach the safe zone")
 	end
 end
 
@@ -30299,17 +30362,15 @@ local function stealOnce()
 	setStatus("Stealing " .. target.rarity .. " crate in " .. (AreaById[target.area] and AreaById[target.area].DisplayName or target.area))
 	local part = target.prompt.Parent
 	local position = part:IsA("BasePart") and part.Position or target.crate:GetPivot().Position
-	travel(position + Vector3.new(0, 3, 0))
+	travel(position + Vector3.new(0, 2.5, 0))
 	if not (target.prompt.Parent and target.prompt.Enabled) then
 		return true
 	end
-	triggerPrompt(target.prompt)
-	local waited = 0
-	while not carrying() and waited < 2.5 do
-		waited += task.wait(0.1) or 0.1
-	end
-	if carrying() then
+	if triggerPrompt(target.prompt, carrying) or carrying() then
 		returnToSafety()
+	else
+		FailedCrates[target.crate] = os.clock() + 20
+		setStatus("Could not steal that crate, trying another one")
 	end
 	return true
 end
@@ -30558,7 +30619,7 @@ local function mountTreadmill()
 	travel(belt.Position + Vector3.new(0, belt.Size.Y / 2 + 3, 0))
 	for _, d in ipairs(treadmill:GetDescendants()) do
 		if d:IsA("ProximityPrompt") and d.Enabled then
-			triggerPrompt(d)
+			triggerPrompt(d, onTreadmill)
 			break
 		end
 	end
@@ -30716,15 +30777,15 @@ StealBox:AddButton({
 local MoveBox = Tabs.Main:AddLeftGroupbox("Movement", "plane")
 MoveBox:AddDropdown("TravelMode", {
 	Text = "Travel Mode",
-	Values = { "Fly", "Teleport" },
-	Default = "Fly",
-	Tooltip = "Fly moves smoothly through the map, Teleport is instant",
+	Values = { "Safe", "Fast Fly", "Teleport" },
+	Default = "Safe",
+	Tooltip = "Safe flies at your own run speed so the game never pulls you back. Fast Fly uses the speed below.",
 })
 MoveBox:AddSlider("TravelSpeed", {
-	Text = "Fly Speed",
-	Default = 350,
-	Min = 50,
-	Max = 2000,
+	Text = "Fast Fly Speed",
+	Default = 150,
+	Min = 30,
+	Max = 1000,
 	Rounding = 0,
 	Suffix = " studs/s",
 })
