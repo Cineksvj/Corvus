@@ -30475,6 +30475,12 @@ local function travelRaw(target, options)
 	local deadline = nil
 	while alive() do
 		local dt = RunService.Heartbeat:Wait()
+		if onTreadmill() and not options.toTreadmill then
+			-- touching the belt mounts the player and the game pins them there
+			-- (live log: 13 s stuck on the way to the plot); get off and go on
+			leaveTreadmill()
+			expected = nil
+		end
 		root = rootPart()
 		if not root or not keepGoing() then
 			return false
@@ -30507,11 +30513,57 @@ local function travelRaw(target, options)
 	return true
 end
 
+-- A waypoint beside the player's own treadmill when the straight path runs over
+-- its belt (it sits between the safe zone and the plot)
+local function beltDetour(from, target)
+	local folder = workspace:FindFirstChild("Treadmills")
+	local treadmill = folder and folder:FindFirstChild("PersonalTreadmill_" .. LocalPlayer.UserId)
+	if folder and not treadmill then
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:GetAttribute("OwnerUserId") == LocalPlayer.UserId then
+				treadmill = child
+				break
+			end
+		end
+	end
+	local belt = treadmill and treadmill:FindFirstChild("Belt", true)
+	if not (belt and belt:IsA("BasePart")) then
+		return nil
+	end
+	local p = Vector3.new(belt.Position.X, 0, belt.Position.Z)
+	local a = Vector3.new(from.X, 0, from.Z)
+	local ab = Vector3.new(target.X, 0, target.Z) - a
+	local length = ab.Magnitude
+	if length < 1 then
+		return nil
+	end
+	local t = (p - a):Dot(ab) / (length * length)
+	if t <= 0 or t >= 1 then
+		return nil
+	end
+	local closest = a + ab * t
+	local side = closest - p
+	if side.Magnitude > 14 then
+		return nil
+	end
+	if side.Magnitude < 0.1 then
+		side = Vector3.new(-ab.Z, 0, ab.X)
+	end
+	local point = p + side.Unit * 20
+	return Vector3.new(point.X, target.Y, point.Z)
+end
+
 local function travel(target, options)
 	local root = rootPart()
 	local from = root and root.Position
 	log("TRAVEL", (options and options.mode) or (Options.MoveMode and Options.MoveMode.Value) or "?", "from", from, "to", target, "dist", from and string.format("%.0f", (target - from).Magnitude) or "?", "carrying=" .. tostring(carrying()))
 	local started = os.clock()
+	local mode = (options and options.mode) or (Options.MoveMode and Options.MoveMode.Value) or "Safe"
+	local waypoint = from and mode ~= "Teleport" and not (options and options.toTreadmill) and beltDetour(from, target)
+	if waypoint then
+		log("TRAVEL around the treadmill via", waypoint)
+		travelRaw(waypoint, options)
+	end
 	local ok = travelRaw(target, options)
 	root = rootPart()
 	log("TRAVEL end ok=" .. tostring(ok), "at", root and root.Position, "left", root and string.format("%.1f", (target - root.Position).Magnitude) or "?", string.format("%.1fs", os.clock() - started), "onTreadmill=" .. tostring(LocalPlayer:GetAttribute("OnTreadmill")))
@@ -30724,11 +30776,17 @@ local function stealOnce()
 	setStatus("Stealing " .. target.rarity .. " crate in " .. (AreaById[target.area] and AreaById[target.area].DisplayName or target.area))
 	local position = promptPosition(target.prompt) or target.crate:GetPivot().Position
 	local spot = position + Vector3.new(0, 2, 0)
-	if not travel(spot) and not travel(spot, { mode = "Safe" }) then
+	-- someone else can take the crate while we run there (live log: the prompt
+	-- was held on a crate already removed from the map)
+	local function crateStillThere()
+		return target.crate:IsDescendantOf(workspace) and target.prompt:IsDescendantOf(workspace) and target.prompt.Enabled
+	end
+	if not travel(spot, { keepGoing = crateStillThere }) and crateStillThere() and not travel(spot, { mode = "Safe", keepGoing = crateStillThere }) then
 		FailedCrates[target.crate.Name] = os.clock() + 20
 		return true
 	end
-	if not (target.prompt.Parent and target.prompt.Enabled) then
+	if not crateStillThere() then
+		setStatus("That crate was taken, picking another")
 		return true
 	end
 	setStatus("Holding Steal on " .. target.rarity .. " crate")
@@ -30752,6 +30810,8 @@ local function stealOnce()
 	if ok then
 		Refusals = 0
 	elseif PromptIssue and PromptIssue:find("refused") then
+		-- live log: right after escapes the same zone refused 3 steals in a row
+		ZoneBackoff[target.area] = math.max(ZoneBackoff[target.area] or 0, os.clock() + 30)
 		Refusals += 1
 		if Refusals >= 3 then
 			-- the server still has us somewhere else: run to the safe zone so it catches up
@@ -31104,7 +31164,7 @@ local function mountTreadmill()
 		return false
 	end
 	setStatus("Going on the treadmill")
-	travel(belt.Position + Vector3.new(0, belt.Size.Y / 2 + 3, 0))
+	travel(belt.Position + Vector3.new(0, belt.Size.Y / 2 + 3, 0), { toTreadmill = true })
 	for _, d in ipairs(treadmill:GetDescendants()) do
 		if d:IsA("ProximityPrompt") and d.Enabled then
 			triggerPrompt(d, onTreadmill)
