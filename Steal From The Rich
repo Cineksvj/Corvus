@@ -1,5 +1,8 @@
 local Boot = getgenv()
-if Boot.CorvusBooting and os.clock() - Boot.CorvusBooting < 90 then
+if Boot.CorvusBooting and os.clock() - Boot.CorvusBooting < 25 then
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("SendNotification", { Title = "Corvus", Text = "Already starting, give it a few seconds", Duration = 5 })
+	end)
 	return
 end
 Boot.CorvusBooting = os.clock()
@@ -29879,8 +29882,23 @@ getgenv().Library = Library
 getgenv().CorvusLibrary = Library
 return Library
 end)()
-local ThemeManager = loadstring(game:HttpGet(AddonsUrl .. "ThemeManager.lua"))()
-local SaveManager = loadstring(game:HttpGet(AddonsUrl .. "SaveManager.lua"))()
+-- the theme/config addons come from GitHub; if that fails the hub still starts
+local function loadAddon(name)
+	local ok, addon = pcall(function()
+		return loadstring(game:HttpGet(AddonsUrl .. name))()
+	end)
+	if ok and type(addon) == "table" then
+		return addon
+	end
+	warn("[Corvus] could not load " .. name .. " (" .. tostring(addon) .. "), themes and configs are off this time")
+	return setmetatable({}, {
+		__index = function()
+			return function() end
+		end,
+	})
+end
+local ThemeManager = loadAddon("ThemeManager.lua")
+local SaveManager = loadAddon("SaveManager.lua")
 
 local Options = Library.Options
 local Toggles = Library.Toggles
@@ -30424,7 +30442,7 @@ end
 
 -- Height the character stands at on the ground below a point (the server runs an
 -- AntiFlyService, so Safe travel keeps the feet on the ground)
-local travel, manualRunning, runManual
+local travel, manualRunning, runManual, Nav
 do
 local GroundParams = RaycastParams.new()
 GroundParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -30596,7 +30614,7 @@ end
 -- Checked offline on the place file: all 46 crate spots are reachable from the
 -- safe zone and from the plots, through the arena opening.
 -- NAV BEGIN (tests/realmap runs this block on the real place geometry)
-local Nav = { cell = 2, minX = -1300, maxX = 2750, minZ = -1350, maxZ = -550, ready = false, search = 0 }
+Nav = { cell = 2, minX = -1300, maxX = 2750, minZ = -1350, maxZ = -550, ready = false, search = 0 }
 do
 	-- floor: wide flat parts (3+ studs across) with a top up to 4.5; a wide part
 	-- up to STEP above the floor is a step; anything else from LOW to HEAD above
@@ -30656,19 +30674,35 @@ do
 		return p.Y - ey, p.Y + ey, math.min(ex, ez) * 2 >= WIDE
 	end
 
-	local function skipPart(part, crates, camera)
+	local function skipPart(part, crates, camera, modelCache)
 		if part:IsA("Terrain") or (crates and part:IsDescendantOf(crates)) or (camera and part:IsDescendantOf(camera)) then
 			return true
 		end
 		-- characters and NPCs move; they are not walls
 		local node = part.Parent
 		while node and node ~= workspace do
-			if node:IsA("Model") and node:FindFirstChildOfClass("Humanoid") then
-				return true
+			if node:IsA("Model") then
+				local mover = modelCache[node]
+				if mover == nil then
+					mover = node:FindFirstChildOfClass("Humanoid") ~= nil
+					modelCache[node] = mover
+				end
+				if mover then
+					return true
+				end
 			end
 			node = node.Parent
 		end
 		return false
+	end
+
+	-- the map is big: work in slices of a few milliseconds so the game never freezes
+	local slice = os.clock()
+	local function breathe()
+		if os.clock() - slice > 0.006 then
+			task.wait()
+			slice = os.clock()
+		end
 	end
 
 	function Nav.build()
@@ -30677,16 +30711,19 @@ do
 		stamp, gScore, cameFrom = buffer.create(COUNT * 4), buffer.create(COUNT * 4), buffer.create(COUNT * 4)
 		local crates = workspace:FindFirstChild("Crates")
 		local treadmills = workspace:FindFirstChild("Treadmills")
-		local tall, work = {}, 0
+		local tall, work, modelCache = {}, 0, {}
 		local function yieldSometimes(amount)
 			work += amount
-			if work > 30000 then
+			if work > 150 then
 				work = 0
-				task.wait()
+				breathe()
 			end
 		end
 		for _, d in ipairs(workspace:GetDescendants()) do
-			if d:IsA("BasePart") and d.CanCollide and not skipPart(d, crates, workspace.CurrentCamera) then
+			if not alive() then
+				return
+			end
+			if d:IsA("BasePart") and d.CanCollide and not skipPart(d, crates, workspace.CurrentCamera, modelCache) then
 				local cells = 0
 				local bottom, top, wide = footprint(d, nil)
 				if treadmills and d:IsDescendantOf(treadmills) then
@@ -30865,8 +30902,8 @@ do
 			local i, j = k // NZ, k % NZ
 			local g = buffer.readf32(gScore, k * 4)
 			expanded += 1
-			if expanded % 3000 == 0 then
-				task.wait()
+			if expanded % 200 == 0 then
+				breathe()
 			end
 			if expanded > 400000 then
 				break
@@ -30937,13 +30974,6 @@ do
 	end
 end
 -- NAV END
-task.spawn(function()
-	task.wait(1)
-	local ok, err = pcall(Nav.build)
-	if not ok then
-		log("ERROR walk map:", tostring(err))
-	end
-end)
 
 -- walks one planned path; "done", "stuck" (and where to), "pulled" (the server moved us) or "stopped"
 local function followWaypoints(list, options)
@@ -30998,6 +31028,11 @@ local function followWaypoints(list, options)
 			end
 			if distance < best - 0.4 then
 				best, progressAt = distance, os.clock()
+			elseif options.lastMile then
+				-- walking up to the thing itself: touching it is as close as it gets
+				if os.clock() - progressAt > 0.35 then
+					return "done"
+				end
 			elseif os.clock() - progressAt > 0.7 then
 				-- a step, a fence or a ledge: jump like a player would
 				hum.Jump = true
@@ -31074,6 +31109,19 @@ local function walkRoute(target, options)
 			if result == "stopped" then
 				return false
 			elseif result == "done" then
+				if final and not options.toTreadmill then
+					-- the walk map keeps a body width off crates and machines;
+					-- the last few studs go straight at the target (the game shows
+					-- the closest prompt only, so standing beside a neighbour fails)
+					local here = rootPart()
+					local left = here and Vector3.new(target.X - here.Position.X, 0, target.Z - here.Position.Z).Magnitude
+					if left and left > 2.5 and left < 16 then
+						local lastMile = table.clone(options)
+						lastMile.lastMile = true
+						followWaypoints({ { Position = here.Position }, { Position = target, Action = Enum.PathWaypointAction.Walk } }, lastMile)
+					end
+					return true
+				end
 				if final or options.toTreadmill and onTreadmill() then
 					return true
 				end
@@ -34189,12 +34237,19 @@ end
 
 end
 if Window.AddSettingsTab then
-	Tabs.Settings = Window:AddSettingsTab({
+	local ok, tab = pcall(Window.AddSettingsTab, Window, {
 		ThemeManager = ThemeManager,
 		SaveManager = SaveManager,
 		Folder = "StealFromTheRich",
 		MenuKeybind = "Z",
 	})
+	if ok and tab then
+		Tabs.Settings = tab
+	else
+		-- without the addons (GitHub unreachable) the hub still starts
+		log("ERROR settings tab:", tostring(tab))
+		Tabs.Settings = addTab("Settings", "settings", "Menu and configs")
+	end
 else
 	Tabs.Settings = Window:AddTab("Settings", "settings")
 	pcall(function()
@@ -34612,6 +34667,16 @@ do
 	notify("Corvus", if Library.IsMobile then "Loaded and ready. The round Corvus button opens and closes the hub." else "Loaded. Press " .. key .. " to hide or show the menu.", 5)
 end
 
+-- the walk map is built once the hub is up (it reads the whole map)
+task.delay(3, function()
+	if alive() then
+		local ok, err = pcall(Nav.build)
+		if not ok then
+			log("ERROR walk map:", tostring(err))
+		end
+	end
+end)
+
 -- first start: offer the quick setup unless a saved config already runs something
 if Library.ShowWizard and not setupDone() then
 	task.delay(1.5, function()
@@ -34630,12 +34695,15 @@ end, debug.traceback)
 
 Boot.CorvusBooting = nil
 if not BootOk then
-	warn("[Corvus] Steal From The Rich failed to start:\n" .. tostring(BootError))
+	local report = "[Corvus] Steal From The Rich failed to start:\n" .. tostring(BootError)
+	warn(report)
+	local copied = pcall(setclipboard, report)
+	pcall(writefile, "Corvus_SFTR_boot_error.txt", report)
 	pcall(function()
 		game:GetService("StarterGui"):SetCore("SendNotification", {
 			Title = "Corvus error",
-			Text = "Hub failed to start. Press F9 and send the red [Corvus] line.",
-			Duration = 15,
+			Text = if copied then "Hub failed to start. The error is copied, paste it to Cinek." else "Hub failed to start. Press F9 and send the red [Corvus] line.",
+			Duration = 20,
 		})
 	end)
 end

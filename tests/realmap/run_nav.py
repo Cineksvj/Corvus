@@ -31,6 +31,7 @@ V3.__mul = function(a, b) return Vector3.new(a.X * b, a.Y * b, a.Z * b) end
 Vector3 = { new = function(x, y, z) return setmetatable({ X = x or 0, Y = y or 0, Z = z or 0 }, V3) end }
 Enum = { PathWaypointAction = { Walk = "Walk", Jump = "Jump" } }
 task = { wait = function() end }
+function alive() return true end
 function log(...) local t = table.pack(...) for i = 1, t.n do t[i] = tostring(t[i]) end print("LOG " .. table.concat(t, " ")) end
 local function node(name, parent, className)
 	local n = { Name = name, Parent = parent, ClassName = className or "Folder" }

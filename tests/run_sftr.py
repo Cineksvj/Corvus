@@ -60,8 +60,8 @@ def transform_script(src):
         sys.exit(f"could not find {what} in the script")
 
     lib = find(lambda l: l.startswith("local Library = (function()"), what="the inlined library start")
-    theme = find(lambda l: l.startswith("local ThemeManager = loadstring"), lib, "the ThemeManager line")
-    save = find(lambda l: l.startswith("local SaveManager = loadstring"), theme, "the SaveManager line")
+    theme = find(lambda l: l.startswith("local ThemeManager = "), lib, "the ThemeManager line")
+    save = find(lambda l: l.startswith("local SaveManager = "), theme, "the SaveManager line")
     lines[lib] = "local Library = __MockLibrary"
     for i in range(lib + 1, theme):
         lines[i] = ""
