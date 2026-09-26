@@ -29902,7 +29902,7 @@ local CorvusConfig = {
 	FeedbackWebhook = "https://discord.com/api/webhooks/1553082900688146502/rW8r0mJiDZYXFnv8O6asKsDPouxr036xA6CcOwitc_3DWjK6cV59_iO_Mpm0tjTNr3S4",
 	LoaderUrl = "",
 	CodesUrl = "",
-	KnownCodes = { "Release", "Update1", "DroverQ", "Russo", "DarkRose", "AG64", "Cupcake", "E11opoppet", "Ellopoppet", "Olopomidoro", "Ostrichh" },
+	KnownCodes = { "Release", "Update1", "DroverQ", "Russo", "DarkRose", "AG64", "Cupcake", "E11opoppet", "Ellopoppet", "Olopomidoro", "Ostrichh", "Update2", "1mvisits" },
 	HubVersion = "2.0",
 }
 
@@ -30128,6 +30128,13 @@ local S = {
 	huntRarity = { Basic = true },
 	huntVariants = { Normal = true, Golden = true, Diamond = true },
 	skipHatchAnim = false,
+	skipLuckyAnim = false,
+	autoServerLuck = false,
+	luckMode = "1 hour",
+	luckKeep = 600,
+	autoItemCraft = false,
+	craftPick = {},
+	webhookMutated = false,
 }
 
 local Stats = {
@@ -30207,26 +30214,128 @@ Items.Icons = {
 	HatchSpeedPotion2 = "rbxassetid://96741767929090",
 	LuckPotion2 = "rbxassetid://84068759314461",
 	RubiesPotion2 = "rbxassetid://131621503426322",
+	CoinsPotion3 = "rbxassetid://89714157203824",
+	CriticalPotion3 = "rbxassetid://110966098282737",
+	HatchSpeedPotion3 = "rbxassetid://135086975055534",
+	LuckPotion3 = "rbxassetid://124475972008789",
+	RubiesPotion3 = "rbxassetid://93679648843782",
+	HackerLuckyblock = "rbxassetid://109896699605258",
+	CoinsCharm1 = "rbxassetid://95495350862854",
+	CoinsCharm2 = "rbxassetid://88238390070969",
+	CoinsCharm3 = "rbxassetid://138196072341139",
+	CoinsCharm4 = "rbxassetid://115186559802367",
+	CriticalCharm1 = "rbxassetid://103961231099924",
+	CriticalCharm2 = "rbxassetid://110272908383217",
+	CriticalCharm3 = "rbxassetid://82111029988349",
+	CriticalCharm4 = "rbxassetid://74872062148038",
+	LuckCharm1 = "rbxassetid://86489964542801",
+	LuckCharm2 = "rbxassetid://115940569640651",
+	LuckCharm3 = "rbxassetid://114179494103516",
+	LuckCharm4 = "rbxassetid://74842884052361",
+	HatchCharm1 = "rbxassetid://114647924469682",
+	HatchCharm2 = "rbxassetid://74608750730021",
+	HatchCharm3 = "rbxassetid://109517927048154",
+	HatchCharm4 = "rbxassetid://113546906203990",
+	RubiesCharm1 = "rbxassetid://114480367033159",
+	RubiesCharm2 = "rbxassetid://109404243120231",
+	RubiesCharm3 = "rbxassetid://70699652537956",
+	RubiesCharm4 = "rbxassetid://90045909460113",
 }
 
 Items.Fruits = { "Apple", "Banana", "Blueberry", "Kiwi", "Mango", "Taco" }
 Items.FruitSeconds = { Apple = 180, Banana = 180, Blueberry = 180, Kiwi = 180, Mango = 180, Taco = 60 }
 Items.Potions = {
+	"LuckPotion3", "CoinsPotion3", "RubiesPotion3", "HatchSpeedPotion3", "CriticalPotion3",
 	"LuckPotion2", "CoinsPotion2", "RubiesPotion2", "HatchSpeedPotion2", "CriticalPotion2",
 	"LuckPotion", "CoinsPotion", "RubiesPotion", "HatchSpeedPotion", "CriticalPotion",
 }
-Items.Lucky = { "BasicLuckyblock", "RareLuckyblock" }
+Items.Lucky = { "BasicLuckyblock", "RareLuckyblock", "HackerLuckyblock" }
 Items.HuntRarities = { "Basic", "Rare", "Epic", "Legendary", "Mythical" }
 Items.Rarities = { "Basic", "Rare", "Epic", "Legendary", "Mythical", "Exclusive", "Secret" }
-Items.PotionSeconds = {}
+Items.PotionSeconds = { LuckPotion3 = 600, CoinsPotion3 = 600, RubiesPotion3 = 600, HatchSpeedPotion3 = 600, CriticalPotion3 = 600 }
 
 function Auto.itemDisplayName(name)
-	if name == "BasicLuckyblock" then return "Basic Lucky Block" end
-	if name == "RareLuckyblock" then return "Rare Lucky Block" end
-	local tier2 = string.sub(name, -1) == "2"
-	local base = if tier2 then string.sub(name, 1, -2) else name
+	name = tostring(name)
+	local kind = string.match(name, "^(%a+)Luckyblock$")
+	if kind then
+		return kind .. " Lucky Block"
+	end
+	local base, digit = string.match(name, "^(.-)(%d)$")
+	local roman = if base and base ~= "" then ({ "I", "II", "III", "IV", "V" })[tonumber(digit)] else nil
+	if not roman then
+		base = name
+	end
 	base = string.gsub(base, "(%l)(%u)", "%1 %2")
-	return if tier2 then base .. " II" else base
+	return if roman then base .. " " .. roman else base
+end
+
+function Auto.potionTier(name)
+	local base, digit = string.match(tostring(name), "^(.-)([23])$")
+	if base and base ~= "" then
+		return base, tonumber(digit)
+	end
+	return tostring(name), 1
+end
+
+function Auto.higherPotions(name)
+	local base, tier = Auto.potionTier(name)
+	local list = {}
+	for level = tier + 1, 3 do
+		table.insert(list, base .. tostring(level))
+	end
+	return list
+end
+
+function Auto.buildRecipes()
+	local kinds = { "Coins", "Rubies", "Luck", "Critical", "Hatch" }
+	local fruits = { Rubies = "Apple", Coins = "Banana", Hatch = "Blueberry", Luck = "Kiwi", Critical = "Mango" }
+	local potions = { Coins = "CoinsPotion", Rubies = "RubiesPotion", Luck = "LuckPotion", Critical = "CriticalPotion", Hatch = "HatchSpeedPotion" }
+	local list = {}
+	local function add(id, result, category, kind, item, amount, fruit, fruitAmount, rubies)
+		table.insert(list, {
+			Id = id,
+			Result = result,
+			Category = category,
+			Order = #list + 1,
+			Costs = {
+				{ Kind = kind, Item = item, Amount = amount },
+				{ Kind = "Fruit", Item = fruit, Amount = fruitAmount },
+				{ Kind = "Currency", Item = "Rubies", Amount = rubies },
+			},
+		})
+	end
+	for _, kind in ipairs(kinds) do
+		local potion, fruit = potions[kind], fruits[kind]
+		add("Potion_" .. kind, potion .. "2", "Potions", "Potion", potion, 5, fruit, 5, 25000)
+		add("Potion_" .. kind .. "_3", potion .. "3", "Potions", "Potion", potion .. "2", 3, fruit, 25, 250000)
+	end
+	for _, kind in ipairs(kinds) do
+		local fruit = fruits[kind]
+		add("Charm_" .. kind .. "_2", kind .. "Charm2", "Charms", "Charm", kind .. "Charm1", 5, fruit, 25, 500000)
+		add("Charm_" .. kind .. "_3", kind .. "Charm3", "Charms", "Charm", kind .. "Charm2", 3, fruit, 100, 5000000)
+		add("Charm_" .. kind .. "_4", kind .. "Charm4", "Charms", "Charm", kind .. "Charm3", 3, fruit, 1000, 50000000)
+	end
+	return list
+end
+
+Auto.Mutations = {
+	UpsideDown = { "Upside Down", "#c77dff" },
+	Taco = { "Taco", "#ffb84d" },
+	Wet = { "Wet", "#5fb8ff" },
+	UFO = { "UFO", "#7dffb3" },
+	Hacker = { "Hacker", "#39ff14" },
+}
+
+function Auto.mutationInfo(text)
+	if type(text) ~= "string" or text == "" then return nil end
+	local names, first = {}, nil
+	for id in string.gmatch(text, "[^+|]+") do
+		local def = Auto.Mutations[id]
+		first = first or def
+		table.insert(names, if def then def[1] else (string.gsub(id, "(%l)(%u)", "%1 %2")))
+	end
+	if #names == 0 then return nil end
+	return table.concat(names, " "), if first then first[2] else "#b692ff", names[1]
 end
 
 Items.DisplayToItem = {}
@@ -30352,6 +30461,9 @@ local Saved = {
 	feedbackDay = "",
 	feedbackCount = 0,
 	feedbackAt = 0,
+	serverLuckBuys = 0,
+	itemsCrafted = 0,
+	mutated = 0,
 }
 
 pcall(function()
@@ -30800,6 +30912,23 @@ local function getDataFolder(name)
 	return folder
 end
 
+function Auto.setGameSetting(key, value)
+	value = value == true
+	local folder = getDataFolder("Settings")
+	local current = folder and folder:FindFirstChild(key)
+	if current then
+		local ok, now = pcall(function() return current.Value end)
+		if ok and now == value then return true end
+	elseif ({ SkipLuckyBlockAnimation = false })[key] == value then
+		return true
+	end
+	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	local settings = remotes and remotes:FindFirstChild("Settings")
+	local remote = settings and settings:FindFirstChild("ToggleSetting")
+	if not remote then return false end
+	return (pcall(function() remote:FireServer(key, value) end))
+end
+
 local function getPartyStatus()
 	if not PartyEggModule then return nil end
 
@@ -30983,6 +31112,12 @@ local function recordHatch(list, egg)
 	local batch = {}
 	for _, pet in ipairs(list) do
 		local name = type(pet) == "table" and pet.Name or (type(pet) == "string" and pet) or nil
+		local mutation = type(pet) == "table" and type(pet.Mutations) == "string" and pet.Mutations ~= "" and pet.Mutations or nil
+		if type(name) == "string" and string.find(name, "|", 1, true) then
+			local base, extra = string.match(name, "^(.-)|(.*)$")
+			name = base
+			mutation = mutation or (if extra ~= "" then extra else nil)
+		end
 		if name then
 			local rarity = type(pet) == "table" and pet.Rarity or nil
 			if not rarity and PetDisplay and PetDisplay.GetRarity then
@@ -30995,7 +31130,10 @@ local function recordHatch(list, egg)
 			if known and known[name] ~= nil then
 				known[name] = true
 			end
-			table.insert(batch, { name = name, rarity = rarity, fresh = fresh })
+			table.insert(batch, { name = name, rarity = rarity, fresh = fresh, mutation = mutation })
+			if mutation then
+				Saved.mutated = (tonumber(Saved.mutated) or 0) + 1
+			end
 			Saved.rarity[rarity] = (tonumber(Saved.rarity[rarity]) or 0) + 1
 			Session.rarity = Session.rarity or {}
 			Session.rarity[rarity] = (Session.rarity[rarity] or 0) + 1
@@ -31018,10 +31156,10 @@ local function recordHatch(list, egg)
 			BestDirty = true
 			SaveDirty = true
 			if Auto.onHatch then
-				pcall(Auto.onHatch, name, rarity)
+				pcall(Auto.onHatch, name, rarity, mutation)
 			end
 			if rank >= 5 then
-				table.insert(NotifyQueue, { "Hatched", string.format("%s  \u{00B7}  %s", name, rarity) })
+				table.insert(NotifyQueue, { "Hatched", string.format("%s%s  \u{00B7}  %s", if mutation then ((Auto.mutationInfo(mutation)) or "") .. " " else "", name, rarity) })
 			end
 		end
 	end
@@ -31372,6 +31510,9 @@ task.spawn(function()
 		local potions = load(modules, "PotionsModule")
 		if potions and type(potions.Tier1Names) == "table" then
 			local names = {}
+			for _, name in ipairs(potions.Tier3Names or {}) do
+				table.insert(names, name)
+			end
 			for _, name in ipairs(potions.Tier2Names or {}) do
 				table.insert(names, name)
 			end
@@ -31620,6 +31761,7 @@ local EggsOpenedRow = HatchStatsBox:AddStat({ Icon = GameIcons.Egg, Text = "Eggs
 local EggsSessionRow = HatchStatsBox:AddStat({ Icon = GameIcons.Egg, Text = "This session", Value = "0", Size = 22, ValueColor = "FontColor" })
 UI.GoldenStatRow = HatchStatsBox:AddStat({ Icon = GameIcons.Index, Text = "Golden crafted", Value = "0", Size = 22 })
 UI.DiamondStatRow = HatchStatsBox:AddStat({ Icon = GameIcons.Index, Text = "Diamond crafted", Value = "0", Size = 22 })
+UI.MutatedStatRow = HatchStatsBox:AddStat({ Icon = "sparkles", Text = "Mutated pets", Value = "0", Size = 22 })
 local RarityRows = {}
 for _, rarity in ipairs({ "Secret", "Exclusive", "Mythical", "Legendary", "Epic", "Rare", "Basic" }) do
 	local icon = Rarities and Rarities[rarity] and Rarities[rarity][2] or nil
@@ -31639,6 +31781,7 @@ HatchStatsBox:AddButton({
 		Saved.rarity = {}
 		Saved.goldenCrafts = 0
 		Saved.diamondCrafts = 0
+		Saved.mutated = 0
 		Saved.hatched = {}
 		Saved.eggsSince = os.time()
 		BestDirty = true
@@ -31813,7 +31956,7 @@ UI.WorldBox = Tabs.Farm:AddRightGroupbox("Worlds", "globe")
 UI.WorldList = {}
 UI.WorldKeys = {}
 UI.WorldOrder = {}
-for _, key in ipairs(Auto.GameData.worldOrder or { "Spawn", "BirchForest", "TreasureDunes", "FrozenAlley", "HauntedHouse", "PetKingdom", "EnchantedGrove", "TheMoon" }) do
+for _, key in ipairs(Auto.GameData.worldOrder or { "Spawn", "BirchForest", "TreasureDunes", "FrozenAlley", "HauntedHouse", "PetKingdom", "EnchantedGrove", "VolcanoHollow", "TheMoon" }) do
 	local cost = Auto.GameData.worldCost
 	local display = cost and type(cost.DisplayNames) == "table" and cost.DisplayNames[key] or (string.gsub(key, "(%l)(%u)", "%1 %2"))
 	table.insert(UI.WorldList, display)
@@ -31916,7 +32059,7 @@ UI.FruitMachineBox = Tabs.Rewards:AddLeftGroupbox("Fruit Machine", "cherry")
 UI.FruitMachineBox:AddToggle("AutoFruitMachine", {
 	Text = "Auto Buy Fruits",
 	Description = "Flies to Frozen Alley on every restock",
-	Tooltip = "Buys the whole stock with rubies as soon as the machine restocks, then brings you back",
+	Tooltip = "Buys the whole stock with rubies as soon as the machine restocks, then brings you back. If you own the Auto Buy Fruit Machine special upgrade, it switches the game's own Auto Buy on once and stops flying there.",
 	Default = false,
 	Callback = function(v)
 		S.autoFruitMachine = v
@@ -31927,6 +32070,8 @@ UI.FMPriceRow = UI.FruitMachineBox:AddStat({ Icon = CurrencyIcons.Rubies, Text =
 UI.FMBoughtRow = UI.FruitMachineBox:AddStat({ Icon = Items.Icons.Apple, Text = "Bought", Value = "0", Size = 22 })
 UI.FMLastLabel = UI.FruitMachineBox:AddLabel({ Text = "", DoesWrap = true })
 pcall(UI.FMLastLabel.SetVisible, UI.FMLastLabel, false)
+UI.FMAutoRow = UI.FruitMachineBox:AddStat({ Icon = GameIcons.FruitMachine, Text = "Game Auto Buy", Value = "...", Size = 22, ValueColor = "FontColor" })
+pcall(UI.FMAutoRow.SetVisible, UI.FMAutoRow, false)
 
 UI.GroupChestBox = Tabs.Rewards:AddRightGroupbox("Group Chest", "box")
 UI.GroupChestBox:AddToggle("AutoGroupChest", {
@@ -32158,6 +32303,7 @@ local EggWorlds = {
 	["Zombie Egg"] = "HauntedHouse",
 	["Castle Egg"] = "PetKingdom",
 	["Mushroom Egg"] = "EnchantedGrove",
+	["Volcano Egg"] = "VolcanoHollow",
 }
 pcall(function()
 	local worlds = require(ReplicatedStorage.Modules:WaitForChild("EggWorldModule", 3))
@@ -32178,6 +32324,7 @@ local WorldBounds = {
 	HauntedHouse = { 2216.941, 2802.141, -3250.918, -2516.318 },
 	PetKingdom = { 1282.367, 1882.367, -3131.53, -2531.53 },
 	EnchantedGrove = { -290, 10, -2810, -2500 },
+	VolcanoHollow = { -1670, -665, -3160, -2228 },
 	TheMoon = { 455, 1055, -3139, -2539 },
 }
 
@@ -32411,7 +32558,7 @@ UI.PotionBox:AddSlider("PotionRefill", {
 })
 UI.PotionBox:AddToggle("AutoPotions", {
 	Text = "Auto Use Potions",
-	Description = "Tier II is used first when you own it",
+	Description = "Higher tiers are used first when you own them",
 	Default = false,
 	Callback = function(v)
 		S.autoPotions = v
@@ -32452,6 +32599,19 @@ UI.LuckyBox:AddToggle("AutoLucky", {
 	Default = false,
 	Callback = function(v)
 		S.autoLucky = v
+	end,
+})
+UI.LuckyBox:AddToggle("SkipLuckyAnim", {
+	Text = "Skip opening animation",
+	Description = "Lucky blocks open instantly",
+	Tooltip = "Uses the game's own Skip Lucky Animation setting from Update 2.",
+	Default = false,
+	Callback = function(v)
+		S.skipLuckyAnim = v
+		if v or UI.skipLuckySet then
+			UI.skipLuckySet = true
+			task.spawn(pcall, Auto.setGameSetting, "SkipLuckyBlockAnimation", v)
+		end
 	end,
 })
 UI.LuckyRows = {}
@@ -32525,6 +32685,49 @@ UI.CraftGoldenRow = UI.CraftBox:AddStat({ Icon = GameIcons.Index, Text = "Golden
 UI.CraftDiamondRow = UI.CraftBox:AddStat({ Icon = GameIcons.Index, Text = "Diamond ready", Value = "0", Size = 26 })
 UI.CraftDoneRow = UI.CraftBox:AddStat({ Icon = GameIcons.Auto, Text = "Golden / Diamond", Value = "0 / 0", Size = 22 })
 UI.CraftStateRow = UI.CraftBox:AddStat({ Icon = GameIcons.Auto, Text = "Status", Value = "Idle", Size = 22, ValueColor = "FontColor" })
+
+UI.ItemCraftBox = Tabs.Items:AddLeftGroupbox("Potion & Charm Crafting", "hammer")
+UI.RecipeList = Auto.buildRecipes()
+UI.RecipeDisplay, UI.RecipeImages, UI.RecipeKeys = {}, {}, {}
+for _, recipe in ipairs(UI.RecipeList) do
+	local display = Auto.itemDisplayName(recipe.Result)
+	table.insert(UI.RecipeDisplay, display)
+	UI.RecipeImages[display] = Items.Icons[recipe.Result]
+	UI.RecipeKeys[display] = recipe.Id
+end
+UI.ItemCraftBox:AddDropdown("ItemCraftPick", {
+	Text = "Craft",
+	Values = UI.RecipeDisplay,
+	ValueImages = UI.RecipeImages,
+	Default = {},
+	Multi = true,
+	Searchable = true,
+	AllowNull = true,
+	Callback = function(value)
+		local pick = {}
+		if type(value) == "table" then
+			for display, on in pairs(value) do
+				if on and UI.RecipeKeys[display] then
+					pick[UI.RecipeKeys[display]] = true
+				end
+			end
+		end
+		S.craftPick = pick
+	end,
+})
+UI.ItemCraftBox:AddToggle("AutoItemCraft", {
+	Text = "Auto Craft Items",
+	Description = "Upgrades your potions and charms",
+	Tooltip = "Flies to the Crafting table in Enchanted Grove and crafts the picked recipes once you own the items, fruits and rubies. Equipped charms are never used and your ruby reserve is kept.",
+	Default = false,
+	Callback = function(v)
+		S.autoItemCraft = v
+	end,
+})
+UI.ItemCraftReadyRow = UI.ItemCraftBox:AddStat({ Icon = "hammer", Text = "Ready", Value = "...", Size = 26 })
+UI.ItemCraftStateRow = UI.ItemCraftBox:AddStat({ Icon = GameIcons.Auto, Text = "Status", Value = "Off", Size = 22, ValueColor = "FontColor" })
+UI.ItemCraftDoneRow = UI.ItemCraftBox:AddStat({ Icon = Items.Icons.LuckPotion3, Text = "Crafted", Value = "0", Size = 22 })
+UI.ItemCraftBox:AddLabel({ Text = '<font transparency="0.45">Potions III last 10 minutes and beat tier I and II. Charms need 3 to 5 of the tier below plus fruits and rubies.</font>', DoesWrap = true })
 
 
 function Auto.prettyUpgrade(name)
@@ -32818,6 +33021,39 @@ UI.RebirthProgressRow = UI.RebirthBox:AddStat({ Icon = "orbit", Text = "Progress
 UI.MoonRebirthRow = UI.RebirthBox:AddStat({ Icon = GameIcons.MoonChest, Text = "Moon rebirths", Value = "...", Size = 22, ValueColor = "FontColor" })
 UI.RebirthStateRow = UI.RebirthBox:AddStat({ Icon = GameIcons.Auto, Text = "Status", Value = "Off", Size = 22, ValueColor = "FontColor" })
 
+UI.ServerLuckBox = Tabs.Upgrades:AddRightGroupbox("Server Luck", "clover")
+UI.ServerLuckBox:AddToggle("AutoServerLuck", {
+	Text = "Auto Server Luck",
+	Description = "Keeps the server luck boost topped up",
+	Tooltip = "Flies to the Server Luck machine in Volcano Hollow and buys more time with rubies when it runs low. It boosts everyone on the server, up to x2 at 5 hours. Your ruby reserve from Budget is kept.",
+	Default = false,
+	Callback = function(v)
+		S.autoServerLuck = v
+	end,
+})
+UI.ServerLuckBox:AddDropdown("ServerLuckMode", {
+	Text = "Buy",
+	Values = { "10 minutes", "1 hour", "Max" },
+	Default = "1 hour",
+	Tooltip = "10 minutes costs 750k rubies, 1 hour costs 4.5M. Max fills the timer up to 5 hours.",
+	Callback = function(v)
+		S.luckMode = tostring(v or "1 hour")
+	end,
+})
+UI.LuckKeepValues = { ["Under 10 minutes"] = 600, ["Under 30 minutes"] = 1800, ["Under 1 hour"] = 3600, ["Under 2 hours"] = 7200, ["Under 4 hours"] = 14400 }
+UI.ServerLuckBox:AddDropdown("ServerLuckKeep", {
+	Text = "Buy when",
+	Values = { "Under 10 minutes", "Under 30 minutes", "Under 1 hour", "Under 2 hours", "Under 4 hours" },
+	Default = "Under 10 minutes",
+	Callback = function(v)
+		S.luckKeep = UI.LuckKeepValues[v] or 600
+	end,
+})
+UI.ServerLuckNowRow = UI.ServerLuckBox:AddStat({ Icon = GameIcons.Luck, Text = "Server luck", Value = "...", Size = 28, Progress = 0 })
+UI.ServerLuckPriceRow = UI.ServerLuckBox:AddStat({ Icon = CurrencyIcons.Rubies, Text = "Price", Value = "...", Size = 22, ValueColor = "FontColor" })
+UI.ServerLuckStateRow = UI.ServerLuckBox:AddStat({ Icon = GameIcons.Auto, Text = "Status", Value = "Off", Size = 22, ValueColor = "FontColor" })
+UI.ServerLuckBoughtRow = UI.ServerLuckBox:AddStat({ Icon = "shopping-cart", Text = "Bought", Value = "0", Size = 22 })
+
 UI.TeamBox = Tabs.Items:AddRightGroupbox("Team", "users-round")
 UI.TeamPowerRow = UI.TeamBox:AddStat({ Icon = GameIcons.EquipBest, Text = "Team power", Value = "...", Size = 30 })
 UI.TeamRows = {}
@@ -32900,6 +33136,14 @@ UI.HookBox:AddDropdown("WebhookPets", {
 			end
 		end
 		S.webhookPets = pick
+	end,
+})
+UI.HookBox:AddToggle("WebhookMutated", {
+	Text = "Post mutated hatches",
+	Description = "Wet, UFO, Hacker and other mutations, any rarity",
+	Default = false,
+	Callback = function(v)
+		S.webhookMutated = v
 	end,
 })
 UI.HookEventMap = { ["UFO broken"] = "UFO", ["World unlocked"] = "World", ["Moon rebirth"] = "Rebirth", ["Special upgrade"] = "Special", ["Code redeemed"] = "Codes", ["Goal reached"] = "Goals" }
@@ -33382,10 +33626,13 @@ do
 			end
 		end)
 		hookEvent("luckyClaimed", "LuckyBlockService", "Claimed", function(data)
-			if Lucky.active and Lucky.count > 0 then
-				Saved.luckyOpened += Lucky.count
+			local skipped = type(data) == "table" and data.Skipped == true
+			local opened = if Lucky.active and Lucky.count > 0 then Lucky.count elseif skipped then tonumber(Lucky.pendingAmount) or 0 else 0
+			if opened > 0 then
+				Saved.luckyOpened += opened
 				SaveDirty = true
 			end
+			Lucky.pendingAmount = 0
 			Lucky.active = false
 			Lucky.waitingSpawn = false
 			Lucky.claimedAt = os.clock()
@@ -33410,10 +33657,12 @@ do
 			end)
 		end
 		for _, kind in ipairs({ "Golden", "Diamond" }) do
-			hookEvent("bulk" .. kind, "CraftMachinesService", "CraftBulk" .. kind, function(total)
+			hookEvent("bulk" .. kind, "CraftMachinesService", "CraftBulk" .. kind, function(total, _, status, reason)
 				local crafted = tonumber(total) or 0
 				AutoCraft.bulkAt = os.clock()
 				AutoCraft.bulkLast = crafted
+				AutoCraft.bulkStatus = status
+				AutoCraft.bulkReason = reason
 				if crafted > 0 then
 					if kind == "Golden" then
 						Saved.goldenCrafts += crafted
@@ -34219,6 +34468,7 @@ do
 			standAt(touch, 4)
 			task.wait(0.7)
 			local done = 0
+			local rejected = false
 			if bulk then
 				for start = 1, #list, 120 do
 					local batch = table.move(list, start, math.min(start + 119, #list), 1, {})
@@ -34231,11 +34481,27 @@ do
 					if AutoCraft.bulkAt <= before then
 						break
 					end
+					if AutoCraft.bulkStatus == "rejected" and AutoCraft.bulkLast <= 0 then
+						rejected = true
+						AutoCraft.rejectedAt = os.clock()
+						AutoCraft.status = "Waiting for game data"
+						if AutoCraft.bulkReason == "empty" or AutoCraft.bulkReason == "invalid" then
+							pcall(function()
+								local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+								local data = remotes and remotes:FindFirstChild("Data")
+								local sync = data and data:FindFirstChild("PlayerDataSync")
+								if sync then
+									sync:FireServer()
+								end
+							end)
+						end
+						break
+					end
 					done += AutoCraft.bulkLast
 					task.wait(0.5)
 				end
 			end
-			if done == 0 and single then
+			if done == 0 and single and not rejected then
 				for _, name in ipairs(list) do
 					if not alive() then break end
 					local before = Craft.resultAt
@@ -34273,7 +34539,7 @@ do
 				end
 			end
 			if total == 0 then
-				AutoCraft.blockedUntil = os.clock() + 120
+				AutoCraft.blockedUntil = os.clock() + (if os.clock() - (AutoCraft.rejectedAt or -1e9) < 30 then 20 else 120)
 				if AutoCraft.status == "Crafting" then
 					AutoCraft.status = "Nothing crafted"
 				end
@@ -34558,7 +34824,7 @@ do
 
 		local function worldInfo()
 			local cost = Auto.GameData.worldCost
-			local order = if cost and type(cost.Order) == "table" then cost.Order else { "BirchForest", "TreasureDunes", "FrozenAlley", "HauntedHouse", "PetKingdom", "EnchantedGrove" }
+			local order = if cost and type(cost.Order) == "table" then cost.Order else { "BirchForest", "TreasureDunes", "FrozenAlley", "HauntedHouse", "PetKingdom", "EnchantedGrove", "VolcanoHollow" }
 			local all = Auto.GameData.worldOrder or UI.WorldOrder or {}
 			local owned, total = 0, 0
 			for _, key in ipairs(all) do
@@ -35119,9 +35385,13 @@ do
 				{ name = "Session", value = Library:FormatDuration(os.clock() - Session.started), inline = true },
 				{ name = "Player", value = if S.webhookHideName then "Hidden" else "||" .. LocalPlayer.Name .. "||", inline = true },
 			}
+			local mutationLabel = if entry.mutation then (Auto.mutationInfo(entry.mutation)) or entry.mutation else nil
+			if mutationLabel then
+				table.insert(fields, 2, { name = "Mutation", value = mutationLabel, inline = true })
+			end
 			local thumb = assetThumb(petAssetId(entry.name))
 			return {
-				title = "\u{2726}  " .. entry.rarity .. " hatch",
+				title = "\u{2726}  " .. (if mutationLabel then mutationLabel .. " " else "") .. entry.rarity .. " hatch",
 				description = "**" .. entry.name .. "** just joined your team.",
 				color = RarityInts[entry.rarity] or 14146792,
 				thumbnail = if thumb then { url = thumb } else nil,
@@ -35132,11 +35402,11 @@ do
 			}
 		end
 
-		Auto.onHatch = function(name, rarity)
+		Auto.onHatch = function(name, rarity, mutation)
 			if not S.webhookOn or not validWebhook(S.webhookUrl) then return end
-			if not (S.webhookRarity[rarity] or S.webhookPets[name]) then return end
+			if not (S.webhookRarity[rarity] or S.webhookPets[name] or (mutation and S.webhookMutated)) then return end
 			if #Hook.queue >= 40 then return end
-			table.insert(Hook.queue, { name = name, rarity = rarity, egg = if S.indexHunt and Hunter.egg then Hunter.egg else S.hatchEggName })
+			table.insert(Hook.queue, { name = name, rarity = rarity, mutation = mutation, egg = if S.indexHunt and Hunter.egg then Hunter.egg else S.hatchEggName })
 		end
 
 		Auto.sendTestWebhook = function()
@@ -35411,7 +35681,7 @@ do
 							if level < maxLevel then
 								info.allDone = false
 								local parent = tree.GroupById and tree.GroupById[group.parent]
-								local parentDone = parent == nil or (levels[parent.id] or 0) >= #parent.levels
+								local parentDone = parent == nil or (levels[parent.id] or 0) >= (tonumber(group.parentLevel) or #parent.levels)
 								local node = group.levels[level + 1]
 								if group.requires ~= nil and not flag(group.requires) then
 									info.needsFlag = info.needsFlag or group.requires
@@ -35627,6 +35897,9 @@ do
 							specialTrip(row)
 						end
 					end
+				end
+				if Auto.nextUpdateErrand then
+					return Auto.nextUpdateErrand(now)
 				end
 				return nil
 			end
@@ -36008,6 +36281,11 @@ do
 				if os.clock() - Hop.lastQuery >= 8 or not Hop.state then
 					Hop.lastQuery = os.clock()
 					local ok, state, stamp = Auto.invokeTimeout(Auto.knitRemote("AlienEventService", "RF", "GetState"), 6)
+					if state == true then
+						state = "Active"
+					elseif ok and state ~= true and type(state) ~= "string" and tonumber(stamp) then
+						state = "Idle"
+					end
 					if ok and type(state) == "string" and tonumber(stamp) then
 						Hop.state, Hop.stamp = state, tonumber(stamp)
 					end
@@ -36081,6 +36359,11 @@ do
 				while alive() do
 					task.wait(2)
 					pcall(hookEvent, "ufoState", "AlienEventService", "UI", function(state, stamp)
+						if state == true then
+							state = "Active"
+						elseif state == false then
+							state = "Idle"
+						end
 						if type(state) == "string" and tonumber(stamp) then
 							Hop.state, Hop.stamp = state, tonumber(stamp)
 							Hop.lastQuery = os.clock()
@@ -36162,6 +36445,10 @@ do
 								return
 							end
 							Hop.hops = 0
+						end
+						if state == "Incoming" and Hop.left and Hop.left > 0 then
+							Hop.status = "UFO landing in " .. formatClock(Hop.left) .. ", staying"
+							return
 						end
 						local window = tonumber(S.ufoHopWindow) or 60
 						if Hop.left and state == "Idle" and Hop.left <= window then
@@ -36479,6 +36766,7 @@ do
 					Lucky.lastOpen = now
 					Lucky.waitingSpawn = true
 					Lucky.status = string.format("Opening %dx", amount)
+					Lucky.pendingAmount = amount
 					pcall(function() open:FireServer(name, amount) end)
 					return
 				end
@@ -36555,14 +36843,15 @@ do
 						amount = chunkFor(count)
 					else
 						local left = tonumber(readData("PotionsTimeData", name)) or 0
-						if string.sub(name, -1) == "2" then
-							amount = if left <= 1 then math.min(S.potionRefill or 1, count) else 0
-						else
-							local higher = name .. "2"
+						local blocked = left > 1
+						for _, higher in ipairs(Auto.higherPotions(name)) do
 							local higherLeft = tonumber(readData("PotionsTimeData", higher)) or 0
 							local higherReady = S.potionPick[higher] and (tonumber(readData("PotionsData", higher)) or 0) > 0
-							amount = if left <= 1 and higherLeft <= 1 and not higherReady then math.min(S.potionRefill or 1, count) else 0
+							if higherLeft > 1 or higherReady then
+								blocked = true
+							end
 						end
+						amount = if blocked then 0 else math.min(S.potionRefill or 1, count)
 					end
 					if amount > 0 then
 						ItemTrack.lastUse[name] = now
@@ -36673,7 +36962,7 @@ do
 							return
 						elseif ufoBusy then
 							return
-						elseif S.autoFruitMachine and fruit.ready and fruit.affordable and now - FM.lastTry > 30 then
+						elseif S.autoFruitMachine and fruit.ready and fruit.affordable and now - FM.lastTry > 30 and not (Auto.fruitGameAuto and Auto.fruitGameAuto()) then
 							runErrand("Fruit Machine", doFruitMachine)
 						elseif S.autoGroupChest and GC.avail == true and now - GC.lastTry > 45 then
 							runErrand("Group Chest", doGroupChest)
@@ -36727,7 +37016,7 @@ do
 					nextName, nextLeft = name, value
 				end
 			end
-			consider(S.autoFruitMachine, "Fruit Machine", Snap.fm.left, Snap.fm.ready and Snap.fm.affordable)
+			consider(S.autoFruitMachine and not (Auto.fruitGameAuto and Auto.fruitGameAuto()), "Fruit Machine", Snap.fm.left, Snap.fm.ready and Snap.fm.affordable)
 			consider(S.autoGroupChest and Snap.gc.member ~= false, "Group Chest", Snap.gc.left, Snap.gc.ready)
 			consider(S.autoMoonChest and Snap.mc.unlocked ~= false, "Moon Chest", Snap.mc.left, Snap.mc.ready)
 			Snap.nextStop = if nextName then { name = nextName, left = nextLeft } else nil
@@ -36744,8 +37033,12 @@ do
 			for _, name in ipairs(Items.Potions) do
 				local left = tonumber(readData("PotionsTimeData", name)) or 0
 				local paused = false
-				if string.sub(name, -1) ~= "2" and left > 0 then
-					paused = (tonumber(readData("PotionsTimeData", name .. "2")) or 0) > 0
+				if left > 0 then
+					for _, higher in ipairs(Auto.higherPotions(name)) do
+						if (tonumber(readData("PotionsTimeData", higher)) or 0) > 0 then
+							paused = true
+						end
+					end
 				end
 				items.potions[name] = {
 					count = tonumber(readData("PotionsData", name)) or 0,
@@ -36867,10 +37160,11 @@ do
 					end
 					local groups, order = {}, {}
 					for _, pet in ipairs(batch.names) do
-						local group = groups[pet.name]
+						local key = pet.name .. "|" .. tostring(pet.mutation or "")
+						local group = groups[key]
 						if not group then
-							group = { name = pet.name, rarity = pet.rarity, count = 0, fresh = false }
-							groups[pet.name] = group
+							group = { name = pet.name, rarity = pet.rarity, count = 0, fresh = false, mutation = pet.mutation }
+							groups[key] = group
 							table.insert(order, group)
 						end
 						group.count += 1
@@ -36879,6 +37173,7 @@ do
 					table.sort(order, function(a, b)
 						local ra, rb = RarityRank[a.rarity] or 0, RarityRank[b.rarity] or 0
 						if ra ~= rb then return ra > rb end
+						if (a.mutation ~= nil) ~= (b.mutation ~= nil) then return a.mutation ~= nil end
 						return a.name < b.name
 					end)
 					for i = #order, 1, -1 do
@@ -36886,6 +37181,7 @@ do
 						Live.seq += 1
 						local variant = if string.sub(group.name, 1, 7) == "Golden " then "Golden" elseif string.sub(group.name, 1, 8) == "Diamond " then "Diamond" else nil
 						local sub = {}
+						local mutationLabel, mutationColor, mutationFirst = Auto.mutationInfo(group.mutation)
 						local chance = oneIn(eggPercent(egg, group.name))
 						if chance then
 							table.insert(sub, chance)
@@ -36895,15 +37191,15 @@ do
 						end
 						table.insert(Live.feed, 1, {
 							Id = Live.seq,
-							Title = group.name,
+							Title = if mutationLabel then mutationLabel .. " " .. group.name else group.name,
 							Count = group.count,
 							Image = petIcon(group.name) or petIcon(baseName(group.name)) or GameIcons.Egg,
 							Color = RarityColors[group.rarity] or RarityColors.Basic,
 							Right = group.rarity,
 							Sub = table.concat(sub, "  \u{00B7}  "),
 							At = batch.at,
-							Badge = if group.fresh then "NEW" elseif variant == "Golden" then "GOLD" elseif variant == "Diamond" then "DIAMOND" else nil,
-							BadgeColor = if group.fresh then "#7dffb3" elseif variant == "Golden" then "#ffcf4d" else "#8fe9ff",
+							Badge = if group.fresh then "NEW" elseif mutationFirst then string.upper(mutationFirst) elseif variant == "Golden" then "GOLD" elseif variant == "Diamond" then "DIAMOND" else nil,
+							BadgeColor = if group.fresh then "#7dffb3" elseif mutationFirst then mutationColor elseif variant == "Golden" then "#ffcf4d" else "#8fe9ff",
 						})
 					end
 				end
@@ -37204,6 +37500,325 @@ do
 		end
 		Auto.setupLive()
 
+		Auto.setupUpdate2 = function()
+			local U = { luckTry = -1e9, luckBlocked = -1e9, luckStatus = "Off", resultAt = 0, craftTry = -1e9, craftBlocked = -1e9, craftStatus = "Off", fruitTry = -1e9, fruitStatus = nil, collectAt = -1e9 }
+			Auto.U2 = U
+			local LuckCfg = { WORLD = "VolcanoHollow", MACHINE_NAME = "SeverLuck", UNIT_SECONDS = 600, UNIT_PRICE = 750000, HOUR_UNITS = 6, TIER_SECONDS = 3600, MAX_SECONDS = 18000, TIERS = { 1.2, 1.4, 1.6, 1.8, 2 } }
+			local luckLoaded = false
+
+			local function luckConfig()
+				if not luckLoaded then
+					luckLoaded = true
+					local cfg = Auto.lazyRequire("ServerLuckConfig", function()
+						local modules = ReplicatedStorage:FindFirstChild("Modules")
+						return modules and modules:FindFirstChild("ServerLuckConfig")
+					end)
+					if type(cfg) == "table" then
+						for key, fallback in pairs(LuckCfg) do
+							if type(cfg[key]) == type(fallback) then
+								LuckCfg[key] = cfg[key]
+							end
+						end
+					end
+				end
+				return LuckCfg
+			end
+
+			local function luckWorld()
+				return Auto.worldKey(luckConfig().WORLD) or "VolcanoHollow"
+			end
+
+			local function serverLuck()
+				local cfg = luckConfig()
+				local state = ReplicatedStorage:FindFirstChild("ServerLuckState")
+				local endsAt = 0
+				if state then
+					local ok, value = pcall(function() return state.Value end)
+					endsAt = if ok then tonumber(value) or 0 else 0
+				end
+				local left = math.clamp(endsAt - serverNow(), 0, cfg.MAX_SECONDS)
+				local tier = if left > 0 then math.clamp(math.ceil(left / cfg.TIER_SECONDS), 1, #cfg.TIERS) else 0
+				local fit = math.max(0, math.floor((cfg.MAX_SECONDS - left) / cfg.UNIT_SECONDS))
+				return { left = left, mult = if tier > 0 then cfg.TIERS[tier] else 1, fit = fit, max = cfg.MAX_SECONDS, price = cfg.UNIT_PRICE, unit = cfg.UNIT_SECONDS, hourUnits = cfg.HOUR_UNITS }
+			end
+			Auto.serverLuck = serverLuck
+
+			local LuckModes = { ["10 minutes"] = "One", ["1 hour"] = "Hour", Max = "Max" }
+			local function luckPlan(info)
+				local cfg = luckConfig()
+				local mode = LuckModes[S.luckMode] or "Hour"
+				local units = if mode == "One" then 1 elseif mode == "Hour" then cfg.HOUR_UNITS else info.fit
+				if units > info.fit then
+					mode, units = "One", 1
+				end
+				if info.fit < 1 or units < 1 then
+					return nil, "Server luck is full"
+				end
+				local cost = units * cfg.UNIT_PRICE
+				local spendable = Extra.spendable("Rubies")
+				if (tonumber(spendable) or 0) < cost then
+					return nil, "Saving up " .. formatNumber(cost) .. " rubies"
+				end
+				return mode, units, cost
+			end
+
+			hookEvent("serverLuckResult", "ServerLuckService", "Result", function(success, reason)
+				U.resultAt = os.clock()
+				U.lastOk = success == true
+				U.lastReason = reason
+			end)
+
+			local function luckTrip(mode, units, cost)
+				U.luckTry = os.clock()
+				local buy = Auto.knitRemote("ServerLuckService", "RE", "Buy")
+				if not buy then
+					U.luckStatus = "Unavailable"
+					U.luckBlocked = os.clock() + 120
+					return
+				end
+				local ok, err = travelTo(luckWorld())
+				if not ok then
+					U.luckStatus = "Travel failed"
+					U.luckBlocked = os.clock() + 60
+					queueToast("Server Luck", err)
+					return
+				end
+				local _, touch = getMachine(luckConfig().MACHINE_NAME)
+				if not touch then
+					_, touch = getMachine("ServerLuck")
+				end
+				if not touch then
+					U.luckStatus = "Machine not found"
+					U.luckBlocked = os.clock() + 300
+					return
+				end
+				Mover.task = "Buying server luck"
+				standAt(touch, 0)
+				task.wait(0.7)
+				local before = U.resultAt
+				U.lastOk, U.lastReason = nil, nil
+				pcall(function() buy:FireServer(mode) end)
+				local waited = 0
+				while waited < 4 and U.resultAt <= before do
+					waited += task.wait(0.2) or 0.2
+				end
+				if U.lastOk == true then
+					U.luckStatus = "Bought"
+					Saved.serverLuckBuys = (tonumber(Saved.serverLuckBuys) or 0) + 1
+					SaveDirty = true
+					local added = Library:FormatDuration(units * luckConfig().UNIT_SECONDS)
+					queueToast("Server Luck", string.format("Added %s of server luck for %s rubies", added, formatNumber(cost)))
+					if Auto.Metrics then
+						pcall(Auto.Metrics.event, "Luck", "Server luck +" .. added, "#ffcf4d")
+					end
+				elseif U.lastOk == false then
+					local reason = tostring(U.lastReason or "")
+					U.luckStatus = ({ rubies = "Not enough rubies", max = "Server luck is full", world = "Unlock Volcano Hollow first", distance = "Too far from the machine", cooldown = "Cooldown" })[reason] or ("Failed: " .. reason)
+					U.luckBlocked = os.clock() + (if reason == "world" then 600 elseif reason == "cooldown" or reason == "distance" then 15 else 90)
+				else
+					U.luckStatus = "No answer"
+					U.luckBlocked = os.clock() + 30
+				end
+			end
+
+			local RecipeList = Auto.buildRecipes()
+			local function itemCount(kind, item)
+				if kind == "Potion" then
+					return tonumber(readData("PotionsData", item)) or 0
+				elseif kind == "Fruit" then
+					return tonumber(readData("FruitsData", item)) or 0
+				elseif kind == "Charm" then
+					local folder = getDataFolder("CharmsData")
+					local entry = folder and folder:FindFirstChild(item)
+					if not entry then return 0 end
+					local function num(childName)
+						local child = entry:FindFirstChild(childName)
+						local ok, value = pcall(function() return child and child.Value end)
+						return if ok then tonumber(value) or 0 else 0
+					end
+					return math.max(0, num("Amount") - num("Equipped"))
+				elseif kind == "Currency" then
+					local spend = Extra.spendable(item)
+					return math.max(0, tonumber(spend) or 0)
+				end
+				return 0
+			end
+
+			local function craftable(recipe)
+				local count = 100
+				for _, cost in ipairs(recipe.Costs or {}) do
+					local amount = tonumber(cost.Amount) or 0
+					if amount > 0 then
+						count = math.min(count, math.floor(itemCount(cost.Kind, cost.Item) / amount))
+					end
+				end
+				return math.max(0, count)
+			end
+			Auto.craftable = craftable
+
+			local function craftTrip(list)
+				U.craftTry = os.clock()
+				local remote = Auto.knitRemote("ItemCraftService", "RF", "Craft")
+				if not remote then
+					U.craftStatus = "Unavailable"
+					U.craftBlocked = os.clock() + 300
+					return
+				end
+				local ok, err = travelTo(machineWorld("Crafting", "EnchantedGrove"))
+				if not ok then
+					U.craftStatus = "Travel failed"
+					U.craftBlocked = os.clock() + 60
+					queueToast("Item Crafting", err)
+					return
+				end
+				local _, touch = getMachine("Crafting")
+				if not touch then
+					U.craftStatus = "Machine not found"
+					U.craftBlocked = os.clock() + 300
+					return
+				end
+				Mover.task = "Crafting items"
+				standAt(touch, 2)
+				task.wait(0.7)
+				local made = {}
+				for _, recipe in ipairs(list) do
+					local count = craftable(recipe)
+					if count > 0 and alive() then
+						local label = Auto.itemDisplayName(recipe.Result)
+						Mover.task = "Crafting " .. label
+						local okCall, result = Auto.invokeTimeout(remote, 8, recipe.Id, count)
+						if okCall and result == true then
+							table.insert(made, string.format("%s x%d", label, count))
+							Saved.itemsCrafted = (tonumber(Saved.itemsCrafted) or 0) + count
+							SaveDirty = true
+						end
+						task.wait(0.6)
+					end
+				end
+				if #made > 0 then
+					U.craftStatus = "Crafted"
+					queueToast("Item Crafting", "Crafted " .. table.concat(made, ", "))
+				else
+					U.craftStatus = "Nothing crafted"
+					U.craftBlocked = os.clock() + 120
+				end
+			end
+
+			local function fruitAutoOn()
+				return readData("FruitMachineData", "AutoBuy") == true
+			end
+			Auto.fruitGameAuto = fruitAutoOn
+
+			local function fruitAutoTrip()
+				U.fruitTry = os.clock()
+				local remote = Auto.knitRemote("FruitMachineService", "RE", "SetAutoBuy")
+				if not remote then
+					U.fruitStatus = "Unavailable"
+					return
+				end
+				local ok, err = travelTo(machineWorld("FruitMachine", "FrozenAlley"))
+				if not ok then
+					queueToast("Fruit Machine", err)
+					return
+				end
+				local _, touch = getMachine("FruitMachine")
+				if touch then
+					Mover.task = "Turning on Auto Buy"
+					standAt(touch, 2)
+					task.wait(0.6)
+				end
+				pcall(function() remote:FireServer(true) end)
+				local waited = 0
+				while waited < 3 and not fruitAutoOn() do
+					waited += task.wait(0.25) or 0.25
+				end
+				if fruitAutoOn() then
+					U.fruitStatus = nil
+					queueToast("Fruit Machine", "The game's Auto Buy is on, no more trips needed")
+				else
+					U.fruitStatus = "Did not turn on"
+					U.fruitTry = os.clock() + 510
+				end
+			end
+
+			Auto.nextUpdateErrand = function(now)
+				if S.autoFruitMachine and now - U.fruitTry > 90 and readData("SPdata", "SP17") == true and not fruitAutoOn() then
+					return "Fruit Auto Buy", fruitAutoTrip
+				end
+				if S.autoServerLuck and now - U.luckTry > 10 and now >= U.luckBlocked then
+					if isWorldUnlocked(luckWorld()) == false then
+						U.luckStatus = "Unlock Volcano Hollow first"
+					else
+						local info = serverLuck()
+						if info.left < (tonumber(S.luckKeep) or 600) then
+							local mode, units, cost = luckPlan(info)
+							if mode then
+								return "Server Luck", function()
+									luckTrip(mode, units, cost)
+								end
+							end
+							U.luckStatus = tostring(units or "Waiting")
+						else
+							U.luckStatus = "Topped up"
+						end
+					end
+				end
+				if S.autoItemCraft and now - U.craftTry > 30 and now >= U.craftBlocked then
+					local list = {}
+					for _, recipe in ipairs(RecipeList) do
+						if S.craftPick[recipe.Id] and craftable(recipe) > 0 then
+							table.insert(list, recipe)
+						end
+					end
+					if #list > 0 then
+						return "Item Crafting", function()
+							craftTrip(list)
+						end
+					end
+					U.craftStatus = "Waiting for items"
+				end
+				return nil
+			end
+
+			Auto.collectUpdate2 = function()
+				local now = os.clock()
+				if now - U.collectAt < 1 then return end
+				U.collectAt = now
+				hookEvent("serverLuckResult", "ServerLuckService", "Result", function(success, reason)
+					U.resultAt = os.clock()
+					U.lastOk = success == true
+					U.lastReason = reason
+				end)
+				local luck = serverLuck()
+				local fruitAuto = fruitAutoOn()
+				local sp17 = readData("SPdata", "SP17") == true
+				local ready, readyText = 0, {}
+				for _, recipe in ipairs(RecipeList) do
+					if S.craftPick[recipe.Id] then
+						local count = craftable(recipe)
+						if count > 0 then
+							ready += 1
+							if #readyText < 2 then
+								table.insert(readyText, Auto.itemDisplayName(recipe.Result) .. " x" .. count)
+							end
+						end
+					end
+				end
+				Snap.u2 = {
+					luck = luck,
+					luckStatus = if S.autoServerLuck then U.luckStatus else "Off",
+					fruitAuto = fruitAuto,
+					sp17 = sp17,
+					fruitStatus = U.fruitStatus,
+					craftReady = ready,
+					craftText = readyText[1] or "",
+					rubies = tonumber((Extra.spendable("Rubies"))) or 0,
+					craftStatus = if S.autoItemCraft then U.craftStatus else "Off",
+				}
+			end
+		end
+		Auto.setupUpdate2()
+
 		Auto.Mover = Mover
 		Auto.Hunter = Hunter
 		Auto.goToEgg = goToEgg
@@ -37443,6 +38058,7 @@ task.spawn(function()
 			safe(collectEggs, "eggs")
 			safe(collectStats, "stats")
 			safe(Auto.collectLive, "live")
+			safe(Auto.collectUpdate2, "update2")
 			if shown then
 				safe(collectFarm, "farm")
 				Snap.gifts = nil
@@ -37543,6 +38159,7 @@ local function drawStats()
 	setStat(UI.LuckyOpenedRow, nil, formatNumber(Saved.luckyOpened))
 	setStat(UI.GoldenStatRow, nil, formatNumber(Saved.goldenCrafts))
 	setStat(UI.DiamondStatRow, nil, formatNumber(Saved.diamondCrafts))
+	setStat(UI.MutatedStatRow, nil, formatNumber(tonumber(Saved.mutated) or 0))
 	setLabel(UI.ItemsSinceLabel, '<font transparency="0.45">Counting for</font> ' .. Library:FormatDuration(os.time() - (tonumber(Saved.itemsSince) or os.time())))
 	setLabel(RewardsSinceLabel, '<font transparency="0.45">Counting for</font> ' .. Library:FormatDuration(os.time() - (tonumber(Saved.rewardsSince) or os.time())))
 	for rarity, row in pairs(RarityRows) do
@@ -37830,7 +38447,8 @@ do
 				local data = shop.rows[name]
 				if data then
 					local label = labels[name] or Auto.prettyUpgrade(name)
-					local level = string.format("Lv %d/%d", data.level, data.max)
+					local uncapped = data.max >= 1e8
+					local level = if uncapped then "Lv " .. formatNumber(data.level) else string.format("Lv %d/%d", data.level, data.max)
 					local text = if data.picked then label .. "  " .. dim(level) else dim(label .. "  " .. level)
 					if data.max > 0 and data.level >= data.max then
 						setStat(row, text, colored(GREEN, "MAX"))
@@ -37841,7 +38459,7 @@ do
 					else
 						setStat(row, text, dim("?"))
 					end
-					setProgress(row, if data.max > 0 then data.level / data.max else 0)
+					setProgress(row, if uncapped then (if data.cap and data.cap > 0 and data.cap < 1e8 then data.level / data.cap else 0) elseif data.max > 0 then data.level / data.max else 0)
 				end
 			end
 			local status = shop.status or "Off"
@@ -38023,6 +38641,8 @@ do
 			if hop then
 				if hop.active then
 					setStat(UI.UfoNextRow, nil, colored(GREEN, if hop.left and hop.left > 0 then "Active  " .. formatClock(hop.left) else "Active"))
+				elseif hop.state == "Incoming" and hop.left then
+					setStat(UI.UfoNextRow, nil, colored(ORANGE, "Landing in " .. formatClock(hop.left)))
 				elseif hop.left then
 					setStat(UI.UfoNextRow, nil, "in " .. formatClock(hop.left))
 				else
@@ -38128,6 +38748,7 @@ task.spawn(function()
 			pcall(Auto.drawExtras)
 			pcall(Auto.drawAnalytics, false)
 			pcall(Auto.drawLive, false)
+			pcall(Auto.drawUpdate2)
 		end
 		pcall(drawQueues)
 	end
@@ -38457,6 +39078,74 @@ function Auto.galleryDetail(pet, filter)
 		tail = "tap to hunt it first"
 	end
 	return head .. '<font transparency="0.35">  \u{00B7}  ' .. where .. "  \u{00B7}  " .. tail .. "</font>"
+end
+
+do
+	local U2Progress = {}
+	local function u2Progress(row, value)
+		value = math.clamp(tonumber(value) or 0, 0, 1)
+		local key = math.floor(value * 400 + 0.5)
+		if U2Progress[row] == key then return end
+		if pcall(row.SetProgress, row, value) then
+			U2Progress[row] = key
+		end
+	end
+	local function paint(color, text)
+		return string.format('<font color="%s">%s</font>', color, text)
+	end
+	local function faint(text)
+		return '<font transparency="0.5">' .. text .. "</font>"
+	end
+	local GOOD, WARN, BAD = "#60d696", "#ffb84d", "#ff6e8a"
+
+	function Auto.drawUpdate2()
+		local u2 = Snap.u2
+		if not u2 then return end
+		local function t(sec)
+			return if Auto.formatClock then Auto.formatClock(sec) else Library:FormatDuration(sec)
+		end
+
+		local luck = u2.luck
+		if luck then
+			local value = if luck.left > 0 then paint(GOOD, string.format("x%s  %s", tostring(luck.mult), t(luck.left))) else faint("x1  \u{00B7}  not active")
+			setStat(UI.ServerLuckNowRow, nil, value)
+			u2Progress(UI.ServerLuckNowRow, luck.left / math.max(1, luck.max))
+			local units = if S.luckMode == "10 minutes" then 1 elseif S.luckMode == "Max" then luck.fit else (luck.hourUnits or 6)
+			local cost = units * luck.price
+			if units <= 0 or luck.fit < units then
+				setStat(UI.ServerLuckPriceRow, "Price", faint("timer is full"))
+			else
+				setStat(UI.ServerLuckPriceRow, "Price  " .. faint("+" .. t(units * luck.unit)), if (u2.rubies or 0) >= cost then formatNumber(cost) else paint(BAD, formatNumber(cost)))
+			end
+		end
+		local luckStatus = tostring(u2.luckStatus or "Off")
+		setStat(UI.ServerLuckStateRow, nil, if luckStatus == "Off" then faint("Off") elseif luckStatus == "Bought" or luckStatus == "Topped up" then paint(GOOD, luckStatus) else paint(WARN, luckStatus))
+		setStat(UI.ServerLuckBoughtRow, nil, formatNumber(tonumber(Saved.serverLuckBuys) or 0))
+
+		if UI.FMAutoRow then
+			setVisible(UI.FMAutoRow, u2.sp17 == true)
+			local value
+			if u2.fruitAuto then
+				value = paint(GOOD, "On")
+			elseif u2.fruitStatus then
+				value = paint(WARN, tostring(u2.fruitStatus))
+			elseif S.autoFruitMachine then
+				value = faint("switching on")
+			else
+				value = faint("Off")
+			end
+			setStat(UI.FMAutoRow, nil, value)
+		end
+
+		if UI.ItemCraftReadyRow then
+			local text = u2.craftText or ""
+			local ready = tonumber(u2.craftReady) or 0
+			setStat(UI.ItemCraftReadyRow, nil, if text ~= "" then text .. (if ready > 1 then "  " .. faint("+" .. (ready - 1)) else "") else faint("nothing yet"))
+			local status = tostring(u2.craftStatus or "Off")
+			setStat(UI.ItemCraftStateRow, nil, if status == "Off" then faint("Off") elseif status == "Crafted" then paint(GOOD, status) elseif status == "Waiting for items" then faint(status) else paint(WARN, status))
+			setStat(UI.ItemCraftDoneRow, nil, formatNumber(tonumber(Saved.itemsCrafted) or 0))
+		end
+	end
 end
 
 function Auto.drawLive(force)
