@@ -1159,6 +1159,9 @@ handlers.rev_INDEX_CLAIM_ALL = function()
 end
 
 invokers.rf_SELL_QUOTE = function(args)
+	if Server.sellQuoteNil then
+		return nil -- the live server answers nil (live logs)
+	end
 	local items = sellableItems()
 	local total = 0
 	for _, t in ipairs(items) do

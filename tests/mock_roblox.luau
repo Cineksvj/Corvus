@@ -2182,6 +2182,12 @@ function MockLibrary:CreateWindow(info)
 	function window:AddKeyTab(i)
 		return self:AddTab("Key")
 	end
+	function window:AddCommandsTab(i)
+		return self:AddTab("Commands")
+	end
+	function window:AddRemoteSpyTab(i)
+		return self:AddTab("Remote Spy")
+	end
 	for _, k in ipairs({ "SetFooter", "SetFooterLink", "ChangeTitle", "SetCompact", "ShowTabInfo", "HideTabInfo" }) do
 		window[k] = function() end
 	end
@@ -2199,6 +2205,50 @@ function MockLibrary:Notify(info, ...)
 end
 function MockLibrary:Unload()
 	self.Unloaded = true
+	for _, fn in ipairs(self.UnloadCallbacks or {}) do
+		pcall(fn)
+	end
+end
+
+-- console commands, quick bar and unload hooks (same shape as the real library)
+MockLibrary.Commands = {}
+MockLibrary.CommandOutput = {}
+function MockLibrary:AddCommand(info)
+	assert(type(info) == "table" and type(info.Name) == "string", "AddCommand expects a table with a Name")
+	self.Commands[string.lower(info.Name)] = info
+	for _, alias in ipairs(info.Aliases or {}) do
+		self.Commands[string.lower(alias)] = self.Commands[string.lower(alias)] or info
+	end
+	return info
+end
+function MockLibrary:RunCommand(text)
+	local words = {}
+	for word in string.gmatch(text, "%S+") do
+		table.insert(words, word)
+	end
+	local name = string.lower(table.remove(words, 1) or "")
+	local command = self.Commands[name]
+	if not command then
+		table.insert(self.CommandOutput, { text = text, ok = false, result = "unknown command" })
+		return false
+	end
+	local ok, result = pcall(command.Callback, words, text)
+	table.insert(self.CommandOutput, { text = text, ok = ok, result = result })
+	Sim.log("COMMAND", text .. " -> " .. tostring(result))
+	return ok, result
+end
+function MockLibrary:SetQuickBar(items)
+	for _, item in ipairs(items) do
+		assert(self.Toggles[item.Toggle], "quick bar toggle " .. tostring(item.Toggle) .. " does not exist")
+	end
+	self.QuickBarItems = items
+end
+function MockLibrary:OnUnload(fn)
+	self.UnloadCallbacks = self.UnloadCallbacks or {}
+	table.insert(self.UnloadCallbacks, fn)
+end
+function MockLibrary:GiveSignal(connection)
+	return connection
 end
 
 local function addonStub(name)
