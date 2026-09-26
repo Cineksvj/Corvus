@@ -1,1 +1,1167 @@
-test
+local Boot = getgenv()
+if Boot.CorvusBooting and os.clock() - Boot.CorvusBooting < 90 then
+	return
+end
+Boot.CorvusBooting = os.clock()
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+do
+	local waited = 0
+	local ok = game.GameId == 10753751277
+	while not ok and waited < 20 do
+		ok = ReplicatedStorage:FindFirstChild("re_SELL_DO") ~= nil and workspace:FindFirstChild("Crates") ~= nil
+		if not ok then
+			waited += task.wait(0.5) or 0.5
+		end
+	end
+	if not ok then
+		Boot.CorvusBooting = nil
+		warn("[Corvus] This is not Steal From The Rich, the hub was not started")
+		return
+	end
+	LocalPlayer:WaitForChild("PlayerGui", 20)
+	ReplicatedStorage:WaitForChild("Shared", 20)
+	task.wait(0.5)
+end
+
+local BootOk, BootError = xpcall(function()
+-- Same Corvus UI as Pets Universe, loaded from the repo so both hubs stay in sync
+local HubRepo = "https://raw.githubusercontent.com/Cineksvj/Corvus/main/"
+local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/"
+local Library
+do
+	local setIdentity = setthreadidentity or set_thread_identity or setidentity or (syn and syn.set_thread_identity)
+	if setIdentity then
+		pcall(setIdentity, 8)
+	end
+	local ok, source = pcall(game.HttpGet, game, HubRepo .. "Pets%20Universe")
+	if ok and type(source) == "string" then
+		local first = source:find("local Library = (function()", 1, true)
+		local last = first and source:find("local ThemeManager = loadstring", first, true)
+		if first and last then
+			local chunk = loadstring(source:sub(first, last - 1) .. "\nreturn Library")
+			if chunk then
+				local okRun, lib = pcall(chunk)
+				if okRun and type(lib) == "table" then
+					Library = lib
+				end
+			end
+		end
+	end
+	if not Library then
+		Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/main/Library.lua"))()
+	end
+end
+local ThemeManager = loadstring(game:HttpGet(AddonsUrl .. "ThemeManager.lua"))()
+local SaveManager = loadstring(game:HttpGet(AddonsUrl .. "SaveManager.lua"))()
+
+local Options = Library.Options
+local Toggles = Library.Toggles
+
+local Discord = "https://discord.gg/PdQvN2bDCu"
+local LoaderScript = 'loadstring(game:HttpGet("' .. HubRepo .. 'Steal%20From%20The%20Rich"))()'
+
+local Env = getgenv()
+if Env.StealFromTheRichInstance then
+	pcall(function()
+		Env.StealFromTheRichInstance.stop = true
+	end)
+end
+task.wait(0.2)
+
+local INSTANCE = { stop = false }
+Env.StealFromTheRichInstance = INSTANCE
+local function alive()
+	return not INSTANCE.stop and Env.StealFromTheRichInstance == INSTANCE and not Library.Unloaded
+end
+
+local function notify(Title, Text, Time)
+	pcall(function()
+		Library:Notify({ Title = Title, Description = Text, Time = Time or 3 })
+	end)
+end
+
+---------------------------------------------------------------------------
+-- Game access
+---------------------------------------------------------------------------
+local Shared = ReplicatedStorage:WaitForChild("Shared", 20)
+local Network
+pcall(function()
+	Network = require(Shared.Packages.Network)
+end)
+local NetFolder = Shared and Shared:FindFirstChild("Packages") and Shared.Packages:FindFirstChild("Network")
+
+local function fire(name, ...)
+	local args = table.pack(...)
+	return pcall(function()
+		if Network then
+			Network.FireServer(name, table.unpack(args, 1, args.n))
+		else
+			NetFolder:WaitForChild("rev_" .. name, 5):FireServer(table.unpack(args, 1, args.n))
+		end
+	end)
+end
+
+local function onNet(name, fn)
+	pcall(function()
+		local remote = NetFolder and NetFolder:WaitForChild("rev_" .. name, 10)
+		if remote then
+			remote.OnClientEvent:Connect(fn)
+		end
+	end)
+end
+
+local Remotes = {}
+for _, name in ipairs({ "re_PLACE_AT", "re_PLOT_UPGRADE", "re_TREADMILL_UPGRADE", "re_SELL_DO", "rf_SELL_QUOTE", "rf_ITEM_LOADOUT" }) do
+	Remotes[name] = ReplicatedStorage:WaitForChild(name, 10)
+end
+
+local function safeRequire(path)
+	local ok, result = pcall(function()
+		local node = ReplicatedStorage
+		for part in path:gmatch("[^%.]+") do
+			node = node:WaitForChild(part, 5)
+		end
+		return require(node)
+	end)
+	return ok and result or nil
+end
+
+local AreaData = safeRequire("Shared.Data.AreaData")
+local TrailData = safeRequire("Shared.Data.TrailData")
+local Balance = safeRequire("LBTHClient.Services.ClientBalanceService")
+
+local Areas = {}
+do
+	local list = AreaData and AreaData.Areas
+	if type(list) ~= "table" then
+		list = {
+			{ Id = "Grandpa", DisplayName = "Grandpa's House", Order = 1, RecommendedSpeed = 20, CrateTiers = { "Common", "Rare", "Epic" } },
+			{ Id = "Jeweler", DisplayName = "Jeweler's Shop", Order = 2, RecommendedSpeed = 900, CrateTiers = { "Rare", "Epic", "Legendary" } },
+			{ Id = "Archeologist", DisplayName = "Dig Site", Order = 3, RecommendedSpeed = 10000, CrateTiers = { "Epic", "Legendary", "Mythic" } },
+			{ Id = "MafiaBoss", DisplayName = "Mafia Boss's Vault", Order = 4, RecommendedSpeed = 40000, CrateTiers = { "Legendary", "Mythic", "Godly" } },
+			{ Id = "Celebrity", DisplayName = "Celebrity's Mansion", Order = 5, RecommendedSpeed = 170000, CrateTiers = { "Mythic", "Godly", "Celestial" } },
+			{ Id = "PirateCaptain", DisplayName = "Pirate Ship", Order = 6, RecommendedSpeed = 700000, CrateTiers = { "Godly", "Celestial", "Demon" } },
+			{ Id = "MuseumOwner", DisplayName = "Museum", Order = 7, RecommendedSpeed = 2500000, CrateTiers = { "Celestial", "Demon", "Hacked" } },
+			{ Id = "GoldTycoon", DisplayName = "Gold Tycoon's Fortress", Order = 8, RecommendedSpeed = 18000000, CrateTiers = { "Demon", "Hacked", "Rainbow" } },
+			{ Id = "Astronaut", DisplayName = "Space Station", Order = 9, RecommendedSpeed = 700000000, CrateTiers = { "Hacked", "Rainbow", "Secret" } },
+			{ Id = "DemonKing", DisplayName = "Demon King's Lair", Order = 10, RecommendedSpeed = 2500000000, CrateTiers = { "Rainbow", "Secret", "Divine" } },
+		}
+	end
+	for _, area in ipairs(list) do
+		table.insert(Areas, area)
+	end
+	table.sort(Areas, function(a, b)
+		return (a.Order or 0) < (b.Order or 0)
+	end)
+end
+
+local AreaById, ZoneLabels, ZoneByLabel, RarityList, RarityRank = {}, {}, {}, {}, {}
+for index, area in ipairs(Areas) do
+	AreaById[area.Id] = area
+	area.Order = area.Order or index
+	local label = area.Id .. " - " .. (area.DisplayName or area.Id)
+	table.insert(ZoneLabels, label)
+	ZoneByLabel[label] = area.Id
+	for tierIndex, tier in ipairs(area.CrateTiers or {}) do
+		local rank = area.Order * 10 + tierIndex
+		if not RarityRank[tier] then
+			table.insert(RarityList, tier)
+		end
+		RarityRank[tier] = math.max(RarityRank[tier] or 0, rank)
+	end
+end
+
+local Trails = {}
+if TrailData and type(TrailData.Trails) == "table" then
+	for _, trail in ipairs(TrailData.Trails) do
+		table.insert(Trails, trail)
+	end
+	table.sort(Trails, function(a, b)
+		return (a.Order or a.Cost or 0) < (b.Order or b.Cost or 0)
+	end)
+end
+
+---------------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------------
+local Suffixes = { "", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc" }
+local function formatNumber(n)
+	n = tonumber(n) or 0
+	if n < 1000 then
+		return tostring(math.floor(n))
+	end
+	local i = 1
+	while n >= 1000 and i < #Suffixes do
+		n /= 1000
+		i += 1
+	end
+	return string.format("%.2f", n):gsub("%.?0+$", "") .. Suffixes[i]
+end
+
+local function money()
+	local ok, value = pcall(function()
+		local b = Balance and Balance.Balance
+		if type(b) == "table" and b.first then
+			return b.first * 10 ^ (b.second or 0)
+		end
+		return tonumber(b) or 0
+	end)
+	return ok and value or 0
+end
+
+local function character()
+	return LocalPlayer.Character
+end
+local function rootPart()
+	local c = character()
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function humanoid()
+	local c = character()
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function selected(option, value)
+	local v = option and option.Value
+	if type(v) == "table" then
+		if next(v) == nil then
+			return true
+		end
+		return v[value] == true
+	end
+	return v == value
+end
+
+local function myFloor()
+	for _, child in ipairs(workspace:GetChildren()) do
+		if child.Name:match("^Plot Building %d+$") then
+			local floor = child:FindFirstChild("floor")
+			if floor and floor:GetAttribute("OwnerUserId") == LocalPlayer.UserId then
+				return floor
+			end
+		end
+	end
+	return nil
+end
+
+local function toolsWith(attribute)
+	local list = {}
+	for _, parent in ipairs({ LocalPlayer:FindFirstChild("Backpack"), character() }) do
+		if parent then
+			for _, child in ipairs(parent:GetChildren()) do
+				if child:IsA("Tool") and child:GetAttribute(attribute) then
+					table.insert(list, child)
+				end
+			end
+		end
+	end
+	return list
+end
+
+local function carrying()
+	return LocalPlayer:GetAttribute("CarryingStolen") == true
+end
+
+local function inSafeZone()
+	local root = rootPart()
+	return root ~= nil and root.Position.X >= 2424
+end
+
+local function safeSpot()
+	local z = -940
+	pcall(function()
+		local zone = workspace["Steal Map"].Lobby["safe zone"]
+		local half = zone.Size.Z / 2 - 20
+		local root = rootPart()
+		z = math.clamp(root and root.Position.Z or zone.Position.Z, zone.Position.Z - half, zone.Position.Z + half)
+	end)
+	return Vector3.new(2444, 5, z)
+end
+
+local function sellerSpot()
+	local part
+	pcall(function()
+		part = workspace.Map.Vendors.SellPlaces.Sell1["sellnpc NEW"].ProximityPart
+	end)
+	return part and (part.Position + Vector3.new(-4, 1, 0)) or Vector3.new(2433, 5, -864)
+end
+
+local function triggerPrompt(prompt)
+	if not (prompt and prompt.Parent) then
+		return false
+	end
+	pcall(function()
+		prompt.RequiresLineOfSight = false
+	end)
+	if fireproximityprompt then
+		local ok = pcall(fireproximityprompt, prompt)
+		if ok then
+			return true
+		end
+	end
+	local ok = pcall(function()
+		prompt:InputHoldBegin()
+		task.wait((prompt.HoldDuration or 0) + 0.1)
+		prompt:InputHoldEnd()
+	end)
+	return ok
+end
+
+local Status = "Idle"
+local function setStatus(text)
+	Status = text
+end
+
+---------------------------------------------------------------------------
+-- Movement
+---------------------------------------------------------------------------
+local function onTreadmill()
+	return LocalPlayer:GetAttribute("OnTreadmill") == true
+end
+
+local function leaveTreadmill()
+	if not onTreadmill() then
+		return
+	end
+	fire("TREADMILL_DISMOUNT")
+	local waited = 0
+	while onTreadmill() and waited < 2 do
+		waited += task.wait(0.1) or 0.1
+	end
+end
+
+local function travel(target)
+	local root = rootPart()
+	if not root then
+		return false
+	end
+	leaveTreadmill()
+	local mode = Options.TravelMode and Options.TravelMode.Value or "Fly"
+	if mode == "Teleport" then
+		root.CFrame = CFrame.new(target) * root.CFrame.Rotation
+		root.AssemblyLinearVelocity = Vector3.zero
+		task.wait(0.15)
+		return true
+	end
+	local speed = Options.TravelSpeed and Options.TravelSpeed.Value or 350
+	local started = os.clock()
+	local limit = (target - root.Position).Magnitude / math.max(speed, 1) + 6
+	while alive() and os.clock() - started < limit do
+		root = rootPart()
+		if not root then
+			return false
+		end
+		local position = root.Position
+		local delta = target - position
+		local distance = delta.Magnitude
+		if distance < 1.5 then
+			break
+		end
+		local dt = RunService.Heartbeat:Wait()
+		local step = math.min(distance, speed * dt)
+		root.CFrame = CFrame.new(position + delta.Unit * step) * root.CFrame.Rotation
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+	root = rootPart()
+	if root then
+		root.CFrame = CFrame.new(target) * root.CFrame.Rotation
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+	return true
+end
+
+---------------------------------------------------------------------------
+-- Stats
+---------------------------------------------------------------------------
+local Session = { stolen = 0, opened = 0, placed = 0, sold = 0, earned = 0, started = os.clock(), startMoney = nil }
+onNet("STEAL_SUCCESS", function()
+	Session.stolen += 1
+end)
+
+---------------------------------------------------------------------------
+-- Steal
+---------------------------------------------------------------------------
+local function crateInfo(crate)
+	local area = crate:GetAttribute("AreaId")
+	local rarity = crate:GetAttribute("CrateTier") or crate:GetAttribute("Rarity")
+	local nameArea, nameRarity = crate.Name:match("^Crate_([^_]+)_([^_]+)_")
+	return area or nameArea, rarity or nameRarity
+end
+
+local function stealPrompt(crate)
+	for _, d in ipairs(crate:GetDescendants()) do
+		if d:IsA("ProximityPrompt") and d.Enabled and (d.ActionText == "Steal" or d.ActionText == "") then
+			return d
+		end
+	end
+	return nil
+end
+
+local function zoneAllowed(areaId)
+	local area = AreaById[areaId]
+	if Toggles.SmartZones and Toggles.SmartZones.Value and area then
+		local level = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
+		if (area.RecommendedSpeed or 0) > level then
+			return false
+		end
+	end
+	for label, id in pairs(ZoneByLabel) do
+		if id == areaId then
+			return selected(Options.StealZones, label)
+		end
+	end
+	return false
+end
+
+local function pickCrate()
+	local folder = workspace:FindFirstChild("Crates")
+	local root = rootPart()
+	if not (folder and root) then
+		return nil
+	end
+	local best, bestScore
+	local priority = Options.StealPriority and Options.StealPriority.Value or "Best Rarity"
+	for _, crate in ipairs(folder:GetChildren()) do
+		if crate:GetAttribute("IsCrate") ~= false and crate:IsA("Model") then
+			local area, rarity = crateInfo(crate)
+			if area and rarity and zoneAllowed(area) and selected(Options.StealRarities, rarity) then
+				local prompt = stealPrompt(crate)
+				if prompt then
+					local distance = (crate:GetPivot().Position - root.Position).Magnitude
+					local score
+					if priority == "Nearest" then
+						score = -distance
+					else
+						local rank = (AreaById[area] and AreaById[area].Order or 0) * 10
+						for i, tier in ipairs(AreaById[area] and AreaById[area].CrateTiers or {}) do
+							if tier == rarity then
+								rank += i
+							end
+						end
+						score = rank * 100000 - distance
+					end
+					if not bestScore or score > bestScore then
+						best, bestScore = { crate = crate, prompt = prompt, area = area, rarity = rarity }, score
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function returnToSafety()
+	setStatus("Bringing the crate home")
+	travel(safeSpot())
+	local waited = 0
+	while carrying() and waited < 4 do
+		waited += task.wait(0.1) or 0.1
+	end
+end
+
+local function stealOnce()
+	if carrying() then
+		returnToSafety()
+		return true
+	end
+	local target = pickCrate()
+	if not target then
+		setStatus("No crate matches your filters")
+		return false
+	end
+	setStatus("Stealing " .. target.rarity .. " crate in " .. (AreaById[target.area] and AreaById[target.area].DisplayName or target.area))
+	local part = target.prompt.Parent
+	local position = part:IsA("BasePart") and part.Position or target.crate:GetPivot().Position
+	travel(position + Vector3.new(0, 3, 0))
+	if not (target.prompt.Parent and target.prompt.Enabled) then
+		return true
+	end
+	triggerPrompt(target.prompt)
+	local waited = 0
+	while not carrying() and waited < 2.5 do
+		waited += task.wait(0.1) or 0.1
+	end
+	if carrying() then
+		returnToSafety()
+	end
+	return true
+end
+
+---------------------------------------------------------------------------
+-- Plot
+---------------------------------------------------------------------------
+local PlotFullUntil = 0
+
+local function findSpot(floor)
+	local occupied = {}
+	for _, child in ipairs(floor:GetChildren()) do
+		if child.Name == "AppraisingCrate" or child.Name == "ItemStand" then
+			table.insert(occupied, child:GetPivot().Position)
+		end
+	end
+	local halfX, halfZ = floor.Size.X / 2 - 3, floor.Size.Z / 2 - 3
+	local top = floor.Size.Y / 2
+	for x = -halfX, halfX, 3.5 do
+		for z = -halfZ, halfZ, 3.5 do
+			local world = floor.CFrame:PointToWorldSpace(Vector3.new(x, top, z))
+			local free = true
+			for _, p in ipairs(occupied) do
+				local dx, dz = p.X - world.X, p.Z - world.Z
+				if dx * dx + dz * dz < 16 then
+					free = false
+					break
+				end
+			end
+			if free then
+				return world
+			end
+		end
+	end
+	return nil
+end
+
+local function goToPlot(floor)
+	local root = rootPart()
+	if not root then
+		return
+	end
+	local local_ = floor.CFrame:PointToObjectSpace(root.Position)
+	if math.abs(local_.X) < floor.Size.X / 2 + 10 and math.abs(local_.Z) < floor.Size.Z / 2 + 10 and math.abs(local_.Y) < 20 then
+		return
+	end
+	travel(floor.Position + Vector3.new(0, floor.Size.Y / 2 + 4, 0))
+end
+
+local function placeCrates()
+	if os.clock() < PlotFullUntil then
+		return false
+	end
+	local crates = toolsWith("CrateUid")
+	if #crates == 0 then
+		return false
+	end
+	local floor = myFloor()
+	local hum = humanoid()
+	if not (floor and hum and Remotes.re_PLACE_AT) then
+		return false
+	end
+	setStatus("Placing crates on your plot")
+	goToPlot(floor)
+	for _, tool in ipairs(crates) do
+		if not alive() then
+			break
+		end
+		local spot = findSpot(floor)
+		if not spot then
+			PlotFullUntil = os.clock() + 20
+			setStatus("Plot is full")
+			break
+		end
+		pcall(hum.EquipTool, hum, tool)
+		task.wait(0.25)
+		Remotes.re_PLACE_AT:FireServer(spot, 0)
+		local function stillMine()
+			return tool.Parent ~= nil and (tool:IsDescendantOf(LocalPlayer) or tool.Parent == character())
+		end
+		local waited = 0
+		while stillMine() and waited < 2 do
+			waited += task.wait(0.1) or 0.1
+		end
+		if not stillMine() then
+			Session.placed += 1
+		else
+			PlotFullUntil = os.clock() + 20
+			break
+		end
+	end
+	pcall(hum.UnequipTools, hum)
+	return true
+end
+
+local function readyCrates(floor)
+	local list = {}
+	for _, child in ipairs(floor:GetChildren()) do
+		if child.Name == "AppraisingCrate" then
+			for _, d in ipairs(child:GetDescendants()) do
+				if d:IsA("ProximityPrompt") and d.Enabled then
+					table.insert(list, d)
+					break
+				end
+			end
+		end
+	end
+	return list
+end
+
+local function openCrates()
+	local floor = myFloor()
+	if not floor then
+		return false
+	end
+	local prompts = readyCrates(floor)
+	if #prompts == 0 then
+		return false
+	end
+	setStatus("Opening " .. #prompts .. " crate" .. (#prompts == 1 and "" or "s"))
+	for _, prompt in ipairs(prompts) do
+		if not alive() then
+			break
+		end
+		local part = prompt.Parent
+		if part and part:IsA("BasePart") then
+			travel(part.Position + Vector3.new(0, 3, 0))
+		end
+		if triggerPrompt(prompt) then
+			Session.opened += 1
+		end
+		task.wait(0.3)
+	end
+	return true
+end
+
+local function placeBest()
+	if not Remotes.rf_ITEM_LOADOUT then
+		return
+	end
+	pcall(function()
+		Remotes.rf_ITEM_LOADOUT:InvokeServer("placebest")
+	end)
+end
+
+local function signOf(floor, name)
+	local building = floor and floor.Parent
+	return building and building:FindFirstChild(name, true)
+end
+
+local function canAfford(board)
+	if not board then
+		return true
+	end
+	local value = board:GetAttribute("CanAfford")
+	return value == nil or value == true
+end
+
+---------------------------------------------------------------------------
+-- Sell
+---------------------------------------------------------------------------
+local function sellQuote()
+	if not Remotes.rf_SELL_QUOTE then
+		return nil
+	end
+	local ok, quote = pcall(function()
+		return Remotes.rf_SELL_QUOTE:InvokeServer()
+	end)
+	return ok and type(quote) == "table" and quote or nil
+end
+
+local LastSell = 0
+local function sellNow(force)
+	if not Remotes.re_SELL_DO then
+		return false
+	end
+	local mode = Options.SellMode and Options.SellMode.Value or "All"
+	if Toggles.PlaceBestBeforeSell and Toggles.PlaceBestBeforeSell.Value then
+		placeBest()
+	end
+	local quote = sellQuote()
+	if quote then
+		if mode == "All" and (tonumber(quote.AllCount) or 0) <= 0 then
+			return false
+		end
+		if mode == "Held" and not quote.HeldLabel then
+			return false
+		end
+	elseif not force then
+		return false
+	end
+	setStatus("Selling (" .. mode .. ")")
+	local root = rootPart()
+	local back = root and root.Position
+	local teleport = Toggles.SellTeleport and Toggles.SellTeleport.Value
+	if teleport then
+		travel(sellerSpot())
+		task.wait(0.2)
+	end
+	local before = money()
+	Remotes.re_SELL_DO:FireServer(mode == "Held" and "held" or "all")
+	task.wait(1)
+	local gained = money() - before
+	if gained > 0 then
+		Session.earned += gained
+	end
+	Session.sold += mode == "All" and (quote and tonumber(quote.AllCount) or 1) or 1
+	if teleport and back and Toggles.SellReturn and Toggles.SellReturn.Value then
+		travel(back)
+	end
+	LastSell = os.clock()
+	return true
+end
+
+---------------------------------------------------------------------------
+-- Treadmill
+---------------------------------------------------------------------------
+local function myTreadmill()
+	local folder = workspace:FindFirstChild("Treadmills")
+	if not folder then
+		return nil
+	end
+	local own = folder:FindFirstChild("PersonalTreadmill_" .. LocalPlayer.UserId)
+	if own then
+		return own
+	end
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:GetAttribute("OwnerUserId") == LocalPlayer.UserId or child:GetAttribute("RiderUserId") == LocalPlayer.UserId then
+			return child
+		end
+	end
+	return nil
+end
+
+local function mountTreadmill()
+	if onTreadmill() then
+		return true
+	end
+	local treadmill = myTreadmill()
+	local belt = treadmill and treadmill:FindFirstChild("Belt", true)
+	if not belt then
+		setStatus("Treadmill not found")
+		return false
+	end
+	setStatus("Going on the treadmill")
+	travel(belt.Position + Vector3.new(0, belt.Size.Y / 2 + 3, 0))
+	for _, d in ipairs(treadmill:GetDescendants()) do
+		if d:IsA("ProximityPrompt") and d.Enabled then
+			triggerPrompt(d)
+			break
+		end
+	end
+	local root = rootPart()
+	if firetouchinterest and root then
+		pcall(firetouchinterest, root, belt, 0)
+		task.wait()
+		pcall(firetouchinterest, root, belt, 1)
+	end
+	local waited = 0
+	while not onTreadmill() and waited < 2 do
+		waited += task.wait(0.1) or 0.1
+	end
+	return onTreadmill()
+end
+
+---------------------------------------------------------------------------
+-- Trails
+---------------------------------------------------------------------------
+local TrailState = { Owned = {}, Equipped = nil, known = false }
+onNet("TRAIL_STATE", function(state)
+	if type(state) == "table" then
+		TrailState.Owned = type(state.Owned) == "table" and state.Owned or {}
+		TrailState.Equipped = state.Equipped
+		TrailState.known = true
+	end
+end)
+fire("TRAIL_STATE")
+
+local function trailTick()
+	if not TrailState.known then
+		fire("TRAIL_STATE")
+		return
+	end
+	local cash = money()
+	for _, trail in ipairs(Trails) do
+		if not TrailState.Owned[trail.Id] then
+			if (trail.Cost or math.huge) <= cash then
+				fire("TRAIL_BUY", trail.Id)
+				task.wait(0.5)
+				fire("TRAIL_STATE")
+			end
+			break
+		end
+	end
+	if Toggles.AutoEquipTrail and Toggles.AutoEquipTrail.Value then
+		local best
+		for _, trail in ipairs(Trails) do
+			if TrailState.Owned[trail.Id] and (not best or (trail.Multiplier or 0) > (best.Multiplier or 0)) then
+				best = trail
+			end
+		end
+		if best and TrailState.Equipped ~= best.Id then
+			fire("TRAIL_EQUIP", best.Id)
+			TrailState.Equipped = best.Id
+		end
+	end
+end
+
+---------------------------------------------------------------------------
+-- UI
+---------------------------------------------------------------------------
+local Window = Library:CreateWindow({
+	Title = "Corvus",
+	Author = "Cinek",
+	Theme = "Corvus Silver",
+	Icon = "corvus",
+	Footer = "Steal From The Rich",
+	FooterGame = true,
+	FooterLink = Discord,
+	NotifySide = "Right",
+	ShowCustomCursor = false,
+	ToggleKeybind = Enum.KeyCode.Z,
+	Center = true,
+	AutoShow = true,
+})
+
+local function addTab(name, icon, description)
+	if Window.AddInfoTab then
+		return Window:AddTab({ Name = name, Icon = icon, Description = description })
+	end
+	return Window:AddTab(name, icon)
+end
+
+local Tabs = {}
+if Window.AddInfoTab then
+	pcall(function()
+		Tabs.Info = Window:AddInfoTab({
+			Discord = Discord,
+			DiscordAvatar = "corvus-square",
+			DiscordBanner = "corvus-banner",
+			DiscordTitle = "Corvus",
+			DiscordDescription = "Keyless scripts, updates and support",
+		})
+	end)
+end
+Tabs.Main = addTab("Main", "swords", "Auto steal and auto sell")
+Tabs.Plot = addTab("Plot", "house", "Crates, upgrades and the treadmill")
+Tabs.Meta = addTab("Meta", "sparkles", "Index rewards and trails")
+Tabs.Stats = addTab("Stats", "chart-column", "Session progress")
+if Window.AddMiscTab then
+	pcall(function()
+		Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
+	end)
+end
+
+-- Steal
+local StealBox = Tabs.Main:AddLeftGroupbox("Steal", "hand")
+StealBox:AddToggle("AutoSteal", {
+	Text = "Auto Steal",
+	Default = false,
+	Tooltip = "Steals crates that match your filters and brings them back to the safe zone",
+})
+StealBox:AddDropdown("StealZones", {
+	Text = "Zone Filter",
+	Values = ZoneLabels,
+	Default = { ZoneLabels[1] },
+	Multi = true,
+	Searchable = true,
+	Tooltip = "Which zones to steal from",
+})
+StealBox:AddDropdown("StealRarities", {
+	Text = "Rarity Filter",
+	Values = RarityList,
+	Default = RarityList,
+	Multi = true,
+	Searchable = true,
+	Tooltip = "Which crate rarities to steal",
+})
+StealBox:AddDropdown("StealPriority", {
+	Text = "Priority",
+	Values = { "Best Rarity", "Nearest" },
+	Default = "Best Rarity",
+	Tooltip = "Best Rarity goes for the most valuable crate first",
+})
+StealBox:AddToggle("SmartZones", {
+	Text = "Only Zones I Can Escape",
+	Default = false,
+	Tooltip = "Skips zones whose recommended speed is above your speed level",
+})
+StealBox:AddButton({
+	Text = "Go To Safe Zone",
+	Func = function()
+		task.spawn(travel, safeSpot())
+	end,
+})
+
+local MoveBox = Tabs.Main:AddLeftGroupbox("Movement", "plane")
+MoveBox:AddDropdown("TravelMode", {
+	Text = "Travel Mode",
+	Values = { "Fly", "Teleport" },
+	Default = "Fly",
+	Tooltip = "Fly moves smoothly through the map, Teleport is instant",
+})
+MoveBox:AddSlider("TravelSpeed", {
+	Text = "Fly Speed",
+	Default = 350,
+	Min = 50,
+	Max = 2000,
+	Rounding = 0,
+	Suffix = " studs/s",
+})
+
+-- Sell
+local SellBox = Tabs.Main:AddRightGroupbox("Sell", "banknote")
+SellBox:AddToggle("AutoSell", { Text = "Auto Sell", Default = false, Tooltip = "Sells your items every interval" })
+SellBox:AddToggle("SellTeleport", { Text = "Teleport to Seller while Selling", Default = true })
+SellBox:AddToggle("SellReturn", { Text = "Return After Selling", Default = true, Tooltip = "Goes back to where you were after selling" })
+SellBox:AddToggle("PlaceBestBeforeSell", {
+	Text = "Place Best Before Selling",
+	Default = true,
+	Tooltip = "Puts your best items on the plot first so they are never sold",
+})
+SellBox:AddDropdown("SellMode", { Text = "Sell Mode", Values = { "All", "Held" }, Default = "All" })
+SellBox:AddSlider("SellInterval", { Text = "Sell Every", Default = 30, Min = 5, Max = 300, Rounding = 0, Suffix = "s" })
+SellBox:AddButton({
+	Text = "Sell Now",
+	Func = function()
+		task.spawn(sellNow, true)
+	end,
+})
+
+local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+local StatusLabel = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+
+-- Plot
+local PlotBox = Tabs.Plot:AddLeftGroupbox("Plot", "house")
+PlotBox:AddToggle("AutoPlace", { Text = "Auto Place", Default = false, Tooltip = "Places stolen crates on your plot" })
+PlotBox:AddToggle("AutoOpen", { Text = "Auto Open", Default = false, Tooltip = "Opens crates on your plot when they are ready" })
+PlotBox:AddToggle("AutoEquipBest", { Text = "Auto Equip Best", Default = false, Tooltip = "Keeps your best items on the plot" })
+PlotBox:AddToggle("AutoBuySlot", { Text = "Auto Buy +1 Equip", Default = false, Tooltip = "Buys extra item slots with cash" })
+PlotBox:AddToggle("AutoUpgradePlot", { Text = "Auto Upgrade Plot", Default = false })
+PlotBox:AddButton({
+	Text = "Go To Plot",
+	Func = function()
+		local floor = myFloor()
+		if floor then
+			task.spawn(travel, floor.Position + Vector3.new(0, floor.Size.Y / 2 + 4, 0))
+		end
+	end,
+})
+
+local TreadBox = Tabs.Plot:AddRightGroupbox("Treadmill", "gauge")
+TreadBox:AddToggle("AutoTreadmill", {
+	Text = "Auto Go On Treadmill",
+	Default = false,
+	Tooltip = "Trains on your treadmill whenever nothing else needs doing",
+})
+TreadBox:AddToggle("AutoUpgradeTreadmill", { Text = "Auto Upgrade Treadmill", Default = false })
+
+-- Meta
+local MetaBox = Tabs.Meta:AddLeftGroupbox("Meta", "sparkles")
+MetaBox:AddToggle("AutoIndex", { Text = "Auto Claim Index", Default = false, Tooltip = "Claims every finished index reward" })
+MetaBox:AddToggle("AutoTrails", { Text = "Auto Buy Trails", Default = false, Tooltip = "Buys the next trail as soon as you can afford it" })
+MetaBox:AddToggle("AutoEquipTrail", { Text = "Auto Equip Best Trail", Default = true })
+
+-- Stats
+local StatBox = Tabs.Stats:AddLeftGroupbox("Session", "chart-column")
+local StatLabels = {}
+for _, key in ipairs({ "Money", "Income", "Speed", "Stolen", "Placed", "Opened", "Sold", "Earned", "Time" }) do
+	StatLabels[key] = StatBox:AddLabel({ Text = key .. ": -", DoesWrap = true })
+end
+
+if Window.AddSettingsTab then
+	Tabs.Settings = Window:AddSettingsTab({
+		ThemeManager = ThemeManager,
+		SaveManager = SaveManager,
+		Folder = "StealFromTheRich",
+		MenuKeybind = "Z",
+	})
+else
+	Tabs.Settings = Window:AddTab("Settings", "settings")
+	pcall(function()
+		ThemeManager:SetLibrary(Library)
+		SaveManager:SetLibrary(Library)
+		SaveManager:IgnoreThemeSettings()
+		SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+		ThemeManager:SetFolder("Corvus")
+		SaveManager:SetFolder("Corvus/StealFromTheRich")
+		SaveManager:BuildConfigSection(Tabs.Settings)
+		ThemeManager:ApplyToTab(Tabs.Settings)
+		SaveManager:LoadAutoloadConfig()
+	end)
+end
+
+if Window.AddInfoTab then
+	local DonateMethods = {
+		{ Id = "PayPal", Icon = "pay-paypal", Symbol = "PP", Name = "PayPal", Network = "paypal.me", Address = "https://paypal.me/KrystianKujawski73", Display = "KrystianKujawski73", Link = true, Color = "#0070e0", Note = "Paste the link in your browser and pick any amount" },
+		{ Id = "BTC", Icon = "pay-btc", Symbol = "BTC", Name = "Bitcoin", Network = "Bitcoin network", Address = "bc1q787972ksk3auu2d37gju8m6je0kx9mmskglsvh", Color = "#f7931a", Note = "Only send BTC on the Bitcoin network" },
+		{ Id = "ETH", Icon = "pay-eth", Symbol = "ETH", Name = "Ethereum", Network = "ERC20", Address = "0xBa0e07FdDB15fe3c9B7CE42F76cef8F09FEdAB64", Color = "#627eea", Note = "Only send ETH or ERC20 tokens on Ethereum" },
+		{ Id = "SOL", Icon = "pay-sol", Symbol = "SOL", Name = "Solana", Network = "Solana", Address = "4UriDCT4iBsLAuzLdowpSEL4mZq7Ecrxs4pNrV5ztHxW", Color = "#9945ff", Note = "Only send SOL or Solana tokens" },
+		{ Id = "BNB", Icon = "pay-bnb", Symbol = "BNB", Name = "BNB", Network = "BNB Smart Chain", Address = "0xBa0e07FdDB15fe3c9B7CE42F76cef8F09FEdAB64", Color = "#f0b90b", Note = "Only send on BNB Smart Chain (BEP20)" },
+	}
+	for _, tab in ipairs({ Tabs.Info, Tabs.Main, Tabs.Plot, Tabs.Meta, Tabs.Stats, Tabs.Misc, Tabs.Settings }) do
+		pcall(function()
+			local left = tab == Tabs.Info and tab.Groupboxes.Community or nil
+			if left then
+				left.BoxHolder.Parent = tab.Sides[1]
+			else
+				left = tab:AddLeftGroupbox("Community", "users")
+				left:AddCommunityStrip({ Invite = Discord, Title = "Corvus Community", Description = "Updates, support and new scripts" })
+			end
+			left:AddLabel({ Text = '<font color="#60d696">All Corvus scripts are keyless and free.</font> <font transparency="0.35">Want your own script for any game? We make custom paid scripts on request, open a ticket on our Discord.</font>', DoesWrap = true })
+			local right = tab:AddRightGroupbox("Support Corvus", "heart")
+			right:AddDonateBoard({ Methods = DonateMethods })
+			right:AddLabel({ Text = '<font transparency="0.35">Donations are 100% voluntary, nothing is locked behind them. They help keep Corvus updated.</font>', DoesWrap = true })
+			left.BoxHolder.LayoutOrder = -100
+			right.BoxHolder.LayoutOrder = -100
+		end)
+	end
+end
+
+pcall(function()
+	Library.RenderOverlayInfo = function()
+		return string.format("%s crates stolen  \u{00B7}  $%s earned", formatNumber(Session.stolen), formatNumber(Session.earned))
+	end
+end)
+
+local function on(name)
+	local t = Toggles[name]
+	return t ~= nil and t.Value == true
+end
+
+---------------------------------------------------------------------------
+-- Loops
+---------------------------------------------------------------------------
+-- Main worker: one task at a time so movement never fights itself
+task.spawn(function()
+	while alive() do
+		local ok, err = pcall(function()
+			if not rootPart() then
+				setStatus("Waiting for character")
+				return
+			end
+			if carrying() and on("AutoSteal") then
+				returnToSafety()
+				return
+			end
+			if on("AutoPlace") and #toolsWith("CrateUid") > 0 and os.clock() >= PlotFullUntil then
+				if placeCrates() then
+					return
+				end
+			end
+			if on("AutoOpen") then
+				local floor = myFloor()
+				if floor and #readyCrates(floor) > 0 then
+					openCrates()
+					return
+				end
+			end
+			if on("AutoSell") and os.clock() - LastSell >= (Options.SellInterval and Options.SellInterval.Value or 30) then
+				LastSell = os.clock()
+				if sellNow(false) then
+					return
+				end
+			end
+			if on("AutoSteal") then
+				if stealOnce() then
+					return
+				end
+			end
+			if on("AutoTreadmill") then
+				if not onTreadmill() then
+					mountTreadmill()
+				else
+					setStatus("Training on the treadmill")
+				end
+				return
+			end
+			setStatus("Idle")
+		end)
+		if not ok then
+			setStatus("Error: " .. tostring(err))
+		end
+		task.wait(0.25)
+	end
+end)
+
+-- Background upgrades and claims (no movement needed)
+task.spawn(function()
+	local last = { index = 0, trails = 0, best = 0, slot = 0, plot = 0, tread = 0 }
+	while alive() do
+		pcall(function()
+			local now = os.clock()
+			local floor = myFloor()
+			if on("AutoIndex") and now - last.index > 10 then
+				last.index = now
+				fire("INDEX_CLAIM_ALL")
+			end
+			if on("AutoTrails") and now - last.trails > 4 then
+				last.trails = now
+				trailTick()
+			end
+			if on("AutoEquipBest") and now - last.best > 15 then
+				last.best = now
+				task.spawn(placeBest)
+			end
+			if floor and on("AutoBuySlot") and now - last.slot > 6 and Remotes.re_PLOT_UPGRADE then
+				last.slot = now
+				Remotes.re_PLOT_UPGRADE:FireServer(floor, true)
+			end
+			if floor and on("AutoUpgradePlot") and now - last.plot > 3 and Remotes.re_PLOT_UPGRADE then
+				if canAfford(signOf(floor, "UpgradeSignBoard")) then
+					last.plot = now
+					Remotes.re_PLOT_UPGRADE:FireServer(floor)
+				end
+			end
+			if floor and on("AutoUpgradeTreadmill") and now - last.tread > 3 and Remotes.re_TREADMILL_UPGRADE then
+				if canAfford(signOf(floor, "TreadmillSignBoard")) then
+					last.tread = now
+					Remotes.re_TREADMILL_UPGRADE:FireServer(floor)
+				end
+			end
+		end)
+		task.wait(0.5)
+	end
+end)
+
+-- UI refresh
+task.spawn(function()
+	while alive() do
+		pcall(function()
+			Session.startMoney = Session.startMoney or money()
+			local elapsed = math.floor(os.clock() - Session.started)
+			StatusLabel:SetText(Status)
+			StatLabels.Money:SetText("Money: $" .. formatNumber(money()))
+			StatLabels.Income:SetText("Income: $" .. formatNumber(LocalPlayer:GetAttribute("IncomePerSecond") or 0) .. "/s")
+			StatLabels.Speed:SetText("Speed level: " .. formatNumber(LocalPlayer:GetAttribute("SpeedLevel") or 0))
+			StatLabels.Stolen:SetText("Crates stolen: " .. Session.stolen)
+			StatLabels.Placed:SetText("Crates placed: " .. Session.placed)
+			StatLabels.Opened:SetText("Crates opened: " .. Session.opened)
+			StatLabels.Sold:SetText("Items sold: " .. Session.sold)
+			StatLabels.Earned:SetText("Earned from selling: $" .. formatNumber(Session.earned))
+			StatLabels.Time:SetText(string.format("Session: %dh %02dm %02ds", elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60))
+		end)
+		task.wait(0.5)
+	end
+end)
+
+pcall(function()
+	Tabs.Main:Show()
+end)
+
+do
+	local key = "Z"
+	pcall(function()
+		if Options.MenuKeybind and Options.MenuKeybind.Value then
+			key = tostring(Options.MenuKeybind.Value)
+		end
+	end)
+	notify("Corvus", if Library.IsMobile then "Loaded and ready. The round Corvus button opens and closes the hub." else "Loaded. Press " .. key .. " to hide or show the menu.", 5)
+end
+end, debug.traceback)
+
+Boot.CorvusBooting = nil
+if not BootOk then
+	warn("[Corvus] Steal From The Rich failed to start:\n" .. tostring(BootError))
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("SendNotification", {
+			Title = "Corvus error",
+			Text = "Hub failed to start. Press F9 and send the red [Corvus] line.",
+			Duration = 15,
+		})
+	end)
+end
