@@ -29934,7 +29934,7 @@ local function onNet(name, fn)
 end
 
 local Remotes = {}
-for _, name in ipairs({ "re_PLACE_AT", "re_PLOT_UPGRADE", "re_TREADMILL_UPGRADE", "re_SELL_DO", "rf_SELL_QUOTE", "rf_ITEM_LOADOUT" }) do
+for _, name in ipairs({ "re_PLACE_AT", "re_PLOT_UPGRADE", "re_TREADMILL_UPGRADE", "re_SELL_DO", "rf_SELL_QUOTE", "rf_ITEM_LOADOUT", "rf_CRATE_TIMERS" }) do
 	Remotes[name] = ReplicatedStorage:WaitForChild(name, 10)
 end
 
@@ -29987,19 +29987,31 @@ do
 	end)
 end
 
-local AreaById, ZoneLabels, ZoneByLabel, RarityList, RarityRank = {}, {}, {}, {}, {}
+local AreaById, ZoneLabels, ZoneByLabel = {}, {}, {}
 for index, area in ipairs(Areas) do
 	AreaById[area.Id] = area
 	area.Order = area.Order or index
 	local label = area.Id .. " - " .. (area.DisplayName or area.Id)
 	table.insert(ZoneLabels, label)
 	ZoneByLabel[label] = area.Id
-	for tierIndex, tier in ipairs(area.CrateTiers or {}) do
-		local rank = area.Order * 10 + tierIndex
-		if not RarityRank[tier] then
-			table.insert(RarityList, tier)
+end
+
+-- Crate names use the item tiers (ItemData.Tiers), e.g. Crate_MafiaBoss_Rare_N1,
+-- not the per-zone AreaData.CrateTiers
+local RarityList, RarityRank = {}, {}
+do
+	local ItemData = safeRequire("Shared.Data.ItemData")
+	for _, tier in ipairs(ItemData and type(ItemData.Tiers) == "table" and ItemData.Tiers or {}) do
+		local name = type(tier) == "table" and tier.Name or tier
+		if type(name) == "string" then
+			table.insert(RarityList, name)
 		end
-		RarityRank[tier] = math.max(RarityRank[tier] or 0, rank)
+	end
+	if #RarityList == 0 then
+		RarityList = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Cosmic", "Secret", "Eternal", "Divine" }
+	end
+	for i, name in ipairs(RarityList) do
+		RarityRank[name] = i
 	end
 end
 
@@ -30244,16 +30256,40 @@ end
 
 -- The game's own speed (LBTHDevSpeedClient): RunSpeed studs/s, and
 -- SpeedData.Modifiers.Carrying (0.82) of that while carrying a stolen crate
+-- While carrying, the crate's own carry multiplier is the CarryStat attribute
+-- (rolled per crate size, 0.5 to 0.94), not a fixed 0.82
 local function runSpeed()
 	local run = tonumber(LocalPlayer:GetAttribute("RunSpeed")) or 0
+	local hum = humanoid()
 	if run <= 0 then
-		local hum = humanoid()
 		run = hum and hum.WalkSpeed or 16
 	end
 	if carrying() then
-		run *= 0.82
+		run *= tonumber(LocalPlayer:GetAttribute("CarryStat")) or 0.82
 	end
-	return math.max(run * 0.97, 12)
+	if hum and hum.WalkSpeed > 0 then
+		run = math.min(run, hum.WalkSpeed)
+	end
+	return math.max(run * 0.95, 8)
+end
+
+-- Height the character stands at on the ground below a point (the server runs an
+-- AntiFlyService, so Safe travel keeps the feet on the ground)
+local GroundParams = RaycastParams.new()
+GroundParams.FilterType = Enum.RaycastFilterType.Exclude
+local function groundHeight(position)
+	local char = character()
+	local root = rootPart()
+	local hum = humanoid()
+	if not (char and root) then
+		return nil
+	end
+	GroundParams.FilterDescendantsInstances = { char }
+	local hit = workspace:Raycast(position + Vector3.new(0, 12, 0), Vector3.new(0, -60, 0), GroundParams)
+	if not hit then
+		return nil
+	end
+	return hit.Position.Y + root.Size.Y / 2 + (hum and hum.HipHeight or 2)
 end
 
 -- options.mode overrides the Travel Mode setting, options.keepGoing stops the
@@ -30289,6 +30325,7 @@ local function travel(target, options)
 	local expected = nil
 	local started = os.clock()
 	while alive() do
+		local dt = RunService.Heartbeat:Wait()
 		root = rootPart()
 		if not root or not keepGoing() then
 			return false
@@ -30296,30 +30333,24 @@ local function travel(target, options)
 		local position = root.Position
 		if expected and (position - expected).Magnitude > 6 then
 			pulledBack += 1
-			if fast then
-				slowdown *= 0.6
-			end
-			if pulledBack >= 4 then
-				setStatus(if fast then "The game keeps moving you back, lower Fast Fly Speed" else "The game keeps moving you back")
+			slowdown *= 0.7
+			if pulledBack >= 6 then
+				setStatus("The game keeps moving you back")
+				return false
 			end
 		end
-		local delta = target - position
+		local delta = Vector3.new(target.X - position.X, 0, target.Z - position.Z)
 		local distance = delta.Magnitude
 		if distance < 1.5 then
 			break
 		end
-		local speed
-		if fast then
-			speed = (Options.TravelSpeed and Options.TravelSpeed.Value or 150) * slowdown
-		else
-			speed = runSpeed()
-		end
+		local speed = (if fast then (Options.TravelSpeed and Options.TravelSpeed.Value or 150) else runSpeed()) * slowdown
 		if os.clock() - started > distance / math.max(speed, 1) + 15 then
 			return false
 		end
-		local dt = RunService.Heartbeat:Wait()
-		local step = math.min(distance, speed * dt)
-		expected = position + delta.Unit * step
+		local nextPosition = position + delta.Unit * math.min(distance, speed * dt)
+		local ground = groundHeight(nextPosition)
+		expected = Vector3.new(nextPosition.X, ground or target.Y, nextPosition.Z)
 		root.CFrame = CFrame.new(expected) * root.CFrame.Rotation
 		root.AssemblyLinearVelocity = Vector3.zero
 	end
@@ -30353,7 +30384,18 @@ local function stealPrompt(crate)
 	return nil
 end
 
+-- rev_ChaseCaught(areaId) tells the client which zone's guard caught it
+local ZoneBackoff = {}
+onNet("ChaseCaught", function(areaId)
+	if areaId ~= nil then
+		ZoneBackoff[tostring(areaId)] = os.clock() + 90
+	end
+end)
+
 local function zoneAllowed(areaId)
+	if (ZoneBackoff[areaId] or 0) > os.clock() then
+		return false
+	end
 	local area = AreaById[areaId]
 	if Toggles.SmartZones and Toggles.SmartZones.Value and area then
 		local level = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
@@ -30369,7 +30411,7 @@ local function zoneAllowed(areaId)
 	return false
 end
 
-local FailedCrates = setmetatable({}, { __mode = "k" })
+local FailedCrates = {}
 
 local function pickCrate()
 	local folder = workspace:FindFirstChild("Crates")
@@ -30380,7 +30422,7 @@ local function pickCrate()
 	local best, bestScore
 	local priority = Options.StealPriority and Options.StealPriority.Value or "Best Rarity"
 	for _, crate in ipairs(folder:GetChildren()) do
-		if crate:GetAttribute("IsCrate") ~= false and crate:IsA("Model") and (FailedCrates[crate] or 0) < os.clock() then
+		if crate:GetAttribute("IsCrate") ~= false and crate:IsA("Model") and (FailedCrates[crate.Name] or 0) < os.clock() then
 			local area, rarity = crateInfo(crate)
 			if area and rarity and zoneAllowed(area) and selected(Options.StealRarities, rarity) then
 				local prompt = stealPrompt(crate)
@@ -30390,12 +30432,7 @@ local function pickCrate()
 					if priority == "Nearest" then
 						score = -distance
 					else
-						local rank = (AreaById[area] and AreaById[area].Order or 0) * 10
-						for i, tier in ipairs(AreaById[area] and AreaById[area].CrateTiers or {}) do
-							if tier == rarity then
-								rank += i
-							end
-						end
+						local rank = (AreaById[area] and AreaById[area].Order or 0) * 100 + (RarityRank[rarity] or 0)
 						score = rank * 100000 - distance
 					end
 					if not bestScore or score > bestScore then
@@ -30414,6 +30451,8 @@ end
 
 -- A stolen crate is carried home at your own run speed: from far zones the
 -- game does not accept a teleport while carrying and keeps putting you back
+local ReturnFails, LastStealArea = 0, nil
+
 local function returnToSafety()
 	local before = bankedCrates()
 	local mode = Options.CarryMode and Options.CarryMode.Value == "Teleport" and "Teleport" or "Safe"
@@ -30426,10 +30465,25 @@ local function returnToSafety()
 		return not carrying()
 	end, 3)
 	if carrying() then
-		setStatus("Could not reach the safe zone")
-	elseif bankedCrates() > before or (rootPart() and rootPart().Position.X >= 2424) then
+		ReturnFails += 1
+		setStatus("Could not reach the safe zone (" .. ReturnFails .. ")")
+		if ReturnFails >= 2 then
+			-- same call as the game's own Drop button (LBTHStolenGoodsUI)
+			fire("CRATE_DROP")
+			if LastStealArea then
+				ZoneBackoff[LastStealArea] = os.clock() + 120
+			end
+			ReturnFails = 0
+			setStatus("Dropped the crate, it could not be brought home")
+		end
+	elseif bankedCrates() > before or LocalPlayer:GetAttribute("InSafeZone") == true then
+		ReturnFails = 0
 		setStatus("Crate brought home")
 	else
+		ReturnFails = 0
+		if LastStealArea then
+			ZoneBackoff[LastStealArea] = os.clock() + 90
+		end
 		setStatus("The guard took the crate back")
 	end
 end
@@ -30448,17 +30502,18 @@ local function stealOnce()
 	local position = promptPosition(target.prompt) or target.crate:GetPivot().Position
 	local spot = position + Vector3.new(0, 2, 0)
 	if not travel(spot) and not travel(spot, { mode = "Safe" }) then
-		FailedCrates[target.crate] = os.clock() + 20
+		FailedCrates[target.crate.Name] = os.clock() + 20
 		return true
 	end
 	if not (target.prompt.Parent and target.prompt.Enabled) then
 		return true
 	end
 	setStatus("Holding Steal on " .. target.rarity .. " crate")
+	LastStealArea = target.area
 	if triggerPrompt(target.prompt, carrying) or carrying() then
 		returnToSafety()
 	else
-		FailedCrates[target.crate] = os.clock() + 20
+		FailedCrates[target.crate.Name] = os.clock() + 20
 		setStatus("Could not steal: " .. (PromptIssue or "the server refused it") .. ". Trying another crate")
 	end
 	return true
@@ -30555,14 +30610,49 @@ local function placeCrates()
 	return true
 end
 
+-- The game's Crates panel (LBTHCrateTimersClient) opens crates without walking:
+-- rf_CRATE_TIMERS:InvokeServer("list") -> { {Uid, Ready, ...} }, then ("open", Uid)
+local OpenedUid = {}
+local function openCratesRemote()
+	local remote = Remotes.rf_CRATE_TIMERS
+	if not remote then
+		return nil
+	end
+	local ok, list = pcall(function()
+		return remote:InvokeServer("list")
+	end)
+	if not ok or type(list) ~= "table" then
+		return nil
+	end
+	local opened = 0
+	local now = os.clock()
+	for _, entry in ipairs(list) do
+		if type(entry) == "table" and entry.Ready == true and entry.Uid ~= nil and (OpenedUid[entry.Uid] or 0) < now then
+			OpenedUid[entry.Uid] = now + 8
+			pcall(function()
+				remote:InvokeServer("open", entry.Uid)
+			end)
+			opened += 1
+			Session.opened += 1
+			task.wait(0.25)
+		end
+	end
+	return opened
+end
+
+local OpenFailUntil = {}
 local function readyCrates(floor)
 	local list = {}
+	local now = os.clock()
 	for _, child in ipairs(floor:GetChildren()) do
 		if child.Name == "AppraisingCrate" then
-			for _, d in ipairs(child:GetDescendants()) do
-				if d:IsA("ProximityPrompt") and d.Enabled then
-					table.insert(list, d)
-					break
+			local key = tostring(child:GetAttribute("PlacementUid") or child:GetFullName())
+			if (OpenFailUntil[key] or 0) < now then
+				for _, d in ipairs(child:GetDescendants()) do
+					if d:IsA("ProximityPrompt") and d.Enabled and d.ActionText == "Open Crate" then
+						table.insert(list, { prompt = d, key = key })
+						break
+					end
 				end
 			end
 		end
@@ -30570,26 +30660,29 @@ local function readyCrates(floor)
 	return list
 end
 
+-- Fallback when rf_CRATE_TIMERS is missing: walk to each ready crate and hold its prompt
 local function openCrates()
 	local floor = myFloor()
 	if not floor then
 		return false
 	end
-	local prompts = readyCrates(floor)
-	if #prompts == 0 then
+	local ready = readyCrates(floor)
+	if #ready == 0 then
 		return false
 	end
-	setStatus("Opening " .. #prompts .. " crate" .. (#prompts == 1 and "" or "s"))
-	for _, prompt in ipairs(prompts) do
+	setStatus("Opening " .. #ready .. " crate" .. (#ready == 1 and "" or "s"))
+	for _, entry in ipairs(ready) do
 		if not alive() then
 			break
 		end
-		local position = promptPosition(prompt)
+		local position = promptPosition(entry.prompt)
 		if position then
 			travel(position + Vector3.new(0, 2, 0))
 		end
-		if triggerPrompt(prompt) then
+		if triggerPrompt(entry.prompt) then
 			Session.opened += 1
+		else
+			OpenFailUntil[entry.key] = os.clock() + 30
 		end
 		task.wait(0.3)
 	end
@@ -30631,6 +30724,25 @@ local function sellQuote()
 	return ok and type(quote) == "table" and quote or nil
 end
 
+local LastSellResult = nil
+onNet("SellResult", function(result)
+	LastSellResult = result
+end)
+
+local function sellOnce(kind)
+	LastSellResult = nil
+	Remotes.re_SELL_DO:FireServer(kind)
+	waitFor(function()
+		return LastSellResult ~= nil
+	end, 4)
+	local result = LastSellResult
+	if type(result) == "table" and result.Ok then
+		Session.earned += tonumber(result.Total) or 0
+		return true, result
+	end
+	return false, result
+end
+
 local LastSell = 0
 local function sellNow(force)
 	if not Remotes.re_SELL_DO then
@@ -30640,15 +30752,20 @@ local function sellNow(force)
 	if Toggles.PlaceBestBeforeSell and Toggles.PlaceBestBeforeSell.Value then
 		placeBest()
 	end
+	local items = toolsWith("ItemUid")
 	local quote = sellQuote()
-	if quote then
-		if mode == "All" and (tonumber(quote.AllCount) or 0) <= 0 then
+	if mode == "All" then
+		if quote and (tonumber(quote.AllCount) or 0) <= 0 and not force then
 			return false
 		end
-		if mode == "Held" and not quote.HeldLabel then
-			return false
+		-- "all" also sells unopened crates at 35% (ItemData.Sell.CrateBlindFactor)
+		if #toolsWith("CrateUid") > 0 and not (Toggles.SellCrates and Toggles.SellCrates.Value) then
+			if not force then
+				setStatus("Not selling: you carry unopened crates (turn on Sell Unopened Crates)")
+				return false
+			end
 		end
-	elseif not force then
+	elseif #items == 0 then
 		return false
 	end
 	setStatus("Selling (" .. mode .. ")")
@@ -30659,14 +30776,32 @@ local function sellNow(force)
 		travel(sellerSpot())
 		task.wait(0.2)
 	end
-	local before = money()
-	Remotes.re_SELL_DO:FireServer(mode == "Held" and "held" or "all")
-	task.wait(1)
-	local gained = money() - before
-	if gained > 0 then
-		Session.earned += gained
+	if mode == "All" then
+		local ok = sellOnce("all")
+		if ok then
+			Session.sold += quote and tonumber(quote.AllCount) or 1
+		else
+			setStatus("Sell failed: " .. tostring(type(LastSellResult) == "table" and LastSellResult.Text or "no answer from the seller"))
+		end
+	else
+		-- Held: equip each item and sell it on its own, crates are never sold
+		local hum = humanoid()
+		for _, tool in ipairs(items) do
+			if not alive() or not hum then
+				break
+			end
+			if tool.Parent then
+				pcall(hum.EquipTool, hum, tool)
+				task.wait(0.2)
+				if sellOnce("held") then
+					Session.sold += 1
+				end
+			end
+		end
+		pcall(function()
+			hum:UnequipTools()
+		end)
 	end
-	Session.sold += mode == "All" and (quote and tonumber(quote.AllCount) or 1) or 1
 	if teleport and back and Toggles.SellReturn and Toggles.SellReturn.Value then
 		travel(back)
 	end
@@ -30738,6 +30873,23 @@ onNet("TRAIL_STATE", function(state)
 end)
 fire("TRAIL_STATE")
 
+local function equipBestTrail()
+	if not TrailState.known then
+		fire("TRAIL_STATE")
+		return
+	end
+	local best
+	for _, trail in ipairs(Trails) do
+		if TrailState.Owned[trail.Id] and (not best or (trail.Multiplier or 0) > (best.Multiplier or 0)) then
+			best = trail
+		end
+	end
+	if best and TrailState.Equipped ~= best.Id then
+		fire("TRAIL_EQUIP", best.Id)
+		TrailState.Equipped = best.Id
+	end
+end
+
 local function trailTick()
 	if not TrailState.known then
 		fire("TRAIL_STATE")
@@ -30752,18 +30904,6 @@ local function trailTick()
 				fire("TRAIL_STATE")
 			end
 			break
-		end
-	end
-	if Toggles.AutoEquipTrail and Toggles.AutoEquipTrail.Value then
-		local best
-		for _, trail in ipairs(Trails) do
-			if TrailState.Owned[trail.Id] and (not best or (trail.Multiplier or 0) > (best.Multiplier or 0)) then
-				best = trail
-			end
-		end
-		if best and TrailState.Equipped ~= best.Id then
-			fire("TRAIL_EQUIP", best.Id)
-			TrailState.Equipped = best.Id
 		end
 	end
 end
@@ -30895,7 +31035,17 @@ SellBox:AddToggle("PlaceBestBeforeSell", {
 	Default = true,
 	Tooltip = "Puts your best items on the plot first so they are never sold",
 })
-SellBox:AddDropdown("SellMode", { Text = "Sell Mode", Values = { "All", "Held" }, Default = "All" })
+SellBox:AddDropdown("SellMode", {
+	Text = "Sell Mode",
+	Values = { "All", "Held" },
+	Default = "All",
+	Tooltip = "All sells everything you carry. Held sells your items one by one and never sells crates.",
+})
+SellBox:AddToggle("SellCrates", {
+	Text = "Sell Unopened Crates",
+	Default = false,
+	Tooltip = "Sell All also sells crates you have not opened yet, for only 35% of their value",
+})
 SellBox:AddSlider("SellInterval", { Text = "Sell Every", Default = 30, Min = 5, Max = 300, Rounding = 0, Suffix = "s" })
 SellBox:AddButton({
 	Text = "Sell Now",
@@ -31025,7 +31175,7 @@ task.spawn(function()
 					return
 				end
 			end
-			if on("AutoOpen") then
+			if on("AutoOpen") and not Remotes.rf_CRATE_TIMERS then
 				local floor = myFloor()
 				if floor and #readyCrates(floor) > 0 then
 					openCrates()
@@ -31062,7 +31212,7 @@ end)
 
 -- Background upgrades and claims (no movement needed)
 task.spawn(function()
-	local last = { index = 0, trails = 0, best = 0, slot = 0, plot = 0, tread = 0 }
+	local last = { index = 0, trails = 0, equip = 0, open = 0, best = 0, slot = 0, plot = 0, tread = 0 }
 	while alive() do
 		pcall(function()
 			local now = os.clock()
@@ -31074,6 +31224,14 @@ task.spawn(function()
 			if on("AutoTrails") and now - last.trails > 4 then
 				last.trails = now
 				trailTick()
+			end
+			if on("AutoEquipTrail") and now - last.equip > 5 then
+				last.equip = now
+				equipBestTrail()
+			end
+			if on("AutoOpen") and Remotes.rf_CRATE_TIMERS and now - last.open > 3 then
+				last.open = now
+				task.spawn(openCratesRemote)
 			end
 			if on("AutoEquipBest") and now - last.best > 15 then
 				last.best = now
