@@ -30668,7 +30668,7 @@ end
 ---------------------------------------------------------------------------
 -- Stats
 ---------------------------------------------------------------------------
-local Session = { stolen = 0, opened = 0, placed = 0, sold = 0, earned = 0, started = os.clock(), startMoney = nil, rarities = {}, orbs = 0, claimed = 0, bought = 0 }
+local Session = { stolen = 0, opened = 0, placed = 0, sold = 0, earned = 0, started = os.clock(), startMoney = nil, rarities = {}, zones = {}, orbs = 0, claimed = 0, bought = 0 }
 
 -- Listeners for things worth reporting (Discord webhook); set further down
 local Events = {}
@@ -30677,6 +30677,290 @@ local function emit(name, ...)
 	if fn then
 		task.spawn(pcall, fn, ...)
 	end
+end
+
+---------------------------------------------------------------------------
+-- Analytics (same design as Pets Universe): all-time stats and goals saved to
+-- Corvus/SFTR_stats.json, 24 h of rate history in Corvus/SFTR_metrics.json,
+-- chart events and the live feed
+---------------------------------------------------------------------------
+local HttpService = game:GetService("HttpService")
+local SaveFolder = "Corvus"
+
+local function readJson(path)
+	local ok, data = pcall(function()
+		if type(isfile) == "function" and type(readfile) == "function" and isfile(path) then
+			return HttpService:JSONDecode(readfile(path))
+		end
+		return nil
+	end)
+	return if ok and type(data) == "table" then data else nil
+end
+
+local function writeJson(path, data)
+	pcall(function()
+		if type(writefile) ~= "function" then
+			return
+		end
+		if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(SaveFolder) then
+			makefolder(SaveFolder)
+		end
+		writefile(path, HttpService:JSONEncode(data))
+	end)
+end
+
+-- game colours (ItemData.Tiers[i].Colour); Secret is near black, so it gets a light violet
+local RarityColor = { Common = "#aaaaaa", Uncommon = "#5ac864", Rare = "#468cf0", Epic = "#a555eb", Legendary = "#fab428", Mythic = "#f04646", Cosmic = "#3cdcdc", Secret = "#c9b8ff", Eternal = "#ff78c8", Divine = "#fffad2" }
+pcall(function()
+	for _, tier in ipairs(ItemData.Tiers) do
+		if type(tier) == "table" and tier.Name and typeof(tier.Colour) == "Color3" and tier.Name ~= "Secret" then
+			RarityColor[tier.Name] = "#" .. tier.Colour:ToHex()
+		end
+	end
+end)
+local function rarityColor(rarity)
+	return RarityColor[rarity] or "#dddddd"
+end
+
+local Saved = { v = 1, since = os.time(), stolen = 0, rarities = {}, zones = {}, earned = 0, sold = 0, made = 0, orbs = 0, fused = 0, charged = 0, seconds = 0, goals = {} }
+do
+	local data = readJson(SaveFolder .. "/SFTR_stats.json")
+	if data then
+		for key, value in pairs(data) do
+			if type(value) == type(Saved[key]) then
+				Saved[key] = value
+			end
+		end
+	end
+end
+local SaveDirty = false
+local function saveStats(force)
+	if SaveDirty or force then
+		SaveDirty = false
+		writeJson(SaveFolder .. "/SFTR_stats.json", Saved)
+	end
+end
+
+local Metrics = {
+	fine = {},
+	coarse = {},
+	cum = { Money = 0, Crates = 0, Speed = 0, Sold = 0, Orbs = 0 },
+	events = {},
+	lastFine = -1e9,
+	lastCoarse = -1e9,
+	lastSave = 0,
+	file = SaveFolder .. "/SFTR_metrics.json",
+	T0 = os.time(),
+	C0 = os.clock(),
+}
+Metrics.columns = { Money = 2, Crates = 3, Speed = 4, Sold = 5, Orbs = 6 }
+do
+	local M = Metrics
+	local MetricColumns = M.columns
+	function M.now()
+		return M.T0 + (os.clock() - M.C0)
+	end
+	local data = readJson(M.file)
+	if data then
+		local cutoff = M.now() - 86400
+		local function restore(list, target)
+			for _, row in ipairs(type(list) == "table" and list or {}) do
+				if type(row) == "table" and tonumber(row[1]) and row[1] >= cutoff then
+					table.insert(target, { tonumber(row[1]), tonumber(row[2]) or 0, tonumber(row[3]) or 0, tonumber(row[4]) or 0, tonumber(row[5]) or 0, tonumber(row[6]) or 0 })
+				end
+			end
+		end
+		restore(data.coarse, M.coarse)
+		restore(data.fine, M.fine)
+		if type(data.cum) == "table" then
+			for key in pairs(MetricColumns) do
+				M.cum[key] = tonumber(data.cum[key]) or 0
+			end
+		end
+		for _, event in ipairs(type(data.events) == "table" and data.events or {}) do
+			if type(event) == "table" and tonumber(event.t) and event.t >= cutoff then
+				table.insert(M.events, event)
+			end
+		end
+	end
+	function M.save()
+		writeJson(M.file, { v = 1, cum = M.cum, fine = M.fine, coarse = M.coarse, events = M.events })
+	end
+	function M.sample(force)
+		local t = M.now()
+		local row = { t, M.cum.Money, M.cum.Crates, M.cum.Speed, M.cum.Sold, M.cum.Orbs }
+		if force == true or t - M.lastFine >= 10 then
+			M.lastFine = t
+			table.insert(M.fine, row)
+			while #M.fine > 0 and M.fine[1][1] < t - 7200 do
+				table.remove(M.fine, 1)
+			end
+		end
+		if force == true or t - M.lastCoarse >= 60 then
+			M.lastCoarse = t
+			table.insert(M.coarse, row)
+			while #M.coarse > 0 and M.coarse[1][1] < t - 86400 do
+				table.remove(M.coarse, 1)
+			end
+		end
+		if t - M.lastSave >= 60 then
+			M.lastSave = t
+			M.save()
+		end
+	end
+	function M.valueAt(key, t)
+		local column = MetricColumns[key]
+		if not column then
+			return nil
+		end
+		local now = M.now()
+		if t >= now - 0.5 then
+			return M.cum[key]
+		end
+		local list, step = M.fine, 10
+		if #list == 0 or t < list[1][1] then
+			list, step = M.coarse, 60
+		end
+		local count = #list
+		if count == 0 or t < list[1][1] then
+			return nil
+		end
+		local last = list[count]
+		if t >= last[1] then
+			if now - last[1] > step * 3 then
+				return nil
+			end
+			local span = now - last[1]
+			if span <= 0 then
+				return last[column]
+			end
+			return last[column] + (M.cum[key] - last[column]) * (t - last[1]) / span
+		end
+		local low, high = 1, count
+		while high - low > 1 do
+			local middle = (low + high) // 2
+			if list[middle][1] <= t then
+				low = middle
+			else
+				high = middle
+			end
+		end
+		local a, b = list[low], list[high]
+		if b[1] - a[1] > step * 3 then
+			return nil
+		end
+		if b[1] == a[1] then
+			return a[column]
+		end
+		return a[column] + (b[column] - a[column]) * (t - a[1]) / (b[1] - a[1])
+	end
+	function M.rate(key, t, window)
+		local a, b = M.valueAt(key, t - window), M.valueAt(key, t)
+		if a == nil or b == nil then
+			return nil
+		end
+		return math.max(0, (b - a) / window * 3600)
+	end
+	function M.series(key, range, count)
+		local now = M.now()
+		local window = math.max(range / count * 2, 60)
+		local values = {}
+		for i = 1, count do
+			local t = now - range + range * (i - 1) / math.max(count - 1, 1)
+			values[i] = M.rate(key, t, window) or false
+		end
+		return values
+	end
+	function M.current(key)
+		if M.now() - M.sessionStart < 30 then
+			return nil
+		end
+		return M.rate(key, M.now(), math.clamp(M.now() - M.sessionStart, 30, 300))
+	end
+	function M.mean(values)
+		local sum, count = 0, 0
+		for _, value in ipairs(values) do
+			if type(value) == "number" then
+				sum += value
+				count += 1
+			end
+		end
+		return if count > 0 then sum / count else nil
+	end
+	function M.event(kind, text, color)
+		table.insert(M.events, { t = M.now(), k = kind, x = tostring(text), c = color })
+		while #M.events > 200 do
+			table.remove(M.events, 1)
+		end
+	end
+	M.sessionStart = M.now()
+	M.sample(true)
+end
+
+local Feed = { seq = 0, list = {} }
+local function feedPush(entry)
+	Feed.seq += 1
+	entry.Id = Feed.seq
+	entry.At = os.clock()
+	table.insert(Feed.list, 1, entry)
+	while #Feed.list > 30 do
+		table.remove(Feed.list)
+	end
+end
+
+local function zoneName(area)
+	return tostring(AreaById[area] and AreaById[area].DisplayName or area or "?")
+end
+
+local Track = {}
+function Track.stolen(rarity, area, seconds)
+	rarity = rarity or "?"
+	Saved.stolen += 1
+	Saved.rarities[rarity] = (Saved.rarities[rarity] or 0) + 1
+	if area then
+		Saved.zones[area] = (Saved.zones[area] or 0) + 1
+		Session.zones[area] = (Session.zones[area] or 0) + 1
+	end
+	Metrics.cum.Crates += 1
+	SaveDirty = true
+	local rank = RarityRank[rarity] or 0
+	local big = rank >= (RarityRank.Legendary or 5)
+	feedPush({
+		Title = rarity .. " crate",
+		Sub = zoneName(area) .. (if seconds then string.format("  \u{00B7}  %ds trip", math.floor(seconds)) else ""),
+		Right = rarity,
+		Image = "package",
+		Color = rarityColor(rarity),
+		Badge = if rank >= (RarityRank.Secret or 8) then "JACKPOT" elseif big then "RARE" else nil,
+		BadgeColor = if rank >= (RarityRank.Secret or 8) then "#ff78c8" else "#fab428",
+	})
+	if big then
+		Metrics.event("Crate", rarity .. " crate", rarityColor(rarity))
+	end
+end
+function Track.sold(total)
+	Saved.earned += total
+	Saved.sold += 1
+	Metrics.cum.Sold += total
+	SaveDirty = true
+	feedPush({ Title = "Sold items", Sub = "Total $" .. formatNumber(Saved.earned) .. " sold", Right = "+$" .. formatNumber(total), Image = "banknote", Color = "#60d696" })
+end
+function Track.orb()
+	Saved.orbs += 1
+	Metrics.cum.Orbs += 1
+	SaveDirty = true
+end
+function Track.money(delta)
+	Saved.made += delta
+	Metrics.cum.Money += delta
+	SaveDirty = true
+end
+function Track.speed(delta)
+	Metrics.cum.Speed += delta
+end
+function Track.event(kind, title, sub, icon, color)
+	Metrics.event(kind, title, color)
+	feedPush({ Title = title, Sub = sub or "", Right = kind, Image = icon or "sparkles", Color = color or "#7dd3fc" })
 end
 -- rev_STEAL_SUCCESS fires on pick-up, so "stolen" is counted when a crate is banked
 
@@ -30820,11 +31104,13 @@ end
 local ReturnFails, LastStealArea, LastStealRarity = 0, nil, nil
 local Refusals = 0
 
+local StealStartedAt = nil
 local function countStolen()
 	Session.stolen += 1
 	if LastStealRarity then
 		Session.rarities[LastStealRarity] = (Session.rarities[LastStealRarity] or 0) + 1
 	end
+	Track.stolen(LastStealRarity, LastStealArea, StealStartedAt and os.clock() - StealStartedAt)
 	emit("stolen", LastStealRarity, LastStealArea)
 end
 
@@ -30906,6 +31192,7 @@ local function stealOnce()
 		return false
 	end
 	setStatus("Stealing " .. target.rarity .. " crate in " .. (AreaById[target.area] and AreaById[target.area].DisplayName or target.area))
+	StealStartedAt = os.clock()
 	local position = promptPosition(target.prompt) or target.crate:GetPivot().Position
 	local spot = position + Vector3.new(0, 2, 0)
 	-- someone else can take the crate while we run there (live log: the prompt
@@ -31194,6 +31481,7 @@ local function sellOnce(kind)
 	local result = LastSellResult
 	if type(result) == "table" and result.Ok then
 		Session.earned += tonumber(result.Total) or 0
+		Track.sold(tonumber(result.Total) or 0)
 		emit("sold", tonumber(result.Total) or 0, result.Text)
 		return true, result
 	end
@@ -31521,6 +31809,7 @@ onNet("STORM_RESULT", function(index, ok, amount)
 		Storm.backAt[index] = os.clock() + (config.RESPAWN_SECONDS or 20)
 		Session.orbs += 1
 		Storm.points += tonumber(amount) or 0
+		Track.orb()
 	else
 		Storm.backAt[index] = os.clock() + (if amount == "taken" then 5 else 1.5)
 	end
@@ -31636,6 +31925,9 @@ local function chargeCrate()
 	local result = invokeWithTimeout(Remotes.rf_THUNDER_MACHINE, 10, "mutate", best.Uid, spend)
 	if type(result) == "table" and result.ok then
 		Session.charged = (Session.charged or 0) + 1
+		Saved.charged += 1
+		SaveDirty = true
+		Track.event("Charge", tostring(best.Tier) .. " crate charged", tostring(result.result or "Charging"), "cloud-lightning", "#5ac8ff")
 		emit("charged", best, result.result)
 		setStatus(if result.result then "Thunder Machine: " .. tostring(result.result) else "Thunder Machine is charging the crate")
 	else
@@ -31743,6 +32035,9 @@ local function fuseOnce()
 	end, 4) then
 		Session.fused = (Session.fused or 0) + 1
 		Session.bought += 1
+		Saved.fused += 1
+		SaveDirty = true
+		Track.event("Fuse", "Fused " .. job.name, "Paid $" .. formatNumber(job.fee), "combine", "#ffb84d")
 		emit("fused", job.name)
 		setStatus("Fused 3x " .. job.name)
 	else
@@ -31861,6 +32156,7 @@ local function claimFreeGift(manual)
 	fire("GroupClaim")
 	if waitFor(freeGiftClaimed, 4) then
 		Session.claimed += 1
+		Track.event("Gift", "Free Gift claimed", "+10,000 speed", "gift", "#ff5d8f")
 		setStatus("Free Gift claimed")
 		notify("Free Gift", "Claimed 10,000 speed", 4)
 	end
@@ -31945,13 +32241,16 @@ Tabs.Main = addTab("Main", "swords", "Auto steal and auto sell")
 Tabs.Plot = addTab("Plot", "house", "Crates, upgrades and the treadmill")
 Tabs.Storm = addTab("Storm", "cloud-lightning", "Storm orbs, Thunder Machine and Fuse Machine")
 Tabs.Meta = addTab("Meta", "sparkles", "Index, trails and free rewards")
-Tabs.Stats = addTab("Stats", "chart-column", "Session progress")
+Tabs.Stats = addTab("Stats", "chart-column", "Session and all-time progress")
+Tabs.Analytics = addTab("Analytics", "chart-spline", "Live rates, trends and goals")
 if Window.AddMiscTab then
 	pcall(function()
 		Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
 	end)
 end
 
+local StatusBox, StatusLabel, StormLabel
+do
 -- Steal
 local StealBox = Tabs.Main:AddLeftGroupbox("Steal", "hand")
 StealBox:AddToggle("AutoSteal", {
@@ -32044,8 +32343,8 @@ SellBox:AddButton({
 	end,
 })
 
-local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
-local StatusLabel = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+StatusLabel = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 StatusBox:AddLabel({ Text = '<font transparency="0.35">Every step is saved to ' .. LogFile .. " in your executor's workspace folder. Send that file if something does not work.</font>", DoesWrap = true })
 StatusBox:AddButton({
 	Text = "Copy Debug Log",
@@ -32131,7 +32430,7 @@ OrbBox:AddDropdown("OrbPriority", {
 	Default = "Orbs first",
 	Tooltip = "Crates first only collects orbs when no crate matches your filters",
 })
-local StormLabel = OrbBox:AddLabel({ Text = "Storm: -", DoesWrap = true })
+StormLabel = OrbBox:AddLabel({ Text = "Storm: -", DoesWrap = true })
 
 local ThunderBox = Tabs.Storm:AddRightGroupbox("Thunder Machine", "cloud-lightning")
 ThunderBox:AddToggle("AutoThunder", {
@@ -32160,7 +32459,11 @@ FuseBox:AddDropdown("FuseTiers", {
 	AllowNull = true,
 })
 
+end
+
 -- Stats (same stat rows as Pets Universe, plain labels if the library has none)
+local StatRows = {}
+do
 local function statRow(box, icon, text, size, color)
 	if box.AddStat then
 		local ok, stat = pcall(box.AddStat, box, { Icon = icon, Text = text, Value = "-", Size = size or 22, ValueColor = color })
@@ -32180,7 +32483,6 @@ local function statRow(box, icon, text, size, color)
 	}
 end
 
-local StatRows = {}
 local MoneyBox = Tabs.Stats:AddLeftGroupbox("Money", "coins")
 StatRows.Money = statRow(MoneyBox, "wallet", "Money", 28)
 StatRows.Gained = statRow(MoneyBox, "trending-up", "Made this session", 22)
@@ -32205,10 +32507,410 @@ StatRows.Orbs = statRow(ExtraBox, "zap", "Orbs collected", 22)
 StatRows.Claimed = statRow(ExtraBox, "gift", "Rewards claimed", 22)
 StatRows.Bought = statRow(ExtraBox, "shopping-cart", "Things bought", 22)
 
+local AllBox = Tabs.Stats:AddLeftGroupbox("All Time", "infinity")
+StatRows.Since = AllBox:AddLabel({ Text = "Counting since -", DoesWrap = true })
+StatRows.AllStolen = statRow(AllBox, "package", "Crates stolen", 28)
+StatRows.AllMade = statRow(AllBox, "trending-up", "Money made", 22)
+StatRows.AllEarned = statRow(AllBox, "banknote", "Earned from selling", 22)
+StatRows.AllOrbs = statRow(AllBox, "zap", "Storm orbs", 22)
+StatRows.AllFused = statRow(AllBox, "combine", "Fused / charged", 22)
+StatRows.AllTime = statRow(AllBox, "clock", "Time farming", 22, "FontColor")
+StatRows.AllBest = statRow(AllBox, "star", "Best crate ever", 22, "FontColor")
+AllBox:AddButton({
+	Text = "Reset All Time",
+	DoubleClick = true,
+	Tooltip = "Starts the all-time stats from zero (goals stay)",
+	Func = function()
+		local goals = Saved.goals
+		for key, value in pairs(Saved) do
+			if type(value) == "number" then
+				Saved[key] = 0
+			elseif type(value) == "table" and key ~= "goals" then
+				Saved[key] = {}
+			end
+		end
+		Saved.v, Saved.since, Saved.goals = 1, os.time(), goals
+		SaveDirty = true
+		saveStats(true)
+		notify("Stats", "All-time stats reset", 3)
+	end,
+})
+end
+
+---------------------------------------------------------------------------
+-- Analytics tab (same widgets as Pets Universe): live rate tiles, trend chart
+-- with events, goals with an ETA, crates by rarity and by zone; Live Steals feed
+---------------------------------------------------------------------------
+local Analytics = {}
+do
+	local MetricColors = { Money = "#60d696", Crates = "#fab428", Speed = "#5fb8ff", Sold = "#c77dff", Orbs = "#7dd3fc" }
+	local MetricSuffix = { Money = "$/h", Crates = "crates/h", Speed = "speed/h", Sold = "$ sold/h", Orbs = "orbs/h" }
+	local RangeSeconds = { ["15m"] = 900, ["1h"] = 3600, ["6h"] = 21600, ["24h"] = 86400 }
+	local RangeEdge = { ["15m"] = { "15m ago", "7m", "now" }, ["1h"] = { "1h ago", "30m", "now" }, ["6h"] = { "6h ago", "3h", "now" }, ["24h"] = { "24h ago", "12h", "now" } }
+	local GoalMeta = {
+		Money = { label = "Money", icon = "wallet", color = "#60d696", metric = "Money", current = function()
+			return money()
+		end },
+		Speed = { label = "Speed level", icon = "gauge", color = "#5fb8ff", metric = "Speed", current = function()
+			return tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
+		end },
+		Crates = { label = "Crates stolen", icon = "package", color = "#fab428", metric = "Crates", current = function()
+			return Saved.stolen
+		end },
+		Storm = { label = "Storm points", icon = "zap", color = "#7dd3fc", metric = nil, current = function()
+			return tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0
+		end },
+	}
+	local GoalLabels = { GoalMeta.Money.label, GoalMeta.Speed.label, GoalMeta.Crates.label, GoalMeta.Storm.label }
+
+	local function parseAmount(text)
+		text = string.lower(string.gsub(tostring(text or ""), "[%s,_$]", ""))
+		local number, suffix = string.match(text, "^([%d%.]+)(%a*)$")
+		number = tonumber(number)
+		local scale = { [""] = 1, k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, qd = 1e15, qi = 1e18, qn = 1e18 }
+		if not number or not scale[suffix] then
+			return nil
+		end
+		return math.floor(number * scale[suffix])
+	end
+	Analytics.parseAmount = parseAmount
+
+	local function eta(metric, missing)
+		if not metric or type(missing) ~= "number" or missing <= 0 then
+			return nil
+		end
+		local rate = Metrics.current(metric)
+		if type(rate) ~= "number" or rate <= 0 then
+			return nil
+		end
+		local seconds = missing / rate * 3600
+		if seconds > 604800 then
+			return nil
+		elseif seconds < 60 then
+			return "<1m"
+		end
+		local days, hours, minutes = seconds // 86400, (seconds % 86400) // 3600, (seconds % 3600) // 60
+		if days > 0 then
+			return string.format("~%dd %dh", days, hours)
+		elseif hours > 0 then
+			return string.format("~%dh %dm", hours, minutes)
+		end
+		return string.format("~%dm", minutes)
+	end
+
+	-- Live Steals feed on the Main tab
+	pcall(function()
+		local FeedBox = Tabs.Main:AddRightGroupbox("Live Steals", "radio")
+		if FeedBox.AddFeed then
+			Analytics.feed = FeedBox:AddFeed("StealFeed", { MaxRows = 7, EmptyText = "Every crate you bring home shows up here live." })
+		end
+	end)
+
+	pcall(function()
+		local RatesBox = Tabs.Analytics:AddLeftGroupbox("Live Rates", "activity")
+		if RatesBox.AddStatTiles then
+			Analytics.tiles = RatesBox:AddStatTiles({
+				Tiles = {
+					{ Id = "Money", Label = "Money", Color = Color3.fromHex(MetricColors.Money) },
+					{ Id = "Crates", Label = "Crates", Color = Color3.fromHex(MetricColors.Crates) },
+					{ Id = "Speed", Label = "Speed", Color = Color3.fromHex(MetricColors.Speed) },
+					{ Id = "Orbs", Label = "Storm orbs", Color = Color3.fromHex(MetricColors.Orbs) },
+				},
+			})
+		end
+		RatesBox:AddLabel({ Text = '<font transparency="0.45">Per hour over the last 5 minutes. Arrows compare with your last hour.</font>', DoesWrap = true })
+
+		local TrendBox = Tabs.Analytics:AddLeftGroupbox("Trend", "chart-spline")
+		if TrendBox.AddChart then
+			Analytics.chart = TrendBox:AddChart("TrendChart", {
+				Metrics = { "Money", "Crates", "Speed", "Sold", "Orbs" },
+				Ranges = { "15m", "1h", "6h", "24h" },
+				Range = "15m",
+				Height = 132,
+				Changed = function()
+					if Analytics.draw then
+						Analytics.draw(true)
+					end
+				end,
+			})
+		end
+
+		local ZoneBox = Tabs.Analytics:AddLeftGroupbox("Crates by Zone", "map")
+		if ZoneBox.AddBarChart then
+			Analytics.zoneBars = ZoneBox:AddBarChart({
+				Scopes = { "Session", "All time" },
+				EmptyText = "Steal a crate to fill this in",
+				Changed = function()
+					if Analytics.draw then
+						Analytics.draw(true)
+					end
+				end,
+			})
+		end
+
+		local GoalsBox = Tabs.Analytics:AddRightGroupbox("Goals", "target")
+		if GoalsBox.AddGoals then
+			Analytics.goals = GoalsBox:AddGoals("GoalCards", {
+				EmptyText = "No goals yet. Pick one below and Corvus tracks it with a live ETA.",
+				Removed = function(id)
+					Analytics.removeGoal(id)
+				end,
+			})
+		end
+		GoalsBox:AddDropdown("GoalKind", { Text = "Goal", Values = GoalLabels, Default = GoalLabels[1] })
+		GoalsBox:AddInput("GoalTarget", { Text = "Target", Placeholder = "10b, 500k, 1.5t...", Default = "", ClearTextOnFocus = false })
+		GoalsBox:AddButton({
+			Text = "Add goal",
+			Func = function()
+				if Analytics.addGoal(Options.GoalKind.Value, Options.GoalTarget.Value) then
+					pcall(Options.GoalTarget.SetValue, Options.GoalTarget, "")
+				end
+			end,
+		}):AddButton({
+			Text = "Clear reached",
+			Func = function()
+				Analytics.clearGoals()
+			end,
+		})
+
+		local RarityBox = Tabs.Analytics:AddRightGroupbox("Crates by Rarity", "gem")
+		if RarityBox.AddBarChart then
+			Analytics.rarityBars = RarityBox:AddBarChart({
+				Scopes = { "Session", "All time" },
+				EmptyText = "Steal a crate to fill this in",
+				Changed = function()
+					if Analytics.draw then
+						Analytics.draw(true)
+					end
+				end,
+			})
+		end
+	end)
+
+	function Analytics.addGoal(label, text)
+		local kind
+		for key, meta in pairs(GoalMeta) do
+			if meta.label == label then
+				kind = key
+			end
+		end
+		if not kind then
+			notify("Goals", "Pick a goal first", 4)
+			return false
+		end
+		if #Saved.goals >= 4 then
+			notify("Goals", "You can track 4 goals at once, remove one first", 4)
+			return false
+		end
+		local target = parseAmount(text)
+		if not target or target <= 0 then
+			notify("Goals", "Type a target like 10b, 500k or 1.5t", 4)
+			return false
+		end
+		local current = GoalMeta[kind].current()
+		if type(current) == "number" and current >= target then
+			notify("Goals", "You already have " .. formatNumber(current) .. ", pick a higher target", 5)
+			return false
+		end
+		table.insert(Saved.goals, { id = string.format("%d-%d", os.time(), math.random(1, 999999)), kind = kind, target = target, created = os.time() })
+		SaveDirty = true
+		notify("Goals", "Tracking " .. formatNumber(target) .. " " .. GoalMeta[kind].label, 3)
+		Analytics.draw(true)
+		return true
+	end
+
+	function Analytics.removeGoal(id)
+		for i = #Saved.goals, 1, -1 do
+			local goal = Saved.goals[i]
+			if type(goal) ~= "table" or goal.id == id then
+				table.remove(Saved.goals, i)
+			end
+		end
+		SaveDirty = true
+		Analytics.draw(true)
+	end
+
+	function Analytics.clearGoals()
+		local removed = 0
+		for i = #Saved.goals, 1, -1 do
+			local goal = Saved.goals[i]
+			if type(goal) ~= "table" or goal.done then
+				table.remove(Saved.goals, i)
+				removed += 1
+			end
+		end
+		SaveDirty = true
+		notify("Goals", if removed > 0 then "Removed " .. removed .. " reached goal" .. (if removed == 1 then "" else "s") else "No reached goals to clear", 3)
+		Analytics.draw(true)
+	end
+
+	-- marks reached goals (toast, chart marker, webhook) and returns the cards
+	function Analytics.goalCards(check)
+		local cards = {}
+		for _, goal in ipairs(Saved.goals) do
+			local meta = type(goal) == "table" and GoalMeta[goal.kind]
+			local target = meta and tonumber(goal.target)
+			if meta and target and target > 0 then
+				local current = meta.current()
+				if check and not goal.done and type(current) == "number" and current >= target then
+					goal.done = true
+					goal.doneAt = os.time()
+					SaveDirty = true
+					local text = formatNumber(target) .. " " .. meta.label
+					notify("Goal reached", text, 6)
+					Track.event("Goal", "Goal reached", text, "target", meta.color)
+					emit("goal", text)
+				end
+				local note
+				if goal.done then
+					local ago = if goal.doneAt then math.max(0, os.time() - goal.doneAt) else 0
+					note = '<font color="#60d696">Reached</font>' .. (if ago >= 60 then "  \u{00B7}  " .. (Library.FormatDuration and Library:FormatDuration(ago) or (ago // 60 .. "m")) .. " ago" else "")
+				elseif type(current) ~= "number" then
+					note = "Waiting for data"
+				else
+					local left = eta(meta.metric, target - current)
+					note = if left then left .. " at your current rate" elseif meta.metric then formatNumber(target - current) .. " to go  \u{00B7}  rate warming up" else formatNumber(target - current) .. " to go"
+				end
+				table.insert(cards, {
+					Id = goal.id,
+					Title = meta.label,
+					Icon = meta.icon,
+					Color = meta.color,
+					Progress = if type(current) == "number" then math.clamp(current / target, 0, 1) else 0,
+					Done = goal.done == true,
+					Value = string.format('%s  <font transparency="0.45">/ %s</font>', if type(current) == "number" then formatNumber(current) else "?", formatNumber(target)),
+					Note = note,
+				})
+			end
+		end
+		return cards
+	end
+
+	local function bars(counts, order, labelOf, colorOf)
+		local list = {}
+		for _, key in ipairs(order) do
+			local amount = tonumber(counts[key]) or 0
+			if amount > 0 then
+				local ok, color = pcall(Color3.fromHex, colorOf(key))
+				table.insert(list, { Label = labelOf(key), Value = amount, Color = if ok then color else nil, Text = formatNumber(amount) })
+			end
+		end
+		return list
+	end
+
+	local ZoneOrder = {}
+	for _, area in ipairs(Areas) do
+		table.insert(ZoneOrder, area.Id)
+	end
+	local function zoneColor(id)
+		local index = table.find(ZoneOrder, id) or 1
+		return "#" .. Color3.fromHSV(((index - 1) / math.max(#ZoneOrder, 1) * 0.8 + 0.55) % 1, 0.55, 0.95):ToHex()
+	end
+
+	function Analytics.draw(force)
+		local active = Library.ActiveTab == nil or Library.ActiveTab == Tabs.Analytics
+		if not active and force ~= true then
+			return
+		end
+		local clock = os.clock()
+		if force ~= true and clock - (Analytics.drawnAt or -1e9) < 3 then
+			return
+		end
+		Analytics.drawnAt = clock
+		local M = Metrics
+		if Analytics.tiles then
+			for _, key in ipairs({ "Money", "Crates", "Speed", "Orbs" }) do
+				local rate = M.current(key)
+				local hour = M.mean(M.series(key, 3600, 30))
+				Analytics.tiles:SetTile(key, {
+					Value = if rate then (if key == "Money" then "$" else "") .. formatNumber(math.floor(rate)) else "-",
+					Suffix = "/h",
+					Delta = if rate and hour and hour > 0 then (rate - hour) / hour else nil,
+					Note = if rate == nil then "warming up" else "",
+					Points = M.series(key, 1800, 12),
+				})
+			end
+		end
+		if Analytics.chart then
+			local metric = Analytics.chart.Metric or "Money"
+			local rangeName = Analytics.chart.Range or "15m"
+			local range = RangeSeconds[rangeName] or 900
+			local count = 60
+			local values = M.series(metric, range, count)
+			local average = M.mean(values)
+			local current = M.current(metric)
+			local now = M.now()
+			local labels = {}
+			for i = 1, count do
+				local t = now - range + range * (i - 1) / (count - 1)
+				local ok, text = pcall(os.date, "%H:%M", math.floor(t))
+				labels[i] = if ok then text else ""
+			end
+			local events = {}
+			for i = #M.events, 1, -1 do
+				local event = M.events[i]
+				if #events >= 12 then
+					break
+				end
+				if tonumber(event.t) and event.t >= now - range then
+					local ok, color = pcall(Color3.fromHex, tostring(event.c or ""))
+					table.insert(events, {
+						Index = math.floor((event.t - (now - range)) / range * (count - 1) + 0.5) + 1,
+						Color = if ok then color else Library.Scheme and Library.Scheme.AccentColor,
+						Text = event.x,
+					})
+				end
+			end
+			local isMoney = metric == "Money" or metric == "Sold"
+			Analytics.chart:SetData({
+				Values = values,
+				Color = Color3.fromHex(MetricColors[metric] or "#60d696"),
+				Headline = if current then (if isMoney then "$" else "") .. formatNumber(math.floor(current)) else "-",
+				Suffix = MetricSuffix[metric] or "/h",
+				Delta = if current and average and average > 0 then (current - average) / average else nil,
+				DeltaLabel = "vs " .. rangeName .. " average",
+				Subtitle = "Rate over the last 5 minutes",
+				Average = average,
+				XLabels = RangeEdge[rangeName],
+				Labels = labels,
+				Events = events,
+				Format = formatNumber,
+				EmptyText = "Farm for a minute to see your " .. string.lower(metric) .. " per hour",
+			})
+		end
+		local allTime = function(widget)
+			return widget and widget.Scope == "All time"
+		end
+		if Analytics.rarityBars then
+			local counts = if allTime(Analytics.rarityBars) then Saved.rarities else Session.rarities
+			Analytics.rarityBars:SetData(bars(counts, RarityList, function(key)
+				return key
+			end, rarityColor))
+		end
+		if Analytics.zoneBars then
+			local counts = if allTime(Analytics.zoneBars) then Saved.zones else Session.zones
+			Analytics.zoneBars:SetData(bars(counts, ZoneOrder, zoneName, zoneColor))
+		end
+		if Analytics.goals then
+			Analytics.goals:SetData(Analytics.goalCards(false))
+		end
+	end
+
+	function Analytics.drawFeed()
+		if not Analytics.feed or (Analytics.feedShown == Feed.seq and os.clock() - (Analytics.feedAt or 0) < 1) then
+			return
+		end
+		Analytics.feedShown = Feed.seq
+		Analytics.feedAt = os.clock()
+		Analytics.feed:SetData(table.move(Feed.list, 1, math.min(#Feed.list, 8), 1, {}))
+	end
+end
+
 ---------------------------------------------------------------------------
 -- Hub extras shared with Pets Universe: auto execute, console commands,
 -- remote spy, quick bar and the quick setup
 ---------------------------------------------------------------------------
+do
 local KeepOnTeleport = true
 local function queueSelf()
 	local queue = queue_on_teleport or (typeof(syn) == "table" and syn.queue_on_teleport) or queueonteleport
@@ -32249,6 +32951,7 @@ if Tabs.Misc then
 	end)
 end
 
+end
 -- Game tweaks
 pcall(function()
 	local TweakBox = (Tabs.Misc or Tabs.Meta):AddLeftGroupbox("Game Tweaks", "wrench")
@@ -32474,6 +33177,8 @@ if Library.OnUnload then
 	Library:OnUnload(function()
 		INSTANCE.stop = true
 		flushLog()
+		saveStats(true)
+		Metrics.save()
 	end)
 end
 
@@ -32607,9 +33312,9 @@ if Library.ShowWizard then
 	})
 end
 
+do
 -- Discord: your own webhook for crates and sales, and feedback / debug logs to Cinek
 local FeedbackWebhook = "https://discord.com/api/webhooks/1553082900688146502/rW8r0mJiDZYXFnv8O6asKsDPouxr036xA6CcOwitc_3DWjK6cV59_iO_Mpm0tjTNr3S4"
-local HttpService = game:GetService("HttpService")
 local Hook = { queue = {}, sent = 0, feedbackAt = -1e9, feedbackCount = 0 }
 
 local function httpRequest(options)
@@ -32709,6 +33414,20 @@ Events.sold = function(total)
 			color = 6344854,
 			fields = {
 				{ name = "Earned this session", value = "$" .. formatNumber(Session.earned), inline = true },
+				{ name = "Money", value = "$" .. formatNumber(money()), inline = true },
+				{ name = "Player", value = playerField(), inline = true },
+			},
+		})
+	end
+end
+
+Events.goal = function(text)
+	if Toggles.WebhookOn and Toggles.WebhookOn.Value then
+		queueEmbed({
+			title = "\u{2726}  Goal reached",
+			description = "**" .. tostring(text) .. "**",
+			color = 3985554,
+			fields = {
 				{ name = "Money", value = "$" .. formatNumber(money()), inline = true },
 				{ name = "Player", value = playerField(), inline = true },
 			},
@@ -32867,6 +33586,7 @@ if Tabs.Info then
 	end)
 end
 
+end
 if Window.AddSettingsTab then
 	Tabs.Settings = Window:AddSettingsTab({
 		ThemeManager = ThemeManager,
@@ -32897,7 +33617,7 @@ if Window.AddInfoTab then
 		{ Id = "SOL", Icon = "pay-sol", Symbol = "SOL", Name = "Solana", Network = "Solana", Address = "4UriDCT4iBsLAuzLdowpSEL4mZq7Ecrxs4pNrV5ztHxW", Color = "#9945ff", Note = "Only send SOL or Solana tokens" },
 		{ Id = "BNB", Icon = "pay-bnb", Symbol = "BNB", Name = "BNB", Network = "BNB Smart Chain", Address = "0xBa0e07FdDB15fe3c9B7CE42F76cef8F09FEdAB64", Color = "#f0b90b", Note = "Only send on BNB Smart Chain (BEP20)" },
 	}
-	for _, tab in ipairs({ Tabs.Info, Tabs.Main, Tabs.Plot, Tabs.Storm, Tabs.Meta, Tabs.Stats, Tabs.Misc, Tabs.Settings }) do
+	for _, tab in ipairs({ Tabs.Info, Tabs.Main, Tabs.Plot, Tabs.Storm, Tabs.Meta, Tabs.Stats, Tabs.Analytics, Tabs.Misc, Tabs.Settings }) do
 		pcall(function()
 			local left = tab == Tabs.Info and tab.Groupboxes.Community or nil
 			if left then
@@ -33216,6 +33936,63 @@ task.spawn(function()
 			StatRows.Claimed.set(formatNumber(Session.claimed))
 			StatRows.Bought.set(formatNumber(Session.bought))
 		end)
+		-- analytics: history, all time, goals, feed and charts
+		local okA, errA = pcall(function()
+			local clock = os.clock()
+			local now = money()
+			if Analytics.lastMoney and now > Analytics.lastMoney then
+				Track.money(now - Analytics.lastMoney)
+			end
+			Analytics.lastMoney = now
+			local speed = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
+			if Analytics.lastSpeed and speed > Analytics.lastSpeed then
+				Track.speed(speed - Analytics.lastSpeed)
+			end
+			Analytics.lastSpeed = speed
+			local step = clock - (Analytics.lastTick or clock)
+			Analytics.lastTick = clock
+			for _, name in ipairs(AllAutoToggles) do
+				if on(name) then
+					Saved.seconds += step
+					break
+				end
+			end
+			local storming = stormActive()
+			if storming and Analytics.storming == false then
+				Track.event("Storm", "Storm started", "Orbs are out for 5 minutes", "cloud-lightning", "#7dd3fc")
+			end
+			Analytics.storming = storming
+			Metrics.sample()
+			if clock - (Analytics.savedAt or 0) >= 30 then
+				Analytics.savedAt = clock
+				saveStats()
+			end
+			if clock - (Analytics.goalsAt or 0) >= 2 then
+				Analytics.goalsAt = clock
+				Analytics.goalCards(true)
+			end
+			Analytics.drawFeed()
+			Analytics.draw()
+			local best, bestRank = nil, 0
+			for rarity in pairs(Saved.rarities) do
+				if (RarityRank[rarity] or 0) > bestRank then
+					best, bestRank = rarity, RarityRank[rarity] or 0
+				end
+			end
+			local seconds = math.floor(Saved.seconds)
+			StatRows.Since:SetText('<font transparency="0.4">Counting since ' .. os.date("%d %b %Y", Saved.since) .. "</font>")
+			StatRows.AllStolen.set(formatNumber(Saved.stolen))
+			StatRows.AllMade.set("$" .. formatNumber(Saved.made))
+			StatRows.AllEarned.set("$" .. formatNumber(Saved.earned))
+			StatRows.AllOrbs.set(formatNumber(Saved.orbs))
+			StatRows.AllFused.set(formatNumber(Saved.fused) .. " / " .. formatNumber(Saved.charged))
+			StatRows.AllTime.set(string.format("%dh %02dm", seconds // 3600, (seconds % 3600) // 60))
+			StatRows.AllBest.set(best and (best .. " x" .. formatNumber(Saved.rarities[best])) or "-")
+		end)
+		if not okA and not Analytics.warned then
+			Analytics.warned = true
+			log("ERROR analytics:", tostring(errA))
+		end
 		task.wait(0.5)
 	end
 end)

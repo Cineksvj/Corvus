@@ -310,20 +310,39 @@ CFrame.fromOrientation = CFrame.fromEulerAnglesYXZ
 CFrame.lookAt = lookAt
 CFrame.identity = cfraw(0, 0, 0, IDENT)
 
-local C3MT = { __type = "Color3" }
+local C3Methods = {}
+local C3MT = { __type = "Color3", __index = C3Methods }
 Color3 = {
 	new = function(r, g, b)
 		return setmetatable({ R = r or 0, G = g or 0, B = b or 0 }, C3MT)
 	end,
 }
+function C3Methods:ToHex()
+	local function byte(v)
+		return math.clamp(math.floor(v * 255 + 0.5), 0, 255)
+	end
+	return string.format("%02x%02x%02x", byte(self.R), byte(self.G), byte(self.B))
+end
+function C3Methods:Lerp(other, t)
+	return Color3.new(self.R + (other.R - self.R) * t, self.G + (other.G - self.G) * t, self.B + (other.B - self.B) * t)
+end
 Color3.fromRGB = function(r, g, b)
 	return Color3.new((r or 0) / 255, (g or 0) / 255, (b or 0) / 255)
 end
-Color3.fromHSV = function()
-	return Color3.new(1, 1, 1)
+Color3.fromHSV = function(h, sat, v)
+	h, sat, v = h or 0, sat or 0, v or 1
+	local i = math.floor(h * 6)
+	local f = h * 6 - i
+	local p, q, t = v * (1 - sat), v * (1 - f * sat), v * (1 - (1 - f) * sat)
+	local row = ({ { v, t, p }, { q, v, p }, { p, v, t }, { p, q, v }, { t, p, v }, { v, p, q } })[i % 6 + 1]
+	return Color3.new(row[1], row[2], row[3])
 end
-Color3.fromHex = function()
-	return Color3.new(1, 1, 1)
+Color3.fromHex = function(hex)
+	hex = tostring(hex or ""):gsub("^#", "")
+	if not hex:match("^%x%x%x%x%x%x$") then
+		error("Unable to convert hex string", 2)
+	end
+	return Color3.fromRGB(tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16))
 end
 local UDMT = { __type = "UDim2" }
 UDim2 = {
@@ -2133,6 +2152,51 @@ function GroupboxMethods:AddLabel(a, b)
 	end
 	return label
 end
+-- data widgets (Pets Universe analytics): they keep the last data for checks
+MockLibrary.Widgets = {}
+local function dataWidget(kind, name, info)
+	local w = { Type = kind, Info = info or {}, Data = nil, Tiles = {}, Scope = info and info.Scopes and info.Scopes[1] or nil, Metric = info and info.Metric, Range = info and info.Range, SetCount = 0 }
+	function w:SetData(data)
+		self.Data = data
+		self.SetCount += 1
+	end
+	function w:SetTile(id, data)
+		self.Tiles[id] = data
+		self.SetCount += 1
+	end
+	function w:SetVisible() end
+	function w:SetValue(v)
+		self.Value = v
+	end
+	function w:SetText(t)
+		self.Text = t
+	end
+	function w:SetProgress(p)
+		self.Progress = p
+	end
+	MockLibrary.Widgets[name or (kind .. #MockLibrary.Labels)] = w
+	return w
+end
+function GroupboxMethods:AddStat(a, b)
+	local info = type(a) == "table" and a or b or {}
+	return dataWidget("Stat", (info.Text or "Stat") .. "@" .. self.Name, info)
+end
+function GroupboxMethods:AddStatTiles(info)
+	return dataWidget("StatTiles", "StatTiles@" .. self.Name, info)
+end
+function GroupboxMethods:AddChart(idx, info)
+	return dataWidget("Chart", idx, info)
+end
+function GroupboxMethods:AddBarChart(info)
+	return dataWidget("BarChart", "BarChart@" .. self.Name, info)
+end
+function GroupboxMethods:AddFeed(idx, info)
+	return dataWidget("Feed", idx, info)
+end
+function GroupboxMethods:AddGoals(idx, info)
+	return dataWidget("Goals", idx, info)
+end
+
 function GroupboxMethods:AddButton(a, b)
 	local info = type(a) == "table" and a or { Text = a, Func = b }
 	local button = setmetatable({ Type = "Button", Text = info.Text, Func = info.Func or info.Callback, __changed = {} }, ElementMethods)
