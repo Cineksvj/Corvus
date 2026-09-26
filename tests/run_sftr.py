@@ -79,7 +79,7 @@ def transform_script(src):
     # the main worker's per-cycle wait (used to count main loop cycles / detect stalls)
     mw = find(lambda l: "Main worker" in l, ss, "the main worker comment")
     wait_line = None
-    for i in range(mw, min(mw + 80, len(lines))):
+    for i in range(mw, min(mw + 200, len(lines))):
         if lines[i] == "\t\ttask.wait(0.25)":
             wait_line = i + 1
             break

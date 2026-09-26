@@ -208,6 +208,8 @@ Sim.stats = {
 	trailBuys = {}, trailEquips = {}, slotBuys = 0, plotUpgrades = 0, treadmillUpgrades = 0,
 	upgradeRejected = {}, mounts = 0, dismounts = 0, indexClaims = 0, placeBest = 0, unhandled = {},
 	promptRejected = {},
+	orbs = {}, orbRejected = {}, charges = {}, chargeRejected = {}, fuses = {}, fuseRejected = {},
+	offlineClaims = 0, freeGift = 0, freeGiftRejected = {}, batEquips = {},
 }
 local stats = Sim.stats
 
@@ -580,11 +582,141 @@ function Server.build(worldConfig)
 		end
 	end
 	Server.nextReset = Sim.T0 + cfg("arenaFirstReset")
+	Server.buildExtras()
 	Server.nextTick = Sim.now + 1
 	Server.incomeAcc = 0
 	Server.speedAcc = 0
 	Server.updateSigns()
 end
+
+---------------------------------------------------------------------------
+-- Storm orbs, Thunder Machine, Fuse Machine, offline cash, Free Gift
+-- (behaviour taken from the decompiled client scripts; server checks the
+-- dump cannot show are modelled conservatively: you must be near the thing)
+---------------------------------------------------------------------------
+local STORM = {
+	ORB_COUNT = 300, MAGNET_RADIUS = 16, RESPAWN_SECONDS = 20, EDGE_MARGIN = 4, HOVER = 1.25,
+	MIN_SPEND = 1000, MAX_CHARGE = 1500,
+	ORB_SIZES = { { Id = "Small", Points = 1, Scale = 0.6, Weight = 50 }, { Id = "Medium", Points = 2, Scale = 1, Weight = 40 }, { Id = "Big", Points = 4, Scale = 1.6, Weight = 10 } },
+}
+-- StormConfig.computeLayout, ported line by line from the dump (line 49794)
+function STORM.computeLayout(p8, p9, p10)
+	local v11, v12 = {}, 0
+	for _, descendant in ipairs(p8:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			table.insert(v11, descendant)
+		end
+	end
+	table.sort(v11, function(p13, p14)
+		if p13.Position.X == p14.Position.X then
+			return p13.Position.Z < p14.Position.Z
+		end
+		return p13.Position.X < p14.Position.X
+	end)
+	local v15 = {}
+	for _, v in ipairs(v11) do
+		local sx = math.max(0.1, v.Size.X - STORM.EDGE_MARGIN * 2)
+		local sz = math.max(0.1, v.Size.Z - STORM.EDGE_MARGIN * 2)
+		v12 += sx * sz
+		table.insert(v15, { part = v, sx = sx, sz = sz, cum = v12 })
+	end
+	local v16 = {}
+	if #v15 == 0 then
+		return v16
+	end
+	local v18 = Random.new(math.floor(tonumber(p9) or 0))
+	for i = 1, p10 or STORM.ORB_COUNT do
+		local v19 = v18:NextNumber() * v12
+		local v20 = v15[#v15]
+		for _, v in ipairs(v15) do
+			if v19 <= v.cum then
+				v20 = v
+				break
+			end
+		end
+		local v21 = (v18:NextNumber() - 0.5) * v20.sx
+		local v22 = (v18:NextNumber() - 0.5) * v20.sz
+		v16[i] = v20.part.CFrame:PointToWorldSpace(V(v21, v20.part.Size.Y / 2 + STORM.HOVER, v22))
+	end
+	local v23, v24 = 0, {}
+	for _, v in ipairs(STORM.ORB_SIZES) do
+		v23 += v.Weight
+	end
+	local v26 = Random.new(math.floor(tonumber(p9) or 0) + 7919)
+	for i = 1, #v16 do
+		local v27 = v26:NextNumber() * v23
+		local v28, v30 = #STORM.ORB_SIZES, 0
+		for i2, v in ipairs(STORM.ORB_SIZES) do
+			v30 += v.Weight
+			if v27 <= v30 then
+				v28 = i2
+				break
+			end
+		end
+		v24[i] = v28
+		local v31 = math.max(0, STORM.ORB_SIZES[v28].Scale - 1) * 1.1
+		if v31 > 0 then
+			v16[i] = v16[i] + V(0, v31, 0)
+		end
+	end
+	return v16, v24
+end
+
+local THUNDER_POS = V(2470.3, 5.2, -937.2)
+local FUSE_POS = V(2438.9, 4.8, -845.8)
+local GIFT_POS = V(2430.6, 10, -1019.1)
+local FUSE_FEE_SECONDS = { Common = 10, Uncommon = 10, Rare = 30, Epic = 30, Legendary = 60, Mythic = 60, Cosmic = 120, Secret = 180, Eternal = 300, Divine = 300 }
+
+function Server.buildExtras()
+	local RS = Sim.services.ReplicatedStorage
+	local WS = Sim.services.Workspace
+	local player = Sim.player
+	-- storm: regions live in ReplicatedStorage like the real game (not raycast)
+	local admin = make("Folder", { Name = "AdminSystem" }, RS)
+	local events = make("Folder", { Name = "Events" }, admin)
+	local stormModule = make("ModuleScript", { Name = "Storm" }, events)
+	local client = make("Folder", { Name = "Client" }, stormModule)
+	local regions = make("Model", { Name = "ElectricOrbSpawnRegions" }, client)
+	for _, r in ipairs(cfg("stormRegions") or { { pos = V(2470, 3, -960), size = V(60, 1, 80) }, { pos = V(2330, 3, -960), size = V(80, 1, 60) } }) do
+		make("Part", { Name = "Part", Anchored = true, Size = r.size, CFrame = CFrame.new(r.pos) }, regions)
+	end
+	if not cfg("stormNoModule") then
+		local shared = make("Folder", { Name = "Shared" }, stormModule)
+		Server.moduleValues[make("ModuleScript", { Name = "StormConfig" }, shared)] = STORM
+	end
+	Server.orbTaken = {}
+	Server.orbs, Server.orbSizes = STORM.computeLayout(regions, cfg("stormSeed") or 1790444418, STORM.ORB_COUNT)
+	local storm = cfg("storm")
+	WS:SetAttribute("StormSeed", cfg("stormSeed") or 1790444418)
+	WS:SetAttribute("StormActive", storm == true)
+	WS:SetAttribute("StormEndsAt", Sim.now + (cfg("stormSeconds") or 300))
+	WS:SetAttribute("ArenaCycle", 5968151)
+	WS:SetAttribute("NextArenaReset", Server.nextReset)
+	player:SetAttribute("StormPoints", cfg("stormPoints") or 0)
+	player:SetAttribute("StormLuckTier", 0)
+	-- machines and the gift chest
+	local thunder = make("Model", { Name = "Thunder Machine" }, WS)
+	make("Part", { Name = "ThunderPromptAnchor", Anchored = true, Size = V(1, 1, 1), CFrame = CFrame.new(THUNDER_POS) }, thunder)
+	local fuse = make("Model", { Name = "Fuse Machine" }, WS)
+	make("Part", { Name = "FusePromptAnchor", Anchored = true, Size = V(1, 1, 1), CFrame = CFrame.new(FUSE_POS) }, fuse)
+	local gift = make("Folder", { Name = "FREEGIFT" }, WS)
+	local chest = make("Model", { Name = "FreeGiftChest" }, gift)
+	make("Part", { Name = "Group Likeframe", Anchored = true, Size = V(6, 6, 6), CanCollide = false, CFrame = CFrame.new(GIFT_POS) }, chest)
+	Server.charged = {}
+	Server.giftState = {}
+	if cfg("offlineCash") then
+		Server.offlinePending = cfg("offlineCash")
+		task.delay(cfg("offlineAt") or 1, function()
+			fireClient("rev_Offline_Update", Server.offlinePending)
+		end)
+	end
+	if cfg("indexBats") then
+		task.delay(2, function()
+			fireClient("rev_INDEX_STATE", { Discovered = {}, Claimed = {}, AreaClaimed = {}, Bats = cfg("indexBats") })
+		end)
+	end
+end
+
 
 ---------------------------------------------------------------------------
 -- require() of game modules
@@ -1266,6 +1398,214 @@ invokers.rf_CRATE_TIMERS = function(args, entry)
 		return false
 	end
 	return nil
+end
+
+local function rootPos()
+	local root = Sim.rootPart()
+	return root and root.Position
+end
+
+handlers.rev_STORM_COLLECT = function(args, entry)
+	local index = tonumber(args[1])
+	local orb = index and Server.orbs[index]
+	local reason
+	local pos = rootPos()
+	if not orb then
+		reason = "bad index"
+	elseif Sim.services.Workspace:GetAttribute("StormActive") ~= true then
+		reason = "no storm"
+	elseif (Server.orbTaken[index] or 0) > Sim.now then
+		reason = "taken"
+	elseif not pos then
+		reason = "no character"
+	else
+		local d = orb - pos
+		if V(d.X, 0, d.Z).Magnitude > STORM.MAGNET_RADIUS + 2 or math.abs(d.Y) >= 20 then
+			reason = fmt("far (%.0f studs)", V(d.X, 0, d.Z).Magnitude)
+		end
+	end
+	if reason then
+		entry.outcome = "rejected: " .. reason
+		table.insert(stats.orbRejected, { t = Sim.elapsed(), index = index, why = reason })
+		fireClient("rev_STORM_RESULT", index, false, if reason == "taken" then "taken" else reason)
+		return
+	end
+	local points = STORM.ORB_SIZES[Server.orbSizes[index] or 2].Points
+	Server.orbTaken[index] = Sim.now + STORM.RESPAWN_SECONDS
+	Sim.player:SetAttribute("StormPoints", (tonumber(Sim.player:GetAttribute("StormPoints")) or 0) + points)
+	table.insert(stats.orbs, { t = Sim.elapsed(), index = index, points = points })
+	entry.outcome = "accepted"
+	fireClient("rev_STORM_RESULT", index, true, points)
+end
+
+local function thunderCrates()
+	local list = {}
+	for _, parent in ipairs({ Sim.player.Backpack, Sim.player.Character }) do
+		for _, c in ipairs(parent and parent:GetChildren() or {}) do
+			if c:IsA("Tool") and c:GetAttribute("CrateUid") then
+				local uid = c:GetAttribute("CrateUid")
+				table.insert(list, { Uid = uid, Name = c.Name, AreaId = c:GetAttribute("CrateAreaId"), Tier = c:GetAttribute("CrateTier"), Charge = Server.charged[uid] })
+			end
+		end
+	end
+	return list
+end
+
+invokers.rf_THUNDER_MACHINE = function(args, entry)
+	local action = args[1]
+	local player = Sim.player
+	local points = tonumber(player:GetAttribute("StormPoints")) or 0
+	if action == "state" then
+		return { ok = true, points = points, crates = thunderCrates() }
+	elseif action == "mutate" then
+		local uid, spend = args[2], tonumber(args[3]) or 0
+		local pos = rootPos()
+		local why
+		if not pos or (pos - THUNDER_POS).Magnitude > 60 then
+			why = "Get closer to the machine"
+		elseif spend < STORM.MIN_SPEND or spend > math.min(points, STORM.MAX_CHARGE) then
+			why = "Not enough storm points"
+		else
+			local found
+			for _, c in ipairs(thunderCrates()) do
+				if c.Uid == uid then
+					found = c
+				end
+			end
+			if not found then
+				why = "Crate not found"
+			elseif found.Charge then
+				why = "Already charged"
+			end
+		end
+		if why then
+			entry.outcome = "rejected: " .. why
+			table.insert(stats.chargeRejected, { t = Sim.elapsed(), why = why })
+			return { ok = false, msg = why }
+		end
+		player:SetAttribute("StormPoints", points - spend)
+		Server.charged[uid] = "Supercharged"
+		table.insert(stats.charges, { t = Sim.elapsed(), uid = uid, spend = spend })
+		entry.outcome = "accepted"
+		return { ok = true, result = "Supercharged" }
+	end
+	return { ok = false, msg = "unknown action" }
+end
+
+handlers.rev_FUSE_ITEMS = function(args, entry)
+	local uids = args[1]
+	local why
+	local tools = {}
+	local pos = rootPos()
+	if type(uids) ~= "table" or #uids ~= 3 then
+		why = "needs 3 uids"
+	elseif not pos or (pos - FUSE_POS).Magnitude > 25 then
+		why = "not at the Fuse Machine"
+	else
+		for _, uid in ipairs(uids) do
+			for _, parent in ipairs({ Sim.player.Backpack, Sim.player.Character }) do
+				for _, c in ipairs(parent and parent:GetChildren() or {}) do
+					if c:IsA("Tool") and c:GetAttribute("ItemUid") == uid and not table.find(tools, c) then
+						table.insert(tools, c)
+					end
+				end
+			end
+		end
+		if #tools ~= 3 then
+			why = "items not found"
+		elseif tools[1].Name ~= tools[2].Name or tools[1].Name ~= tools[3].Name then
+			why = "not the same item"
+		else
+			for _, t in ipairs(tools) do
+				if t:GetAttribute("ItemFused") then
+					why = "already fused"
+				end
+			end
+		end
+	end
+	local fee = 0
+	if not why then
+		local income = 0
+		for _, t in ipairs(tools) do
+			income = math.max(income, tonumber(t:GetAttribute("ItemIncome")) or 0)
+		end
+		fee = math.max(1, math.floor(income * (FUSE_FEE_SECONDS[tools[1]:GetAttribute("ItemTier")] or 60)))
+		if Server.money < fee then
+			why = "cannot afford $" .. fee
+		end
+	end
+	if why then
+		entry.outcome = "rejected: " .. why
+		table.insert(stats.fuseRejected, { t = Sim.elapsed(), why = why })
+		return
+	end
+	local name, tier, value = tools[1].Name, tools[1]:GetAttribute("ItemTier"), tools[1]:GetAttribute("ItemValue")
+	for _, t in ipairs(tools) do
+		t:Destroy()
+	end
+	Server.setMoney(Server.money - fee)
+	local fused = Server.giveItemTool({ name = name, tier = tier, value = (value or 100) * 3 })
+	fused:SetAttribute("ItemFused", true)
+	table.insert(stats.fuses, { t = Sim.elapsed(), name = name, fee = fee })
+	entry.outcome = "accepted"
+	fireClient("rev_FUSE_RESULT", { Name = name })
+end
+
+handlers.rev_Offline_Claim = function(args, entry)
+	if Server.offlinePending then
+		Server.setMoney(Server.money + Server.offlinePending)
+		Server.offlinePending = nil
+		stats.offlineClaims += 1
+		entry.outcome = "accepted"
+	else
+		entry.outcome = "nothing to claim"
+	end
+end
+
+handlers.rev_FreeGiftState = function(args, entry)
+	if type(args[3]) == "table" then
+		Server.giftState = args[3]
+	end
+end
+
+handlers.rev_GroupClaim = function(args, entry)
+	local player = Sim.player
+	local pos = rootPos()
+	local why
+	if player:GetAttribute("LBTHFreeGiftClaimed") == true then
+		why = "already claimed"
+	elseif not cfg("inGroup") then
+		why = "not in the group"
+	elseif not pos or (pos - GIFT_POS).Magnitude > 20 then
+		why = "not at the chest"
+	elseif not Server.giftState.Favorited then
+		why = "not favorited"
+	end
+	if why then
+		entry.outcome = "rejected: " .. why
+		table.insert(stats.freeGiftRejected, why)
+		fireClient("rev_GroupClaimResponse", false, nil, {})
+		return
+	end
+	player:SetAttribute("LBTHFreeGiftClaimed", true)
+	player:SetAttribute("SpeedLevel", (tonumber(player:GetAttribute("SpeedLevel")) or 0) + 10000)
+	stats.freeGift += 1
+	entry.outcome = "accepted"
+	fireClient("rev_GroupClaimResponse", true, nil, { Claimed = true })
+end
+
+handlers.rev_INDEX_EQUIP_BAT = function(args, entry)
+	local owned = cfg("indexBats") and cfg("indexBats").Owned or { Default = true }
+	if owned[args[1]] then
+		table.insert(stats.batEquips, args[1])
+		entry.outcome = "accepted"
+	else
+		entry.outcome = "rejected: bat not owned"
+	end
+end
+
+for _, n in ipairs({ "rev_ItemVisibilitySet" }) do
+	handlers[n] = function(args, entry) end
 end
 
 function Server.onEvent(remoteInst, args, entry)

@@ -30039,7 +30039,7 @@ local function loggedRemote(remote)
 end
 
 local Remotes = {}
-for _, name in ipairs({ "re_PLACE_AT", "re_PLOT_UPGRADE", "re_TREADMILL_UPGRADE", "re_SELL_DO", "rf_SELL_QUOTE", "rf_ITEM_LOADOUT", "rf_CRATE_TIMERS" }) do
+for _, name in ipairs({ "re_PLACE_AT", "re_PLOT_UPGRADE", "re_TREADMILL_UPGRADE", "re_SELL_DO", "rf_SELL_QUOTE", "rf_ITEM_LOADOUT", "rf_CRATE_TIMERS", "rf_THUNDER_MACHINE" }) do
 	Remotes[name] = loggedRemote(ReplicatedStorage:WaitForChild(name, 10))
 	if not Remotes[name] then
 		log("MISSING remote", name)
@@ -30128,8 +30128,8 @@ end
 -- Crate names use the item tiers (ItemData.Tiers), e.g. Crate_MafiaBoss_Rare_N1,
 -- not the per-zone AreaData.CrateTiers
 local RarityList, RarityRank = {}, {}
+local ItemData = safeRequire("Shared.Data.ItemData")
 do
-	local ItemData = safeRequire("Shared.Data.ItemData")
 	for _, tier in ipairs(ItemData and type(ItemData.Tiers) == "table" and ItemData.Tiers or {}) do
 		local name = type(tier) == "table" and tier.Name or tier
 		if type(name) == "string" then
@@ -31281,6 +31281,528 @@ local function trailTick()
 end
 
 ---------------------------------------------------------------------------
+-- Storm orbs (AdminSystem.Events.Storm): every 4th arena cycle the storm fills
+-- the map with 300 orbs. Their positions come from StormConfig.computeLayout
+-- with workspace.StormSeed; the game's own client fires rev_STORM_COLLECT(index)
+-- when you are within MAGNET_RADIUS, and the server answers
+-- rev_STORM_RESULT(index, ok, pointsOrReason). Points (StormPoints) charge
+-- crates at the Thunder Machine.
+---------------------------------------------------------------------------
+local StormDefaults = {
+	ORB_COUNT = 300,
+	MAGNET_RADIUS = 16,
+	RESPAWN_SECONDS = 20,
+	EDGE_MARGIN = 4,
+	HOVER = 1.25,
+	MIN_SPEND = 1000,
+	MAX_CHARGE = 1500,
+	ORB_SIZES = { { Id = "Small", Points = 1, Scale = 0.6, Weight = 50 }, { Id = "Medium", Points = 2, Scale = 1, Weight = 40 }, { Id = "Big", Points = 4, Scale = 1.6, Weight = 10 } },
+}
+local Storm = { config = nil, loaded = false, seed = nil, orbs = nil, backAt = {}, pendingUntil = {}, points = 0 }
+
+local function stormActive()
+	return workspace:GetAttribute("StormActive") == true and workspace:GetAttribute("StormSeed") ~= nil
+end
+
+local function stormConfig()
+	if not Storm.loaded then
+		Storm.loaded = true
+		Storm.config = safeRequire("AdminSystem.Events.Storm.Shared.StormConfig")
+	end
+	return Storm.config or StormDefaults
+end
+
+local function stormRegions()
+	local node = ReplicatedStorage
+	for _, name in ipairs({ "AdminSystem", "Events", "Storm", "Client", "ElectricOrbSpawnRegions" }) do
+		node = node and node:FindFirstChild(name)
+	end
+	return node
+end
+
+-- the same maths as StormConfig.computeLayout (dump line 49794), used when the
+-- module cannot be required
+local function computeOrbLayout(regions, seed, count, config)
+	local parts = {}
+	for _, d in ipairs(regions:GetDescendants()) do
+		if d:IsA("BasePart") then
+			table.insert(parts, d)
+		end
+	end
+	table.sort(parts, function(a, b)
+		if a.Position.X == b.Position.X then
+			return a.Position.Z < b.Position.Z
+		end
+		return a.Position.X < b.Position.X
+	end)
+	local areas, total = {}, 0
+	for _, part in ipairs(parts) do
+		local sx = math.max(0.1, part.Size.X - config.EDGE_MARGIN * 2)
+		local sz = math.max(0.1, part.Size.Z - config.EDGE_MARGIN * 2)
+		total += sx * sz
+		table.insert(areas, { part = part, sx = sx, sz = sz, cum = total })
+	end
+	local positions, sizes = {}, {}
+	if #areas == 0 then
+		return positions, sizes
+	end
+	local rng = Random.new(math.floor(tonumber(seed) or 0))
+	for i = 1, count do
+		local pick = rng:NextNumber() * total
+		local area = areas[#areas]
+		for _, a in ipairs(areas) do
+			if pick <= a.cum then
+				area = a
+				break
+			end
+		end
+		local x = (rng:NextNumber() - 0.5) * area.sx
+		local z = (rng:NextNumber() - 0.5) * area.sz
+		positions[i] = area.part.CFrame:PointToWorldSpace(Vector3.new(x, area.part.Size.Y / 2 + config.HOVER, z))
+	end
+	local weights = 0
+	for _, size in ipairs(config.ORB_SIZES) do
+		weights += size.Weight
+	end
+	local rng2 = Random.new(math.floor(tonumber(seed) or 0) + 7919)
+	for i = 1, #positions do
+		local roll = rng2:NextNumber() * weights
+		local index, sum = #config.ORB_SIZES, 0
+		for j, size in ipairs(config.ORB_SIZES) do
+			sum += size.Weight
+			if roll <= sum then
+				index = j
+				break
+			end
+		end
+		sizes[i] = index
+		local lift = math.max(0, config.ORB_SIZES[index].Scale - 1) * 1.1
+		if lift > 0 then
+			positions[i] += Vector3.new(0, lift, 0)
+		end
+	end
+	return positions, sizes
+end
+
+local function stormOrbs()
+	local seed = workspace:GetAttribute("StormSeed")
+	if Storm.orbs and Storm.seed == seed then
+		return Storm.orbs
+	end
+	local regions = stormRegions()
+	if not seed or not regions then
+		return nil
+	end
+	local config = stormConfig()
+	local positions, sizes
+	if type(config.computeLayout) == "function" then
+		pcall(function()
+			positions, sizes = config.computeLayout(regions, seed, config.ORB_COUNT or 300)
+		end)
+	end
+	if type(positions) ~= "table" or #positions == 0 then
+		positions, sizes = computeOrbLayout(regions, seed, config.ORB_COUNT or 300, config)
+	end
+	local orbs = {}
+	for i, position in ipairs(positions) do
+		local size = (config.ORB_SIZES or StormDefaults.ORB_SIZES)[sizes and sizes[i] or 2]
+		orbs[i] = { index = i, pos = position, points = size and size.Points or 1 }
+	end
+	Storm.seed, Storm.orbs = seed, orbs
+	table.clear(Storm.backAt)
+	table.clear(Storm.pendingUntil)
+	log("STORM layout", #orbs, "orbs, seed", seed)
+	return orbs
+end
+
+onNet("STORM_RESULT", function(index, ok, amount)
+	index = tonumber(index)
+	if not index then
+		return
+	end
+	local config = Storm.config or StormDefaults
+	Storm.pendingUntil[index] = nil
+	if ok then
+		Storm.backAt[index] = os.clock() + (config.RESPAWN_SECONDS or 20)
+		Session.orbs += 1
+		Storm.points += tonumber(amount) or 0
+	else
+		Storm.backAt[index] = os.clock() + (if amount == "taken" then 5 else 1.5)
+	end
+end)
+
+-- one leg: run to the best ready orb (points per stud), collecting on the way
+local function collectOrbs()
+	local orbs = stormOrbs()
+	local root = rootPart()
+	if not orbs or not root then
+		return false
+	end
+	local config = stormConfig()
+	local radius = config.MAGNET_RADIUS or 16
+	local now = os.clock()
+	local best, bestScore
+	for _, orb in ipairs(orbs) do
+		if (Storm.backAt[orb.index] or 0) <= now and (Storm.pendingUntil[orb.index] or 0) <= now then
+			local d = (orb.pos - root.Position).Magnitude
+			local score = orb.points / (d + 25)
+			if not bestScore or score > bestScore then
+				best, bestScore = orb, score
+			end
+		end
+	end
+	if not best then
+		setStatus("Storm: every orb is taken, waiting for them to come back")
+		return false
+	end
+	setStatus(string.format("Collecting storm orbs (%s points)", formatNumber(tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0)))
+	travel(best.pos, {
+		keepGoing = function()
+			return stormActive() and (Storm.backAt[best.index] or 0) <= os.clock()
+		end,
+	})
+	root = rootPart()
+	if root and stormActive() and (Storm.backAt[best.index] or 0) <= os.clock() then
+		local offset = best.pos - root.Position
+		if Vector3.new(offset.X, 0, offset.Z).Magnitude <= radius and math.abs(offset.Y) < 20 then
+			-- the game's own client normally sends this; send it if it has not
+			task.wait(0.15)
+			if (Storm.backAt[best.index] or 0) <= os.clock() then
+				fire("STORM_COLLECT", best.index)
+			end
+		end
+	end
+	Storm.pendingUntil[best.index] = os.clock() + 3
+	return true
+end
+
+---------------------------------------------------------------------------
+-- Thunder Machine: StormPoints charge a crate (Supercharged x3, Supercell x6)
+-- rf_THUNDER_MACHINE("state") -> {ok, points, crates = {Uid, Name, AreaId, Tier, Charge, InMachine, Blocked}}
+-- rf_THUNDER_MACHINE("mutate", uid, spend) -> {ok, msg} / {ok, processing} / {ok, result}
+---------------------------------------------------------------------------
+local ThunderNext = 0
+local function thunderSpot()
+	local machine = workspace:FindFirstChild("Thunder Machine")
+	local anchor = machine and machine:FindFirstChild("ThunderPromptAnchor", true)
+	local position = anchor and anchor.Position or (machine and machine:GetPivot().Position) or Vector3.new(2470.3, 5.2, -937.2)
+	return position + Vector3.new(0, 1, 0)
+end
+
+local function thunderReady()
+	local config = stormConfig()
+	return Remotes.rf_THUNDER_MACHINE ~= nil and os.clock() >= ThunderNext and LocalPlayer:GetAttribute("ThunderProcessing") ~= true and (tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0) >= (config.MIN_SPEND or 1000)
+end
+
+local function tierRank(tier)
+	tier = tostring(tier or "")
+	for name, rank in pairs(RarityRank) do
+		if string.lower(name) == string.lower(tier) then
+			return rank
+		end
+	end
+	return 0
+end
+
+local function chargeCrate()
+	local config = stormConfig()
+	ThunderNext = os.clock() + 20
+	setStatus("Going to the Thunder Machine")
+	travel(thunderSpot(), { mode = "Safe" })
+	local state = invokeWithTimeout(Remotes.rf_THUNDER_MACHINE, 8, "state")
+	if type(state) ~= "table" or not state.ok then
+		setStatus("The Thunder Machine did not answer")
+		return true
+	end
+	local points = tonumber(state.points) or 0
+	local best
+	for _, crate in ipairs(type(state.crates) == "table" and state.crates or {}) do
+		if type(crate) == "table" and crate.Uid and crate.Charge == nil and crate.InMachine ~= true and crate.Blocked ~= true then
+			if not best or tierRank(crate.Tier) > tierRank(best.Tier) then
+				best = crate
+			end
+		end
+	end
+	if not best then
+		ThunderNext = os.clock() + 60
+		setStatus("Thunder Machine: no crate left to charge")
+		return true
+	end
+	-- the machine's own spend rule (setSpend): at most MAX_CHARGE, in steps of 10
+	local most = math.min(points, config.MAX_CHARGE or 1500)
+	local spend = math.floor(most / 10) * 10
+	if most - spend < 10 then
+		spend = most
+	end
+	if spend < (config.MIN_SPEND or 1000) then
+		return true
+	end
+	setStatus("Charging " .. tostring(best.Tier) .. " crate with " .. formatNumber(spend) .. " storm points")
+	local result = invokeWithTimeout(Remotes.rf_THUNDER_MACHINE, 10, "mutate", best.Uid, spend)
+	if type(result) == "table" and result.ok then
+		Session.charged = (Session.charged or 0) + 1
+		emit("charged", best, result.result)
+		setStatus(if result.result then "Thunder Machine: " .. tostring(result.result) else "Thunder Machine is charging the crate")
+	else
+		setStatus("Thunder Machine: " .. tostring(type(result) == "table" and result.msg or "no answer"))
+	end
+	return true
+end
+
+---------------------------------------------------------------------------
+-- Fuse Machine: 3 copies of the same item (not fused yet) -> 1 fused item, for
+-- cash. rev_FUSE_ITEMS({uid1, uid2, uid3}); fee = ItemData:GetFuseFee(tier, income, mutated)
+---------------------------------------------------------------------------
+local FuseFeeSeconds = { COMMON = 10, UNCOMMON = 10, RARE = 30, EPIC = 30, LEGENDARY = 60, MYTHIC = 60, COSMIC = 120, SECRET = 180, ETERNAL = 300, DIVINE = 300 }
+local FuseNext = 0
+
+local function fuseFee(tier, income, mutated)
+	local fee
+	if ItemData and type(ItemData.GetFuseFee) == "function" then
+		pcall(function()
+			fee = ItemData:GetFuseFee(tier, income, mutated)
+		end)
+	end
+	if type(fee) ~= "number" then
+		local name = type(tier) == "number" and RarityList[tier] or tostring(tier or "")
+		fee = math.max(1, math.floor((tonumber(income) or 0) * (FuseFeeSeconds[string.upper(name)] or 60) * (if mutated then 2 else 1)))
+	end
+	return fee
+end
+
+local function mutated(tool)
+	local m = tool:GetAttribute("ItemMutation") or tool:GetAttribute("Mutation")
+	return m ~= nil and m ~= "None" and m ~= ""
+end
+
+-- groups of 3 fusable items the player can afford, best income first
+local function fuseCandidates()
+	local groups = {}
+	for _, tool in ipairs(toolsWith("ItemUid")) do
+		if not tool:GetAttribute("ItemFused") then
+			local name = tool:GetAttribute("ItemName") or tool.Name
+			local tier = tool:GetAttribute("ItemTier")
+			local tierName = type(tier) == "number" and RarityList[tier] or tier
+			if not tierName or selected(Options.FuseTiers, tierName) or selected(Options.FuseTiers, (tostring(tierName):sub(1, 1) .. tostring(tierName):sub(2):lower())) then
+				groups[name] = groups[name] or {}
+				table.insert(groups[name], tool)
+			end
+		end
+	end
+	local list = {}
+	for name, tools in pairs(groups) do
+		if #tools >= 3 then
+			table.sort(tools, function(a, b)
+				return (tonumber(a:GetAttribute("ItemIncome")) or 0) > (tonumber(b:GetAttribute("ItemIncome")) or 0)
+			end)
+			local pick = { tools[1], tools[2], tools[3] }
+			local income, anyMutated = 0, false
+			for _, tool in ipairs(pick) do
+				income = math.max(income, tonumber(tool:GetAttribute("ItemIncome")) or 0)
+				anyMutated = anyMutated or mutated(tool)
+			end
+			local fee = fuseFee(pick[1]:GetAttribute("ItemTier"), income, anyMutated)
+			table.insert(list, { name = name, tools = pick, fee = fee, income = income })
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.income > b.income
+	end)
+	return list
+end
+
+local function fuseSpot()
+	local machine = workspace:FindFirstChild("Fuse Machine")
+	local anchor = machine and machine:FindFirstChild("FusePromptAnchor", true)
+	local position = anchor and anchor.Position or (machine and machine:GetPivot().Position) or Vector3.new(2438.9, 4.8, -845.8)
+	return position + Vector3.new(0, 1, 0)
+end
+
+local function fuseOnce()
+	if os.clock() < FuseNext then
+		return false
+	end
+	local cash = money()
+	local job
+	for _, candidate in ipairs(fuseCandidates()) do
+		if candidate.fee <= cash then
+			job = candidate
+			break
+		end
+	end
+	if not job then
+		FuseNext = os.clock() + 10
+		return false
+	end
+	FuseNext = os.clock() + 3
+	setStatus("Fusing 3x " .. job.name .. " ($" .. formatNumber(job.fee) .. ")")
+	travel(fuseSpot(), { mode = "Safe" })
+	local uids = {}
+	for _, tool in ipairs(job.tools) do
+		table.insert(uids, tool:GetAttribute("ItemUid"))
+	end
+	local before = #toolsWith("ItemUid")
+	fire("FUSE_ITEMS", uids)
+	if waitFor(function()
+		return #toolsWith("ItemUid") < before
+	end, 4) then
+		Session.fused = (Session.fused or 0) + 1
+		Session.bought += 1
+		emit("fused", job.name)
+		setStatus("Fused 3x " .. job.name)
+	else
+		FuseNext = os.clock() + 30
+		setStatus("The Fuse Machine did not take " .. job.name)
+	end
+	return true
+end
+
+---------------------------------------------------------------------------
+-- Rewards and extras
+---------------------------------------------------------------------------
+-- Storm timer, same maths as LBTHStormTimerSignClient: the storm starts 18 s
+-- into every arena cycle where ArenaCycle % 4 == 0
+local function nextStormIn()
+	local ok, left = pcall(function()
+		local cycle = tonumber(workspace:GetAttribute("ArenaCycle"))
+		local reset = tonumber(workspace:GetAttribute("NextArenaReset"))
+		if not (cycle and reset) then
+			return nil
+		end
+		local now = workspace:GetServerTimeNow()
+		if cycle % 4 == 0 then
+			local start = reset - 300 + 18
+			if now < start then
+				return start - now
+			end
+		end
+		return reset + (4 - cycle % 4 - 1) * 300 + 18 - now
+	end)
+	return ok and left and math.max(0, math.floor(left)) or nil
+end
+
+-- Offline earnings: rev_Offline_Update(amount) opens the popup, both of its
+-- buttons fire rev_Offline_Claim()
+local function claimOffline(reason)
+	fire("Offline_Claim")
+	Session.claimed += 1
+	log("offline cash claimed", reason)
+end
+onNet("Offline_Update", function(amount)
+	if Toggles.AutoOffline and Toggles.AutoOffline.Value then
+		task.delay(1.5, claimOffline, amount)
+	end
+end)
+
+-- Best bat from the item index: rev_INDEX_STATE {Bats = {Owned, Equipped}},
+-- rev_INDEX_EQUIP_BAT(batId). Order from Shared.Data.BatData.
+local BatOrder = { "Default", "Grandpa", "Jeweler", "Archeologist", "MafiaBoss", "Celebrity", "PirateCaptain", "MuseumOwner", "GoldTycoon", "Astronaut", "DemonKing" }
+local IndexBats = { Owned = nil, Equipped = nil }
+onNet("INDEX_STATE", function(state)
+	if type(state) == "table" and type(state.Bats) == "table" then
+		IndexBats.Owned = state.Bats.Owned or { Default = true }
+		IndexBats.Equipped = state.Bats.Equipped or "Default"
+	end
+end)
+local function equipBestBat()
+	if type(IndexBats.Owned) ~= "table" then
+		return
+	end
+	for i = #BatOrder, 1, -1 do
+		local id = BatOrder[i]
+		if IndexBats.Owned[id] then
+			if IndexBats.Equipped ~= id then
+				fire("INDEX_EQUIP_BAT", id)
+				IndexBats.Equipped = id
+			end
+			return
+		end
+	end
+end
+
+-- Free Gift (10,000 speed): the chest at the spawn; the game's client sends
+-- rev_FreeGiftState(false, false, {Favorited, HasPermission}) and then
+-- rev_GroupClaim() once you are in the group
+local FreeGiftGroup = 900458044
+local FreeGiftNext = 0
+local function freeGiftClaimed()
+	return LocalPlayer:GetAttribute("LBTHFreeGiftClaimed") == true
+end
+local function inFreeGiftGroup()
+	local ok, member = pcall(function()
+		return LocalPlayer:IsInGroup(FreeGiftGroup)
+	end)
+	return ok and member == true
+end
+local function freeGiftSpot()
+	local part
+	pcall(function()
+		part = workspace.FREEGIFT.FreeGiftChest["Group Likeframe"]
+	end)
+	return part and part.Position or Vector3.new(2430.6, 10, -1019.1)
+end
+local function claimFreeGift(manual)
+	FreeGiftNext = os.clock() + 300
+	if freeGiftClaimed() then
+		if manual then
+			notify("Free Gift", "Already claimed on this account", 4)
+		end
+		return false
+	end
+	if not inFreeGiftGroup() then
+		if manual then
+			pcall(function()
+				game:GetService("GroupService"):PromptJoinAsync(FreeGiftGroup)
+			end)
+		end
+		FreeGiftNext = os.clock() + 1800
+		return false
+	end
+	setStatus("Claiming the Free Gift (10K speed)")
+	local spot = freeGiftSpot()
+	travel(Vector3.new(spot.X, spot.Y - 4, spot.Z), { mode = "Safe" })
+	fire("FreeGiftState", false, false, { Favorited = true, HasPermission = true })
+	task.wait(0.3)
+	fire("GroupClaim")
+	if waitFor(freeGiftClaimed, 4) then
+		Session.claimed += 1
+		setStatus("Free Gift claimed")
+		notify("Free Gift", "Claimed 10,000 speed", 4)
+	end
+	return true
+end
+
+-- The game rejoins you after 19 minutes without input (LBTHIdleRejoinClient)
+local function setIdleRejoinBlocked(blocked)
+	pcall(function()
+		local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
+		local idle = scripts and scripts:FindFirstChild("LBTHIdleRejoinClient")
+		if idle then
+			idle.Disabled = blocked
+		end
+	end)
+end
+
+-- Knockback (bats, guard catches) is applied by your own client from
+-- ReplicatedStorage.RAGDOLL_TUMBLE; switching those handlers off keeps you running
+local function setAntiKnockback(enabled)
+	local remote = ReplicatedStorage:FindFirstChild("RAGDOLL_TUMBLE")
+	if not remote or type(getconnections) ~= "function" then
+		return false
+	end
+	local ok = pcall(function()
+		for _, connection in ipairs(getconnections(remote.OnClientEvent)) do
+			if enabled then
+				connection:Disable()
+			else
+				connection:Enable()
+			end
+		end
+	end)
+	return ok
+end
+
+---------------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------------
 do
@@ -31326,7 +31848,8 @@ if Window.AddInfoTab then
 end
 Tabs.Main = addTab("Main", "swords", "Auto steal and auto sell")
 Tabs.Plot = addTab("Plot", "house", "Crates, upgrades and the treadmill")
-Tabs.Meta = addTab("Meta", "sparkles", "Index rewards and trails")
+Tabs.Storm = addTab("Storm", "cloud-lightning", "Storm orbs, Thunder Machine and Fuse Machine")
+Tabs.Meta = addTab("Meta", "sparkles", "Index, trails and free rewards")
 Tabs.Stats = addTab("Stats", "chart-column", "Session progress")
 if Window.AddMiscTab then
 	pcall(function()
@@ -31472,6 +31995,75 @@ local MetaBox = Tabs.Meta:AddLeftGroupbox("Meta", "sparkles")
 MetaBox:AddToggle("AutoIndex", { Text = "Auto Claim Index", Default = false, Tooltip = "Claims every finished index reward" })
 MetaBox:AddToggle("AutoTrails", { Text = "Auto Buy Trails", Default = false, Tooltip = "Buys the next trail as soon as you can afford it" })
 MetaBox:AddToggle("AutoEquipTrail", { Text = "Auto Equip Best Trail", Default = true })
+MetaBox:AddToggle("AutoEquipBat", { Text = "Auto Equip Best Bat", Default = true, Tooltip = "Equips the strongest bat your index unlocked" })
+
+local RewardBox = Tabs.Meta:AddRightGroupbox("Free Rewards", "gift")
+RewardBox:AddToggle("AutoOffline", { Text = "Auto Claim Offline Cash", Default = true, Tooltip = "Claims the offline earnings popup as soon as it shows" })
+RewardBox:AddToggle("AutoFreeGift", {
+	Text = "Auto Claim Free Gift",
+	Default = true,
+	Tooltip = "The 10,000 speed chest at spawn. Needs you in the game's group; the button below asks you to join.",
+})
+RewardBox:AddButton({
+	Text = "Claim Free Gift / Join Group",
+	Func = function()
+		task.spawn(claimFreeGift, true)
+	end,
+})
+RewardBox:AddButton({
+	Text = "Skip Tutorial",
+	Func = function()
+		local remote = ReplicatedStorage:FindFirstChild("re_TUTORIAL_DONE")
+		if LocalPlayer:GetAttribute("TutorialDone") == true then
+			notify("Tutorial", "Already done on this account", 3)
+		elseif remote then
+			pcall(remote.FireServer, remote)
+			notify("Tutorial", "Sent, the tutorial is skipped", 3)
+		end
+	end,
+})
+
+-- Storm
+local OrbBox = Tabs.Storm:AddLeftGroupbox("Storm Orbs", "zap")
+OrbBox:AddToggle("AutoOrbs", {
+	Text = "Auto Collect Storm Orbs",
+	Default = false,
+	Tooltip = "During the storm (every 20 minutes) runs through the orbs. Points charge crates at the Thunder Machine.",
+})
+OrbBox:AddDropdown("OrbPriority", {
+	Text = "During the storm",
+	Values = { "Orbs first", "Crates first" },
+	Default = "Orbs first",
+	Tooltip = "Crates first only collects orbs when no crate matches your filters",
+})
+local StormLabel = OrbBox:AddLabel({ Text = "Storm: -", DoesWrap = true })
+
+local ThunderBox = Tabs.Storm:AddRightGroupbox("Thunder Machine", "cloud-lightning")
+ThunderBox:AddToggle("AutoThunder", {
+	Text = "Auto Charge Crates",
+	Default = false,
+	Tooltip = "At 1,000+ storm points charges your best crate: Supercharged x3, Supercell x6",
+})
+ThunderBox:AddButton({
+	Text = "Go To Thunder Machine",
+	Func = function()
+		task.spawn(travel, thunderSpot())
+	end,
+})
+
+local FuseBox = Tabs.Storm:AddRightGroupbox("Fuse Machine", "combine")
+FuseBox:AddToggle("AutoFuse", {
+	Text = "Auto Fuse",
+	Default = false,
+	Tooltip = "Fuses 3 copies of the same item into one stronger item when you can afford the fee. Runs before selling.",
+})
+FuseBox:AddDropdown("FuseTiers", {
+	Text = "Fuse Rarities",
+	Values = RarityList,
+	Default = RarityList,
+	Multi = true,
+	AllowNull = true,
+})
 
 -- Stats (same stat rows as Pets Universe, plain labels if the library has none)
 local function statRow(box, icon, text, size, color)
@@ -31562,6 +32154,39 @@ if Tabs.Misc then
 	end)
 end
 
+-- Game tweaks
+pcall(function()
+	local TweakBox = (Tabs.Misc or Tabs.Meta):AddLeftGroupbox("Game Tweaks", "wrench")
+	TweakBox:AddToggle("BlockIdleRejoin", {
+		Text = "Block Idle Rejoin",
+		Default = true,
+		Tooltip = "The game moves you to another server after 19 minutes without input. This stops it so AFK farming keeps going.",
+		Callback = function(value)
+			setIdleRejoinBlocked(value)
+		end,
+	})
+	TweakBox:AddToggle("AntiKnockback", {
+		Text = "Anti Knockback",
+		Default = true,
+		Tooltip = "Bat hits and guard flings no longer throw you around",
+		Callback = function(value)
+			if not setAntiKnockback(value) and value then
+				log("anti knockback: getconnections missing")
+			end
+		end,
+	})
+	TweakBox:AddToggle("HideOthersVfx", {
+		Text = "Hide Others' Item Effects",
+		Default = false,
+		Tooltip = "The game's own setting: fewer effects, more FPS",
+		Callback = function(value)
+			fire("ItemVisibilitySet", "others", not value)
+		end,
+	})
+	setIdleRejoinBlocked(Toggles.BlockIdleRejoin.Value)
+	setAntiKnockback(Toggles.AntiKnockback.Value)
+end)
+
 -- Console commands (Commands tab, and the command bar)
 local function setToggles(names, args)
 	local word = args and args[1] and string.lower(tostring(args[1])) or ""
@@ -31597,7 +32222,7 @@ local function toggleCommand(name, aliases, names, text)
 end
 
 local FarmToggles = { "AutoSteal", "AutoPlace", "AutoOpen", "AutoEquipBest", "AutoIndex" }
-local AllAutoToggles = { "AutoSteal", "AutoSell", "AutoPlace", "AutoOpen", "AutoEquipBest", "AutoBuySlot", "AutoUpgradePlot", "AutoTreadmill", "AutoUpgradeTreadmill", "AutoIndex", "AutoTrails" }
+local AllAutoToggles = { "AutoSteal", "AutoSell", "AutoPlace", "AutoOpen", "AutoEquipBest", "AutoBuySlot", "AutoUpgradePlot", "AutoTreadmill", "AutoUpgradeTreadmill", "AutoIndex", "AutoTrails", "AutoOrbs", "AutoThunder", "AutoFuse" }
 
 local function copyLog()
 	flushLog()
@@ -31619,6 +32244,31 @@ if Library.AddCommand then
 		toggleCommand("index", { "autoindex" }, { "AutoIndex" }, "Auto Claim Index")
 		toggleCommand("trails", { "autotrails" }, { "AutoTrails" }, "Auto Buy Trails")
 		toggleCommand("farm", { "autofarm" }, FarmToggles, "The full farm (steal, place, open, equip best, index)")
+		toggleCommand("orbs", { "storm" }, { "AutoOrbs" }, "Auto Collect Storm Orbs")
+		toggleCommand("thunder", { "charge" }, { "AutoThunder" }, "Auto Charge Crates")
+		toggleCommand("fuse", { "autofuse" }, { "AutoFuse" }, "Auto Fuse")
+		Library:AddCommand({
+			Name = "freegift",
+			Aliases = { "gift" },
+			Description = "Claims the 10,000 speed Free Gift (asks you to join the group first)",
+			Source = "Steal From The Rich",
+			Callback = function()
+				task.spawn(claimFreeGift, true)
+				return if freeGiftClaimed() then "Already claimed" else "Claiming the Free Gift"
+			end,
+		})
+		Library:AddCommand({
+			Name = "nextstorm",
+			Description = "Shows when the next storm starts",
+			Source = "Steal From The Rich",
+			Callback = function()
+				if stormActive() then
+					return "The storm is on now"
+				end
+				local left = nextStormIn()
+				return if left then string.format("Next storm in %dm %02ds", left // 60, left % 60) else "Storm time unknown"
+			end,
+		})
 		Library:AddCommand({
 			Name = "stop",
 			Aliases = { "alloff" },
@@ -31752,6 +32402,9 @@ if Library.SetQuickBar then
 			{ Toggle = "AutoOpen", Icon = "package-open", Label = "Open" },
 			{ Toggle = "AutoEquipBest", Icon = "star", Label = "Best" },
 			{ Toggle = "AutoTreadmill", Icon = "gauge", Label = "Train" },
+			{ Toggle = "AutoOrbs", Icon = "zap", Label = "Orbs", Default = false },
+			{ Toggle = "AutoThunder", Icon = "cloud-lightning", Label = "Charge", Default = false },
+			{ Toggle = "AutoFuse", Icon = "combine", Label = "Fuse", Default = false },
 			{ Toggle = "AutoIndex", Icon = "book-open", Label = "Index", Default = false },
 			{ Toggle = "AutoTrails", Icon = "sparkles", Label = "Trails", Default = false },
 			{ Toggle = "AutoUpgradePlot", Icon = "trending-up", Label = "Plot", Default = false },
@@ -31790,7 +32443,7 @@ local function openWizard()
 				Description = "Pick everything you want running. Tap again to unpick.",
 				Multi = true,
 				Required = true,
-				Default = { "steal", "plot", "meta" },
+				Default = { "steal", "plot", "meta", "storm" },
 				Choices = {
 					{ Id = "steal", Title = "Steal crates", Description = "Runs to the richest crates and brings them home", Icon = "hand", Color = "#e0a526" },
 					{ Id = "plot", Title = "Place and open", Description = "Places crates on your plot, opens them, keeps your best items out", Icon = "package-open", Color = "#3ccf91" },
@@ -31798,6 +32451,8 @@ local function openWizard()
 					{ Id = "upgrades", Title = "Buy upgrades", Description = "Plot upgrades, extra slots and treadmill upgrades", Icon = "trending-up", Color = "#c77dff" },
 					{ Id = "meta", Title = "Index and trails", Description = "Claims index rewards, buys and equips the best trail", Icon = "sparkles", Color = "#5fb8ff" },
 					{ Id = "treadmill", Title = "Train speed", Description = "Runs on your treadmill whenever nothing else needs doing", Icon = "gauge", Color = "#ff5d8f" },
+					{ Id = "storm", Title = "Storm orbs", Description = "Collects orbs in every storm and charges your best crate with them", Icon = "zap", Color = "#7dd3fc" },
+					{ Id = "fuse", Title = "Fuse items", Description = "Turns 3 copies of an item into one stronger item", Icon = "combine", Color = "#ffb84d" },
 				},
 			},
 			{
@@ -31825,6 +32480,8 @@ local function openWizard()
 				upgrades = { "AutoUpgradePlot", "AutoBuySlot", "AutoUpgradeTreadmill" },
 				meta = { "AutoIndex", "AutoTrails", "AutoEquipTrail" },
 				treadmill = { "AutoTreadmill" },
+				storm = { "AutoOrbs", "AutoThunder" },
+				fuse = { "AutoFuse" },
 			}
 			for id, names in pairs(groups) do
 				setToggles(names, { if picked[id] then "on" else "off" })
@@ -32145,7 +32802,7 @@ if Window.AddInfoTab then
 		{ Id = "SOL", Icon = "pay-sol", Symbol = "SOL", Name = "Solana", Network = "Solana", Address = "4UriDCT4iBsLAuzLdowpSEL4mZq7Ecrxs4pNrV5ztHxW", Color = "#9945ff", Note = "Only send SOL or Solana tokens" },
 		{ Id = "BNB", Icon = "pay-bnb", Symbol = "BNB", Name = "BNB", Network = "BNB Smart Chain", Address = "0xBa0e07FdDB15fe3c9B7CE42F76cef8F09FEdAB64", Color = "#f0b90b", Note = "Only send on BNB Smart Chain (BEP20)" },
 	}
-	for _, tab in ipairs({ Tabs.Info, Tabs.Main, Tabs.Plot, Tabs.Meta, Tabs.Stats, Tabs.Misc, Tabs.Settings }) do
+	for _, tab in ipairs({ Tabs.Info, Tabs.Main, Tabs.Plot, Tabs.Storm, Tabs.Meta, Tabs.Stats, Tabs.Misc, Tabs.Settings }) do
 		pcall(function()
 			local left = tab == Tabs.Info and tab.Groupboxes.Community or nil
 			if left then
@@ -32270,7 +32927,7 @@ task.spawn(function()
 				returnToSafety()
 				return
 			end
-			if ArenaResetting and (on("AutoSteal") or on("AutoPlace") or on("AutoSell")) then
+			if ArenaResetting and (on("AutoSteal") or on("AutoPlace") or on("AutoSell") or on("AutoOrbs")) then
 				setStatus("Arena is resetting, waiting")
 				return
 			end
@@ -32286,6 +32943,27 @@ task.spawn(function()
 					return
 				end
 			end
+			local orbsFirst = not (Options.OrbPriority and Options.OrbPriority.Value == "Crates first")
+			if on("AutoOrbs") and stormActive() and (orbsFirst or not on("AutoSteal")) then
+				if collectOrbs() then
+					return
+				end
+			end
+			if on("AutoThunder") and thunderReady() then
+				if chargeCrate() then
+					return
+				end
+			end
+			if on("AutoFuse") and os.clock() >= FuseNext then
+				if fuseOnce() then
+					return
+				end
+			end
+			if on("AutoFreeGift") and os.clock() >= FreeGiftNext and not freeGiftClaimed() then
+				if claimFreeGift(false) then
+					return
+				end
+			end
 			if on("AutoSell") and os.clock() - LastSell >= (Options.SellInterval and Options.SellInterval.Value or 30) then
 				LastSell = os.clock()
 				if sellNow(false) then
@@ -32294,6 +32972,10 @@ task.spawn(function()
 			end
 			if on("AutoSteal") then
 				if stealOnce() then
+					return
+				end
+				-- Crates first: the storm orbs fill the time when nothing matches
+				if on("AutoOrbs") and stormActive() and collectOrbs() then
 					return
 				end
 			end
@@ -32319,7 +33001,7 @@ end)
 
 -- Background upgrades and claims (no movement needed)
 task.spawn(function()
-	local last = { index = 0, trails = 0, equip = 0, open = 0, best = 0, slot = 0, plot = 0, tread = 0 }
+	local last = { index = 0, trails = 0, equip = 0, open = 0, best = 0, slot = 0, plot = 0, tread = 0, bat = 0, offline = 0 }
 	while alive() do
 		local okBg, errBg = pcall(function()
 			local now = os.clock()
@@ -32335,6 +33017,20 @@ task.spawn(function()
 			if on("AutoEquipTrail") and now - last.equip > 5 then
 				last.equip = now
 				equipBestTrail()
+			end
+			if on("AutoEquipBat") and now - last.bat > 10 then
+				last.bat = now
+				equipBestBat()
+			end
+			-- the offline popup can open before the hub started
+			if on("AutoOffline") and now - last.offline > 5 then
+				last.offline = now
+				local gui = LocalPlayer:FindFirstChild("PlayerGui")
+				local frame = gui and gui:FindFirstChild("OfflineFrame", true)
+				if frame and frame:IsA("GuiObject") and frame.Visible then
+					claimOffline("popup open")
+					last.offline = now + 25
+				end
 			end
 			if on("AutoOpen") and Remotes.rf_CRATE_TIMERS and now - last.open > 3 then
 				last.open = now
@@ -32408,7 +33104,17 @@ task.spawn(function()
 			StatRows.Opened.set(formatNumber(Session.opened))
 			StatRows.Sold.set(formatNumber(Session.sold))
 			StatRows.Best.set(best and (best .. " x" .. Session.rarities[best]) or "-")
-			StatRows.Orbs.set(formatNumber(Session.orbs))
+			StatRows.Orbs.set(formatNumber(Session.orbs) .. " (+" .. formatNumber(Storm.points) .. " pts)")
+			local stormText
+			if stormActive() then
+				local ends = tonumber(workspace:GetAttribute("StormEndsAt"))
+				local left = ends and math.max(0, math.floor(ends - workspace:GetServerTimeNow())) or nil
+				stormText = "Storm is ON" .. (if left then string.format(", ends in %dm %02ds", left // 60, left % 60) else "")
+			else
+				local left = nextStormIn()
+				stormText = if left then string.format("Next storm in %dm %02ds", left // 60, left % 60) else "Storm time unknown"
+			end
+			StormLabel:SetText(stormText .. "\nStorm points: " .. formatNumber(tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0))
 			StatRows.Claimed.set(formatNumber(Session.claimed))
 			StatRows.Bought.set(formatNumber(Session.bought))
 		end)

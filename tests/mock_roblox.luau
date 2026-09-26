@@ -1284,8 +1284,11 @@ defClass("Humanoid", "Instance", {
 
 defClass("Player", "Instance", {
 	props = { UserId = 0, DisplayName = "", Character = NIL, AccountAge = 1000 },
-	events = { "CharacterAdded", "CharacterRemoving", "Idled" },
+	events = { "CharacterAdded", "CharacterRemoving", "Idled", "OnTeleport" },
 	methods = {
+		IsInGroup = function(self, groupId)
+			return Sim.config and Sim.config.inGroup == true
+		end,
 		GetMouse = function()
 			return { Hit = CFrame.new(), Target = nil }
 		end,
@@ -1294,6 +1297,29 @@ defClass("Player", "Instance", {
 		end,
 	},
 })
+
+-- Random: deterministic Park-Miller generator (not Roblox's numbers, but the sim
+-- server and the script use the same one, so layouts computed on both sides agree)
+Random = {}
+function Random.new(seed)
+	local state = math.floor(tonumber(seed) or 1) % 2147483647
+	if state <= 0 then
+		state += 2147483646
+	end
+	local r = {}
+	function r:NextNumber(a, b)
+		state = (state * 48271) % 2147483647
+		local x = state / 2147483647
+		if a and b then
+			return a + (b - a) * x
+		end
+		return x
+	end
+	function r:NextInteger(a, b)
+		return a + math.floor(self:NextNumber() * (b - a + 1))
+	end
+	return r
+end
 
 -- Remotes ----------------------------------------------------------------------
 local Net = { queue = {}, up = 0.08, down = 0.04 }
