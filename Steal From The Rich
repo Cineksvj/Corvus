@@ -30381,21 +30381,16 @@ end
 
 -- The game's own speed (LBTHDevSpeedClient): RunSpeed studs/s, and
 -- SpeedData.Modifiers.Carrying (0.82) of that while carrying a stolen crate
--- While carrying, the crate's own carry multiplier is the CarryStat attribute
--- (rolled per crate size, 0.5 to 0.94), not a fixed 0.82
+-- The player's real speed. The live game lowers RunSpeed (and WalkSpeed) itself
+-- while a crate is carried (e.g. 89.2 -> 82.7), so nothing is multiplied here:
+-- applying CarryStat on top made carries far too slow and the guard caught up
 local function runSpeed()
-	local run = tonumber(LocalPlayer:GetAttribute("RunSpeed")) or 0
 	local hum = humanoid()
+	local run = hum and hum.WalkSpeed or 0
 	if run <= 0 then
-		run = hum and hum.WalkSpeed or 16
+		run = tonumber(LocalPlayer:GetAttribute("RunSpeed")) or 16
 	end
-	if carrying() then
-		run *= tonumber(LocalPlayer:GetAttribute("CarryStat")) or 0.82
-	end
-	if hum and hum.WalkSpeed > 0 then
-		run = math.min(run, hum.WalkSpeed)
-	end
-	return math.max(run * 0.95, 8)
+	return math.max(run * 0.97, 8)
 end
 
 -- Height the character stands at on the ground below a point (the server runs an
@@ -30432,14 +30427,14 @@ local function travelRaw(target, options)
 	local keepGoing = options.keepGoing or function()
 		return true
 	end
-	local mode = options.mode or (Options.TravelMode and Options.TravelMode.Value) or "Teleport"
+	local mode = options.mode or (Options.MoveMode and Options.MoveMode.Value) or "Safe"
 	if mode == "Teleport" then
 		root.CFrame = CFrame.new(target) * root.CFrame.Rotation
 		root.AssemblyLinearVelocity = Vector3.zero
 		task.wait(0.35)
 		root = rootPart()
 		if root and (root.Position - target).Magnitude > 10 then
-			setStatus(if carrying() then "Teleport with a crate was refused, running home instead" else "The game moved you back, switch Travel Mode to Safe")
+			setStatus(if carrying() then "Teleport with a crate was refused, running home instead" else "The game undid the teleport, running instead")
 			return false
 		end
 		return true
@@ -30486,7 +30481,7 @@ end
 local function travel(target, options)
 	local root = rootPart()
 	local from = root and root.Position
-	log("TRAVEL", (options and options.mode) or (Options.TravelMode and Options.TravelMode.Value) or "?", "from", from, "to", target, "dist", from and string.format("%.0f", (target - from).Magnitude) or "?", "carrying=" .. tostring(carrying()))
+	log("TRAVEL", (options and options.mode) or (Options.MoveMode and Options.MoveMode.Value) or "?", "from", from, "to", target, "dist", from and string.format("%.0f", (target - from).Magnitude) or "?", "carrying=" .. tostring(carrying()))
 	local started = os.clock()
 	local ok = travelRaw(target, options)
 	root = rootPart()
@@ -30584,6 +30579,37 @@ local function bankedCrates()
 	return #toolsWith("CrateUid")
 end
 
+-- rev_STEAL_SUCCESS fires on every successful pick-up, including the case where
+-- the player stands inside the safe zone and the crate is banked instantly
+local StealSuccesses = 0
+onNet("STEAL_SUCCESS", function()
+	StealSuccesses += 1
+end)
+
+-- After a guard catch the character is flung and tumbles for a few seconds;
+-- starting the next trip or prompt during that fails
+local LastCaught = 0
+onNet("ChaseCaught", function()
+	LastCaught = os.clock()
+end)
+local function waitUntilSteady()
+	local started = os.clock()
+	while alive() and os.clock() - started < 6 do
+		local hum = humanoid()
+		local root = rootPart()
+		local state = hum and hum:GetState()
+		local tumbling = state == Enum.HumanoidStateType.Physics or state == Enum.HumanoidStateType.Ragdoll or state == Enum.HumanoidStateType.FallingDown or state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.GettingUp
+		local moving = root and root.AssemblyLinearVelocity.Magnitude > 25
+		if os.clock() - LastCaught > 1.5 and not tumbling and not moving then
+			return
+		end
+		if os.clock() - started > 0.3 then
+			setStatus("Waiting to land after the guard catch")
+		end
+		task.wait(0.1)
+	end
+end
+
 -- A stolen crate is carried home at your own run speed: from far zones the
 -- game does not accept a teleport while carrying and keeps putting you back
 local ReturnFails, LastStealArea = 0, nil
@@ -30629,6 +30655,7 @@ local function stealOnce()
 		returnToSafety()
 		return true
 	end
+	waitUntilSteady()
 	local target = pickCrate()
 	if not target then
 		setStatus("No crate matches your filters")
@@ -30646,7 +30673,16 @@ local function stealOnce()
 	end
 	setStatus("Holding Steal on " .. target.rarity .. " crate")
 	LastStealArea = target.area
-	if triggerPrompt(target.prompt, carrying) or carrying() then
+	local bankedBefore, successesBefore = bankedCrates(), StealSuccesses
+	local function stolen()
+		return carrying() or bankedCrates() > bankedBefore or StealSuccesses > successesBefore
+	end
+	if triggerPrompt(target.prompt, stolen) or stolen() then
+		if not carrying() then
+			Session.stolen += 1
+			setStatus("Crate banked straight away")
+			return true
+		end
 		returnToSafety()
 	else
 		FailedCrates[target.crate.Name] = os.clock() + 20
@@ -31134,11 +31170,11 @@ StealBox:AddButton({
 })
 
 local MoveBox = Tabs.Main:AddLeftGroupbox("Movement", "plane")
-MoveBox:AddDropdown("TravelMode", {
+MoveBox:AddDropdown("MoveMode", {
 	Text = "Travel Mode",
-	Values = { "Teleport", "Fast Fly", "Safe" },
-	Default = "Teleport",
-	Tooltip = "Teleport is the fastest. If the game pulls you back, use Safe (your own run speed) or Fast Fly (speed below).",
+	Values = { "Safe", "Fast Fly", "Teleport" },
+	Default = "Safe",
+	Tooltip = "Safe runs at your own speed and always works. The server undoes teleports a few seconds later, so Teleport and Fast Fly waste time and make steals fail.",
 })
 MoveBox:AddDropdown("CarryMode", {
 	Text = "Carry Crate Home",
