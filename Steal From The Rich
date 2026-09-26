@@ -30296,6 +30296,7 @@ local function triggerPrompt(prompt, done)
 		local position = promptPosition(prompt)
 		log("PROMPT start", prompt, "action=" .. tostring(prompt.ActionText), "hold=" .. tostring(prompt.HoldDuration), "dist=" .. (if root and position then string.format("%.1f", (root.Position - position).Magnitude) else "?"), "max=" .. tostring(prompt.MaxActivationDistance), "shown=" .. tostring(ShownPrompts[prompt] == true), "style=" .. tostring(prompt.Style))
 	end
+	local everBegan = false
 	for attempt = 1, 2 do
 		if not (prompt.Parent and prompt.Enabled) then
 			break
@@ -30303,7 +30304,11 @@ local function triggerPrompt(prompt, done)
 		if not waitFor(function()
 			return ShownPrompts[prompt] == true
 		end, 1.5) then
+			-- another prompt is closer or the server moved us: holding a prompt the
+			-- engine does not show does nothing (live log), so stop here
 			PromptIssue = "the game did not show the prompt (too far or another prompt is closer)"
+			log("PROMPT not shown, giving up on it")
+			return false
 		end
 		local began, fired = false, false
 		local c1 = prompt.PromptButtonHoldBegan:Connect(function()
@@ -30331,13 +30336,17 @@ local function triggerPrompt(prompt, done)
 		if waitFor(done, 0.6) then
 			return true
 		end
+		everBegan = everBegan or began
 		if fired then
+			-- the live server refuses the same steal again right away, retrying only wastes time
 			PromptIssue = "the prompt fired but the server refused it"
+			log("PROMPT failed:", PromptIssue)
+			return false
 		elseif not began and (prompt.HoldDuration or 0) > 0 then
 			PromptIssue = PromptIssue or "the prompt did not start holding"
 		end
 	end
-	if fireproximityprompt and prompt.Parent and prompt.Enabled then
+	if not everBegan and fireproximityprompt and prompt.Parent and prompt.Enabled then
 		local okFire, errFire = pcall(fireproximityprompt, prompt)
 		log("PROMPT fireproximityprompt", okFire, errFire)
 		if waitFor(done, 1) then
@@ -30579,6 +30588,13 @@ local function bankedCrates()
 	return #toolsWith("CrateUid")
 end
 
+-- rev_ARENA_RESET(true, seconds) ... rev_ARENA_RESET(false, 0): during the reset
+-- the server keeps everyone in the safe zone and pulls back anyone who leaves
+local ArenaResetting = false
+onNet("ARENA_RESET", function(active)
+	ArenaResetting = active == true
+end)
+
 -- rev_STEAL_SUCCESS fires on every successful pick-up, including the case where
 -- the player stands inside the safe zone and the crate is banked instantly
 local StealSuccesses = 0
@@ -30613,6 +30629,30 @@ end
 -- A stolen crate is carried home at your own run speed: from far zones the
 -- game does not accept a teleport while carrying and keeps putting you back
 local ReturnFails, LastStealArea = 0, nil
+local Refusals = 0
+
+-- The crate a shown steal prompt belongs to, if it passes the filters
+local function shownAllowedPrompt()
+	local folder = workspace:FindFirstChild("Crates")
+	if not folder then
+		return nil
+	end
+	for prompt in pairs(ShownPrompts) do
+		if prompt.Parent and prompt.Enabled and prompt.ActionText == "Steal" and prompt:IsDescendantOf(folder) then
+			local crate = prompt.Parent
+			while crate and crate.Parent ~= folder do
+				crate = crate.Parent
+			end
+			if crate and (FailedCrates[crate.Name] or 0) < os.clock() then
+				local area, rarity = crateInfo(crate)
+				if area and rarity and zoneAllowed(area) and selected(Options.StealRarities, rarity) then
+					return { crate = crate, prompt = prompt, area = area, rarity = rarity }
+				end
+			end
+		end
+	end
+	return nil
+end
 
 local function returnToSafety()
 	local before = bankedCrates()
@@ -30677,7 +30717,32 @@ local function stealOnce()
 	local function stolen()
 		return carrying() or bankedCrates() > bankedBefore or StealSuccesses > successesBefore
 	end
-	if triggerPrompt(target.prompt, stolen) or stolen() then
+	local ok = triggerPrompt(target.prompt, stolen) or stolen()
+	if not ok and PromptIssue and PromptIssue:find("did not show") then
+		-- the engine shows the closest prompt only: take that crate if it is allowed
+		local other = shownAllowedPrompt()
+		if other and other.prompt ~= target.prompt then
+			FailedCrates[target.crate.Name] = os.clock() + 20
+			target = other
+			LastStealArea = target.area
+			setStatus("Holding Steal on nearby " .. target.rarity .. " crate")
+			ok = triggerPrompt(target.prompt, stolen) or stolen()
+		end
+	end
+	if ok then
+		Refusals = 0
+	elseif PromptIssue and PromptIssue:find("refused") then
+		Refusals += 1
+		if Refusals >= 3 then
+			-- the server still has us somewhere else: run to the safe zone so it catches up
+			Refusals = 0
+			setStatus("The server lost track of you, running to the safe zone to resync")
+			travel(safeSpot(), { mode = "Safe" })
+			FailedCrates[target.crate.Name] = os.clock() + 20
+			return true
+		end
+	end
+	if ok then
 		if not carrying() then
 			Session.stolen += 1
 			setStatus("Crate banked straight away")
@@ -30724,16 +30789,26 @@ local function findSpot(floor)
 	return nil
 end
 
-local function goToPlot(floor)
+-- Same rule as the game's placement client (nearMyPlot): within 30 studs of the floor
+local function nearPlot(floor)
 	local root = rootPart()
 	if not root then
-		return
+		return false
 	end
-	local local_ = floor.CFrame:PointToObjectSpace(root.Position)
-	if math.abs(local_.X) < floor.Size.X / 2 + 10 and math.abs(local_.Z) < floor.Size.Z / 2 + 10 and math.abs(local_.Y) < 20 then
-		return
+	local offset = floor.CFrame:PointToObjectSpace(root.Position)
+	local dx = math.max(math.abs(offset.X) - floor.Size.X / 2, 0)
+	local dz = math.max(math.abs(offset.Z) - floor.Size.Z / 2, 0)
+	return dx * dx + dz * dz <= 900 and math.abs(offset.Y) <= 60
+end
+
+local function goToPlot(floor)
+	if nearPlot(floor) then
+		return true
 	end
-	travel(floor.Position + Vector3.new(0, floor.Size.Y / 2 + 4, 0))
+	-- a teleport here was undone by the server and placing then failed with
+	-- "Go to your plot to place this" (live log), so always run
+	travel(floor.Position + Vector3.new(0, floor.Size.Y / 2 + 4, 0), { mode = "Safe" })
+	return nearPlot(floor)
 end
 
 local function placeCrates()
@@ -30750,7 +30825,10 @@ local function placeCrates()
 		return false
 	end
 	setStatus("Placing crates on your plot")
-	goToPlot(floor)
+	if not goToPlot(floor) then
+		setStatus("Could not reach your plot")
+		return false
+	end
 	for _, tool in ipairs(crates) do
 		if not alive() then
 			break
@@ -31427,6 +31505,10 @@ task.spawn(function()
 			end
 			if carrying() and on("AutoSteal") then
 				returnToSafety()
+				return
+			end
+			if ArenaResetting and (on("AutoSteal") or on("AutoPlace") or on("AutoSell")) then
+				setStatus("Arena is resetting, waiting")
 				return
 			end
 			if on("AutoPlace") and #toolsWith("CrateUid") > 0 and os.clock() >= PlotFullUntil then
