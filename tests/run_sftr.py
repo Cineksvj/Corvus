@@ -195,6 +195,18 @@ def main():
     args = ap.parse_args()
 
     luau = find_luau(args.luau)
+    # Executors compile without optimisations: at -O0 every local takes a
+    # register, and a function with more than 200 fails to compile, so the hub
+    # does not start at all (live: "nie executuje sie w ogole"). Check that first.
+    compiler = os.path.join(os.path.dirname(luau), "luau-compile")
+    if os.path.isfile(compiler):
+        check = subprocess.run([compiler, "--binary", "-O0", args.script], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if check.returncode != 0:
+            print("COMPILE ERROR at -O0 (the executor would not run the script):\n" + check.stderr.strip())
+            sys.exit(2)
+        print("compile check: ok at -O0")
+    else:
+        print("compile check skipped: no luau-compile next to " + luau)
     with open(args.script, encoding="utf-8") as f:
         script_src, info = transform_script(f.read())
     print(f"script: {os.path.relpath(args.script, ROOT)} (library lines {info['library_lines'][0]}-{info['library_lines'][1]} mocked, "

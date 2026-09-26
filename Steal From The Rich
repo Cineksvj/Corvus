@@ -30424,6 +30424,8 @@ end
 
 -- Height the character stands at on the ground below a point (the server runs an
 -- AntiFlyService, so Safe travel keeps the feet on the ground)
+local travel, manualRunning, runManual
+do
 local GroundParams = RaycastParams.new()
 GroundParams.FilterType = Enum.RaycastFilterType.Exclude
 local function groundHeight(position)
@@ -30449,10 +30451,10 @@ end
 local TravelGeneration = 0
 -- Buttons and commands run here; the farm waits until they are done
 local ManualThreads = {}
-local function manualRunning()
+function manualRunning()
 	return next(ManualThreads) ~= nil
 end
-local function runManual(fn, ...)
+function runManual(fn, ...)
 	local thread = coroutine.running()
 	ManualThreads[thread] = true
 	local ok, err = pcall(fn, ...)
@@ -30781,7 +30783,7 @@ local function lobbyGate(from, target)
 	return Vector3.new(LOBBY_X + 12, lobbySide.Y, z)
 end
 
-local function travel(target, options)
+function travel(target, options)
 	local root = rootPart()
 	local from = root and root.Position
 	log("TRAVEL", (options and options.mode) or (Options.MoveMode and Options.MoveMode.Value) or "?", "from", from, "to", target, "dist", from and string.format("%.0f", (target - from).Magnitude) or "?", "carrying=" .. tostring(carrying()))
@@ -30858,6 +30860,7 @@ local function travel(target, options)
 	return ok
 end
 
+end
 ---------------------------------------------------------------------------
 -- Stats
 ---------------------------------------------------------------------------
@@ -30872,12 +30875,14 @@ local function emit(name, ...)
 	end
 end
 
+local HttpService, rarityColor, Saved, SaveDirty, saveStats, Metrics, Feed, zoneName, Track
+do
 ---------------------------------------------------------------------------
 -- Analytics (same design as Pets Universe): all-time stats and goals saved to
 -- Corvus/SFTR_stats.json, 24 h of rate history in Corvus/SFTR_metrics.json,
 -- chart events and the live feed
 ---------------------------------------------------------------------------
-local HttpService = game:GetService("HttpService")
+HttpService = game:GetService("HttpService")
 local SaveFolder = "Corvus"
 
 local function readJson(path)
@@ -30911,11 +30916,11 @@ pcall(function()
 		end
 	end
 end)
-local function rarityColor(rarity)
+function rarityColor(rarity)
 	return RarityColor[rarity] or "#dddddd"
 end
 
-local Saved = { v = 1, since = os.time(), stolen = 0, rarities = {}, zones = {}, earned = 0, sold = 0, made = 0, orbs = 0, fused = 0, charged = 0, seconds = 0, goals = {} }
+Saved = { v = 1, since = os.time(), stolen = 0, rarities = {}, zones = {}, earned = 0, sold = 0, made = 0, orbs = 0, fused = 0, charged = 0, seconds = 0, goals = {} }
 do
 	local data = readJson(SaveFolder .. "/SFTR_stats.json")
 	if data then
@@ -30926,15 +30931,15 @@ do
 		end
 	end
 end
-local SaveDirty = false
-local function saveStats(force)
+SaveDirty = false
+function saveStats(force)
 	if SaveDirty or force then
 		SaveDirty = false
 		writeJson(SaveFolder .. "/SFTR_stats.json", Saved)
 	end
 end
 
-local Metrics = {
+Metrics = {
 	fine = {},
 	coarse = {},
 	cum = { Money = 0, Crates = 0, Speed = 0, Sold = 0, Orbs = 0 },
@@ -31090,7 +31095,7 @@ do
 	M.sample(true)
 end
 
-local Feed = { seq = 0, list = {} }
+Feed = { seq = 0, list = {} }
 local function feedPush(entry)
 	Feed.seq += 1
 	entry.Id = Feed.seq
@@ -31101,11 +31106,11 @@ local function feedPush(entry)
 	end
 end
 
-local function zoneName(area)
+function zoneName(area)
 	return tostring(AreaById[area] and AreaById[area].DisplayName or area or "?")
 end
 
-local Track = {}
+Track = {}
 function Track.stolen(rarity, area, seconds)
 	rarity = rarity or "?"
 	Saved.stolen += 1
@@ -31157,6 +31162,7 @@ function Track.event(kind, title, sub, icon, color)
 end
 -- rev_STEAL_SUCCESS fires on pick-up, so "stolen" is counted when a crate is banked
 
+end
 ---------------------------------------------------------------------------
 -- Steal
 ---------------------------------------------------------------------------
@@ -31865,6 +31871,8 @@ local function trailTick()
 	end
 end
 
+local stormActive, collectOrbs, Storm, thunderSpot, thunderReady, chargeCrate
+do
 ---------------------------------------------------------------------------
 -- Storm orbs (AdminSystem.Events.Storm): every 4th arena cycle the storm fills
 -- the map with 300 orbs. Their positions come from StormConfig.computeLayout
@@ -31883,9 +31891,9 @@ local StormDefaults = {
 	MAX_CHARGE = 1500,
 	ORB_SIZES = { { Id = "Small", Points = 1, Scale = 0.6, Weight = 50 }, { Id = "Medium", Points = 2, Scale = 1, Weight = 40 }, { Id = "Big", Points = 4, Scale = 1.6, Weight = 10 } },
 }
-local Storm = { config = nil, loaded = false, seed = nil, orbs = nil, backAt = {}, pendingUntil = {}, points = 0 }
+Storm = { config = nil, loaded = false, seed = nil, orbs = nil, backAt = {}, pendingUntil = {}, points = 0 }
 
-local function stormActive()
+function stormActive()
 	return workspace:GetAttribute("StormActive") == true and workspace:GetAttribute("StormSeed") ~= nil
 end
 
@@ -32018,7 +32026,7 @@ onNet("STORM_RESULT", function(index, ok, amount)
 end)
 
 -- one leg: run to the best ready orb (points per stud), collecting on the way
-local function collectOrbs()
+function collectOrbs()
 	local orbs = stormOrbs()
 	local root = rootPart()
 	if not orbs or not root then
@@ -32068,14 +32076,14 @@ end
 -- rf_THUNDER_MACHINE("mutate", uid, spend) -> {ok, msg} / {ok, processing} / {ok, result}
 ---------------------------------------------------------------------------
 local ThunderNext = 0
-local function thunderSpot()
+function thunderSpot()
 	local machine = workspace:FindFirstChild("Thunder Machine")
 	local anchor = machine and machine:FindFirstChild("ThunderPromptAnchor", true)
 	local position = anchor and anchor.Position or (machine and machine:GetPivot().Position) or Vector3.new(2470.3, 5.2, -937.2)
 	return position + Vector3.new(0, 1, 0)
 end
 
-local function thunderReady()
+function thunderReady()
 	local config = stormConfig()
 	return Remotes.rf_THUNDER_MACHINE ~= nil and os.clock() >= ThunderNext and LocalPlayer:GetAttribute("ThunderProcessing") ~= true and (tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0) >= (config.MIN_SPEND or 1000)
 end
@@ -32090,7 +32098,7 @@ local function tierRank(tier)
 	return 0
 end
 
-local function chargeCrate()
+function chargeCrate()
 	local config = stormConfig()
 	ThunderNext = os.clock() + 20
 	setStatus("Going to the Thunder Machine")
@@ -32138,12 +32146,15 @@ local function chargeCrate()
 	return true
 end
 
+end
+local fuseOnce, FuseNext
+do
 ---------------------------------------------------------------------------
 -- Fuse Machine: 3 copies of the same item (not fused yet) -> 1 fused item, for
 -- cash. rev_FUSE_ITEMS({uid1, uid2, uid3}); fee = ItemData:GetFuseFee(tier, income, mutated)
 ---------------------------------------------------------------------------
 local FuseFeeSeconds = { COMMON = 10, UNCOMMON = 10, RARE = 30, EPIC = 30, LEGENDARY = 60, MYTHIC = 60, COSMIC = 120, SECRET = 180, ETERNAL = 300, DIVINE = 300 }
-local FuseNext = 0
+FuseNext = 0
 
 local function fuseFee(tier, income, mutated)
 	local fee
@@ -32207,7 +32218,7 @@ local function fuseSpot()
 	return position + Vector3.new(0, 1, 0)
 end
 
-local function fuseOnce()
+function fuseOnce()
 	if os.clock() < FuseNext then
 		return false
 	end
@@ -32249,12 +32260,15 @@ local function fuseOnce()
 	return true
 end
 
+end
+local nextStormIn, claimOffline, equipBestBat, FreeGiftNext, freeGiftClaimed, claimFreeGift, setIdleRejoinBlocked, setAntiKnockback
+do
 ---------------------------------------------------------------------------
 -- Rewards and extras
 ---------------------------------------------------------------------------
 -- Storm timer, same maths as LBTHStormTimerSignClient: the storm starts 18 s
 -- into every arena cycle where ArenaCycle % 4 == 0
-local function nextStormIn()
+function nextStormIn()
 	local ok, left = pcall(function()
 		local cycle = tonumber(workspace:GetAttribute("ArenaCycle"))
 		local reset = tonumber(workspace:GetAttribute("NextArenaReset"))
@@ -32275,7 +32289,7 @@ end
 
 -- Offline earnings: rev_Offline_Update(amount) opens the popup, both of its
 -- buttons fire rev_Offline_Claim()
-local function claimOffline(reason)
+function claimOffline(reason)
 	fire("Offline_Claim")
 	Session.claimed += 1
 	log("offline cash claimed", reason)
@@ -32296,7 +32310,7 @@ onNet("INDEX_STATE", function(state)
 		IndexBats.Equipped = state.Bats.Equipped or "Default"
 	end
 end)
-local function equipBestBat()
+function equipBestBat()
 	if type(IndexBats.Owned) ~= "table" then
 		return
 	end
@@ -32316,8 +32330,8 @@ end
 -- rev_FreeGiftState(false, false, {Favorited, HasPermission}) and then
 -- rev_GroupClaim() once you are in the group
 local FreeGiftGroup = 900458044
-local FreeGiftNext = 0
-local function freeGiftClaimed()
+FreeGiftNext = 0
+function freeGiftClaimed()
 	return LocalPlayer:GetAttribute("LBTHFreeGiftClaimed") == true
 end
 local function inFreeGiftGroup()
@@ -32333,7 +32347,7 @@ local function freeGiftSpot()
 	end)
 	return part and part.Position or Vector3.new(2430.6, 10, -1019.1)
 end
-local function claimFreeGift(manual)
+function claimFreeGift(manual)
 	FreeGiftNext = os.clock() + 300
 	if freeGiftClaimed() then
 		if manual then
@@ -32366,7 +32380,7 @@ local function claimFreeGift(manual)
 end
 
 -- The game rejoins you after 19 minutes without input (LBTHIdleRejoinClient)
-local function setIdleRejoinBlocked(blocked)
+function setIdleRejoinBlocked(blocked)
 	pcall(function()
 		local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
 		local idle = scripts and scripts:FindFirstChild("LBTHIdleRejoinClient")
@@ -32378,7 +32392,7 @@ end
 
 -- Knockback (bats, guard catches) is applied by your own client from
 -- ReplicatedStorage.RAGDOLL_TUMBLE; switching those handlers off keeps you running
-local function setAntiKnockback(enabled)
+function setAntiKnockback(enabled)
 	local remote = ReplicatedStorage:FindFirstChild("RAGDOLL_TUMBLE")
 	if not remote or type(getconnections) ~= "function" then
 		return false
@@ -32395,6 +32409,7 @@ local function setAntiKnockback(enabled)
 	return ok
 end
 
+end
 ---------------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------------
