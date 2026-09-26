@@ -209,7 +209,7 @@ Sim.stats = {
 	upgradeRejected = {}, mounts = 0, dismounts = 0, indexClaims = 0, placeBest = 0, unhandled = {},
 	promptRejected = {},
 	orbs = {}, orbRejected = {}, charges = {}, chargeRejected = {}, fuses = {}, fuseRejected = {},
-	offlineClaims = 0, freeGift = 0, freeGiftRejected = {}, batEquips = {},
+	offlineClaims = 0, freeGift = 0, freeGiftRejected = {}, batEquips = {}, wallHits = 0,
 }
 local stats = Sim.stats
 
@@ -843,6 +843,23 @@ function Sim.serverStep(dt)
 		return
 	end
 	local pos = root.Position
+
+	-- the lobby wall: between the lobby (X >= 2424) and the arena the only way is
+	-- through the safe zone (live log: pinned 30 s at X=2424.5, Z=-1063 running
+	-- from the plot straight at a crate)
+	local prev = Server.wallLast
+	if prev and (prev.X >= SAFE_X) ~= (pos.X >= SAFE_X) and pos.X ~= prev.X then
+		local zone = Server.safeZone
+		local zMin, zMax = zone.Position.Z - zone.Size.Z / 2, zone.Position.Z + zone.Size.Z / 2
+		local t = (SAFE_X - prev.X) / (pos.X - prev.X)
+		local z = prev.Z + (pos.Z - prev.Z) * t
+		if z < zMin or z > zMax then
+			pos = V(if prev.X >= SAFE_X then SAFE_X + 0.6 else SAFE_X - 0.6, pos.Y, pos.Z)
+			root.CFrame = CFrame.new(pos) * root.CFrame.Rotation
+			stats.wallHits += 1
+		end
+	end
+	Server.wallLast = pos
 
 	-- movement validation while carrying
 	if carrying() then

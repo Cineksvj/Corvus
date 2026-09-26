@@ -30443,6 +30443,25 @@ end
 
 -- options.mode overrides the Travel Mode setting, options.keepGoing stops the
 -- trip early when it returns false (for example the crate was taken back)
+-- Each trip gets a number; a trip started later stops the one running, so two
+-- trips never fight over the character (live log: the Free Gift button and the
+-- farm both moved the player and it stood still for 30 s)
+local TravelGeneration = 0
+-- Buttons and commands run here; the farm waits until they are done
+local ManualThreads = {}
+local function manualRunning()
+	return next(ManualThreads) ~= nil
+end
+local function runManual(fn, ...)
+	local thread = coroutine.running()
+	ManualThreads[thread] = true
+	local ok, err = pcall(fn, ...)
+	ManualThreads[thread] = nil
+	if not ok then
+		log("ERROR manual action:", tostring(err))
+	end
+end
+
 local function travelRaw(target, options)
 	options = options or {}
 	local root = rootPart()
@@ -30473,8 +30492,14 @@ local function travelRaw(target, options)
 	local pulledBack = 0
 	local expected = nil
 	local deadline = nil
+	local generation = options.generation
+	local checkAt, checkDistance = os.clock() + 3, nil
 	while alive() do
 		local dt = RunService.Heartbeat:Wait()
+		if generation and generation ~= TravelGeneration then
+			-- a newer trip (a button or command) took over
+			return false
+		end
 		if onTreadmill() and not options.toTreadmill then
 			-- touching the belt mounts the player and the game pins them there
 			-- (live log: 13 s stuck on the way to the plot); get off and go on
@@ -30498,6 +30523,17 @@ local function travelRaw(target, options)
 		local distance = delta.Magnitude
 		if distance < 1.5 then
 			break
+		end
+		-- a wall pushes the character back a little every frame without ever
+		-- counting as pulled back (live log: 30 s pinned at X=2424.5)
+		if not options.toTreadmill and os.clock() >= checkAt then
+			-- never while carrying: a failed trip home ends with the crate dropped
+			if checkDistance and checkDistance - distance < 4 and not carrying() then
+				setStatus("Something blocks the way, going around")
+				log("TRAVEL blocked at", position, "distance left", string.format("%.0f", distance))
+				return false
+			end
+			checkAt, checkDistance = os.clock() + 3, distance
 		end
 		local speed = (if fast then (Options.TravelSpeed and Options.TravelSpeed.Value or 150) else runSpeed()) * slowdown
 		deadline = deadline or os.clock() + distance / math.max(speed, 1) * 1.5 + 15
@@ -30553,18 +30589,77 @@ local function beltDetour(from, target)
 	return Vector3.new(point.X, target.Y, point.Z)
 end
 
+-- The lobby (X >= 2424: safe zone, plots, shops) and the arena are only joined
+-- through the safe zone; south and north of it is a wall (live log: running from
+-- the plot straight at a crate pinned the player at X=2424.5 for 30 s)
+local LOBBY_X = 2424
+local function safeZoneBounds()
+	local zMin, zMax = -1030, -850
+	pcall(function()
+		local zone = workspace["Steal Map"].Lobby["safe zone"]
+		zMin, zMax = zone.Position.Z - zone.Size.Z / 2, zone.Position.Z + zone.Size.Z / 2
+	end)
+	return zMin, zMax
+end
+
+local function lobbyGate(from, target)
+	local fromLobby, toLobby = from.X >= LOBBY_X, target.X >= LOBBY_X
+	if fromLobby == toLobby or from.X == target.X then
+		return nil
+	end
+	local zMin, zMax = safeZoneBounds()
+	local t = (LOBBY_X - from.X) / (target.X - from.X)
+	local crossZ = from.Z + (target.Z - from.Z) * t
+	if crossZ >= zMin + 12 and crossZ <= zMax - 12 then
+		return nil
+	end
+	local z = math.clamp(crossZ, zMin + 25, zMax - 25)
+	local lobbySide = if fromLobby then from else target
+	return Vector3.new(LOBBY_X + 12, lobbySide.Y, z)
+end
+
 local function travel(target, options)
 	local root = rootPart()
 	local from = root and root.Position
 	log("TRAVEL", (options and options.mode) or (Options.MoveMode and Options.MoveMode.Value) or "?", "from", from, "to", target, "dist", from and string.format("%.0f", (target - from).Magnitude) or "?", "carrying=" .. tostring(carrying()))
 	local started = os.clock()
-	local mode = (options and options.mode) or (Options.MoveMode and Options.MoveMode.Value) or "Safe"
-	local waypoint = from and mode ~= "Teleport" and not (options and options.toTreadmill) and beltDetour(from, target)
-	if waypoint then
-		log("TRAVEL around the treadmill via", waypoint)
-		travelRaw(waypoint, options)
+	options = table.clone(options or {})
+	if not ManualThreads[coroutine.running()] then
+		-- the farm waits while a button or command is moving the character
+		while manualRunning() and alive() do
+			task.wait(0.1)
+		end
 	end
-	local ok = travelRaw(target, options)
+	TravelGeneration += 1
+	options.generation = TravelGeneration
+	local mode = options.mode or (Options.MoveMode and Options.MoveMode.Value) or "Safe"
+	local ok = true
+	if from and mode ~= "Teleport" then
+		local stops = {}
+		local gate = lobbyGate(from, target)
+		if gate then
+			log("TRAVEL through the safe zone via", gate)
+			table.insert(stops, gate)
+		end
+		local cursor = from
+		for _, stop in ipairs(stops) do
+			local detour = beltDetour(cursor, stop)
+			if detour then
+				log("TRAVEL around the treadmill via", detour)
+				travelRaw(detour, options)
+			end
+			if not travelRaw(stop, options) and options.generation ~= TravelGeneration then
+				ok = false
+			end
+			cursor = stop
+		end
+		local waypoint = ok and not options.toTreadmill and beltDetour(cursor, target)
+		if waypoint then
+			log("TRAVEL around the treadmill via", waypoint)
+			travelRaw(waypoint, options)
+		end
+	end
+	ok = ok and options.generation == TravelGeneration and travelRaw(target, options)
 	root = rootPart()
 	log("TRAVEL end ok=" .. tostring(ok), "at", root and root.Position, "left", root and string.format("%.1f", (target - root.Position).Magnitude) or "?", string.format("%.1fs", os.clock() - started), "onTreadmill=" .. tostring(LocalPlayer:GetAttribute("OnTreadmill")))
 	return ok
@@ -31894,7 +31989,7 @@ StealBox:AddToggle("SmartZones", {
 StealBox:AddButton({
 	Text = "Go To Safe Zone",
 	Func = function()
-		task.spawn(travel, safeSpot())
+		task.spawn(runManual, travel, safeSpot())
 	end,
 })
 
@@ -31945,7 +32040,7 @@ SellBox:AddSlider("SellInterval", { Text = "Sell Every", Default = 30, Min = 5, 
 SellBox:AddButton({
 	Text = "Sell Now",
 	Func = function()
-		task.spawn(sellNow, true)
+		task.spawn(runManual, sellNow, true)
 	end,
 })
 
@@ -31977,7 +32072,7 @@ PlotBox:AddButton({
 	Func = function()
 		local floor = myFloor()
 		if floor then
-			task.spawn(travel, floor.Position + Vector3.new(0, floor.Size.Y / 2 + 4, 0))
+			task.spawn(runManual, travel, floor.Position + Vector3.new(0, floor.Size.Y / 2 + 4, 0))
 		end
 	end,
 })
@@ -32007,7 +32102,7 @@ RewardBox:AddToggle("AutoFreeGift", {
 RewardBox:AddButton({
 	Text = "Claim Free Gift / Join Group",
 	Func = function()
-		task.spawn(claimFreeGift, true)
+		task.spawn(runManual, claimFreeGift, true)
 	end,
 })
 RewardBox:AddButton({
@@ -32047,7 +32142,7 @@ ThunderBox:AddToggle("AutoThunder", {
 ThunderBox:AddButton({
 	Text = "Go To Thunder Machine",
 	Func = function()
-		task.spawn(travel, thunderSpot())
+		task.spawn(runManual, travel, thunderSpot())
 	end,
 })
 
@@ -32253,7 +32348,7 @@ if Library.AddCommand then
 			Description = "Claims the 10,000 speed Free Gift (asks you to join the group first)",
 			Source = "Steal From The Rich",
 			Callback = function()
-				task.spawn(claimFreeGift, true)
+				task.spawn(runManual, claimFreeGift, true)
 				return if freeGiftClaimed() then "Already claimed" else "Claiming the Free Gift"
 			end,
 		})
@@ -32285,7 +32380,7 @@ if Library.AddCommand then
 			Description = "Sells right now (uses your Sell Mode)",
 			Source = "Steal From The Rich",
 			Callback = function()
-				task.spawn(sellNow, true)
+				task.spawn(runManual, sellNow, true)
 				return "Selling"
 			end,
 		})
@@ -32295,7 +32390,7 @@ if Library.AddCommand then
 			Description = "Runs back to the safe zone",
 			Source = "Steal From The Rich",
 			Callback = function()
-				task.spawn(travel, safeSpot())
+				task.spawn(runManual, travel, safeSpot())
 				return "Going to the safe zone"
 			end,
 		})
@@ -32309,7 +32404,7 @@ if Library.AddCommand then
 				if not floor then
 					return "Plot not found"
 				end
-				task.spawn(goToPlot, floor)
+				task.spawn(runManual, goToPlot, floor)
 				return "Going to your plot"
 			end,
 		})
@@ -32921,6 +33016,9 @@ task.spawn(function()
 		local ok, err = pcall(function()
 			if not rootPart() then
 				setStatus("Waiting for character")
+				return
+			end
+			if manualRunning() then
 				return
 			end
 			if carrying() and on("AutoSteal") then
