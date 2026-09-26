@@ -6,7 +6,9 @@ Scenario {
 	description = "Auto Steal, zone = DemonKing only, SmartZones OFF, SpeedLevel 55555: a ~56 s carry home that the guard in this "
 		.. "sim allows (~63 s). The script must keep running and bank it, not abort the trip and drop the crate.",
 	duration = 120,
-	stallLimit = 90, -- one legitimate carry trip takes ~56 s (a single main-loop cycle)
+	-- one steal cycle is a single main-loop cycle: since travel runs (the live server undoes teleports)
+	-- that is a ~45 s run out to DemonKing + the hold + a ~56 s carry home, so ~110 s is legitimate
+	stallLimit = 150,
 	world = { attrs = { SpeedLevel = 55555 } },
 	options = function(Toggles, Options, Sim)
 		Toggles.AutoSteal.Value = true

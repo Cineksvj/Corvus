@@ -30020,7 +30020,19 @@ local function loggedRemote(remote)
 			log("  " .. remote.Name .. " error:", tostring(result[2]))
 			error(result[2], 0)
 		end
-		log("  " .. remote.Name .. " ->", table.unpack(result, 2, math.max(result.n, 2)))
+		local answer = result[2]
+		if type(answer) == "table" and #answer > 0 and type(answer[1]) == "table" and answer[1].Ready ~= nil then
+			-- the crate timer list was most of the live log; one line is enough
+			local ready = 0
+			for _, entry in ipairs(answer) do
+				if entry.Ready == true then
+					ready += 1
+				end
+			end
+			log("  " .. remote.Name .. " ->", #answer .. " crates, " .. ready .. " ready")
+		else
+			log("  " .. remote.Name .. " ->", table.unpack(result, 2, math.max(result.n, 2)))
+		end
 		return table.unpack(result, 2, result.n)
 	end
 	return wrapper
@@ -30307,6 +30319,14 @@ local function triggerPrompt(prompt, done)
 			-- another prompt is closer or the server moved us: holding a prompt the
 			-- engine does not show does nothing (live log), so stop here
 			PromptIssue = "the game did not show the prompt (too far or another prompt is closer)"
+			-- some executors can only press prompts through fireproximityprompt
+			if fireproximityprompt then
+				local okFire, errFire = pcall(fireproximityprompt, prompt)
+				log("PROMPT not shown, fireproximityprompt", okFire, errFire)
+				if waitFor(done, 1) then
+					return true
+				end
+			end
 			log("PROMPT not shown, giving up on it")
 			return false
 		end
