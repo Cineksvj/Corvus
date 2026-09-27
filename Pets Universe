@@ -29899,11 +29899,11 @@ local Toggles = Library.Toggles
 
 local Discord = "https://discord.gg/PdQvN2bDCu"
 local CorvusConfig = {
-	FeedbackWebhook = "https://discord.com/api/webhooks/1553082900688146502/rW8r0mJiDZYXFnv8O6asKsDPouxr036xA6CcOwitc_3DWjK6cV59_iO_Mpm0tjTNr3S4",
+	FeedbackWebhook = "https://discord.com/api/webhooks/1553750054823657556/GptorSTOkdcDO9cZyYJOIM6f0crrWmemuUzIlwTynetcaypqXaF1XAvipsE5ywrt1xXk",
 	LoaderUrl = "",
 	CodesUrl = "",
 	KnownCodes = { "Release", "Update1", "DroverQ", "Russo", "DarkRose", "AG64", "Cupcake", "E11opoppet", "Ellopoppet", "Olopomidoro", "Ostrichh", "Update2", "1mvisits" },
-	HubVersion = "2.0",
+	HubVersion = "2.1",
 }
 
 local Env = getgenv()
@@ -30062,6 +30062,11 @@ end)
 
 local S = {
 	autoFarm = false,
+	autoTap = true,
+	farmWorldOn = false,
+	farmWorld = "Best unlocked",
+	autoBen = false,
+	rebirthWaitPerm = false,
 	targetMode = "HighestHP",
 	autoGift = false,
 	autoPartyEgg = false,
@@ -30451,6 +30456,7 @@ local Saved = {
 	treeBought = 0,
 	specialBought = 0,
 	rebirthsDone = 0,
+	bensFound = 0,
 	codesRedeemed = 0,
 	codes = {},
 	lastTierAt = {},
@@ -30789,6 +30795,11 @@ local function doClickPass()
 			Stats.lastAutoFire = now
 			pcall(function() SetAutoBreaking:FireServer(true) end)
 		end
+	end
+
+	if S.autoTap == false then
+		lockedTarget = nil
+		return
 	end
 
 	if zone == "" then return end
@@ -31892,11 +31903,48 @@ FarmBox:AddDropdown("TargetMode", {
 		lockedTarget = nil
 	end,
 })
+FarmBox:AddToggle("AutoTap", {
+	Text = "Auto Tap",
+	Description = "Taps the target so every pet hits it",
+	Tooltip = "On is the fastest: all your pets focus one breakable, rubies and fruits first. Off lets the game's auto mode send each pet to its own breakable.",
+	Default = true,
+	Callback = function(v)
+		S.autoTap = v
+		if not v then
+			lockedTarget = nil
+		end
+	end,
+})
+FarmBox:AddDivider()
+FarmBox:AddToggle("FarmWorldOn", {
+	Text = "Farm In Best World",
+	Description = "Travels to your farm world and stays there",
+	Tooltip = "Goes back after egg trips, chests and other errands. Waits while Auto Hatch or the Index Hunter needs another world.",
+	Default = false,
+	Callback = function(v)
+		S.farmWorldOn = v
+	end,
+})
+UI.FarmWorldList = { "Best unlocked" }
+for _, key in ipairs(Auto.GameData.worldOrder or { "Spawn", "BirchForest", "TreasureDunes", "FrozenAlley", "HauntedHouse", "PetKingdom", "EnchantedGrove", "VolcanoHollow", "TheMoon" }) do
+	local cost = Auto.GameData.worldCost
+	table.insert(UI.FarmWorldList, cost and type(cost.DisplayNames) == "table" and cost.DisplayNames[key] or (string.gsub(key, "(%l)(%u)", "%1 %2")))
+end
+FarmBox:AddDropdown("FarmWorld", {
+	Text = "Farm World",
+	Values = UI.FarmWorldList,
+	Default = "Best unlocked",
+	Tooltip = "Best unlocked is your newest world except The Moon, which drops gems instead of coins. Pick The Moon by name to farm gems.",
+	Callback = function(v)
+		S.farmWorld = tostring(v or "Best unlocked")
+	end,
+})
 
 local StatusBox = Tabs.Farm:AddRightGroupbox("Status", "activity")
 local FarmStateRow = StatusBox:AddStat({ Icon = GameIcons.Auto, Text = "Auto Farm", Value = "Idle", Size = 26, ValueColor = "FontColor" })
 local TargetRow = StatusBox:AddStat({ Icon = CurrencyIcons.Coins, Text = "No target", Value = "", Size = 26 })
 local AreaRow = StatusBox:AddStat({ Icon = "map-pin", Text = "Area", Value = "unknown", Size = 22, ValueColor = "FontColor" })
+UI.FarmWorldRow = StatusBox:AddStat({ Icon = "globe", Text = "Farm world", Value = "Off", Size = 22, ValueColor = "FontColor" })
 UI.UfoBox = Tabs.Farm:AddLeftGroupbox("UFO Event", "rocket")
 UI.UfoBox:AddToggle("AutoUfo", {
 	Text = "Auto Break UFO",
@@ -32154,6 +32202,21 @@ UI.TravelBox:AddToggle("ReturnAfterErrand", {
 })
 UI.ErrandRow = UI.TravelBox:AddStat({ Icon = "navigation", Text = "Now", Value = "Idle", Size = 24, ValueColor = "FontColor" })
 UI.ErrandNextRow = UI.TravelBox:AddStat({ Icon = "clock", Text = "Next stop", Value = "-", Size = 22, ValueColor = "FontColor" })
+
+UI.BenBox = Tabs.Rewards:AddLeftGroupbox("Ben Hunt", "search")
+UI.BenBox:AddToggle("AutoBen", {
+	Text = "Auto Find Bens",
+	Description = "Grabs every hidden Ben for extra luck",
+	Tooltip = "Each Ben gives permanent luck, finding them all adds golden chance too. New Bens from updates are picked up on their own. Only worlds you own.",
+	Default = false,
+	Callback = function(v)
+		S.autoBen = v
+	end,
+})
+UI.BenFoundRow = UI.BenBox:AddStat({ Icon = "search", Text = "Found", Value = "...", Size = 26, Progress = 0 })
+UI.BenLuckRow = UI.BenBox:AddStat({ Icon = GameIcons.Luck, Text = "Luck bonus", Value = "...", Size = 22 })
+UI.BenNextRow = UI.BenBox:AddStat({ Icon = "map-pin", Text = "Next Ben", Value = "-", Size = 22, ValueColor = "FontColor" })
+UI.BenStateRow = UI.BenBox:AddStat({ Icon = GameIcons.Auto, Text = "Status", Value = "Off", Size = 22, ValueColor = "FontColor" })
 
 UI.CodesBox = Tabs.Rewards:AddRightGroupbox("Codes", "ticket")
 UI.CodesBox:AddToggle("AutoCodes", {
@@ -33007,6 +33070,15 @@ UI.RebirthBox:AddToggle("AutoRebirth", {
 		S.autoRebirth = v
 	end,
 })
+UI.RebirthBox:AddToggle("RebirthWaitPerm", {
+	Text = "Wait For Permanent Max",
+	Description = "Rebirths only once Moon Permanent is maxed",
+	Tooltip = "Maxed means every Moon Permanent upgrade is as high as your current rebirth allows. Pair it with Auto Buy on Moon Permanent.",
+	Default = false,
+	Callback = function(v)
+		S.rebirthWaitPerm = v
+	end,
+})
 UI.RebirthBox:AddInput("RebirthStopAt", {
 	Text = "Stop at rebirth",
 	Placeholder = "0 = never",
@@ -33019,6 +33091,7 @@ UI.RebirthBox:AddInput("RebirthStopAt", {
 })
 UI.RebirthProgressRow = UI.RebirthBox:AddStat({ Icon = "orbit", Text = "Progress", Value = "...", Size = 24, Progress = 0 })
 UI.MoonRebirthRow = UI.RebirthBox:AddStat({ Icon = GameIcons.MoonChest, Text = "Moon rebirths", Value = "...", Size = 22, ValueColor = "FontColor" })
+UI.PermMaxRow = UI.RebirthBox:AddStat({ Icon = "moon", Text = "Permanent shop", Value = "...", Size = 22, Progress = 0 })
 UI.RebirthStateRow = UI.RebirthBox:AddStat({ Icon = GameIcons.Auto, Text = "Status", Value = "Off", Size = 22, ValueColor = "FontColor" })
 
 UI.ServerLuckBox = Tabs.Upgrades:AddRightGroupbox("Server Luck", "clover")
@@ -35523,17 +35596,17 @@ do
 					allowed_mentions = { parse = {} },
 					embeds = {
 						{
-							title = "\u{2726}  " .. kind,
+							title = "\u{2726}  " .. kind .. "  \u{00B7}  Pets Universe",
 							description = text,
 							color = kindColors[kind] or 14146792,
 							fields = {
 								{ name = "From", value = if anonymous then "Anonymous" else string.format("%s (@%s)", LocalPlayer.DisplayName, LocalPlayer.Name), inline = true },
-								{ name = "Game", value = "Pets Universe", inline = true },
+								{ name = "Game", value = "[Pets Universe](https://www.roblox.com/games/" .. tostring(game.PlaceId) .. ")", inline = true },
 								{ name = "Executor", value = executor, inline = true },
 								{ name = "Hub", value = "Corvus " .. tostring(CorvusConfig.HubVersion), inline = true },
 							},
-							author = { name = "Corvus", icon_url = gameIcon() },
-							footer = { text = "Corvus feedback  \u{00B7}  made by Cinek" },
+							author = { name = "Pets Universe", url = "https://www.roblox.com/games/" .. tostring(game.PlaceId), icon_url = gameIcon() },
+							footer = { text = "Corvus feedback  \u{00B7}  Pets Universe" },
 							timestamp = DateTime.now():ToIsoDate(),
 						},
 					},
@@ -35869,7 +35942,7 @@ do
 			Extra.nextErrand = function(now)
 				if S.autoRebirth and now - Rebirth.lastTry > 12 and now >= Rebirth.blockedUntil then
 					local info = rebirthInfo()
-					if info.available and info.ready and info.moonUnlocked and info.nextNumber and not info.stopped then
+					if info.available and info.ready and info.moonUnlocked and info.nextNumber and not info.stopped and not (S.rebirthWaitPerm and Auto.permMaxed and not Auto.permMaxed()) then
 						return "Moon rebirth", function()
 							local travel = Rebirth.needsTravel == true
 							if rebirthTrip(travel) then
@@ -36106,6 +36179,9 @@ do
 								Rebirth.status = "Max rebirths"
 							elseif info.stopped then
 								Rebirth.status = "Stopped at " .. tostring(S.rebirthStopAt)
+							elseif info.ready and S.rebirthWaitPerm and Auto.permMaxed and not Auto.permMaxed() then
+								local _, owned, cap = Auto.permMaxed()
+								Rebirth.status = string.format("Waiting for Permanent %d/%d", owned or 0, cap or 0)
 							elseif info.ready then
 								Rebirth.status = if os.clock() < Rebirth.blockedUntil then "Retrying soon" else "Rebirthing"
 							else
@@ -36978,6 +37054,8 @@ do
 							hunterMove()
 						elseif eggTravelWanted(now) then
 							eggTravel()
+						elseif Auto.farmWorldStep then
+							Auto.farmWorldStep(now)
 						end
 					end)
 					if not ok then
@@ -37818,6 +37896,382 @@ do
 			end
 		end
 		Auto.setupUpdate2()
+		Auto.setupUpdate3 = function()
+			local B = { status = "Off", lastTry = -1e9, blocked = {}, found = 0, total = 0, luck = 0.5, loaded = false }
+			Auto.Ben = B
+			local BenAlias = { Haunted = "HauntedHouse", Grove = "EnchantedGrove", Volcano = "VolcanoHollow", Moon = "TheMoon" }
+			local GREEN, ORANGE = "#60d696", "#ffb84d"
+			local function tint(color, text)
+				return string.format('<font color="%s">%s</font>', color, text)
+			end
+			local function faded(text)
+				return '<font transparency="0.5">' .. text .. "</font>"
+			end
+			local function pct(value)
+				return (string.gsub(string.format("%.2f", tonumber(value) or 0), "%.?0+$", ""))
+			end
+			local ProgressShown = {}
+			local function progress(row, value)
+				local key = math.floor(math.clamp(tonumber(value) or 0, 0, 1) * 400 + 0.5)
+				if ProgressShown[row] ~= key and pcall(row.SetProgress, row, key / 400) then
+					ProgressShown[row] = key
+				end
+			end
+
+			local function benConfig()
+				if not B.loaded then
+					B.loaded = true
+					local cfg = Auto.lazyRequire("BenFindConfig", function()
+						local modules = ReplicatedStorage:FindFirstChild("Modules")
+						return modules and modules:FindFirstChild("BenFindConfig")
+					end)
+					if type(cfg) == "table" and tonumber(cfg.PER_BEN_LUCK) then
+						B.luck = tonumber(cfg.PER_BEN_LUCK)
+					end
+				end
+			end
+
+			local function worldIndex(key)
+				for index, name in ipairs(Auto.GameData.worldOrder or UI.WorldOrder or {}) do
+					if name == key then
+						return index
+					end
+				end
+				return 99
+			end
+
+			local function benList()
+				local list = {}
+				local folder = ReplicatedStorage:FindFirstChild("BenFind")
+				for _, model in ipairs(folder and folder:GetChildren() or {}) do
+					local id = model:GetAttribute("BenId")
+					if model:IsA("Model") and type(id) == "string" and id ~= "" then
+						local world = model:GetAttribute("BenWorld")
+						if type(world) ~= "string" or world == "" then
+							local suffix = string.match(model.Name, "^Ben(.+)$")
+							world = suffix
+						end
+						if type(world) == "string" then
+							world = Auto.worldKey(BenAlias[world] or world) or world
+							local ok, pivot = pcall(model.GetPivot, model)
+							table.insert(list, { id = id, world = world, pos = if ok and pivot then pivot.Position else nil })
+						end
+					end
+				end
+				return list
+			end
+
+			local function benCollected(id)
+				local folder = getDataFolder("BenFindData")
+				local flag = folder and folder:FindFirstChild(id)
+				if not flag then
+					return false
+				end
+				local ok, value = pcall(function()
+					return flag.Value
+				end)
+				return ok and value == true
+			end
+
+			local function benState()
+				local list = benList()
+				local here = currentWorld()
+				local state = { total = #list, found = 0, locked = 0, pending = {} }
+				for _, ben in ipairs(list) do
+					if benCollected(ben.id) then
+						state.found += 1
+					elseif not worldUnlocked(ben.world) then
+						state.locked += 1
+					elseif ben.pos and (B.blocked[ben.id] or 0) <= os.clock() then
+						ben.rank = (if ben.world == here then 0 else 1000) + worldIndex(ben.world)
+						table.insert(state.pending, ben)
+					end
+				end
+				table.sort(state.pending, function(a, b)
+					if a.rank ~= b.rank then
+						return a.rank < b.rank
+					end
+					return a.id < b.id
+				end)
+				return state
+			end
+
+			local function claimRemote()
+				local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+				local folder = remotes and remotes:FindFirstChild("BenFind")
+				return folder and folder:FindFirstChild("ClaimBen")
+			end
+
+			local function benTrip(ben)
+				B.lastTry = os.clock()
+				local remote = claimRemote()
+				if not remote then
+					B.blocked[ben.id] = os.clock() + 600
+					return false
+				end
+				local ok, err = travelTo(ben.world)
+				if not ok then
+					B.blocked[ben.id] = os.clock() + 120
+					queueToast("Ben Hunt", tostring(err or ("Could not reach " .. prettyWorld(ben.world))))
+					return false
+				end
+				Mover.task = "Finding Ben"
+				local spots = { ben.pos + Vector3.new(0, 3, 0), ben.pos + Vector3.new(0, 9, 0), ben.pos + Vector3.new(5, 4, 5) }
+				for _, spot in ipairs(spots) do
+					if not alive() then
+						return false
+					end
+					local hrp = getRoot()
+					if not hrp then
+						return false
+					end
+					pcall(function()
+						hrp.AssemblyLinearVelocity = Vector3.zero
+					end)
+					hrp.CFrame = CFrame.new(spot) * hrp.CFrame.Rotation
+					task.wait(0.4)
+					pcall(function()
+						remote:FireServer(ben.id)
+					end)
+					local waited = 0
+					while waited < 2.5 and not benCollected(ben.id) do
+						waited += task.wait(0.2) or 0.2
+					end
+					if benCollected(ben.id) then
+						Saved.bensFound = (tonumber(Saved.bensFound) or 0) + 1
+						SaveDirty = true
+						queueToast("Ben Hunt", "Found a Ben in " .. prettyWorld(ben.world) .. "  (+" .. pct(B.luck) .. "% luck)")
+						pcall(function()
+							Auto.Metrics.event("Ben", "Found a Ben in " .. prettyWorld(ben.world), "#7dffb3")
+						end)
+						return true
+					end
+				end
+				B.blocked[ben.id] = os.clock() + 300
+				queueToast("Ben Hunt", "The Ben in " .. prettyWorld(ben.world) .. " did not count, trying again in 5 minutes")
+				return false
+			end
+
+			local previousErrand = Auto.nextUpdateErrand
+			Auto.nextUpdateErrand = function(now)
+				if S.autoBen and now - B.lastTry > 4 and claimRemote() then
+					benConfig()
+					local ben = benState().pending[1]
+					if ben then
+						return "Finding Ben", function()
+							benTrip(ben)
+						end
+					end
+				end
+				if previousErrand then
+					return previousErrand(now)
+				end
+				return nil
+			end
+
+			Auto.permMaxed = function()
+				local config = Auto.GameData.moonConfig
+				if type(config) ~= "table" then
+					return true, 0, 0
+				end
+				if type(config.GetShopOwned) == "function" and type(config.GetShopCapTotal) == "function" then
+					local okOwned, owned = pcall(config.GetShopOwned, LocalPlayer, "Permanent")
+					local okCap, cap = pcall(config.GetShopCapTotal, LocalPlayer, "Permanent")
+					if okOwned and okCap and tonumber(owned) and tonumber(cap) then
+						return tonumber(owned) >= tonumber(cap), tonumber(owned), tonumber(cap)
+					end
+				end
+				local shop = config.Permanent
+				local folderName = config.DataFolders and config.DataFolders.Permanent or "MoonPermUpgradesData"
+				local owned, cap = 0, 0
+				for _, name in ipairs(shop and shop.Order or {}) do
+					local level = tonumber(readLevel(folderName, name)) or 0
+					local limit = tonumber(shop.MaxLevels and shop.MaxLevels[name]) or 0
+					if type(config.GetLevelCap) == "function" then
+						local ok, levelCap = pcall(config.GetLevelCap, LocalPlayer, "Permanent", name)
+						if ok and tonumber(levelCap) then
+							limit = math.min(limit, tonumber(levelCap))
+						end
+					end
+					owned += math.min(level, limit)
+					cap += limit
+				end
+				return owned >= cap, owned, cap
+			end
+
+			local FW = { lastTry = -1e9, fails = 0 }
+			Auto.FarmWorld = FW
+			local function farmTarget()
+				local pick = tostring(S.farmWorld or "Best unlocked")
+				if pick ~= "Best unlocked" then
+					for key, display in pairs(Auto.GameData.worldCost and Auto.GameData.worldCost.DisplayNames or {}) do
+						if display == pick then
+							return Auto.worldKey(key) or key
+						end
+					end
+					return Auto.worldKey((string.gsub(pick, "%s", ""))) or pick
+				end
+				local best, moon = "Spawn", moonWorld()
+				for _, key in ipairs(Auto.GameData.worldOrder or UI.WorldOrder or {}) do
+					if key ~= moon and worldUnlocked(key) then
+						best = key
+					end
+				end
+				return best
+			end
+			local function farmWorldWait(target)
+				if S.indexHunt and Hunter.egg then
+					return "Index Hunter"
+				end
+				if S.autoHatch and S.eggAutoTravel and S.hatchEggName ~= "" then
+					local eggWorld = EggWorlds[S.hatchEggName] or "Spawn"
+					if eggWorld ~= target then
+						return "Hatching in " .. prettyWorld(eggWorld)
+					end
+				end
+				if S.autoUfo and Ufo.engaged then
+					return "UFO"
+				end
+				return nil
+			end
+			Auto.farmWorldStep = function(now)
+				if not (S.autoFarm and S.farmWorldOn) then
+					return false
+				end
+				local target = farmTarget()
+				if not target or not worldUnlocked(target) or farmWorldWait(target) or currentWorld() == target then
+					if currentWorld() == target then
+						FW.fails = 0
+					end
+					return false
+				end
+				if now - FW.lastTry < (if FW.fails >= 3 then 60 else 10) then
+					return false
+				end
+				FW.lastTry = now
+				Mover.busy = true
+				Mover.task = "Going to " .. prettyWorld(target) .. " to farm"
+				local ok, reached = pcall(travelTo, target)
+				Mover.busy = false
+				Mover.task = ""
+				if ok and reached then
+					FW.fails = 0
+					queueToast("Farm", "Farming in " .. prettyWorld(target))
+				else
+					FW.fails += 1
+				end
+				return true
+			end
+
+			task.spawn(function()
+				local drawn = nil
+				while alive() do
+					task.wait(0.5)
+					local view = B.view
+					if view and view ~= drawn then
+						drawn = view
+						for _, item in ipairs(view) do
+							if item.value ~= nil then
+								setStat(item.row, nil, item.value)
+							end
+							if item.progress ~= nil then
+								progress(item.row, item.progress)
+							end
+						end
+					end
+				end
+			end)
+			task.spawn(function()
+				while alive() do
+					task.wait(1)
+					local view = {}
+					local function show(row, _, value)
+						table.insert(view, { row = row, value = value })
+					end
+					local function bar(row, value)
+						table.insert(view, { row = row, progress = value })
+					end
+					local ok, err = pcall(function()
+						benConfig()
+						local state = benState()
+						B.found, B.total = state.found, state.total
+						local nextBen = state.pending[1]
+						if state.total == 0 then
+							show(UI.BenFoundRow, nil, faded("none yet"))
+							bar(UI.BenFoundRow, 0)
+						else
+							show(UI.BenFoundRow, nil, string.format("%d / %d", state.found, state.total))
+							bar(UI.BenFoundRow, state.found / state.total)
+						end
+						local bonus = state.found * B.luck
+						show(UI.BenLuckRow, nil, (if bonus > 0 then tint(GREEN, "+" .. pct(bonus) .. "%") else faded("+0%")) .. faded("  of +" .. pct(state.total * B.luck) .. "%"))
+						if nextBen then
+							show(UI.BenNextRow, nil, prettyWorld(nextBen.world))
+						elseif state.total > 0 and state.found >= state.total then
+							show(UI.BenNextRow, nil, tint(GREEN, "All found"))
+						elseif state.locked > 0 then
+							show(UI.BenNextRow, nil, faded(state.locked .. " in locked worlds"))
+						else
+							show(UI.BenNextRow, nil, faded("-"))
+						end
+						local status
+						if not S.autoBen then
+							status = faded("Off")
+						elseif Mover.busy and Mover.task == "Finding Ben" then
+							status = tint(GREEN, "Finding Ben")
+						elseif state.total > 0 and state.found >= state.total then
+							status = tint(GREEN, "All found")
+						elseif not claimRemote() then
+							status = tint(ORANGE, "Ben Hunt is not in this server")
+						elseif nextBen then
+							status = tint(GREEN, "Going soon")
+						elseif state.locked > 0 then
+							status = tint(ORANGE, "Unlock more worlds")
+						elseif state.total == 0 then
+							status = tint(ORANGE, "No Bens found")
+						else
+							status = tint(ORANGE, "Retrying soon")
+						end
+						show(UI.BenStateRow, nil, status)
+
+						local maxed, owned, cap = Auto.permMaxed()
+						if cap and cap > 0 then
+							show(UI.PermMaxRow, nil, if maxed then tint(GREEN, "Maxed") else string.format("%d / %d", owned, cap))
+							bar(UI.PermMaxRow, owned / cap)
+						else
+							show(UI.PermMaxRow, nil, faded("-"))
+						end
+
+						local farmValue
+						if not S.farmWorldOn then
+							farmValue = faded("Off")
+						else
+							local target = farmTarget()
+							local wait = target and farmWorldWait(target)
+							if not target then
+								farmValue = faded("-")
+							elseif not worldUnlocked(target) then
+								farmValue = tint(ORANGE, prettyWorld(target) .. " is locked")
+							elseif wait then
+								farmValue = tint(ORANGE, prettyWorld(target)) .. faded("  after " .. wait)
+							elseif currentWorld() == target then
+								farmValue = tint(GREEN, prettyWorld(target))
+							elseif not S.autoFarm then
+								farmValue = prettyWorld(target) .. faded("  when Auto Farm is on")
+							else
+								farmValue = tint(ORANGE, "Going to " .. prettyWorld(target))
+							end
+						end
+						show(UI.FarmWorldRow, nil, farmValue)
+					end)
+					B.view = view
+					if not ok then
+						diag("update3", err)
+					end
+				end
+			end)
+		end
+		Auto.setupUpdate3()
 
 		Auto.Mover = Mover
 		Auto.Hunter = Hunter
@@ -37918,6 +38372,9 @@ local function collectFarm()
 	local hasTarget = target ~= nil and target.Parent ~= nil
 	if not S.autoFarm then
 		farm.state = "idle"
+	elseif S.autoTap == false then
+		farm.state = "pets"
+		hasTarget = false
 	elseif hasTarget then
 		farm.state = "firing"
 	elseif area == "" then
@@ -38080,6 +38537,7 @@ local function drawFarm()
 		firing = '<font color="#60d696">Firing...</font>',
 		noarea = '<font color="#ffb84d">No area</font>',
 		search = '<font color="#ffb84d">Searching...</font>',
+		pets = '<font color="#60d696">Pets on auto</font>',
 	})[farm.state] or "Idle"
 	setStat(FarmStateRow, nil, stateText)
 	if farm.target then
@@ -38771,6 +39229,29 @@ if eggsFolder then
 		task.defer(refreshEggs, true)
 	end))
 end
+
+Library:AddCommand({
+	Name = "bens",
+	Aliases = { "ben" },
+	Args = "[on/off]",
+	Description = "Starts or stops Auto Find Bens",
+	Callback = function(Args)
+		local State = if Args[1] then Args[1] == "on" else not Toggles.AutoBen.Value
+		Toggles.AutoBen:SetValue(State)
+		return "Auto Find Bens " .. (if State then "on" else "off")
+	end,
+})
+
+Library:AddCommand({
+	Name = "tap",
+	Args = "[on/off]",
+	Description = "Turns Auto Tap on or off",
+	Callback = function(Args)
+		local State = if Args[1] then Args[1] == "on" else not Toggles.AutoTap.Value
+		Toggles.AutoTap:SetValue(State)
+		return "Auto Tap " .. (if State then "on" else "off")
+	end,
+})
 
 Library:AddCommand({
 	Name = "farm",
