@@ -984,30 +984,113 @@ local function NormalizeSearch(Search: string): string
     return (Search:gsub("%s+", ""))
 end
 
-local function TryFuzzyMatch(Text: any, Search: string): (boolean, number)
+local SearchRecords = {}
+local SearchRecordCount = 0
+
+local function GetSearchRecord(Text: any)
     if typeof(Text) ~= "string" or Text == "" then
-        return false, 0
+        return nil
     end
 
-    return FuzzyScore(Text:lower(), Search)
+    local Record = SearchRecords[Text]
+    if Record then
+        return Record
+    end
+
+    local Clean = (Text:gsub("<[^<>]->", ""):lower():gsub("%s+", " "))
+    Record = {
+        Clean = Clean,
+        Compact = (Clean:gsub("[%s%p]+", "")),
+        Initials = ((Clean:gsub("(%w)%w*", "%1")):gsub("[^%w]", "")),
+    }
+
+    if SearchRecordCount >= 4000 then
+        table.clear(SearchRecords)
+        SearchRecordCount = 0
+    end
+    SearchRecords[Text] = Record
+    SearchRecordCount += 1
+
+    return Record
+end
+
+local function SearchTokenScore(Record, Token: string, Strict: boolean?): number
+    local Clean = Record.Clean
+    local Index = Clean:find(Token, 1, true)
+    if Index then
+        local PrevChar = if Index > 1 then Clean:sub(Index - 1, Index - 1) else ""
+        local AtBoundary = Index == 1 or PrevChar:match("[%s%p]") ~= nil
+        return 100 + Token:len() * 4 + (if AtBoundary then 60 else 0) + (if Clean == Token then 200 else 0) - math.min(Index, 60) * 0.5
+    end
+
+    local CompactToken = (Token:gsub("[%s%p]+", ""))
+    if CompactToken == "" then
+        return 0
+    end
+    if Record.Compact:find(CompactToken, 1, true) then
+        return 80 + CompactToken:len() * 3
+    end
+    if Strict then
+        return 0
+    end
+    if CompactToken:len() >= 2 and Record.Initials:sub(1, CompactToken:len()) == CompactToken then
+        return 70 + CompactToken:len() * 3
+    end
+    if CompactToken:len() < 3 then
+        return 0
+    end
+
+    local Compact = Record.Compact
+    local Position, First, Last = 1, 0, 0
+    for Char in CompactToken:gmatch(".") do
+        local Found = Compact:find(Char, Position, true)
+        if not Found then
+            return 0
+        end
+        if First == 0 then
+            First = Found
+        end
+        Last = Found
+        Position = Found + 1
+    end
+
+    local Span = Last - First + 1
+    if Span > CompactToken:len() * 2 then
+        return 0
+    end
+
+    return 30 + CompactToken:len() * 2 - (Span - CompactToken:len())
+end
+
+local function SearchFieldsScore(Fields, Search: string): number
+    local Total = 0
+    for Token in Search:gmatch("%S+") do
+        local Best = 0
+        for _, Field in Fields do
+            local Record = GetSearchRecord(Field[1])
+            if Record then
+                local Score = SearchTokenScore(Record, Token, Field[3]) * Field[2]
+                if Score > Best then
+                    Best = Score
+                end
+            end
+        end
+        if Best <= 0 then
+            return 0
+        end
+        Total += Best
+    end
+
+    return Total
+end
+
+local function TryFuzzyMatch(Text: any, Search: string): (boolean, number)
+    local Score = SearchFieldsScore({ { Text, 1, false } }, Search)
+    return Score > 0, Score
 end
 
 local function FuzzyMatchScore(Text: any, Search: string): number
-    if typeof(Text) ~= "string" or Text == "" then
-        return 0
-    end
-
-    local Normalized = NormalizeSearch(Text:lower())
-    local Matched, Score = FuzzyScore(Normalized, Search)
-    if not Matched then
-        return 0
-    end
-
-    if Normalized == Search then
-        Score += 1000
-    end
-
-    return Score
+    return SearchFieldsScore({ { Text, 1, false } }, Search)
 end
 
 local function MatchesSearch(ElementInfo, Search: string, ForceMatch: boolean?): boolean
@@ -1018,14 +1101,15 @@ local function MatchesSearch(ElementInfo, Search: string, ForceMatch: boolean?):
         return true
     end
 
-    if TryFuzzyMatch(ElementInfo.Text, Search) then
-        return true
-    end
-    if TryFuzzyMatch(ElementInfo.Tooltip, Search) then
-        return true
-    end
-    if TryFuzzyMatch(ElementInfo.DisabledTooltip, Search) then
-        return true
+    local Fields = {
+        { ElementInfo.Text, 1, false },
+        { ElementInfo.Tooltip, 0.5, true },
+        { ElementInfo.DisabledTooltip, 0.4, true },
+    }
+
+    local DescriptionLabel = ElementInfo.DescriptionLabel
+    if typeof(DescriptionLabel) == "Instance" and DescriptionLabel:IsA("TextLabel") then
+        table.insert(Fields, { DescriptionLabel.Text, 0.7, true })
     end
 
     if typeof(ElementInfo.Values) == "table" then
@@ -1036,16 +1120,14 @@ local function MatchesSearch(ElementInfo, Search: string, ForceMatch: boolean?):
                 break
             end
 
-            if TryFuzzyMatch(Value, Search) or (typeof(Value) ~= "string" and TryFuzzyMatch(tostring(Value), Search)) then
-                return true
-            end
-            if typeof(Key) == "string" and TryFuzzyMatch(Key, Search) then
-                return true
+            table.insert(Fields, { if typeof(Value) == "string" then Value else tostring(Value), 0.6, true })
+            if typeof(Key) == "string" then
+                table.insert(Fields, { Key, 0.6, true })
             end
         end
     end
 
-    return false
+    return SearchFieldsScore(Fields, Search) > 0
 end
 
 local function GetPlayers(ExcludeLocalPlayer: boolean?)
@@ -1487,7 +1569,24 @@ local function ResetTab(Tab)
     end
 end
 
+function Library:QueueSearchRefresh()
+    if not Library.Searching or Library.SearchRefreshQueued then
+        return
+    end
+
+    Library.SearchRefreshQueued = true
+    task.defer(function()
+        Library.SearchRefreshQueued = false
+        if Library.Searching and not Library.Unloaded then
+            Library:UpdateSearch(Library.SearchText)
+        end
+    end)
+end
+
 function Library:UpdateSearch(SearchText)
+    SearchText = tostring(SearchText or "")
+    local QueryChanged = SearchText ~= Library.LastSearchQuery
+    Library.LastSearchQuery = SearchText
     Library.SearchText = SearchText
 
     local TabsToSearch = {}
@@ -1501,8 +1600,8 @@ function Library:UpdateSearch(SearchText)
         ResetTab(Tab)
     end
 
-    local Search = NormalizeSearch(SearchText:lower())
-    if Trim(Search) == "" then
+    local Search = Trim((SearchText:lower():gsub("%s+", " ")))
+    if Search == "" then
         Library.Searching = false
         Library.LastSearchTab = nil
         return
@@ -1515,10 +1614,9 @@ function Library:UpdateSearch(SearchText)
 
     Library.Searching = true
 
+    local Results = {}
     local BestTab = nil
     local BestScore = -1
-    local ActiveScore = -1
-    local ActiveHasVisible = false
 
     for _, Tab in TabsToSearch do
         local HasVisible, Score = ApplySearchToTab(Tab, Search)
@@ -1526,36 +1624,41 @@ function Library:UpdateSearch(SearchText)
             continue
         end
 
-        if Tab == Library.ActiveTab then
-            ActiveHasVisible = true
-            ActiveScore = Score
-        end
+        Results[Tab] = Score
         if Score > BestScore then
             BestScore = Score
             BestTab = Tab
         end
     end
 
+    local ActiveTab = Library.ActiveTab
+    local ActiveScore = ActiveTab and Results[ActiveTab]
+    local Target = ActiveTab
+    if QueryChanged and BestTab and not (ActiveScore and ActiveScore >= BestScore) then
+        Target = BestTab
+    end
+
     if not Library.GlobalSearch then
         for _, Tab in TabsToSearch do
-            if Tab ~= BestTab then
+            if Tab ~= Target or not Results[Tab] then
                 ResetTab(Tab)
             end
         end
     end
 
-    local StayOnActive = ActiveHasVisible and ActiveScore >= BestScore
-    if StayOnActive and Library.ActiveTab then
-        Library.ActiveTab:RefreshSides()
-    elseif BestTab then
+    if Target == ActiveTab then
+        if ActiveTab then
+            ActiveTab:RefreshSides()
+        end
+    elseif Target then
         local SearchMarker = SearchText
         task.defer(function()
             if Library.SearchText ~= SearchMarker then
                 return
             end
 
-            if Library.ActiveTab ~= BestTab then
-                BestTab:Show()
+            if Library.ActiveTab ~= Target then
+                Target:Show()
             elseif Library.ActiveTab then
                 Library.ActiveTab:RefreshSides()
             end
@@ -9145,6 +9248,7 @@ do
 
             TextLabel.Visible = Label.Visible
             Groupbox:Resize()
+            Library:QueueSearchRefresh()
         end
 
         function Label:SetText(Text: string)
@@ -11196,6 +11300,7 @@ do
         if Info.Searchable then
             SearchBox = New("TextBox", {
                 BackgroundTransparency = 1,
+                ClearTextOnFocus = false,
                 PlaceholderText = "Search...",
                 Position = UDim2.fromOffset(-8, 0),
                 Size = UDim2.new(1, -12, 1, 0),
@@ -13942,6 +14047,7 @@ do
             Stat.Visible = Visible
             Holder.Visible = Visible
             Groupbox:Resize()
+            Library:QueueSearchRefresh()
         end
 
         function Stat:Destroy()
@@ -19706,6 +19812,7 @@ function Library:CreateWindow(WindowInfo)
 
         SearchBox = New("TextBox", {
             BackgroundColor3 = "MainColor",
+            ClearTextOnFocus = false,
             PlaceholderText = "Search...",
             Size = WindowInfo.SearchbarSize,
             TextSize = 14,
@@ -25298,7 +25405,7 @@ function Library:CreateWindow(WindowInfo)
             Enabled = Library:GetSetting("AntiAFK", true) ~= false,
             Count = 0,
             LastPulse = os.clock(),
-            NextPulse = os.clock() + 90,
+            NextPulse = os.clock() + 45,
             Jump = false,
             JumpEvery = 30,
             LastJump = os.clock(),
@@ -25366,7 +25473,7 @@ function Library:CreateWindow(WindowInfo)
                 if Afk.Enabled and Now >= Afk.NextPulse then
                     Nudge()
                     Afk.LastPulse = Now
-                    Afk.NextPulse = Now + 90 + math.random() * 90
+                    Afk.NextPulse = Now + 45 + math.random() * 30
                 end
                 if Afk.Jump and Now - Afk.LastJump >= Afk.JumpEvery then
                     Afk.LastJump = Now
@@ -25685,124 +25792,21 @@ function Library:CreateWindow(WindowInfo)
         })
         local LagStat = Perf:AddStat({ Icon = "zap", Text = "Objects optimized", Value = "0", Size = 22 })
 
-        local Adaptive = {
-            Enabled = true,
-            Threshold = 25,
-            Low = 0,
-            LastAction = -1e9,
-            Started = os.clock(),
-            Focused = true,
-            Frames = 0,
-            Elapsed = 0,
-            Fps = nil,
-            Raised = nil,
-        }
-        Library.AdaptiveLag = Adaptive
-        pcall(function()
-            Library:GiveSignal(UserInputService.WindowFocusReleased:Connect(function()
-                Adaptive.Focused = false
-                Adaptive.Low = 0
-            end))
-            Library:GiveSignal(UserInputService.WindowFocused:Connect(function()
-                Adaptive.Focused = true
-                Adaptive.Low = 0
-            end))
-        end)
+        local FpsMeter = { Frames = 0, Elapsed = 0 }
         Library:GiveSignal(RunService.Heartbeat:Connect(function(Delta)
-            Adaptive.Frames += 1
-            Adaptive.Elapsed += tonumber(Delta) or 0
+            FpsMeter.Frames += 1
+            FpsMeter.Elapsed += tonumber(Delta) or 0
         end))
 
-        function Adaptive.Sample(Fps: number)
-            Adaptive.Fps = Fps
-            if not Adaptive.Enabled or not Adaptive.Focused then
-                Adaptive.Low = 0
-                return
-            end
-            if os.clock() - Adaptive.Started < 20 then
-                return
-            end
-            local CapOption = Library.Options.CorvusFPSCap
-            local Cap = CapOption and tonumber(CapOption.Value)
-            if Cap and Cap <= Adaptive.Threshold + 5 then
-                Adaptive.Low = 0
-                return
-            end
-            local NoRender = Library.Toggles.CorvusNoRender
-            if NoRender and NoRender.Value then
-                Adaptive.Low = 0
-                return
-            end
-            if Fps < Adaptive.Threshold then
-                Adaptive.Low += 1
-            else
-                Adaptive.Low = 0
-                return
-            end
-            if os.clock() - Adaptive.LastAction < 20 then
-                return
-            end
-            local Toggle = Library.Toggles.CorvusAntiLag
-            local LevelOption = Library.Options.CorvusAntiLagLevel
-            if not Toggle then
-                return
-            end
-            if not AntiLag.Enabled and Adaptive.Low >= 8 then
-                Adaptive.LastAction = os.clock()
-                Adaptive.Low = 0
-                if LevelOption and AntiLag.Level < 2 then
-                    LevelOption:SetValue("Balanced")
-                end
-                Toggle:SetValue(true)
-                Adaptive.Raised = if LevelOption then LevelOption.Value else "Balanced"
-                Library:Notify({
-                    Title = "Adaptive anti lag",
-                    Description = string.format("FPS dropped to %d, anti lag is now on (%s)", math.floor(Fps + 0.5), tostring(Adaptive.Raised)),
-                    Time = 6,
-                })
-            elseif AntiLag.Enabled and AntiLag.Level < 3 and Adaptive.Low >= 12 and LevelOption then
-                Adaptive.LastAction = os.clock()
-                Adaptive.Low = 0
-                LevelOption:SetValue("Ultra")
-                Adaptive.Raised = "Ultra"
-                Library:Notify({
-                    Title = "Adaptive anti lag",
-                    Description = string.format("Still %d FPS, switched anti lag to Ultra", math.floor(Fps + 0.5)),
-                    Time = 6,
-                })
-            end
-        end
-
-        Perf:AddToggle("CorvusAdaptiveLag", {
-            Text = "Adaptive anti lag",
-            Description = "Turns anti lag on by itself when FPS drops",
-            Tooltip = "Watches your FPS. If it stays under the limit for about 8 seconds, anti lag turns on at Balanced, and moves to Ultra if that is not enough. It never turns anything off on its own.",
-            Default = true,
-            Callback = function(Value)
-                Adaptive.Enabled = Value
-                Adaptive.Low = 0
-            end,
-        })
-        Perf:AddDropdown("CorvusAdaptiveFPS", {
-            Text = "Kick in below",
-            Values = { "15 FPS", "20 FPS", "25 FPS", "30 FPS", "40 FPS" },
-            Default = "25 FPS",
-            Callback = function(Value)
-                Adaptive.Threshold = tonumber(string.match(tostring(Value), "%d+")) or 25
-                Adaptive.Low = 0
-            end,
-        })
         local FpsStat = Perf:AddStat({ Icon = "gauge", Text = "FPS", Value = "-", Size = 22, ValueColor = "FontColor" })
         task.spawn(function()
             while not Library.Unloaded do
                 task.wait(1)
-                if Adaptive.Elapsed > 0.2 then
-                    local Fps = Adaptive.Frames / Adaptive.Elapsed
-                    Adaptive.Frames, Adaptive.Elapsed = 0, 0
-                    pcall(Adaptive.Sample, Fps)
+                if FpsMeter.Elapsed > 0.2 then
+                    local Fps = FpsMeter.Frames / FpsMeter.Elapsed
+                    FpsMeter.Frames, FpsMeter.Elapsed = 0, 0
                     local Color = if Fps >= 50 then "#60d696" elseif Fps >= 30 then "#ffb84d" else "#ff6e8a"
-                    local Suffix = if Adaptive.Low > 0 and Adaptive.Enabled then string.format('  <font transparency="0.5">low %ds</font>', Adaptive.Low) else ""
-                    pcall(FpsStat.SetValue, FpsStat, string.format('<font color="%s">%d</font>%s', Color, math.floor(Fps + 0.5), Suffix))
+                    pcall(FpsStat.SetValue, FpsStat, string.format('<font color="%s">%d</font>', Color, math.floor(Fps + 0.5)))
                 end
             end
         end)
@@ -29903,7 +29907,7 @@ local CorvusConfig = {
 	LoaderUrl = "",
 	CodesUrl = "",
 	KnownCodes = { "Release", "Update1", "DroverQ", "Russo", "DarkRose", "AG64", "Cupcake", "E11opoppet", "Ellopoppet", "Olopomidoro", "Ostrichh", "Update2", "1mvisits" },
-	HubVersion = "2.1",
+	HubVersion = "2.2",
 }
 
 local Env = getgenv()
@@ -30125,7 +30129,7 @@ local S = {
 	autoRebirth = false,
 	rebirthStopAt = 0,
 	autoCodes = false,
-	hookEvents = { UFO = true, World = true, Rebirth = true, Special = true, Codes = true, Goals = true },
+	hookEvents = { UFO = true, World = true, Rebirth = true, Special = true, Codes = true, Goals = true, Fish = true },
 	ufoHop = false,
 	ufoHopWindow = 60,
 	ufoHopChase = false,
@@ -30140,6 +30144,38 @@ local S = {
 	autoItemCraft = false,
 	craftPick = {},
 	webhookMutated = false,
+	autoFish = false,
+	fishSpot = "Best unlocked",
+	fishTap = true,
+	fishPriority = "Eggs first",
+	autoWorms = false,
+	autoHooks = false,
+	autoSellFish = false,
+	sellFishPick = {},
+	sellTiers = { Normal = true },
+	keepFish = 0,
+	sellAt = 25,
+	autoMerchantBuy = false,
+	merchantPick = {},
+	tokenReserve = 0,
+	autoFishTree = false,
+	fishTreePick = {},
+	fishTreeOrder = "Cheapest first",
+	autoInvEggs = false,
+	invEggKeep = {},
+	moonGameAuto = false,
+	stopAfkRejoin = true,
+	webhookHatches = true,
+	webhookEventsOn = true,
+	webhookName = "Corvus",
+	webhookMinOneIn = 0,
+	pingId = "",
+	pingFor = { Secret = true, UFO = true },
+	ufoHookMode = "Only when I win",
+	profileOn = false,
+	profileEvery = 300,
+	profileShow = {},
+	profileButtons = true,
 }
 
 local Stats = {
@@ -30329,6 +30365,7 @@ Auto.Mutations = {
 	Wet = { "Wet", "#5fb8ff" },
 	UFO = { "UFO", "#7dffb3" },
 	Hacker = { "Hacker", "#39ff14" },
+	Rainbow = { "Rainbow", "#ff8de1" },
 }
 
 function Auto.mutationInfo(text)
@@ -30470,6 +30507,16 @@ local Saved = {
 	serverLuckBuys = 0,
 	itemsCrafted = 0,
 	mutated = 0,
+	fishCaught = 0,
+	fishRare = 0,
+	fishSold = 0,
+	tokensEarned = 0,
+	merchantBought = 0,
+	fishTreeBought = 0,
+	invEggsOpened = 0,
+	fishSince = os.time(),
+	ufoWon = 0,
+	ufoTop3 = 0,
 }
 
 pcall(function()
@@ -31198,6 +31245,9 @@ pcall(function()
 	Library:GiveSignal(Result.OnClientEvent:Connect(function(player, list)
 		if player == LocalPlayer then
 			recordHatch(list)
+			if Auto.onInvEggResult then
+				pcall(Auto.onInvEggResult, list)
+			end
 		end
 	end))
 end)
@@ -31233,10 +31283,79 @@ local function getEggPrice(name)
 	return (if ok and type(price) == "number" then price else nil), free
 end
 
+function Auto.eventEggConfig()
+	return Auto.lazyRequire("EventEggConfig", function()
+		local modules = ReplicatedStorage:FindFirstChild("Modules")
+		return modules and modules:FindFirstChild("EventEggConfig")
+	end)
+end
+
+function Auto.eggCurrency(name)
+	local config = Auto.eventEggConfig()
+	if type(config) == "table" and type(config.GetCurrency) == "function" then
+		local ok, currency = pcall(config.GetCurrency, name)
+		if ok and (currency == "Rubies" or currency == "Coins") then
+			return currency
+		end
+	end
+	return "Coins"
+end
+
+function Auto.eggEvent(name)
+	local config = Auto.eventEggConfig()
+	if type(config) ~= "table" or type(config.IsEventEgg) ~= "function" then
+		return nil
+	end
+	local okEvent, isEvent = pcall(config.IsEventEgg, name)
+	if not (okEvent and isEvent) then
+		return nil
+	end
+	local info = {}
+	local okAvailable, available = pcall(config.IsAvailable, name)
+	info.ended = okAvailable and available == false
+	local okLeft, left = pcall(config.GetRemaining, name)
+	info.left = if okLeft and type(left) == "number" then left else nil
+	local okWorld, world, display = pcall(config.GetRequiredWorld, name)
+	if okWorld and type(world) == "string" then
+		info.world = tostring(display or world)
+		local okMet, met = pcall(config.IsWorldRequirementMet, LocalPlayer, name)
+		info.locked = okMet and met == false
+	end
+	return info
+end
+
+function Auto.eggCombo()
+	local config = Auto.lazyRequire("EggLuckComboConfig", function()
+		local modules = ReplicatedStorage:FindFirstChild("Modules")
+		return modules and modules:FindFirstChild("EggLuckComboConfig")
+	end)
+	if type(config) ~= "table" or type(config.GetLevel) ~= "function" then
+		return nil
+	end
+	local okOwned, owned = pcall(config.HasUpgrade, LocalPlayer)
+	local okLevel, level = pcall(config.GetLevel, LocalPlayer)
+	level = if okLevel then tonumber(level) or 0 else 0
+	local okBonus, bonus = pcall(config.BonusForLevel, level)
+	return {
+		owned = okOwned and owned == true,
+		level = level,
+		max = math.max(1, tonumber(config.MAX_LEVEL) or 200),
+		bonus = if okBonus then tonumber(bonus) or 0 else 0,
+		maxBonus = tonumber(config.MAX_BONUS) or 0.1,
+	}
+end
+
 local EggRange = 34
 local function checkHatch(name)
 	if name == "" then
 		return false, "Select an egg"
+	end
+	local event = Auto.eggEvent(name)
+	if event and event.ended then
+		return false, "This event egg has left"
+	end
+	if event and event.locked then
+		return false, "Unlock " .. tostring(event.world) .. " first"
 	end
 	local model = getEggModel(name)
 	if not model then
@@ -31252,9 +31371,10 @@ local function checkHatch(name)
 	end
 	local price, free = getEggPrice(name)
 	if price and not free then
-		local coins = getStat("Coins")
-		if coins and coins < price then
-			return false, "Need " .. formatNumber(price) .. " coins"
+		local currency = Auto.eggCurrency(name)
+		local balance = getStat(currency)
+		if balance and balance < price then
+			return false, "Need " .. formatNumber(price) .. " " .. string.lower(currency)
 		end
 	end
 	return true, "Hatching"
@@ -31267,15 +31387,17 @@ function Auto.hatchPlan(name, mode, remaining)
 	local okMax, maxOpen = pcall(function() return maxValue and maxValue.Value end)
 	maxOpen = math.max(1, math.floor(tonumber(okMax and maxOpen or nil) or 1))
 	local paid = price ~= nil and price > 0 and not free
-	local coins = getStat("Coins") or 0
-	local canBuy = if paid then math.min(maxOpen, math.floor(coins / price)) else maxOpen
+	local currency = Auto.eggCurrency(name)
+	local balance = getStat(currency) or 0
+	local keep = if currency == "Rubies" then (S.rubyReserve or 0) else (S.hatchKeepCoins or 0)
+	local canBuy = if paid then math.min(maxOpen, math.floor(balance / price)) else maxOpen
 	local budget = math.huge
-	if paid and (S.hatchKeepCoins or 0) > 0 then
-		budget = math.floor((coins - S.hatchKeepCoins) / price)
+	if paid and keep > 0 then
+		budget = math.floor((balance - keep) / price)
 	end
 	local limit = math.min(budget, remaining or math.huge)
 	if limit < 1 then
-		return nil, if budget < 1 then "Keeping " .. formatNumber(S.hatchKeepCoins) .. " coins" else "Done"
+		return nil, if budget < 1 then "Keeping " .. formatNumber(keep) .. " " .. string.lower(currency) else "Done"
 	end
 	local counts = { Max = math.max(1, canBuy), Half = math.max(1, math.ceil(canBuy / 2)), Single = 1 }
 	local order = { "Max", "Half", "Single" }
@@ -31652,7 +31774,22 @@ task.spawn(function()
 			end
 			table.sort(names)
 			data.petNames = names
+			local icons = {}
+			for name, info in pairs(multi) do
+				if type(name) == "string" and type(info) == "table" and type(info[4]) == "string" then
+					icons[name] = info[4]
+				end
+			end
+			data.petIcons = icons
 		end
+	end)
+	pcall(function()
+		local fishing = ReplicatedStorage:FindFirstChild("Fishing")
+		local tree = load(fishing, "FishingTreeData")
+		if tree and type(tree.Groups) == "table" then
+			data.fishTree = tree
+		end
+		data.merchant = load(fishing, "MerchantConfig")
 	end)
 	data.ready = true
 end)
@@ -31676,7 +31813,7 @@ local Window = Library:CreateWindow({
 	ToggleKeybind = Enum.KeyCode.Z,
 })
 
-Library.ShareIgnore = { WebhookUrl = true, FeedbackText = true, CodeInput = true, GoalKind = true, GoalTarget = true, HatchEgg = true }
+Library.ShareIgnore = { WebhookUrl = true, WebhookPingId = true, FeedbackText = true, CodeInput = true, GoalKind = true, GoalTarget = true, HatchEgg = true }
 
 local Tabs = {}
 
@@ -31691,10 +31828,12 @@ Tabs.Info = Window:AddInfoTab({
 Tabs.Farm = Window:AddTab({ Name = "Farm", Icon = "swords", Description = "Auto farm at maximum speed" })
 Tabs.Rewards = Window:AddTab({ Name = "Rewards", Icon = "gift", Description = "Gifts, chests and the fruit machine" })
 Tabs.Eggs = Window:AddTab({ Name = "Eggs", Icon = "egg", Description = "Auto buy eggs and index hunter" })
+Tabs.Fishing = Window:AddTab({ Name = "Fishing", Icon = "fish", Description = "Auto fish, bait, merchant and tokens" })
 Tabs.Items = Window:AddTab({ Name = "Items", Icon = "backpack", Description = "Fruits, potions, lucky blocks" })
-Tabs.Upgrades = Window:AddTab({ Name = "Upgrades", Icon = "trending-up", Description = "Spawn machine and Moon shops" })
+Tabs.Upgrades = Window:AddTab({ Name = "Upgrades", Icon = "trending-up", Description = "Spawn machine, trees and Moon shops" })
 Tabs.Stats = Window:AddTab({ Name = "Stats", Icon = "chart-column", Description = "Earnings, rewards and items" })
 Tabs.Analytics = Window:AddTab({ Name = "Analytics", Icon = "chart-spline", Description = "Live rates, trends and luck" })
+Tabs.Webhook = Window:AddTab({ Name = "Webhook", Icon = "webhook", Description = "Discord posts, pings and a live profile card" })
 Tabs.Misc = Window:AddMiscTab({
 	Description = "Performance, AFK, friends and webhook",
 	RejoinScript = Auto.loaderSource("reconnect"),
@@ -31811,7 +31950,8 @@ UI.FruitBuyStatRow = RewardsStatsBox:AddStat({ Icon = GameIcons.FruitMachine, Te
 UI.FruitGotStatRow = RewardsStatsBox:AddStat({ Icon = Items.Icons.Apple, Text = "Fruits from machine", Value = "0", Size = 22, ValueColor = "FontColor" })
 UI.GroupStatRow = RewardsStatsBox:AddStat({ Icon = GameIcons.GroupChest, Text = "Group chests", Value = "0", Size = 28 })
 UI.MoonStatRow = RewardsStatsBox:AddStat({ Icon = GameIcons.MoonChest, Text = "Moon chests", Value = "0", Size = 28 })
-UI.UfoStatRow = RewardsStatsBox:AddStat({ Icon = GameIcons.Alien, Text = "UFOs broken", Value = "0", Size = 28 })
+UI.UfoStatRow = RewardsStatsBox:AddStat({ Icon = GameIcons.Alien, Text = "UFOs helped", Value = "0", Size = 28 })
+UI.UfoWonStatRow = RewardsStatsBox:AddStat({ Icon = "trophy", Text = "UFOs won  /  top 3", Value = "0 / 0", Size = 22 })
 UI.UpgradeStatRow = RewardsStatsBox:AddStat({ Icon = "trending-up", Text = "Upgrades bought", Value = "0", Size = 22 })
 UI.WorldStatRow = RewardsStatsBox:AddStat({ Icon = "globe", Text = "Worlds bought", Value = "0", Size = 22 })
 UI.TreeStatRow = RewardsStatsBox:AddStat({ Icon = "git-branch", Text = "Tree nodes bought", Value = "0", Size = 22 })
@@ -31831,6 +31971,8 @@ RewardsStatsBox:AddButton({
 		Saved.moonChests = 0
 		Saved.ufoBroken = 0
 		Saved.ufoHits = 0
+		Saved.ufoWon = 0
+		Saved.ufoTop3 = 0
 		Saved.upgradesBought = 0
 		Saved.worldsBought = 0
 		Saved.treeBought = 0
@@ -31871,6 +32013,30 @@ for i = 1, 8 do
 	pcall(row.SetVisible, row, false)
 	BestRows[i] = row
 end
+
+UI.FishStatsBox = Tabs.Stats:AddRightGroupbox("Fishing", "fish")
+UI.FishSinceLabel = UI.FishStatsBox:AddLabel({ Text = "Counting since reset", DoesWrap = true })
+UI.FishCaughtStatRow = UI.FishStatsBox:AddStat({ Icon = "fish", Text = "Catches", Value = "0", Size = 28 })
+UI.FishRareStatRow = UI.FishStatsBox:AddStat({ Icon = "sparkles", Text = "Rare and golden catches", Value = "0", Size = 22 })
+UI.FishSoldStatRow = UI.FishStatsBox:AddStat({ Icon = "store", Text = "Pets sold", Value = "0", Size = 22 })
+UI.TokensStatRow = UI.FishStatsBox:AddStat({ Icon = "rbxassetid://125389046620562", Text = "Tokens from selling", Value = "0", Size = 22 })
+UI.MerchantStatRow = UI.FishStatsBox:AddStat({ Icon = "shopping-cart", Text = "Merchant buys", Value = "0", Size = 22 })
+UI.FishTreeStatRow = UI.FishStatsBox:AddStat({ Icon = "git-branch", Text = "Fishing tree nodes", Value = "0", Size = 22 })
+UI.InvEggStatRow = UI.FishStatsBox:AddStat({ Icon = GameIcons.PartyEgg, Text = "Inventory eggs opened", Value = "0", Size = 22 })
+UI.FishStatsBox:AddButton({
+	Text = "Reset Fishing",
+	DoubleClick = true,
+	Tooltip = "Starts catches, sales, merchant buys and inventory eggs from zero",
+	Func = function()
+		for _, key in ipairs({ "fishCaught", "fishRare", "fishSold", "tokensEarned", "merchantBought", "fishTreeBought", "invEggsOpened" }) do
+			Saved[key] = 0
+		end
+		Saved.fishSince = os.time()
+		SaveDirty = true
+		saveStats(true)
+		notify("Stats", "Fishing stats reset", 3)
+	end,
+})
 
 local FarmBox = Tabs.Farm:AddLeftGroupbox("Auto Farm", "swords")
 FarmBox:AddToggle("AutoFarm", {
@@ -31965,7 +32131,8 @@ UI.UfoBox:AddToggle("UfoTravel", {
 })
 UI.UfoStateRow = UI.UfoBox:AddStat({ Icon = GameIcons.Alien, Text = "UFO", Value = "...", Size = 30 })
 UI.UfoHpRow = UI.UfoBox:AddStat({ Icon = GameIcons.AlienWorld, Text = "Health", Value = "-", Size = 22, Progress = 0 })
-UI.UfoHitsRow = UI.UfoBox:AddStat({ Icon = GameIcons.Auto, Text = "Hits  /  broken", Value = "0 / 0", Size = 22 })
+UI.UfoRankRow = UI.UfoBox:AddStat({ Icon = "trophy", Text = "Your damage", Value = "-", Size = 22, ValueColor = "FontColor" })
+UI.UfoHitsRow = UI.UfoBox:AddStat({ Icon = GameIcons.Auto, Text = "Helped  /  won", Value = "0 / 0", Size = 22 })
 UI.UfoNextRow = UI.UfoBox:AddStat({ Icon = "clock", Text = "Next UFO", Value = "...", Size = 22, ValueColor = "FontColor" })
 UI.UfoBox:AddDivider()
 UI.UfoBox:AddToggle("UfoHop", {
@@ -32311,6 +32478,7 @@ EggBox:AddToggle("SkipHatchAnim", {
 	end,
 })
 EggBox:AddInput("HatchStopAfter", {
+	ClearTextOnFocus = false,
 	Text = "Stop after (eggs)",
 	Placeholder = "0 = never",
 	Numeric = true,
@@ -32324,11 +32492,12 @@ EggBox:AddInput("HatchStopAfter", {
 	end,
 })
 EggBox:AddInput("HatchKeepCoins", {
+	ClearTextOnFocus = false,
 	Text = "Keep at least (coins)",
 	Placeholder = "0, 250k, 1.5m, 2b...",
 	Finished = true,
 	Default = "0",
-	Tooltip = "Auto Buy never spends below this. The hatch count drops from Max to Half to Single so you stay above it.",
+	Tooltip = "Auto Buy never spends below this. The hatch count drops from Max to Half to Single so you stay above it. Ruby event eggs keep the ruby reserve from Upgrades > Budget instead.",
 	Callback = function(value)
 		local amount = Auto.parseAmount(value)
 		if amount == nil and tostring(value or "") ~= "" then
@@ -32454,6 +32623,38 @@ local SelectedEggRow = EggStatsBox:AddStat({ Icon = GameIcons.Egg, Text = "No eg
 local EggPriceRow = EggStatsBox:AddStat({ Icon = CurrencyIcons.Coins, Text = "Price", Value = "?", Size = 22, ValueColor = "FontColor" })
 local HatchStateRow = EggStatsBox:AddStat({ Icon = GameIcons.Auto, Text = "Auto Buy", Value = "Off", Size = 22, ValueColor = "FontColor" })
 local EggsTabOpenedRow = EggStatsBox:AddStat({ Icon = GameIcons.Egg, Text = "Eggs opened", Value = "0", Size = 22 })
+UI.EggComboRow = EggStatsBox:AddStat({ Icon = GameIcons.Luck, Text = "Egg Luck Combo", Value = "...", Size = 22, Progress = 0 })
+
+UI.InvEggBox = Tabs.Eggs:AddRightGroupbox("Inventory Eggs", "package")
+UI.InvEggNames = { "Alien Egg", "Party Egg" }
+UI.InvEggBox:AddToggle("AutoInvEggs", {
+	Text = "Auto Open Inventory Eggs",
+	Description = "Opens Party, Alien and other owned eggs",
+	Tooltip = "Opens the eggs in your inventory 8, 3 or 1 at a time, from anywhere. The game blocks eggs while you fish, so this follows the With eggs setting in the Fishing tab.",
+	Default = false,
+	Callback = function(v)
+		S.autoInvEggs = v
+	end,
+})
+UI.InvEggBox:AddDropdown("InvEggKeep", {
+	Text = "Never open",
+	Values = UI.InvEggNames,
+	ValueImages = { ["Party Egg"] = GameIcons.PartyEgg, ["Alien Egg"] = "rbxassetid://123226572543807" },
+	Default = {},
+	Multi = true,
+	AllowNull = true,
+	Callback = function(value)
+		local keep = {}
+		if type(value) == "table" then
+			for name, on in pairs(value) do
+				if on then keep[name] = true end
+			end
+		end
+		S.invEggKeep = keep
+	end,
+})
+UI.InvEggOwnedRow = UI.InvEggBox:AddStat({ Icon = GameIcons.PartyEgg, Text = "Eggs in inventory", Value = "...", Size = 26 })
+UI.InvEggStateRow = UI.InvEggBox:AddStat({ Icon = GameIcons.Auto, Text = "Status", Value = "Off", Size = 22, ValueColor = "FontColor" })
 
 UI.HuntBox = Tabs.Eggs:AddLeftGroupbox("Index Hunter", "book-open")
 UI.HuntBox:AddToggle("IndexHunter", {
@@ -32792,6 +32993,243 @@ UI.ItemCraftStateRow = UI.ItemCraftBox:AddStat({ Icon = GameIcons.Auto, Text = "
 UI.ItemCraftDoneRow = UI.ItemCraftBox:AddStat({ Icon = Items.Icons.LuckPotion3, Text = "Crafted", Value = "0", Size = 22 })
 UI.ItemCraftBox:AddLabel({ Text = '<font transparency="0.45">Potions III last 10 minutes and beat tier I and II. Charms need 3 to 5 of the tier below plus fruits and rubies.</font>', DoesWrap = true })
 
+UI.TokenIcon = "rbxassetid://125389046620562"
+UI.FishSpotKeys = { ["Best unlocked"] = "Best unlocked", ["Where I stand"] = "Here" }
+UI.FishSpotList = { "Best unlocked" }
+for _, key in ipairs({ "HauntedHouse", "TreasureDunes", "Spawn" }) do
+	local label = prettyWorld(Auto.worldKey(key) or key)
+	table.insert(UI.FishSpotList, label)
+	UI.FishSpotKeys[label] = key
+end
+table.insert(UI.FishSpotList, "Where I stand")
+
+UI.FishBox = Tabs.Fishing:AddLeftGroupbox("Auto Fish", "fish")
+UI.FishBox:AddToggle("AutoFish", {
+	Text = "Auto Fish",
+	Description = "Casts, taps and catches on its own",
+	Tooltip = "Goes to the water, casts the rod and keeps fishing. Errands and the UFO still run, fishing starts again when you are back.",
+	Default = false,
+	Callback = function(v)
+		S.autoFish = v
+	end,
+})
+UI.FishBox:AddDropdown("FishSpot", {
+	Text = "Fishing spot",
+	Values = UI.FishSpotList,
+	Default = "Best unlocked",
+	Tooltip = "Best unlocked fishes in your best fishing world: Haunted House, then Treasure Dunes, then Spawn. Where I stand never moves you.",
+	Callback = function(v)
+		S.fishSpot = UI.FishSpotKeys[v] or "Best unlocked"
+	end,
+})
+UI.FishBox:AddToggle("FishTap", {
+	Text = "Auto Tap",
+	Description = "Hits every speed-up for faster catches",
+	Tooltip = "Taps each speed-up at a human pace. Every tap shortens the catch and grows the streak, which adds fishing luck.",
+	Default = true,
+	Callback = function(v)
+		S.fishTap = v
+	end,
+})
+UI.FishBox:AddDropdown("FishPriority", {
+	Text = "With eggs",
+	Values = { "Eggs first", "Fishing first" },
+	Default = "Eggs first",
+	Tooltip = "The game blocks eggs while you fish. Eggs first stops fishing whenever an egg can be opened. Fishing first pauses Auto Buy Egg, the Index Hunter and inventory eggs while Auto Fish is on.",
+	Callback = function(v)
+		S.fishPriority = tostring(v or "Eggs first")
+	end,
+})
+UI.FishBox:AddLabel({ Text = '<font transparency="0.45">You can fish in Spawn, Treasure Dunes and Haunted House. Every world has its own fish.</font>', DoesWrap = true })
+
+UI.FishStatusBox = Tabs.Fishing:AddRightGroupbox("Fishing Status", "activity")
+UI.FishStateRow = UI.FishStatusBox:AddStat({ Icon = "fish", Text = "Auto Fish", Value = "Off", Size = 26, ValueColor = "FontColor" })
+UI.FishSpotRow = UI.FishStatusBox:AddStat({ Icon = "map-pin", Text = "Spot", Value = "-", Size = 22, ValueColor = "FontColor" })
+UI.FishTimerRow = UI.FishStatusBox:AddStat({ Icon = "clock", Text = "Next catch", Value = "-", Size = 22, Progress = 0 })
+UI.FishCatchRow = UI.FishStatusBox:AddStat({ Icon = GameIcons.Auto, Text = "Catches", Value = "0", Size = 22 })
+UI.FishLastRow = UI.FishStatusBox:AddStat({ Icon = "fish", Text = "Last catch", Value = "-", Size = 26 })
+UI.FishStreakRow = UI.FishStatusBox:AddStat({ Icon = "flame", Text = "Tap streak", Value = "0", Size = 22 })
+UI.FishBoostRow = UI.FishStatusBox:AddStat({ Icon = GameIcons.Luck, Text = "Luck  /  speed", Value = "-", Size = 22 })
+UI.FishRodRow = UI.FishStatusBox:AddStat({ Icon = "rbxassetid://87369163614866", Text = "Rod", Value = "-", Size = 22, ValueColor = "FontColor" })
+
+UI.BaitBox = Tabs.Fishing:AddLeftGroupbox("Bait & Hooks", "anchor")
+UI.BaitBox:AddToggle("AutoWorms", {
+	Text = "Auto Use Worms",
+	Description = "Keeps your best worm active while fishing",
+	Tooltip = "Uses the best worm you own when none is active or a better one is in your bag. Worms add fishing luck and egg luck.",
+	Default = false,
+	Callback = function(v)
+		S.autoWorms = v
+	end,
+})
+UI.BaitBox:AddToggle("AutoHooks", {
+	Text = "Auto Use Fishhooks",
+	Description = "Adds hook charges when they run out",
+	Tooltip = "Golden Fishhooks first. Each hook adds fishing luck for its next catches.",
+	Default = false,
+	Callback = function(v)
+		S.autoHooks = v
+	end,
+})
+UI.WormRow = UI.BaitBox:AddStat({ Icon = "rbxassetid://107068290205953", Text = "Worm", Value = "-", Size = 24 })
+UI.HookRow = UI.BaitBox:AddStat({ Icon = "rbxassetid://117784683977288", Text = "Fishhook", Value = "-", Size = 24 })
+
+UI.SellFishNames, UI.SellFishImages = {}, {}
+do
+	local merchant = Auto.GameData.merchant
+	local prices = type(merchant) == "table" and type(merchant.SellPrices) == "table" and merchant.SellPrices or nil
+	if prices then
+		for name in pairs(prices) do
+			table.insert(UI.SellFishNames, name)
+		end
+		table.sort(UI.SellFishNames, function(a, b)
+			if prices[a] ~= prices[b] then
+				return (prices[a] or 0) < (prices[b] or 0)
+			end
+			return a < b
+		end)
+	else
+		UI.SellFishNames = { "Fish", "Tadpole", "Turtle", "Duck", "Shadow Fish", "Octopus", "Ghost Axolotl", "Axolotl", "Jellyfish", "Skeleton Fish", "Shark", "Seaweed Monster", "Blobfish", "Sunken Eel" }
+	end
+	for _, name in ipairs(UI.SellFishNames) do
+		UI.SellFishImages[name] = Auto.GameData.petIcons and Auto.GameData.petIcons[name] or nil
+	end
+	UI.MerchantDisplay, UI.MerchantImages, UI.MerchantKeys, UI.MerchantDefault = {}, {}, {}, {}
+	UI.MerchantNames = { Worm1 = "Juicy Worm", Worm2 = "Golden Worm", UniverseWorm = "Universe Worm", ["1MLuckyblock"] = "1M Lucky Block", GlobalCoins = "Global Coins", GlobalLuck = "Global Luck", GlobalEgg = "Global Egg", VIPKey = "VIP Key", VIPUpper = "VIP Key Top", VIPLower = "VIP Key Bottom" }
+	for _, entry in ipairs(type(merchant) == "table" and type(merchant.Pool) == "table" and merchant.Pool or {}) do
+		local item = tostring(entry.Item)
+		local label = UI.MerchantNames[item] or Auto.itemDisplayName(item)
+		if (tonumber(entry.Amount) or 1) > 1 then
+			label = label .. " x" .. tostring(entry.Amount)
+		end
+		if UI.MerchantKeys[label] then
+			label = label .. "  (" .. tostring(entry.Id) .. ")"
+		end
+		table.insert(UI.MerchantDisplay, label)
+		UI.MerchantKeys[label] = entry.Id
+		UI.MerchantImages[label] = Items.Icons[item] or (type(merchant.ICONS) == "table" and merchant.ICONS[item]) or nil
+		if entry.Rare or item == "Worm1" or item == "Worm2" or item == "Golden Fishhook" then
+			table.insert(UI.MerchantDefault, label)
+		end
+	end
+end
+
+UI.MerchantBox = Tabs.Fishing:AddRightGroupbox("Fishing Merchant", "store")
+UI.MerchantBox:AddToggle("AutoSellFish", {
+	Text = "Auto Sell Fish",
+	Description = "Sells picked fish to the Merchant for tokens",
+	Tooltip = "Flies to the Merchant in Treasure Dunes once enough fish are ready, sells them and flies back. Equipped, locked and mutated pets are never sold.",
+	Default = false,
+	Callback = function(v)
+		S.autoSellFish = v
+	end,
+})
+UI.MerchantBox:AddDropdown("SellFishPick", {
+	Text = "Sell",
+	Values = UI.SellFishNames,
+	ValueImages = UI.SellFishImages,
+	Default = { "Fish", "Turtle", "Tadpole", "Duck", "Shadow Fish" },
+	Multi = true,
+	Searchable = true,
+	AllowNull = true,
+	Callback = function(value)
+		local pick = {}
+		if type(value) == "table" then
+			for name, on in pairs(value) do
+				if on then pick[name] = true end
+			end
+		end
+		S.sellFishPick = pick
+	end,
+})
+UI.MerchantBox:AddDropdown("SellTiers", {
+	Text = "Tiers",
+	Values = { "Normal", "Golden", "Diamond" },
+	Default = { "Normal" },
+	Multi = true,
+	AllowNull = true,
+	Callback = function(value)
+		local pick = {}
+		if type(value) == "table" then
+			for tier, on in pairs(value) do
+				if on then pick[tier] = true end
+			end
+		end
+		S.sellTiers = pick
+	end,
+})
+UI.MerchantBox:AddSlider("KeepFish", {
+	Text = "Keep of each",
+	Min = 0,
+	Max = 25,
+	Default = 0,
+	Rounding = 0,
+	HideMax = true,
+	Tooltip = "How many of every picked fish stay in your inventory",
+	Callback = function(v)
+		S.keepFish = math.clamp(math.floor(tonumber(v) or 0), 0, 25)
+	end,
+})
+UI.MerchantBox:AddSlider("SellAt", {
+	Text = "Sell when ready",
+	Min = 1,
+	Max = 200,
+	Default = 25,
+	Rounding = 0,
+	HideMax = true,
+	Tooltip = "Goes to the Merchant once this many picked fish are ready to sell",
+	Callback = function(v)
+		S.sellAt = math.clamp(math.floor(tonumber(v) or 25), 1, 200)
+	end,
+})
+UI.MerchantBox:AddDivider()
+UI.MerchantBox:AddToggle("AutoMerchantBuy", {
+	Text = "Auto Buy Offers",
+	Description = "Buys picked items when they are in stock",
+	Tooltip = "Checks the Merchant stock every restock and buys the picked offers you can afford with tokens.",
+	Default = false,
+	Callback = function(v)
+		S.autoMerchantBuy = v
+	end,
+})
+UI.MerchantBox:AddDropdown("MerchantPick", {
+	Text = "Buy",
+	Values = UI.MerchantDisplay,
+	ValueImages = UI.MerchantImages,
+	Default = UI.MerchantDefault,
+	Multi = true,
+	Searchable = true,
+	AllowNull = true,
+	Callback = function(value)
+		local pick = {}
+		if type(value) == "table" then
+			for label, on in pairs(value) do
+				if on and UI.MerchantKeys[label] then pick[UI.MerchantKeys[label]] = true end
+			end
+		end
+		S.merchantPick = pick
+	end,
+})
+UI.MerchantBox:AddInput("TokenReserve", {
+	Text = "Keep at least (tokens)",
+	Placeholder = "0, 500, 2k...",
+	Finished = true,
+	ClearTextOnFocus = false,
+	Default = "0",
+	Tooltip = "Merchant offers and the Fishing Tree never spend below this.",
+	Callback = function(value)
+		local amount = Auto.parseAmount(value)
+		if amount == nil and tostring(value or "") ~= "" then
+			notify("Fishing", "Use a number like 500 or 2k", 4)
+		end
+		S.tokenReserve = math.max(0, amount or 0)
+	end,
+})
+UI.TokensRow = UI.MerchantBox:AddStat({ Icon = UI.TokenIcon, Text = "Tokens", Value = "...", Size = 28 })
+UI.SellReadyRow = UI.MerchantBox:AddStat({ Icon = "store", Text = "Ready to sell", Value = "-", Size = 22 })
+UI.RestockRow = UI.MerchantBox:AddStat({ Icon = "clock", Text = "Restock", Value = "...", Size = 22, Progress = 0, ValueColor = "FontColor" })
+UI.MerchantStateRow = UI.MerchantBox:AddStat({ Icon = GameIcons.Auto, Text = "Status", Value = "Off", Size = 22, ValueColor = "FontColor" })
+
 
 function Auto.prettyUpgrade(name)
 	local base = string.gsub(name, "Upgrades$", "")
@@ -32840,6 +33278,7 @@ UI.BudgetBox:AddDropdown("UpgradeOrder", {
 	end,
 })
 UI.BudgetBox:AddInput("RubyReserve", {
+	ClearTextOnFocus = false,
 	Text = "Keep at least (rubies)",
 	Placeholder = "0, 5k, 2.5m...",
 	Finished = true,
@@ -32854,6 +33293,7 @@ UI.BudgetBox:AddInput("RubyReserve", {
 	end,
 })
 UI.BudgetBox:AddInput("GemReserve", {
+	ClearTextOnFocus = false,
 	Text = "Keep at least (gems)",
 	Placeholder = "0, 100, 1k...",
 	Finished = true,
@@ -33057,8 +33497,75 @@ UI.SpecialOwnedRow = UI.SpecialBox:AddStat({ Icon = "sparkle", Text = "Owned", V
 UI.SpecialNextRow = UI.SpecialBox:AddStat({ Icon = CurrencyIcons.Rubies, Text = "Next", Value = "-", Size = 26 })
 UI.SpecialStateRow = UI.SpecialBox:AddStat({ Icon = GameIcons.Auto, Text = "Status", Value = "Off", Size = 22, ValueColor = "FontColor" })
 
+UI.FishTreeList, UI.FishTreeImages, UI.FishTreeKeys = {}, {}, {}
+do
+	local tree = Auto.GameData.fishTree
+	local used = {}
+	for _, group in ipairs(tree and tree.Groups or {}) do
+		if group.parent then
+			local label = tostring(group.title or group.id)
+			if used[label] then
+				label = label .. "  (" .. tostring(group.id) .. ")"
+			end
+			used[label] = true
+			table.insert(UI.FishTreeList, label)
+			UI.FishTreeImages[label] = group.image
+			UI.FishTreeKeys[label] = group.id
+		end
+	end
+end
+UI.FishTreeBox = Tabs.Upgrades:AddLeftGroupbox("Fishing Tree", "fish")
+UI.FishTreeBox:AddToggle("AutoFishTree", {
+	Text = "Auto Fishing Tree",
+	Description = "Buys fishing nodes with tokens",
+	Tooltip = "Visits the Merchant in Treasure Dunes and buys the picked nodes as soon as you have the tokens. A node opens once the one before it is bought. Keeps the token reserve from the Fishing tab.",
+	Default = false,
+	Callback = function(v)
+		S.autoFishTree = v
+	end,
+})
+UI.FishTreeBox:AddDropdown("FishTreePick", {
+	Text = "Nodes",
+	Values = UI.FishTreeList,
+	ValueImages = UI.FishTreeImages,
+	Default = UI.FishTreeList,
+	Multi = true,
+	Searchable = true,
+	AllowNull = true,
+	Callback = function(value)
+		local pick = {}
+		if type(value) == "table" then
+			for label, on in pairs(value) do
+				if on and UI.FishTreeKeys[label] then pick[UI.FishTreeKeys[label]] = true end
+			end
+		end
+		S.fishTreePick = pick
+	end,
+})
+UI.FishTreeBox:AddDropdown("FishTreeOrder", {
+	Text = "Order",
+	Values = { "Cheapest first", "Tree order" },
+	Default = "Cheapest first",
+	Callback = function(v)
+		S.fishTreeOrder = tostring(v or "Cheapest first")
+	end,
+})
+UI.FishTreeOwnedRow = UI.FishTreeBox:AddStat({ Icon = "git-branch", Text = "Nodes owned", Value = "...", Size = 24, Progress = 0 })
+UI.FishTreeNextRow = UI.FishTreeBox:AddStat({ Icon = "rbxassetid://125389046620562", Text = "Next", Value = "-", Size = 26 })
+UI.FishTreeStateRow = UI.FishTreeBox:AddStat({ Icon = GameIcons.Auto, Text = "Status", Value = "Off", Size = 22, ValueColor = "FontColor" })
+
 UI.MoonPerm = Auto.moonShopUi("Permanent", "Moon Permanent", "moon", "AutoMoonPerm", "MoonPermPick", "Kept forever, paid with purple gems")
 UI.MoonIncr = Auto.moonShopUi("Incremental", "Moon Incremental", "sparkles", "AutoMoonIncr", "MoonIncrPick", "Resets on rebirth, paid with gems")
+UI.MoonIncr.box:AddToggle("MoonGameAuto", {
+	Text = "Use the game's Auto Buy",
+	Description = "No more Moon trips for incremental upgrades",
+	Tooltip = "Needs the Auto Buy Upgrades special upgrade. Corvus flies to the Moon once and switches the game's own Auto Buy on, then it buys every incremental upgrade without trips.",
+	Default = false,
+	Callback = function(v)
+		S.moonGameAuto = v
+	end,
+})
+UI.MoonAutoRow = UI.MoonIncr.box:AddStat({ Icon = "moon", Text = "Game Auto Buy", Value = "...", Size = 22, ValueColor = "FontColor" })
 
 UI.RebirthBox = Tabs.Upgrades:AddRightGroupbox("Moon Rebirth", "orbit")
 UI.RebirthBox:AddToggle("AutoRebirth", {
@@ -33080,6 +33587,7 @@ UI.RebirthBox:AddToggle("RebirthWaitPerm", {
 	end,
 })
 UI.RebirthBox:AddInput("RebirthStopAt", {
+	ClearTextOnFocus = false,
 	Text = "Stop at rebirth",
 	Placeholder = "0 = never",
 	Numeric = true,
@@ -33160,16 +33668,59 @@ UI.FriendBoostRow = UI.FriendBox:AddStat({ Icon = GameIcons.Friend, Text = "Boos
 UI.FriendCountRow = UI.FriendBox:AddStat({ Icon = "users-round", Text = "Friends in server", Value = "...", Size = 22 })
 UI.FriendSentRow = UI.FriendBox:AddStat({ Icon = "send", Text = "Requests sent", Value = "0", Size = 22 })
 
-UI.HookBox = Tabs.Misc:AddLeftGroupbox("Discord Webhook", "webhook")
+do
+	local afkBox = Tabs.Misc and Tabs.Misc.Groupboxes and Tabs.Misc.Groupboxes["Anti AFK"]
+	UI.AfkPings = 0
+	if afkBox then
+		afkBox:AddToggle("StopAfkRejoin", {
+			Text = "Stop AFK rejoin",
+			Description = "The game no longer moves you when you go AFK",
+			Tooltip = "Pets Universe sends idle players through a rejoin. This keeps your session active, so you stay in your server while Corvus farms.",
+			Default = true,
+			Callback = function(v)
+				S.stopAfkRejoin = v
+			end,
+		})
+		UI.AfkPingRow = afkBox:AddStat({ Icon = "radio", Text = "Activity sent", Value = "0", Size = 22 })
+	end
+	task.spawn(function()
+		local nextPing, nextNudge = 0, 0
+		while alive() do
+			task.wait(5)
+			local now = os.clock()
+			if S.stopAfkRejoin and now >= nextNudge then
+				nextNudge = now + 50 + math.random() * 20
+				pcall(function()
+					local virtualUser = game:GetService("VirtualUser")
+					virtualUser:CaptureController()
+					virtualUser:ClickButton2(Vector2.new())
+				end)
+			end
+			if S.stopAfkRejoin and now >= nextPing then
+				local remote = Auto.knitRemote("AutoRejoinService", "RE", "ReportActivity")
+				nextPing = now + (if remote then 35 + math.random() * 15 else 30)
+				if remote and pcall(function() remote:FireServer() end) then
+					UI.AfkPings += 1
+					if UI.AfkPingRow then
+						setStat(UI.AfkPingRow, nil, formatNumber(UI.AfkPings))
+					end
+				end
+			end
+		end
+	end)
+end
+
+UI.HookBox = Tabs.Webhook:AddLeftGroupbox("Discord", "webhook")
 UI.HookBox:AddToggle("WebhookOn", {
-	Text = "Hatch webhook",
-	Description = "Posts rare hatches to your Discord",
+	Text = "Discord posts",
+	Description = "Master switch for everything on this tab",
 	Default = false,
 	Callback = function(v)
 		S.webhookOn = v
 	end,
 })
 UI.HookBox:AddInput("WebhookUrl", {
+	ClearTextOnFocus = false,
 	Text = "Webhook URL",
 	Placeholder = "https://discord.com/api/webhooks/...",
 	Finished = true,
@@ -33178,7 +33729,77 @@ UI.HookBox:AddInput("WebhookUrl", {
 		S.webhookUrl = tostring(value or "")
 	end,
 })
-UI.HookBox:AddDropdown("WebhookRarity", {
+UI.HookBox:AddInput("WebhookName", {
+	ClearTextOnFocus = false,
+	Text = "Bot name",
+	Placeholder = "Corvus",
+	Finished = true,
+	Default = "Corvus",
+	Tooltip = "The name the posts show in Discord. Names with Discord or Clyde in them are not allowed by Discord.",
+	Callback = function(value)
+		S.webhookName = tostring(value or "")
+	end,
+})
+UI.HookBox:AddToggle("WebhookHideName", {
+	Text = "Hide my username",
+	Description = "Posts and the profile card stay anonymous",
+	Default = false,
+	Callback = function(v)
+		S.webhookHideName = v
+	end,
+})
+UI.HookBox:AddInput("WebhookPingId", {
+	ClearTextOnFocus = false,
+	Text = "Ping user ID",
+	Placeholder = "Your Discord user ID",
+	Finished = true,
+	Default = "",
+	Tooltip = "In Discord turn on Settings > Advanced > Developer Mode, then right click your name and pick Copy User ID.",
+	Callback = function(value)
+		S.pingId = tostring(value or "")
+		if S.pingId ~= "" and not string.match(S.pingId, "^%s*%d+%s*$") then
+			notify("Webhook", "A user ID is only numbers, like 123456789012345678", 4)
+		end
+	end,
+})
+UI.PingMap = { ["Secret hatch"] = "Secret", ["Mythical or better"] = "Mythical", ["Picked pets"] = "Picked", ["Mutated hatch"] = "Mutated", ["UFO win"] = "UFO", ["Rare catch"] = "Fish", ["Goal reached"] = "Goals", ["World unlocked"] = "World", ["Moon rebirth"] = "Rebirth" }
+UI.HookBox:AddDropdown("WebhookPingFor", {
+	Text = "Ping me for",
+	Values = { "Secret hatch", "Mythical or better", "Picked pets", "Mutated hatch", "UFO win", "Rare catch", "Goal reached", "World unlocked", "Moon rebirth" },
+	Default = { "Secret hatch", "UFO win" },
+	Multi = true,
+	AllowNull = true,
+	Callback = function(value)
+		local pick = {}
+		if type(value) == "table" then
+			for label, on in pairs(value) do
+				if on and UI.PingMap[label] then pick[UI.PingMap[label]] = true end
+			end
+		end
+		S.pingFor = pick
+	end,
+})
+UI.HookBox:AddButton({
+	Text = "Send test",
+	Func = function()
+		if Auto.sendTestWebhook then
+			Auto.sendTestWebhook()
+		end
+	end,
+})
+UI.HookSentRow = UI.HookBox:AddStat({ Icon = "send", Text = "Sent", Value = "0", Size = 22 })
+UI.HookLastRow = UI.HookBox:AddStat({ Icon = "radio", Text = "Last post", Value = "-", Size = 22, ValueColor = "FontColor" })
+
+UI.HatchHookBox = Tabs.Webhook:AddRightGroupbox("Hatch Posts", "egg")
+UI.HatchHookBox:AddToggle("WebhookHatches", {
+	Text = "Hatch posts",
+	Description = "Rare pets the moment they hatch",
+	Default = true,
+	Callback = function(v)
+		S.webhookHatches = v
+	end,
+})
+UI.HatchHookBox:AddDropdown("WebhookRarity", {
 	Text = "Rarities",
 	Values = Items.Rarities,
 	ValueImages = UI.CraftRarityImages,
@@ -33194,13 +33815,14 @@ UI.HookBox:AddDropdown("WebhookRarity", {
 		S.webhookRarity = pick
 	end,
 })
-UI.HookBox:AddDropdown("WebhookPets", {
-	Text = "Specific pets",
+UI.HatchHookBox:AddDropdown("WebhookPets", {
+	Text = "Picked pets",
 	Values = Auto.GameData.petNames or {},
 	Default = {},
 	Multi = true,
 	Searchable = true,
 	AllowNull = true,
+	Tooltip = "These pets always post, whatever their rarity or chance",
 	Callback = function(value)
 		local pick = {}
 		if type(value) == "table" then
@@ -33211,19 +33833,44 @@ UI.HookBox:AddDropdown("WebhookPets", {
 		S.webhookPets = pick
 	end,
 })
-UI.HookBox:AddToggle("WebhookMutated", {
+UI.HatchHookBox:AddToggle("WebhookMutated", {
 	Text = "Post mutated hatches",
-	Description = "Wet, UFO, Hacker and other mutations, any rarity",
+	Description = "Wet, UFO, Hacker, Rainbow and other mutations, any rarity",
 	Default = false,
 	Callback = function(v)
 		S.webhookMutated = v
 	end,
 })
-UI.HookEventMap = { ["UFO broken"] = "UFO", ["World unlocked"] = "World", ["Moon rebirth"] = "Rebirth", ["Special upgrade"] = "Special", ["Code redeemed"] = "Codes", ["Goal reached"] = "Goals" }
-UI.HookBox:AddDropdown("WebhookEvents", {
-	Text = "Also post",
-	Values = { "UFO broken", "World unlocked", "Moon rebirth", "Special upgrade", "Code redeemed", "Goal reached" },
-	Default = { "UFO broken", "World unlocked", "Moon rebirth", "Special upgrade", "Code redeemed", "Goal reached" },
+UI.HatchHookBox:AddInput("WebhookMinOneIn", {
+	ClearTextOnFocus = false,
+	Text = "Only 1 in X or rarer",
+	Placeholder = "0 = any chance",
+	Finished = true,
+	Default = "0",
+	Tooltip = "Skips rarity posts that are more common than 1 in X from that egg, before luck. Picked pets always post. Use 10k, 1m and so on.",
+	Callback = function(value)
+		local amount = Auto.parseAmount(value)
+		if amount == nil and tostring(value or "") ~= "" then
+			notify("Webhook", "Use a number like 1000, 10k or 1m", 4)
+		end
+		S.webhookMinOneIn = math.max(0, amount or 0)
+	end,
+})
+
+UI.EventHookBox = Tabs.Webhook:AddLeftGroupbox("Event Posts", "bell")
+UI.EventHookBox:AddToggle("WebhookEventsOn", {
+	Text = "Event posts",
+	Description = "UFO, worlds, rebirths, codes, goals and rare catches",
+	Default = true,
+	Callback = function(v)
+		S.webhookEventsOn = v
+	end,
+})
+UI.HookEventMap = { ["UFO broken"] = "UFO", ["World unlocked"] = "World", ["Moon rebirth"] = "Rebirth", ["Special upgrade"] = "Special", ["Code redeemed"] = "Codes", ["Goal reached"] = "Goals", ["Rare catch"] = "Fish" }
+UI.EventHookBox:AddDropdown("WebhookEvents", {
+	Text = "Post",
+	Values = { "UFO broken", "World unlocked", "Moon rebirth", "Special upgrade", "Code redeemed", "Goal reached", "Rare catch" },
+	Default = { "UFO broken", "World unlocked", "Moon rebirth", "Special upgrade", "Code redeemed", "Goal reached", "Rare catch" },
 	Multi = true,
 	AllowNull = true,
 	Callback = function(value)
@@ -33236,22 +33883,86 @@ UI.HookBox:AddDropdown("WebhookEvents", {
 		S.hookEvents = pick
 	end,
 })
-UI.HookBox:AddToggle("WebhookHideName", {
-	Text = "Hide my username",
-	Default = false,
+UI.EventHookBox:AddDropdown("WebhookUfoMode", {
+	Text = "UFO posts",
+	Values = { "Only when I win", "When I'm top 3", "Every UFO I helped" },
+	Default = "Only when I win",
+	Tooltip = "The winner is the player who gets the Alien Egg. Top 3 comes from the damage board above the UFO.",
 	Callback = function(v)
-		S.webhookHideName = v
+		S.ufoHookMode = tostring(v or "Only when I win")
 	end,
 })
-UI.HookBox:AddButton({
-	Text = "Send test",
-	Func = function()
-		if Auto.sendTestWebhook then
-			Auto.sendTestWebhook()
+
+UI.CardBox = Tabs.Webhook:AddRightGroupbox("Profile Card", "id-card")
+UI.CardBox:AddToggle("WebhookProfile", {
+	Text = "Live profile card",
+	Description = "One Discord message that keeps itself updated",
+	Tooltip = "Posts your profile once and then edits that same message: currencies, rates, eggs, index, best pets, fishing and more. It keeps editing the same card after a rejoin.",
+	Default = false,
+	Callback = function(v)
+		S.profileOn = v
+		if v and Auto.Card then
+			Auto.Card.nextAt = 0
 		end
 	end,
 })
-UI.HookSentRow = UI.HookBox:AddStat({ Icon = "send", Text = "Sent", Value = "0", Size = 22 })
+UI.CardEvery = { ["1 minute"] = 60, ["2 minutes"] = 120, ["5 minutes"] = 300, ["10 minutes"] = 600, ["15 minutes"] = 900, ["30 minutes"] = 1800 }
+UI.CardBox:AddDropdown("WebhookProfileEvery", {
+	Text = "Update every",
+	Values = { "1 minute", "2 minutes", "5 minutes", "10 minutes", "15 minutes", "30 minutes" },
+	Default = "5 minutes",
+	Callback = function(v)
+		S.profileEvery = UI.CardEvery[v] or 300
+		if Auto.Card then
+			Auto.Card.nextAt = math.min(Auto.Card.nextAt, os.clock() + S.profileEvery)
+		end
+	end,
+})
+UI.CardSections = { "Activity", "Currencies", "Rates per hour", "Eggs", "Index", "Best pets", "Team", "Worlds and rebirths", "Fishing", "UFO", "Boosts" }
+UI.CardBox:AddDropdown("WebhookProfileShow", {
+	Text = "Show",
+	Values = UI.CardSections,
+	Default = UI.CardSections,
+	Multi = true,
+	AllowNull = true,
+	Callback = function(value)
+		local pick = {}
+		if type(value) == "table" then
+			for label, on in pairs(value) do
+				if on then pick[label] = true end
+			end
+		end
+		S.profileShow = pick
+	end,
+})
+UI.CardBox:AddToggle("WebhookProfileButtons", {
+	Text = "Link buttons",
+	Description = "Play and Corvus Discord buttons under the card",
+	Default = true,
+	Callback = function(v)
+		S.profileButtons = v
+	end,
+})
+UI.CardBox:AddButton({
+	Text = "Refresh now",
+	Func = function()
+		if Auto.refreshCard then
+			Auto.refreshCard(false)
+		end
+	end,
+}):AddButton({
+	Text = "New card",
+	DoubleClick = true,
+	Tooltip = "Posts a fresh card and stops editing the old one",
+	Func = function()
+		if Auto.refreshCard then
+			Auto.refreshCard(true)
+		end
+	end,
+})
+UI.CardStateRow = UI.CardBox:AddStat({ Icon = "id-card", Text = "Card", Value = "Off", Size = 24, ValueColor = "FontColor" })
+UI.CardNextRow = UI.CardBox:AddStat({ Icon = "clock", Text = "Next update", Value = "-", Size = 22, ValueColor = "FontColor" })
+UI.CardBox:AddLabel({ Text = '<font transparency="0.45">Discord lets webhooks add link buttons only, so the card refreshes itself on the timer above and with Refresh now. A refresh button you click inside Discord needs a Discord bot.</font>', DoesWrap = true })
 
 UI.StartBox = Tabs.Info:AddLeftGroupbox("Quick Start", "wand-sparkles")
 UI.StartBox:AddLabel({ Text = '<font transparency="0.4">Tell Corvus what to do in three taps: what to automate, which egg and how your game runs. Everything can be changed later.</font>', DoesWrap = true })
@@ -33330,6 +34041,13 @@ do
 	S.treePick = pickKeys(Options.TreePick, UI.TreeKeys)
 	S.specialPick = pickKeys(Options.SpecialPick, UI.SpecialKeys)
 	S.hookEvents = pickKeys(Options.WebhookEvents, UI.HookEventMap)
+	S.sellFishPick = pickKeys(Options.SellFishPick, nil)
+	S.sellTiers = pickKeys(Options.SellTiers, nil)
+	S.merchantPick = pickKeys(Options.MerchantPick, UI.MerchantKeys)
+	S.fishTreePick = pickKeys(Options.FishTreePick, UI.FishTreeKeys)
+	S.invEggKeep = pickKeys(Options.InvEggKeep, nil)
+	S.pingFor = pickKeys(Options.WebhookPingFor, UI.PingMap)
+	S.profileShow = pickKeys(Options.WebhookProfileShow, nil)
 	S.questPick = {}
 	local questMap = { ["Index rewards"] = "Index", ["Daily reward"] = "Daily", ["Group reward"] = "Group", ["Like, group, favorite"] = "Verify" }
 	for display, on in pairs(Options.QuestPick and Options.QuestPick.Value or {}) do
@@ -34754,7 +35472,7 @@ do
 			Snap.quests = quests
 		end
 
-		local Ufo = { hits = 0, hitThisEgg = false, lastEgg = nil, needTravel = nil, travelTry = -1e9, status = "No UFO right now", engaged = false, back = nil, returnNow = false }
+		local Ufo = { hits = 0, hitThisEgg = false, lastEgg = nil, needTravel = nil, travelTry = -1e9, status = "No UFO right now", engaged = false, back = nil, returnNow = false, round = 0, roundEgg = nil, finalized = false, myRank = nil, myDmg = nil, topDmg = nil }
 		local Worlds = { lastBuy = -1e9, fails = 0, padTry = -1e9, status = "" }
 		local ShopState = {}
 		local Friends = { sent = {}, count = 0, here = 0, total = 0, lastScan = -1e9, acceptOk = nil }
@@ -34798,22 +35516,99 @@ do
 			}
 		end
 
+		local function readUfoBoard(egg)
+			local rank, mine, best = nil, nil, 0
+			for i = 1, 3 do
+				local id = tonumber(egg:GetAttribute("Top" .. i .. "Id"))
+				local dmg = tonumber(egg:GetAttribute("Top" .. i .. "Dmg")) or 0
+				if id and id > 0 then
+					best = math.max(best, dmg)
+					if id == LocalPlayer.UserId then
+						rank, mine = i, dmg
+					end
+				end
+			end
+			return rank, mine, best
+		end
+
+		local function finalizeUfo(result)
+			if Ufo.finalized then
+				return
+			end
+			Ufo.finalized = true
+			if result and result.despawned then
+				queueToast("UFO Event", "The UFO left before anyone broke it")
+				return
+			end
+			local won = result ~= nil and result.winner == LocalPlayer.Name
+			local rank, dmg = Ufo.myRank, Ufo.myDmg
+			Saved.ufoBroken += 1
+			if won then
+				Saved.ufoWon = (tonumber(Saved.ufoWon) or 0) + 1
+			end
+			if rank then
+				Saved.ufoTop3 = (tonumber(Saved.ufoTop3) or 0) + 1
+			end
+			SaveDirty = true
+			local damage = if dmg then formatNumber(dmg) .. " damage" else "outside the top 3 on damage"
+			local title, text, toast
+			if won then
+				title = "UFO won"
+				text = "Got the **Alien Egg**  \u{00B7}  " .. damage
+				toast = "You won the UFO and got the Alien Egg"
+			elseif rank then
+				title = "UFO  \u{00B7}  #" .. rank .. " on damage"
+				text = string.format("Finished **#%d** with %s, another player got the Alien Egg", rank, damage)
+				toast = string.format("UFO down, you were #%d on damage", rank)
+			else
+				title = "UFO helped"
+				text = "Helped break the UFO, " .. damage
+				toast = "UFO down" .. (if result and result.winner then ", " .. tostring(result.winner) .. " got the Alien Egg" else "")
+			end
+			queueToast("UFO Event", toast)
+			if won or rank then
+				pcall(Auto.Metrics.event, "UFO", title, if won then "#60d696" else "#7dd3fc")
+			end
+			local mode = tostring(S.ufoHookMode or "Only when I win")
+			local post = won or (mode == "When I'm top 3" and rank ~= nil) or mode == "Every UFO I helped"
+			if post and Auto.postEvent then
+				Auto.postEvent("UFO", title, text .. "  \u{00B7}  " .. formatNumber(tonumber(Saved.ufoWon) or 0) .. " won in total", if won then 5814783 else 8190976, won and S.pingFor.UFO == true)
+			end
+		end
+
 		task.spawn(function()
+			local hookAt = -1e9
 			while alive() do
 				task.wait(0.12)
 				local ok, err = pcall(function()
-					local egg = workspace:FindFirstChild("AlienEventEgg")
-					if Ufo.lastEgg and Ufo.lastEgg ~= egg then
-						if Ufo.hitThisEgg then
-							Saved.ufoBroken += 1
-							SaveDirty = true
-							queueToast("UFO Event", "The UFO is down")
-							Auto.Metrics.event("UFO", "UFO broken", "#7dd3fc")
-							if Auto.postEvent then
-								Auto.postEvent("UFO", "UFO broken", "Took down a UFO  \u{00B7}  " .. formatNumber(Saved.ufoBroken) .. " total", 8190976)
+					if os.clock() - hookAt > 5 then
+						hookAt = os.clock()
+						hookEvent("ufoAnnounce", "AlienEventService", "Announce", function(kind, who, value)
+							if kind == "Destroyed" and Ufo.hitThisEgg then
+								finalizeUfo({ winner = tostring(who), dmg = tonumber(value) })
+							elseif kind == "Despawned" and Ufo.hitThisEgg then
+								finalizeUfo({ despawned = true })
 							end
-						end
+						end)
+					end
+					local egg = workspace:FindFirstChild("AlienEventEgg")
+					if egg and egg ~= Ufo.roundEgg then
+						Ufo.roundEgg = egg
+						Ufo.round += 1
 						Ufo.hitThisEgg = false
+						Ufo.finalized = false
+						Ufo.myRank, Ufo.myDmg, Ufo.topDmg = nil, nil, nil
+					end
+					if egg then
+						Ufo.myRank, Ufo.myDmg, Ufo.topDmg = readUfoBoard(egg)
+					end
+					if Ufo.lastEgg and Ufo.lastEgg ~= egg and Ufo.hitThisEgg and not Ufo.finalized then
+						local round = Ufo.round
+						task.delay(4, function()
+							if Ufo.round == round and Ufo.hitThisEgg and not Ufo.finalized then
+								finalizeUfo(nil)
+							end
+						end)
 					end
 					Ufo.lastEgg = egg
 					Ufo.engaged = false
@@ -35197,7 +35992,8 @@ do
 		local function shopNeedsTrip(now)
 			for _, shop in ipairs(allShops()) do
 				local state = shopStateOf(shop)
-				if shop.enabled and state.needsTravel == true and now >= state.blockedUntil and now - state.lastTrip > 30 then
+				local gameBuys = shop.id == "Incremental" and S.moonGameAuto and Auto.moonGameAutoOn ~= nil and Auto.moonGameAutoOn()
+				if shop.enabled and not gameBuys and state.needsTravel == true and now >= state.blockedUntil and now - state.lastTrip > 30 then
 					local snap = shopSnapshot(shop)
 					if snap.affordable then
 						return shop
@@ -35434,8 +36230,31 @@ do
 				Body = body,
 			})
 			local code = response and tonumber(response.StatusCode) or 0
+			Hook.lastCode, Hook.lastAt = code, os.clock()
 			return code >= 200 and code < 300, code
 		end
+
+		local function hookName()
+			local name = string.gsub(string.gsub(tostring(S.webhookName or ""), "^%s+", ""), "%s+$", "")
+			local lower = string.lower(name)
+			if name == "" or string.find(lower, "discord", 1, true) or string.find(lower, "clyde", 1, true) then
+				return "Corvus"
+			end
+			return string.sub(name, 1, 80)
+		end
+		Auto.hookName = hookName
+
+		local function withPing(payload, ping)
+			local id = string.match(tostring(S.pingId or ""), "^%s*(%d+)%s*$")
+			if ping and id and #id >= 15 then
+				payload.content = "<@" .. id .. ">"
+				payload.allowed_mentions = { users = { id } }
+			else
+				payload.allowed_mentions = { parse = {} }
+			end
+			return payload
+		end
+		Auto.withPing = withPing
 
 		local function petAssetId(name)
 			local icon = petIcon(name)
@@ -35476,10 +36295,19 @@ do
 		end
 
 		Auto.onHatch = function(name, rarity, mutation)
-			if not S.webhookOn or not validWebhook(S.webhookUrl) then return end
-			if not (S.webhookRarity[rarity] or S.webhookPets[name] or (mutation and S.webhookMutated)) then return end
+			if not (S.webhookOn and S.webhookHatches and validWebhook(S.webhookUrl)) then return end
+			local picked = S.webhookPets[name] == true
+			if not (S.webhookRarity[rarity] or picked or (mutation and S.webhookMutated)) then return end
+			local egg = if S.indexHunt and Hunter.egg then Hunter.egg else S.hatchEggName
+			if not picked and not (mutation and S.webhookMutated) and (S.webhookMinOneIn or 0) > 0 then
+				local catalog = petCatalog()
+				local info = catalog and catalog[name]
+				local percent = info and egg and info.eggs[egg]
+				if percent and percent > 0 and 100 / percent < S.webhookMinOneIn then return end
+			end
 			if #Hook.queue >= 40 then return end
-			table.insert(Hook.queue, { name = name, rarity = rarity, mutation = mutation, egg = if S.indexHunt and Hunter.egg then Hunter.egg else S.hatchEggName })
+			local ping = (S.pingFor.Secret and rarity == "Secret") or (S.pingFor.Mythical and (RarityRank[rarity] or 0) >= (RarityRank.Mythical or 5)) or (S.pingFor.Picked and picked) or (S.pingFor.Mutated and mutation ~= nil)
+			table.insert(Hook.queue, { name = name, rarity = rarity, mutation = mutation, egg = egg, ping = ping == true })
 		end
 
 		Auto.sendTestWebhook = function()
@@ -35502,7 +36330,7 @@ do
 				local embed = hatchEmbed(sample)
 				embed.title = "\u{2726}  Test message"
 				embed.description = "Corvus is connected. This is how a **" .. sample.rarity .. "** hatch will look."
-				local ok, code = postWebhook(S.webhookUrl, { username = "Corvus", embeds = { embed } })
+				local ok, code = postWebhook(S.webhookUrl, withPing({ username = hookName(), embeds = { embed } }, true))
 				queueToast("Webhook", if ok then "Test message sent" else "Discord refused it (" .. tostring(code) .. ")")
 			end)
 		end
@@ -35517,7 +36345,9 @@ do
 					end
 					local ok, err = pcall(function()
 						local embeds = {}
+						local ping = false
 						for _, entry in ipairs(batch) do
+							ping = ping or entry.ping == true
 							if entry.embed then
 								entry.embed.author = { name = "Pets Universe", icon_url = gameIcon() }
 								table.insert(embeds, entry.embed)
@@ -35525,7 +36355,7 @@ do
 								table.insert(embeds, hatchEmbed(entry))
 							end
 						end
-						local sent = postWebhook(S.webhookUrl, { username = "Corvus", embeds = embeds })
+						local sent = postWebhook(S.webhookUrl, withPing({ username = hookName(), embeds = embeds }, ping))
 						Hook.lastSend = os.clock()
 						if sent then
 							Hook.sent += #batch
@@ -35677,10 +36507,14 @@ do
 			end
 			Extra.spendable = spendable
 
-			local function postEvent(kind, title, description, color)
-				if not (S.webhookOn and validWebhook(S.webhookUrl) and S.hookEvents[kind]) then return end
+			local function postEvent(kind, title, description, color, ping)
+				if not (S.webhookOn and S.webhookEventsOn and validWebhook(S.webhookUrl) and S.hookEvents[kind]) then return end
 				if #Hook.queue >= 40 then return end
+				if ping == nil then
+					ping = S.pingFor[kind] == true
+				end
 				table.insert(Hook.queue, {
+					ping = ping == true,
 					embed = {
 						title = "\u{2726}  " .. title,
 						description = description,
@@ -36613,6 +37447,7 @@ do
 
 		local function eggTravelWanted(now)
 			if not (S.autoHatch and S.eggAutoTravel and EggTravel.need) then return false end
+			if S.autoFish and S.fishPriority == "Fishing first" then return false end
 			if S.indexHunt and Hunter.egg then return false end
 			if EggTravel.need ~= S.hatchEggName then
 				EggTravel.need = nil
@@ -36688,6 +37523,7 @@ do
 			local ufo = ufoInfo()
 			ufo.status = Ufo.status
 			ufo.engaged = Ufo.engaged
+			ufo.rank, ufo.myDmg, ufo.topDmg, ufo.helped = Ufo.myRank, Ufo.myDmg, Ufo.topDmg, Ufo.hitThisEgg
 			Snap.ufo = ufo
 			local worlds = worldInfo()
 			worlds.here = currentWorld()
@@ -37054,6 +37890,8 @@ do
 							hunterMove()
 						elseif eggTravelWanted(now) then
 							eggTravel()
+						elseif Auto.fishStep and Auto.fishStep(now) then
+							return
 						elseif Auto.farmWorldStep then
 							Auto.farmWorldStep(now)
 						end
@@ -37566,7 +38404,7 @@ do
 					for index, name in ipairs(collectEggNames()) do
 						if index > 8 then break end
 						local price, free = getEggPrice(name)
-						prices[name] = { price = price, free = free }
+						prices[name] = { price = price, free = free, currency = Auto.eggCurrency(name) }
 					end
 					Snap.eggPrices = prices
 				end
@@ -38120,6 +38958,9 @@ do
 				return best
 			end
 			local function farmWorldWait(target)
+				if S.autoFish then
+					return "Fishing"
+				end
 				if S.indexHunt and Hunter.egg then
 					return "Index Hunter"
 				end
@@ -38272,6 +39113,1408 @@ do
 			end)
 		end
 		Auto.setupUpdate3()
+		Auto.setupUpdate4 = function()
+			local CollectionService = game:GetService("CollectionService")
+			local Fish = { active = false, own = false, stopFor = nil, status = "Off", seq = nil, tapIndex = 1, nextTapAt = 0, tapBusy = false, taps = 0, streak = 0, catches = 0, last = nil, startTry = -1e9, startFails = 0, needTravel = false, travelTry = -1e9, travelFails = 0, spots = {}, error = nil, endsAt = nil, duration = nil, baitAt = -1e9, invAt = -1e9 }
+			Auto.Fish = Fish
+			local Merchant = { lastTrip = -1e9, blockedUntil = -1e9, status = "Off", wantAt = -1e9, want = false, sellAt = -1e9, sell = nil }
+			local FishTree = { status = "Off", blocked = {}, last = nil }
+			local Inv = { lastFire = -1e9, status = "Off", waiting = false }
+			local MoonAuto = { lastTry = -1e9, status = nil }
+			local WormRank = { Worm = 1, Worm1 = 2, Worm2 = 3, UniverseWorm = 4 }
+			local WormOrder = { "UniverseWorm", "Worm2", "Worm1", "Worm" }
+			local HookOrder = { "Golden Fishhook", "Fishhook" }
+
+			local function fishModule(name)
+				return Auto.lazyRequire("Fishing/" .. name, function()
+					local folder = ReplicatedStorage:FindFirstChild("Fishing")
+					return folder and folder:FindFirstChild(name)
+				end)
+			end
+
+			local function fishRemote(name)
+				return Auto.knitRemote("FishingService", "RF", name)
+			end
+
+			local function resolveWorld(...)
+				local first = nil
+				for _, name in ipairs({ ... }) do
+					local key = Auto.worldKey(name)
+					first = first or key
+					if key and WorldBounds[key] then
+						return key
+					end
+				end
+				return first
+			end
+
+			local FishWorlds = {
+				{ key = resolveWorld("HauntedHouse", "Haunted"), frame = "HauntedHouse" },
+				{ key = resolveWorld("TreasureDunes"), frame = "TreasureDunes" },
+				{ key = resolveWorld("Spawn"), frame = "Spawn" },
+			}
+
+			local function fishTarget()
+				local pick = tostring(S.fishSpot or "Best unlocked")
+				if pick == "Here" then
+					return nil, nil
+				end
+				for _, entry in ipairs(FishWorlds) do
+					if entry.frame == pick then
+						return entry.key, entry.frame
+					end
+				end
+				for _, entry in ipairs(FishWorlds) do
+					if worldUnlocked(entry.key) then
+						return entry.key, entry.frame
+					end
+				end
+				return FishWorlds[#FishWorlds].key, FishWorlds[#FishWorlds].frame
+			end
+
+			local function waterSpotFrom(position, look)
+				local water = fishModule("FishingWater")
+				if type(water) ~= "table" or type(water.FindSpot) ~= "function" then
+					return nil
+				end
+				local ok, spot = pcall(water.FindSpot, position, look, water.BuildExclude())
+				return if ok then spot else nil
+			end
+
+			local function atFishingSpot()
+				local hrp = getRoot()
+				if not hrp then
+					return false
+				end
+				local target = fishTarget()
+				if target and currentWorld() ~= target then
+					return false
+				end
+				return waterSpotFrom(hrp.Position, hrp.CFrame.LookVector) ~= nil
+			end
+
+			local function groundBelow(point, params)
+				for _ = 1, 5 do
+					local hit = workspace:Raycast(point, Vector3.new(0, -90, 0), params)
+					if not hit then
+						return nil
+					end
+					local part = hit.Instance
+					if CollectionService:HasTag(part, "FishingWater") then
+						return nil
+					end
+					if part.CanCollide and part.Transparency < 0.95 then
+						return hit.Position
+					end
+					params:AddToFilter(part)
+				end
+				return nil
+			end
+
+			local function findSpot(world)
+				local water = fishModule("FishingWater")
+				local hrp = getRoot()
+				if type(water) ~= "table" or not hrp then
+					return nil
+				end
+				local exclude = water.BuildExclude()
+				local origin = hrp.Position
+				local parts = {}
+				for _, part in ipairs(CollectionService:GetTagged("FishingWater")) do
+					if part:IsA("BasePart") and part:IsDescendantOf(workspace) and getWorldAt(part.Position) == world then
+						table.insert(parts, part)
+					end
+				end
+				table.sort(parts, function(a, b)
+					return (a.Position - origin).Magnitude < (b.Position - origin).Magnitude
+				end)
+				local faces = { Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0), Vector3.new(0, 0, 1), Vector3.new(0, 0, -1) }
+				local checks = 0
+				for _, part in ipairs(parts) do
+					local size, frame = part.Size, part.CFrame
+					local surface = tonumber(part:GetAttribute("FishingSurfaceY")) or (part.Position.Y + size.Y / 2)
+					for _, gap in ipairs({ 3, 6, 9 }) do
+						for _, face in ipairs(faces) do
+							for _, along in ipairs({ 0, 0.3, -0.3 }) do
+								local offset = if face.X ~= 0 then Vector3.new(face.X * (size.X / 2 + gap), 0, along * size.Z) else Vector3.new(along * size.X, 0, face.Z * (size.Z / 2 + gap))
+								local point = frame:PointToWorldSpace(offset)
+								local params = RaycastParams.new()
+								params.FilterType = Enum.RaycastFilterType.Exclude
+								params.FilterDescendantsInstances = exclude
+								params.IgnoreWater = true
+								local ground = groundBelow(Vector3.new(point.X, surface + 30, point.Z), params)
+								if ground and ground.Y > surface - 3 and ground.Y < surface + 15 then
+									local stand = ground + Vector3.new(0, 3, 0)
+									local towards = Vector3.new(part.Position.X - stand.X, 0, part.Position.Z - stand.Z)
+									local look = if towards.Magnitude > 0.1 then towards.Unit else Vector3.new(0, 0, -1)
+									if waterSpotFrom(stand, look) then
+										return { pos = stand, look = look }
+									end
+								end
+								checks += 1
+								if checks % 12 == 0 then
+									task.wait()
+								end
+							end
+						end
+					end
+				end
+				return nil
+			end
+
+			local function fastTravelReady()
+				return readData("SPdata", "SP15") == true and worldUnlocked(resolveWorld("EnchantedGrove"))
+			end
+
+			local function goToSpot(world, frame)
+				if not worldUnlocked(world) then
+					Fish.error = prettyWorld(world) .. " is locked"
+					return false
+				end
+				local goMachine = Auto.knitRemote("TeleportService", "RE", "GoToMachine")
+				if goMachine and frame and not Fish.spots[world] and fastTravelReady() then
+					Mover.task = "Fast travel to the water"
+					pcall(function()
+						goMachine:FireServer(frame .. "/Fishing")
+					end)
+					local waited = 0
+					repeat
+						waited += task.wait(0.25) or 0.25
+					until waited >= 5 or not alive() or atFishingSpot()
+					if atFishingSpot() then
+						local hrp = getRoot()
+						if hrp then
+							Fish.spots[world] = { pos = hrp.Position, look = hrp.CFrame.LookVector }
+						end
+						return true
+					end
+				end
+				local ok, err = travelTo(world)
+				if not ok then
+					Fish.error = tostring(err)
+					return false
+				end
+				local spot = Fish.spots[world]
+				if not spot then
+					Mover.task = "Looking for water"
+					spot = findSpot(world)
+					Fish.spots[world] = spot
+				end
+				if not spot then
+					Fish.error = "No water found in " .. prettyWorld(world)
+					return false
+				end
+				local hrp = getRoot()
+				if not hrp then
+					return false
+				end
+				pcall(function()
+					hrp.AssemblyLinearVelocity = Vector3.zero
+				end)
+				hrp.CFrame = CFrame.lookAt(spot.pos, spot.pos + spot.look)
+				task.wait(0.6)
+				if atFishingSpot() then
+					return true
+				end
+				Fish.spots[world] = nil
+				Fish.error = "That spot did not work, looking again"
+				return false
+			end
+
+			local function beginSession(data, own)
+				Fish.active = true
+				Fish.own = own == true
+				Fish.stopFor = nil
+				Fish.startFails = 0
+				Fish.error = nil
+				Fish.endsAt = tonumber(data.EndsAt)
+				Fish.duration = tonumber(data.Duration)
+				Fish.streak = tonumber(data.Streak) or 0
+				Fish.seq = nil
+				local taps = fishModule("FishingTaps")
+				if type(taps) == "table" and type(taps.NewSequence) == "function" then
+					local ok, seq = pcall(taps.NewSequence, tonumber(data.TapSeed) or 0)
+					Fish.seq = if ok then seq else nil
+				end
+				Fish.tapIndex = math.max(1, math.floor(tonumber(data.TapIndex) or 1))
+				Fish.nextTapAt = os.clock() + 1.1
+				Fish.tapBusy = false
+			end
+
+			local function stopFishing(reason)
+				local remote = fishRemote("StopFishing")
+				Fish.active = false
+				Fish.own = false
+				Fish.status = reason or "Off"
+				if remote then
+					task.spawn(Auto.invokeTimeout, remote, 5)
+				end
+			end
+
+			local function resultError(ok, result)
+				if ok and type(result) == "table" then
+					return tostring(result.Error or result.Reason or "Refused")
+				end
+				return if ok then "Refused" else "No answer"
+			end
+
+			local function onCatch(loot)
+				Fish.catches += 1
+				Saved.fishCaught = (tonumber(Saved.fishCaught) or 0) + 1
+				SaveDirty = true
+				local raw = tostring(loot.Name)
+				local name = string.match(raw, "^[^|]+") or raw
+				local mutation = string.match(raw, "|(.+)$")
+				local last = { name = name, kind = tostring(loot.Kind or ""), amount = math.max(1, math.floor(tonumber(loot.Amount) or 1)), deleted = loot.Deleted == true, mutation = mutation }
+				if last.kind == "Pet" then
+					local rarity = "Basic"
+					if PetDisplay and PetDisplay.GetRarity then
+						local ok, result = pcall(PetDisplay.GetRarity, name)
+						if ok and type(result) == "string" then
+							rarity = result
+						end
+					end
+					last.rarity = rarity
+					last.icon = petIcon(name) or petIcon((string.gsub(name, "^Golden ", "")))
+					Auto.FeedRaw = Auto.FeedRaw or {}
+					table.insert(Auto.FeedRaw, { at = os.clock(), egg = "Fishing", names = { { name = name, rarity = rarity, fresh = false, mutation = mutation } } })
+					while #Auto.FeedRaw > 20 do
+						table.remove(Auto.FeedRaw, 1)
+					end
+					if (RarityRank[rarity] or 0) >= 4 or string.sub(name, 1, 7) == "Golden " then
+						Saved.fishRare = (tonumber(Saved.fishRare) or 0) + 1
+						local label = (if mutation then ((Auto.mutationInfo(mutation)) or mutation) .. " " else "") .. name
+						queueToast("Fishing", "Caught " .. label .. "  \u{00B7}  " .. rarity)
+						if Auto.Metrics then
+							pcall(Auto.Metrics.event, "Fish", label .. "  \u{00B7}  " .. rarity, RarityColors[rarity])
+						end
+						if Auto.postEvent then
+							Auto.postEvent("Fish", "Rare catch", "Caught **" .. label .. "** (" .. rarity .. ") while fishing", 6275327)
+						end
+					end
+				end
+				Fish.last = last
+			end
+
+			local function hookFishing()
+				hookEvent("fishStopped", "FishingService", "Stopped", function()
+					Fish.active = false
+					Fish.own = false
+				end)
+				hookEvent("fishResumed", "FishingService", "Resumed", function(data)
+					if type(data) == "table" and data.Ok == true then
+						beginSession(data, Fish.own)
+					end
+				end)
+				hookEvent("fishCaught", "FishingService", "Caught", function(loot, endsAt, duration)
+					if tonumber(endsAt) then
+						Fish.endsAt = tonumber(endsAt)
+					end
+					if tonumber(duration) and tonumber(duration) > 0 then
+						Fish.duration = tonumber(duration)
+					end
+					if type(loot) == "table" and type(loot.Name) == "string" then
+						onCatch(loot)
+					end
+				end)
+			end
+
+			local function tapStep(now)
+				if not (S.fishTap and Fish.active and Fish.seq) or Fish.tapBusy or now < Fish.nextTapAt then
+					return
+				end
+				local remote = fishRemote("SpeedUp")
+				if not remote then
+					return
+				end
+				local index = Fish.tapIndex
+				local okPos, x, y = pcall(Fish.seq.Get, Fish.seq, index)
+				if not okPos or type(x) ~= "number" or type(y) ~= "number" then
+					return
+				end
+				x += (math.random() - 0.5) * 0.04
+				y += (math.random() - 0.5) * 0.06
+				Fish.tapBusy = true
+				Fish.nextTapAt = now + 0.42 + math.random() * 0.18
+				task.spawn(function()
+					local ok, result = Auto.invokeTimeout(remote, 5, index, x, y)
+					Fish.tapBusy = false
+					Fish.tapIndex = math.max(Fish.tapIndex, index + 1)
+					if ok and type(result) == "table" then
+						local tapIndex = tonumber(result.TapIndex)
+						if tapIndex and tapIndex > Fish.tapIndex then
+							Fish.tapIndex = math.floor(tapIndex)
+						end
+						if tonumber(result.EndsAt) then
+							Fish.endsAt = tonumber(result.EndsAt)
+						end
+						if tonumber(result.Streak) then
+							Fish.streak = tonumber(result.Streak)
+						end
+						if result.Accepted == true then
+							Fish.taps += 1
+						end
+					end
+				end)
+			end
+
+			local function activeWorm()
+				local potions = Auto.lazyRequire("PotionsModule", function()
+					local modules = ReplicatedStorage:FindFirstChild("Modules")
+					return modules and modules:FindFirstChild("PotionsModule")
+				end)
+				if type(potions) == "table" and type(potions.GetActiveWorm) == "function" then
+					local ok, worm = pcall(potions.GetActiveWorm, LocalPlayer)
+					if ok and type(worm) == "string" then
+						local okLeft, left = pcall(potions.GetTimeLeft, LocalPlayer, worm)
+						return worm, if okLeft then tonumber(left) else nil
+					end
+				end
+				return nil, nil
+			end
+
+			local function hookCharges()
+				return tonumber(readData("FishingItemsData", "GoldenFishhookCharges")) or 0, tonumber(readData("FishingItemsData", "FishhookCharges")) or 0
+			end
+
+			local function baitStep(now)
+				if now - Fish.baitAt < 2 or not Fish.active then
+					return
+				end
+				Fish.baitAt = now
+				local use = Auto.knitRemote("ConsumablesService", "RE", "UseItem")
+				if not use then
+					return
+				end
+				if S.autoWorms then
+					local worm = activeWorm()
+					for _, name in ipairs(WormOrder) do
+						if (tonumber(readData("FishingItemsData", name)) or 0) > 0 then
+							if worm == nil or (WormRank[name] or 0) > (WormRank[worm] or 0) then
+								pcall(function()
+									use:FireServer(name, 1)
+								end)
+							end
+							break
+						end
+					end
+				end
+				if S.autoHooks then
+					local golden, normal = hookCharges()
+					if golden + normal <= 0 then
+						for _, name in ipairs(HookOrder) do
+							if (tonumber(readData("FishingItemsData", name)) or 0) > 0 then
+								pcall(function()
+									use:FireServer(name, 1)
+								end)
+								break
+							end
+						end
+					end
+				end
+			end
+
+			local function merchantCfg()
+				return fishModule("MerchantConfig")
+			end
+
+			local function merchantWorld()
+				return machineWorld("MerchantFishing", resolveWorld("TreasureDunes"))
+			end
+
+			local function tokenBalance()
+				return math.max(0, math.floor(tonumber(readData("FishingMerchantData", "Tokens")) or 0))
+			end
+
+			local function sellSummary(force)
+				local now = os.clock()
+				if not force and Merchant.sell and now - Merchant.sellAt < 5 then
+					return Merchant.sell
+				end
+				Merchant.sellAt = now
+				local summary = { list = {}, count = 0, value = 0 }
+				Merchant.sell = summary
+				local cfg = merchantCfg()
+				if type(cfg) ~= "table" or type(cfg.GetSellValue) ~= "function" or not (PetDisplay and PetDisplay.GetAvailable) then
+					return summary
+				end
+				local pets = getDataFolder("PetsData")
+				for _, tier in ipairs({ "Normal", "Golden", "Diamond" }) do
+					local folder = if pets and S.sellTiers[tier] then pets:FindFirstChild(tier .. "PetsData") else nil
+					for _, entry in ipairs(folder and folder:GetChildren() or {}) do
+						local name = entry.Name
+						if not string.find(name, "|", 1, true) then
+							local base = string.gsub(string.gsub(name, "^Golden ", ""), "^Diamond ", "")
+							if S.sellFishPick[base] then
+								local okValue, price = pcall(cfg.GetSellValue, name, PetDisplay)
+								if okValue and type(price) == "number" and price > 0 then
+									local okAvailable, available = pcall(PetDisplay.GetAvailable, LocalPlayer, name)
+									local amount = math.floor((if okAvailable then tonumber(available) or 0 else 0) - (S.keepFish or 0))
+									if amount > 0 then
+										summary.list[name] = amount
+										summary.count += amount
+										summary.value += price * amount
+									end
+								end
+							end
+						end
+					end
+				end
+				return summary
+			end
+
+			local function merchantOffers()
+				local cfg = merchantCfg()
+				local fishing = ReplicatedStorage:FindFirstChild("Fishing")
+				if type(cfg) ~= "table" or not fishing or type(cfg.DecodeStock) ~= "function" then
+					return nil
+				end
+				local ok, stock = pcall(cfg.DecodeStock, fishing:GetAttribute(cfg.STOCK_ATTRIBUTE or "FishingMerchantStock"), HttpService)
+				if not (ok and type(stock) == "table" and type(stock.Offers) == "table") then
+					return nil
+				end
+				local restock = math.floor(tonumber(readData("FishingMerchantData", "RestockId")) or -1)
+				local purchases = tonumber(readData("FishingMerchantData", "Purchases")) or 0
+				for _, offer in ipairs(stock.Offers) do
+					local bought = 0
+					if restock == stock.RestockId then
+						bought = tonumber(readData("FishingMerchantData", "Bought_" .. tostring(offer.Id))) or 0
+					end
+					offer.Left = math.max(0, (tonumber(offer.Stock) or 0) - bought)
+					local okOpen, open = pcall(cfg.IsUnlocked, offer, purchases)
+					offer.Open = okOpen and open == true
+				end
+				return stock
+			end
+
+			local function nextOffer(stock)
+				if not stock then
+					return nil
+				end
+				local spend = tokenBalance() - (S.tokenReserve or 0)
+				for _, offer in ipairs(stock.Offers) do
+					if S.merchantPick[offer.PoolId] and offer.Open and offer.Left > 0 and spend >= (tonumber(offer.Price) or math.huge) then
+						return offer
+					end
+				end
+				return nil
+			end
+
+			local function fishTreeInfo()
+				local tree = fishModule("FishingTreeData")
+				local info = { available = type(tree) == "table" and type(tree.Groups) == "table", owned = 0, total = 0, anyPicked = false, allDone = true }
+				if not info.available then
+					return info
+				end
+				local folder = getDataFolder(tree.FOLDER_NAME or "FishingTreeData")
+				local function owned(id)
+					local node = folder and folder:FindFirstChild(id)
+					if not node then
+						return false
+					end
+					local ok, value = pcall(function()
+						return node.Value
+					end)
+					return ok and value == true
+				end
+				local levels = {}
+				for _, group in ipairs(tree.Groups) do
+					local level = 0
+					if not group.parent then
+						level = #group.levels
+					else
+						for _, node in ipairs(group.levels) do
+							if not owned(node.id) then
+								break
+							end
+							level += 1
+						end
+					end
+					levels[group.id] = level
+				end
+				local balance = tokenBalance()
+				local spend = balance - (S.tokenReserve or 0)
+				info.balance = balance
+				local best, bestCost, bestIndex = nil, nil, nil
+				local now = os.clock()
+				for index, group in ipairs(tree.Groups) do
+					if group.parent then
+						local level = levels[group.id] or 0
+						local maxLevel = #group.levels
+						info.owned += level
+						info.total += maxLevel
+						if S.fishTreePick[group.id] and level < maxLevel then
+							info.anyPicked = true
+							info.allDone = false
+							local parent = tree.GroupById and tree.GroupById[group.parent]
+							local parentDone = parent == nil or (levels[parent.id] or 0) >= (tonumber(group.parentLevel) or #parent.levels)
+							local node = group.levels[level + 1]
+							if (parentDone or level > 0) and node and (FishTree.blocked[group.id] or 0) < now then
+								local cost = tonumber(node.cost) or 0
+								local better
+								if S.fishTreeOrder == "Tree order" then
+									better = best == nil or index < bestIndex
+								else
+									better = best == nil or cost < bestCost
+								end
+								if better then
+									best, bestCost, bestIndex = { group = group, node = node }, cost, index
+								end
+							end
+						elseif S.fishTreePick[group.id] then
+							info.anyPicked = true
+						end
+					end
+				end
+				if best then
+					info.next = best
+					info.cost = bestCost
+					info.title = tostring(best.node.title or best.group.title or best.node.id)
+					info.image = best.node.image or best.group.image
+					info.affordable = spend >= bestCost
+				end
+				return info
+			end
+
+			local function merchantAnchor()
+				local machine, touch = getMachine("MerchantFishing")
+				if touch then
+					return touch
+				end
+				if not machine then
+					return nil
+				end
+				if machine:IsA("BasePart") then
+					return machine
+				end
+				if machine:IsA("Model") and machine.PrimaryPart then
+					return machine.PrimaryPart
+				end
+				for _, child in ipairs(machine:GetDescendants()) do
+					if child:IsA("BasePart") then
+						return child
+					end
+				end
+				return nil
+			end
+
+			local function merchantWanted(now)
+				if not (S.autoSellFish or S.autoMerchantBuy or S.autoFishTree) then
+					Merchant.status = "Off"
+					return false
+				end
+				if now - Merchant.wantAt < 3 then
+					return Merchant.want
+				end
+				Merchant.wantAt = now
+				Merchant.want = false
+				local world = merchantWorld()
+				if not worldUnlocked(world) then
+					Merchant.status = "Unlock " .. prettyWorld(world) .. " first"
+					return false
+				end
+				local reasons = 0
+				if S.autoSellFish and sellSummary().count >= (S.sellAt or 25) then
+					reasons += 1
+				end
+				if S.autoFishTree then
+					local info = fishTreeInfo()
+					if info.next and info.affordable then
+						reasons += 1
+					end
+				end
+				if S.autoMerchantBuy and nextOffer(merchantOffers()) then
+					reasons += 1
+				end
+				if reasons == 0 then
+					Merchant.status = "Waiting"
+					return false
+				end
+				if now - Merchant.lastTrip < 45 or now < Merchant.blockedUntil then
+					Merchant.status = "Going soon"
+					return false
+				end
+				Merchant.status = "Going to the Merchant"
+				Merchant.want = true
+				return true
+			end
+
+			local function merchantTrip()
+				Merchant.lastTrip = os.clock()
+				Merchant.want = false
+				Merchant.wantAt = os.clock()
+				local ok, err = travelTo(merchantWorld())
+				if not ok then
+					Merchant.status = "Travel failed"
+					Merchant.blockedUntil = os.clock() + 90
+					queueToast("Fishing Merchant", tostring(err))
+					return
+				end
+				local anchor = merchantAnchor()
+				if anchor then
+					Mover.task = "Visiting the Merchant"
+					pcall(standAt, anchor, 4)
+					task.wait(0.7)
+				end
+				local done = {}
+				local tooFar = false
+				local sell = Auto.knitRemote("FishingMerchantService", "RF", "SellPets")
+				if S.autoSellFish and sell then
+					local summary = sellSummary(true)
+					if summary.count > 0 then
+						Mover.task = "Selling fish"
+						local okCall, result = Auto.invokeTimeout(sell, 10, summary.list)
+						if okCall and type(result) == "table" and result.Ok == true then
+							Saved.fishSold = (tonumber(Saved.fishSold) or 0) + summary.count
+							Saved.tokensEarned = (tonumber(Saved.tokensEarned) or 0) + summary.value
+							SaveDirty = true
+							table.insert(done, string.format("sold %d pets for %s tokens", summary.count, formatNumber(summary.value)))
+						else
+							local reason = resultError(okCall, result)
+							tooFar = reason == "TooFar"
+							table.insert(done, "selling failed (" .. reason .. ")")
+						end
+						Merchant.sell = nil
+						task.wait(0.5)
+					end
+				end
+				local buyNode = Auto.knitRemote("FishingMerchantService", "RF", "BuyTreeNode")
+				if S.autoFishTree and buyNode and not tooFar then
+					local bought = 0
+					for _ = 1, 40 do
+						if not alive() then
+							break
+						end
+						local info = fishTreeInfo()
+						if not (info.next and info.affordable) then
+							break
+						end
+						Mover.task = "Buying " .. info.title
+						local okCall, result = Auto.invokeTimeout(buyNode, 6, info.next.node.id)
+						if okCall and type(result) == "table" and result.Ok == true then
+							bought += 1
+							Saved.fishTreeBought = (tonumber(Saved.fishTreeBought) or 0) + 1
+							SaveDirty = true
+							FishTree.last = info.title
+							task.wait(0.4)
+						else
+							local reason = resultError(okCall, result)
+							if reason == "TooFast" then
+								task.wait(0.8)
+							else
+								FishTree.blocked[info.next.group.id] = os.clock() + 120
+								if reason == "TooFar" then
+									tooFar = true
+									break
+								end
+							end
+						end
+					end
+					if bought > 0 then
+						table.insert(done, string.format("bought %d tree node%s", bought, if bought == 1 then "" else "s"))
+					end
+				end
+				local buy = Auto.knitRemote("FishingMerchantService", "RF", "Buy")
+				if S.autoMerchantBuy and buy and not tooFar then
+					local bought = 0
+					for _ = 1, 40 do
+						if not alive() then
+							break
+						end
+						local offer = nextOffer(merchantOffers())
+						if not offer then
+							break
+						end
+						Mover.task = "Buying " .. Auto.itemDisplayName(offer.Item)
+						local okCall, result = Auto.invokeTimeout(buy, 6, offer.Id, false, offer.PoolId)
+						if okCall and type(result) == "table" and result.Ok == true then
+							bought += 1
+							Saved.merchantBought = (tonumber(Saved.merchantBought) or 0) + 1
+							SaveDirty = true
+							task.wait(0.45)
+						else
+							local reason = resultError(okCall, result)
+							if reason ~= "TooFast" then
+								tooFar = reason == "TooFar"
+								break
+							end
+							task.wait(0.8)
+						end
+					end
+					if bought > 0 then
+						table.insert(done, string.format("bought %d item%s", bought, if bought == 1 then "" else "s"))
+					end
+				end
+				if tooFar then
+					Merchant.blockedUntil = os.clock() + 120
+				end
+				Merchant.status = if #done > 0 then "Done" else "Nothing to do"
+				if #done > 0 then
+					queueToast("Fishing Merchant", (string.gsub(table.concat(done, ", "), "^%l", string.upper)))
+				end
+			end
+
+			local function invEggNames()
+				local folder = getDataFolder("Eggs")
+				local names = {}
+				for _, child in ipairs(folder and folder:GetChildren() or {}) do
+					if child:IsA("ValueBase") then
+						table.insert(names, child.Name)
+					end
+				end
+				table.sort(names)
+				return names
+			end
+
+			local function invEggStep(now)
+				if not S.autoInvEggs then
+					Inv.status = "Off"
+					return
+				end
+				local hatch = Auto.knitRemote("ExclusiveEggsService", "RE", "Hatch")
+				if not hatch then
+					Inv.status = "Unavailable"
+					return
+				end
+				local name, count = nil, 0
+				for _, egg in ipairs(invEggNames()) do
+					local owned = math.floor(tonumber(readData("Eggs", egg)) or 0)
+					if not S.invEggKeep[egg] and owned > 0 then
+						name, count = egg, owned
+						break
+					end
+				end
+				if not name then
+					Inv.status = "Nothing to open"
+					return
+				end
+				if S.autoFish and S.fishPriority == "Fishing first" then
+					Inv.status = "Paused for fishing"
+					return
+				end
+				HatchState.activeAt = os.clock()
+				if Fish.active then
+					if S.autoFish then
+						Fish.stopFor = "Eggs"
+					end
+					Inv.status = "Waiting for fishing to stop"
+					return
+				end
+				if HatchState.waiting or now - Inv.lastFire < 3 or (Inv.waiting and now - Inv.lastFire < 10) then
+					Inv.status = "Opening"
+					return
+				end
+				local amount = if count >= 8 then 8 elseif count >= 3 then 3 else 1
+				Inv.lastFire = now
+				Inv.waiting = true
+				Inv.status = string.format("Opening %s x%d", name, amount)
+				pcall(function()
+					hatch:FireServer(name, amount)
+				end)
+			end
+
+			Auto.onInvEggResult = function(list)
+				Inv.waiting = false
+				local opened = if type(list) == "table" then #list else 0
+				if opened > 0 then
+					Saved.invEggsOpened = (tonumber(Saved.invEggsOpened) or 0) + opened
+					SaveDirty = true
+				end
+			end
+
+			local function moonAutoOn()
+				return readData("MoonAutoBuyData", "Enabled") == true
+			end
+			Auto.moonGameAutoOn = moonAutoOn
+
+			local function moonAutoWanted(now)
+				return S.moonGameAuto and readData("SPdata", "SP14") == true and not moonAutoOn() and now - MoonAuto.lastTry > 90 and worldUnlocked(moonWorld())
+			end
+
+			local function moonAutoTrip()
+				MoonAuto.lastTry = os.clock()
+				local remote = Auto.knitRemote("MoonAutoBuyService", "RE", "SetEnabled")
+				if not remote then
+					MoonAuto.status = "Unavailable"
+					return
+				end
+				local ok, err = travelTo(moonWorld())
+				if not ok then
+					MoonAuto.status = "Travel failed"
+					queueToast("Moon Auto Buy", tostring(err))
+					return
+				end
+				local shop = moonShop("Incremental")
+				local anchor = shop and shop.anchor()
+				if anchor and anchor:IsA("BasePart") then
+					Mover.task = "Turning on Moon Auto Buy"
+					pcall(standAt, anchor, 7)
+					task.wait(0.6)
+				end
+				pcall(function()
+					remote:FireServer(true)
+				end)
+				local waited = 0
+				while waited < 3 and not moonAutoOn() do
+					waited += task.wait(0.25) or 0.25
+				end
+				if moonAutoOn() then
+					MoonAuto.status = nil
+					queueToast("Moon Auto Buy", "The game now buys every incremental upgrade for you")
+				else
+					MoonAuto.status = "Did not turn on"
+				end
+			end
+
+			Auto.eggsActive = function()
+				local wants = (S.autoHatch and S.hatchEggName ~= "") or (S.indexHunt and Hunter.egg ~= nil) or S.autoInvEggs
+				if not wants then
+					return false
+				end
+				return os.clock() - (HatchState.activeAt or -1e9) < 6
+			end
+
+			local function fishBlocked()
+				if S.fishPriority ~= "Fishing first" and Auto.eggsActive() then
+					return "Paused for eggs"
+				end
+				return nil
+			end
+
+			Auto.fishStep = function(now)
+				if not (S.autoFish and Fish.needTravel) or Fish.active or fishBlocked() then
+					return false
+				end
+				local world, frame = fishTarget()
+				if not world then
+					return false
+				end
+				if now - Fish.travelTry < (if Fish.travelFails >= 3 then 60 else 8) then
+					return false
+				end
+				Fish.travelTry = now
+				Mover.busy = true
+				Mover.task = "Going fishing in " .. prettyWorld(world)
+				local ok, reached = pcall(goToSpot, world, frame)
+				Mover.busy = false
+				Mover.task = ""
+				if ok and reached then
+					Fish.travelFails = 0
+					Fish.needTravel = false
+				else
+					Fish.travelFails += 1
+					if not ok then
+						Fish.error = shortError(reached)
+					end
+				end
+				return true
+			end
+
+			local previousErrand = Auto.nextUpdateErrand
+			Auto.nextUpdateErrand = function(now)
+				if merchantWanted(now) then
+					return "Fishing Merchant", merchantTrip
+				end
+				if moonAutoWanted(now) then
+					return "Moon Auto Buy", moonAutoTrip
+				end
+				if previousErrand then
+					return previousErrand(now)
+				end
+				return nil
+			end
+
+			task.spawn(function()
+				pcall(hookFishing)
+				pcall(function()
+					local remote = fishRemote("GetSession")
+					if remote then
+						local ok, data = Auto.invokeTimeout(remote, 6)
+						if ok and type(data) == "table" and data.Ok == true then
+							beginSession(data, false)
+						end
+					end
+				end)
+				local hookAt = os.clock()
+				while alive() do
+					task.wait(0.15)
+					local ok, err = pcall(function()
+						local now = os.clock()
+						if now - hookAt > 5 then
+							hookAt = now
+							hookFishing()
+						end
+						if now - Fish.invAt >= 0.5 then
+							Fish.invAt = now
+							invEggStep(now)
+						end
+						if not S.autoFish then
+							if Fish.active and Fish.own then
+								stopFishing("Off")
+							end
+							Fish.needTravel = false
+							Fish.status = if Fish.active then "You are fishing" else "Off"
+							return
+						end
+						if Fish.stopFor then
+							local reason = Fish.stopFor
+							Fish.stopFor = nil
+							if Fish.active then
+								stopFishing("Paused for " .. string.lower(reason))
+							end
+							return
+						end
+						local blocked = fishBlocked()
+						if blocked then
+							if Fish.active then
+								stopFishing(blocked)
+							end
+							Fish.status = blocked
+							Fish.needTravel = false
+							return
+						end
+						if Fish.active then
+							Fish.status = "Fishing"
+							Fish.needTravel = false
+							tapStep(now)
+							baitStep(now)
+							return
+						end
+						if Mover.busy then
+							Fish.status = "Waiting: " .. (if Mover.task ~= "" then Mover.task else "travelling")
+							return
+						end
+						if now - Fish.startTry < (if Fish.startFails >= 3 then 10 else 2) then
+							return
+						end
+						Fish.startTry = now
+						if not getRoot() then
+							Fish.status = "Waiting for your character"
+							return
+						end
+						if not atFishingSpot() then
+							Fish.needTravel = fishTarget() ~= nil
+							Fish.status = if Fish.needTravel then "Going to the water" else "Stand next to water"
+							return
+						end
+						Fish.needTravel = false
+						local remote = fishRemote("StartFishing")
+						if not remote then
+							Fish.status = "Fishing is not in this server"
+							return
+						end
+						Fish.status = "Casting"
+						local okCall, result = Auto.invokeTimeout(remote, 6)
+						if okCall and type(result) == "table" and result.Ok == true then
+							beginSession(result, true)
+							Fish.status = "Fishing"
+						else
+							Fish.startFails += 1
+							Fish.error = resultError(okCall, result)
+							Fish.status = "Cast failed: " .. Fish.error
+							if Fish.startFails >= 3 then
+								local world = fishTarget()
+								if world then
+									Fish.spots[world] = nil
+									Fish.needTravel = true
+								end
+							end
+						end
+					end)
+					if not ok then
+						diag("fishing", err)
+					end
+				end
+			end)
+
+			task.spawn(function()
+				while alive() do
+					task.wait(1)
+					local ok, err = pcall(function()
+						if not S.autoFishTree then
+							FishTree.status = "Off"
+							return
+						end
+						local info = fishTreeInfo()
+						if not info.available then
+							FishTree.status = "Not in this game"
+						elseif not info.anyPicked then
+							FishTree.status = "Pick upgrades"
+						elseif info.allDone then
+							FishTree.status = "All done"
+						elseif not info.next then
+							FishTree.status = "Waiting"
+						elseif not info.affordable then
+							FishTree.status = "Saving up"
+						else
+							FishTree.status = if Mover.busy and string.find(Mover.task, "Buying", 1, true) then "Buying" else "Going to buy"
+						end
+					end)
+					if not ok then
+						diag("fishtree", err)
+					end
+				end
+			end)
+
+			Auto.collectFishing = function()
+				local fish = { status = Fish.status, active = Fish.active, catches = Fish.catches, taps = Fish.taps, streak = Fish.streak, last = Fish.last, error = Fish.error }
+				local target = fishTarget()
+				fish.world = if Fish.active then currentWorld() else target
+				if Fish.active and Fish.endsAt then
+					fish.left = math.max(0, Fish.endsAt - serverNow())
+					fish.duration = Fish.duration
+				end
+				local boosts = fishModule("FishingBoosts")
+				if type(boosts) == "table" then
+					local okLuck, luck = pcall(boosts.GetDisplayLuckMultiplier, LocalPlayer)
+					local okSpeed, speed = pcall(boosts.GetSpeedMultiplier, LocalPlayer)
+					local okRod, rod = pcall(boosts.GetRodName, LocalPlayer)
+					fish.luck = if okLuck then tonumber(luck) else nil
+					fish.speed = if okSpeed then tonumber(speed) else nil
+					fish.rod = if okRod and type(rod) == "string" then rod else nil
+				end
+				fish.worm, fish.wormLeft = activeWorm()
+				fish.golden, fish.normal = hookCharges()
+				fish.wormCount, fish.hookCount = 0, 0
+				for name in pairs(WormRank) do
+					fish.wormCount += tonumber(readData("FishingItemsData", name)) or 0
+				end
+				for _, name in ipairs(HookOrder) do
+					fish.hookCount += tonumber(readData("FishingItemsData", name)) or 0
+				end
+				fish.tokens = tokenBalance()
+				local sell = sellSummary()
+				fish.sellCount, fish.sellValue = sell.count, sell.value
+				local cfg = merchantCfg()
+				if type(cfg) == "table" and type(cfg.GetTimeToRestock) == "function" then
+					local okLeft, left = pcall(cfg.GetTimeToRestock)
+					fish.restock = if okLeft then tonumber(left) else nil
+					fish.restockTotal = tonumber(cfg.RESTOCK_SECONDS) or 1800
+				end
+				fish.merchant = if Mover.busy and (string.find(Mover.task, "Merchant", 1, true) or string.find(Mover.task, "Selling", 1, true)) then Mover.task else Merchant.status
+				local tree = fishTreeInfo()
+				tree.status = FishTree.status
+				tree.last = FishTree.last
+				fish.tree = tree
+				local names = invEggNames()
+				local owned = 0
+				for _, name in ipairs(names) do
+					owned += math.floor(tonumber(readData("Eggs", name)) or 0)
+				end
+				fish.inv = { status = Inv.status, names = names, owned = owned }
+				fish.moonAuto = { owned = readData("SPdata", "SP14") == true, on = moonAutoOn(), status = MoonAuto.status }
+				Snap.fish = fish
+			end
+		end
+		Auto.setupUpdate4()
+		Auto.setupProfileCard = function()
+			local Card = { nextAt = 0, busy = false, status = "Off", force = false, forceNew = false, avatar = nil, saved = {}, updatedAt = nil, file = SaveFolder .. "/PetsUniverse_card.json" }
+			Auto.Card = Card
+			local GREEN, ORANGE = "#60d696", "#ffb84d"
+
+			pcall(function()
+				if type(isfile) == "function" and type(readfile) == "function" and isfile(Card.file) then
+					local data = HttpService:JSONDecode(readfile(Card.file))
+					if type(data) == "table" and type(data.messages) == "table" then
+						Card.saved = data.messages
+					end
+				end
+			end)
+
+			local function saveIds()
+				pcall(function()
+					if type(writefile) ~= "function" then
+						return
+					end
+					if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(SaveFolder) then
+						makefolder(SaveFolder)
+					end
+					writefile(Card.file, HttpService:JSONEncode({ messages = Card.saved }))
+				end)
+			end
+
+			local function hookParts(url)
+				local id, token = string.match(tostring(url or ""), "/api/webhooks/(%d+)/([%w_%-]+)")
+				if not id then
+					return nil, nil, nil
+				end
+				local host = string.match(url, "^(https://[%w%.]+)") or "https://discord.com"
+				return host .. "/api/webhooks/" .. id .. "/" .. token, id, string.match(url, "[%?&]thread_id=(%d+)")
+			end
+
+			local function avatarUrl()
+				if Card.avatar ~= nil then
+					return Card.avatar or nil
+				end
+				Card.avatar = false
+				local response = httpRequest({
+					Url = "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=" .. tostring(LocalPlayer.UserId) .. "&size=420x420&format=Png&isCircular=false",
+					Method = "GET",
+				})
+				if response and response.Body then
+					pcall(function()
+						local decoded = HttpService:JSONDecode(response.Body)
+						local entry = decoded and decoded.data and decoded.data[1]
+						if entry and type(entry.imageUrl) == "string" and entry.imageUrl ~= "" then
+							Card.avatar = entry.imageUrl
+						end
+					end)
+				end
+				return Card.avatar or nil
+			end
+
+			local function rate(key)
+				local ok, value = pcall(Auto.Metrics.current, key)
+				return if ok and type(value) == "number" then value else nil
+			end
+
+			local function activityText()
+				local parts = {}
+				local here = Snap.worlds and Snap.worlds.here
+				if S.autoFarm then
+					table.insert(parts, "Farming" .. (if here then " in " .. prettyWorld(here) else ""))
+				end
+				if Auto.Fish and Auto.Fish.active then
+					table.insert(parts, "Fishing")
+				end
+				if tostring(HatchState.status) == "Hatching" then
+					table.insert(parts, "Hatching " .. tostring(if S.indexHunt and Hunter.egg then Hunter.egg else S.hatchEggName))
+				end
+				if S.indexHunt then
+					table.insert(parts, "Index Hunter on")
+				end
+				if Mover.busy and Mover.task ~= "" then
+					table.insert(parts, Mover.task)
+				end
+				return if #parts > 0 then table.concat(parts, "  \u{00B7}  ") else "Idle"
+			end
+
+			local function buildCard()
+				local show = S.profileShow or {}
+				local hidden = S.webhookHideName == true
+				local fields = {}
+				local function add(name, value, inline)
+					if #fields < 25 then
+						table.insert(fields, { name = name, value = tostring(value), inline = inline ~= false })
+					end
+				end
+				for _, key in ipairs({ "Coins", "Rubies", "Gems" }) do
+					local perHour = if show["Rates per hour"] then rate(key) else nil
+					if show.Currencies then
+						add(key, formatNumber(getStat(key) or 0) .. (if perHour then "\n+" .. formatNumber(perHour) .. "/h" else ""))
+					elseif show["Rates per hour"] then
+						add(key .. " per hour", if perHour then "+" .. formatNumber(perHour) else "warming up")
+					end
+				end
+				if show.Eggs then
+					local perHour = if show["Rates per hour"] then rate("Eggs") else nil
+					add("Eggs opened", formatNumber(getEggsOpenedTotal() or Saved.eggs) .. "\n" .. formatNumber(Session.eggs) .. " this session" .. (if perHour then "\n" .. formatNumber(perHour) .. "/h" else ""))
+				end
+				if show.Index and Auto.Live and Auto.Live.indexTotal then
+					add("Index", string.format("%s / %s", formatNumber(Auto.Live.indexCount or 0), formatNumber(Auto.Live.indexTotal)))
+				end
+				if show["Worlds and rebirths"] then
+					local worlds = Snap.worlds
+					if worlds then
+						add("Worlds", string.format("%d / %d", worlds.owned or 0, worlds.total or 0))
+					end
+					add("Moon rebirths", formatNumber(Snap.moonRebirths or 0))
+				end
+				if show.Team and Snap.team then
+					add("Team power", "x" .. formatNumber((Snap.team.power or 0) + 1) .. "\n" .. formatNumber(Snap.team.count or 0) .. " pets equipped")
+				end
+				if show.Fishing then
+					add("Fishing", formatNumber(tonumber(Saved.fishCaught) or 0) .. " caught\n" .. formatNumber(Snap.fish and Snap.fish.tokens or 0) .. " tokens")
+				end
+				if show.UFO then
+					add("UFO", string.format("%s won  \u{00B7}  %s top 3\n%s helped", formatNumber(tonumber(Saved.ufoWon) or 0), formatNumber(tonumber(Saved.ufoTop3) or 0), formatNumber(Saved.ufoBroken or 0)))
+				end
+				if show.Boosts then
+					local parts = {}
+					local luck = Snap.u2 and Snap.u2.luck
+					if luck and luck.left and luck.left > 0 then
+						table.insert(parts, "Server luck x" .. tostring(luck.mult))
+					end
+					local friends = Snap.friends
+					if friends and friends.percent and friends.percent > 0 then
+						table.insert(parts, string.format("Friends +%d%%", math.floor(friends.percent + 0.5)))
+					end
+					local combo = Auto.eggCombo and Auto.eggCombo()
+					if combo and combo.owned and combo.bonus > 0 then
+						table.insert(parts, "Egg combo +" .. (string.gsub(string.format("%.2f", combo.bonus * 100), "%.?0+$", "")) .. "%")
+					end
+					add("Boosts", if #parts > 0 then table.concat(parts, "\n") else "none active")
+				end
+				if show["Best pets"] then
+					local lines = {}
+					for i, entry in ipairs(getBest()) do
+						if i > 5 then
+							break
+						end
+						table.insert(lines, string.format("**%s**  \u{00B7}  %s%s", entry.name, entry.rarity, if (entry.count or 1) > 1 then "  x" .. formatNumber(entry.count) else ""))
+					end
+					if #lines > 0 then
+						add("Best hatches", table.concat(lines, "\n"), false)
+					end
+				end
+				local embed = {
+					title = if hidden then "Corvus player" else LocalPlayer.DisplayName .. "  (@" .. LocalPlayer.Name .. ")",
+					url = if hidden then nil else "https://www.roblox.com/users/" .. tostring(LocalPlayer.UserId) .. "/profile",
+					description = if show.Activity then "\u{25CF}  " .. activityText() .. "\nSession " .. Library:FormatDuration(os.clock() - Session.started) else nil,
+					color = 13158620,
+					fields = fields,
+					author = { name = "Pets Universe  \u{00B7}  live profile", icon_url = gameIcon() },
+					footer = { text = "Corvus " .. tostring(CorvusConfig.HubVersion) .. "  \u{00B7}  updates every " .. Library:FormatDuration(S.profileEvery or 300) },
+					timestamp = DateTime.now():ToIsoDate(),
+				}
+				local thumb = if hidden then gameIcon() else avatarUrl()
+				if thumb then
+					embed.thumbnail = { url = thumb }
+				end
+				return embed
+			end
+
+			local function cardRequest(method, url, payload)
+				local response = httpRequest({
+					Url = url,
+					Method = method,
+					Headers = { ["Content-Type"] = "application/json" },
+					Body = HttpService:JSONEncode(payload),
+				})
+				return response and tonumber(response.StatusCode) or 0, response and response.Body or nil
+			end
+
+			local function sendCard(forceNew)
+				local base, hookId, thread = hookParts(S.webhookUrl)
+				if not base then
+					Card.status = "Bad webhook URL"
+					return
+				end
+				local payload = { username = hookName(), embeds = { buildCard() }, allowed_mentions = { parse = {} } }
+				if S.profileButtons then
+					payload.components = {
+						{
+							type = 1,
+							components = {
+								{ type = 2, style = 5, label = "Play Pets Universe", url = "https://www.roblox.com/games/" .. tostring(game.PlaceId) },
+								{ type = 2, style = 5, label = "Corvus Discord", url = Discord },
+							},
+						},
+					}
+				end
+				local function query(wait)
+					local parts = {}
+					if wait then
+						table.insert(parts, "wait=true")
+					end
+					if thread then
+						table.insert(parts, "thread_id=" .. thread)
+					end
+					if payload.components then
+						table.insert(parts, "with_components=true")
+					end
+					return if #parts > 0 then "?" .. table.concat(parts, "&") else ""
+				end
+				local messageId = if forceNew then nil else Card.saved[hookId]
+				if messageId then
+					local edit = { embeds = payload.embeds, components = payload.components, allowed_mentions = payload.allowed_mentions }
+					local code = cardRequest("PATCH", base .. "/messages/" .. tostring(messageId) .. query(false), edit)
+					if code == 400 and payload.components then
+						payload.components = nil
+						edit.components = nil
+						code = cardRequest("PATCH", base .. "/messages/" .. tostring(messageId) .. query(false), edit)
+					end
+					if code >= 200 and code < 300 then
+						Card.status = "Live"
+						Card.updatedAt = os.clock()
+						return
+					end
+					if code ~= 404 then
+						Card.status = "Discord refused it (" .. tostring(code) .. ")"
+						return
+					end
+					Card.saved[hookId] = nil
+					saveIds()
+				end
+				local code, body = cardRequest("POST", base .. query(true), payload)
+				if code == 400 and payload.components then
+					payload.components = nil
+					code, body = cardRequest("POST", base .. query(true), payload)
+				end
+				if code >= 200 and code < 300 then
+					local ok, data = pcall(function()
+						return HttpService:JSONDecode(body)
+					end)
+					if ok and type(data) == "table" and data.id then
+						Card.saved[hookId] = tostring(data.id)
+						saveIds()
+					end
+					Card.status = "Live"
+					Card.updatedAt = os.clock()
+				else
+					Card.status = "Discord refused it (" .. tostring(code) .. ")"
+				end
+			end
+
+			Auto.refreshCard = function(forceNew)
+				if not (S.webhookOn and validWebhook(S.webhookUrl)) then
+					queueToast("Profile Card", "Turn on Discord posts and add a webhook URL first")
+					return
+				end
+				Card.force = true
+				Card.forceNew = forceNew == true
+				queueToast("Profile Card", if forceNew then "Posting a new card..." else "Refreshing the card...")
+			end
+
+			task.spawn(function()
+				while alive() do
+					task.wait(1)
+					local ok, err = pcall(function()
+						local now = os.clock()
+						local ready = S.webhookOn and validWebhook(S.webhookUrl)
+						if not ready then
+							Card.status = if S.profileOn then "Turn on Discord posts" else "Off"
+						elseif (S.profileOn or Card.force) and not Card.busy and (Card.force or now >= Card.nextAt) then
+							local forceNew = Card.forceNew
+							Card.force, Card.forceNew = false, false
+							Card.busy = true
+							Card.nextAt = now + (S.profileEvery or 300)
+							Card.status = "Updating"
+							task.spawn(function()
+								local okSend, errSend = pcall(sendCard, forceNew)
+								if not okSend then
+									Card.status = "Error"
+									diag("profile card", errSend)
+								end
+								Card.busy = false
+							end)
+						elseif not S.profileOn and not Card.busy and Card.status ~= "Live" then
+							Card.status = "Off"
+						end
+						local status = tostring(Card.status)
+						local value
+						if status == "Live" and Card.updatedAt then
+							value = string.format('<font color="%s">Live</font>  <font transparency="0.5">updated %s ago</font>', GREEN, Library:FormatDuration(math.max(1, now - Card.updatedAt)))
+						elseif status == "Off" then
+							value = '<font transparency="0.5">Off</font>'
+						else
+							value = string.format('<font color="%s">%s</font>', ORANGE, status)
+						end
+						setStat(UI.CardStateRow, nil, value)
+						setStat(UI.CardNextRow, nil, if S.profileOn and ready then formatClock(math.max(0, Card.nextAt - now)) else '<font transparency="0.5">-</font>')
+						local code = Hook.lastCode
+						if code and Hook.lastAt then
+							local ago = Library:FormatDuration(math.max(1, now - Hook.lastAt))
+							setStat(UI.HookLastRow, nil, if code >= 200 and code < 300 then string.format('<font color="%s">OK</font>  <font transparency="0.5">%s ago</font>', GREEN, ago) else string.format('<font color="%s">Error %d</font>  <font transparency="0.5">%s ago</font>', ORANGE, code, ago))
+						end
+					end)
+					if not ok then
+						diag("profile card", err)
+					end
+				end
+			end)
+		end
+		Auto.setupProfileCard()
 
 		Auto.Mover = Mover
 		Auto.Hunter = Hunter
@@ -38292,6 +40535,11 @@ local function hatchStep()
 	local eggName = huntEgg or (if S.autoHatch then S.hatchEggName else nil)
 	if not (eggName and EggHatch) then
 		HatchState.status = "Off"
+		return
+	end
+	if S.autoFish and S.fishPriority == "Fishing first" then
+		HatchState.status = "Paused for fishing"
+		HatchState.waiting = false
 		return
 	end
 	if Auto.Mover.busy then
@@ -38319,11 +40567,13 @@ local function hatchStep()
 		local far = reason == "Egg not in this world" or string.find(reason, "Too far", 1, true) ~= nil
 		if far and huntEgg then
 			Auto.Hunter.needMove = true
+			HatchState.activeAt = os.clock()
 		elseif far and S.eggAutoTravel and Auto.EggTravel then
 			if S.autoUfo and Auto.Ufo and Auto.Ufo.engaged then
 				HatchState.status = "Paused for the UFO"
 			else
 				Auto.EggTravel.need = eggName
+				HatchState.activeAt = os.clock()
 			end
 		end
 		return
@@ -38344,6 +40594,17 @@ local function hatchStep()
 	if not mode then
 		HatchState.status = count or "Waiting"
 		HatchState.waiting = false
+		return
+	end
+	HatchState.activeAt = os.clock()
+	if Auto.Fish and Auto.Fish.active then
+		HatchState.waiting = false
+		if S.autoFish then
+			Auto.Fish.stopFor = "Eggs"
+			HatchState.status = "Stopping fishing"
+		else
+			HatchState.status = "You are fishing"
+		end
 		return
 	end
 	HatchState.lastFire = now
@@ -38422,7 +40683,10 @@ local function collectEggs()
 	if S.hatchEggName ~= "" then
 		eggs.price, eggs.free = getEggPrice(S.hatchEggName)
 		eggs.visual = getEggVisual(S.hatchEggName)
+		eggs.currency = Auto.eggCurrency(S.hatchEggName)
+		eggs.event = Auto.eggEvent(S.hatchEggName)
 	end
+	eggs.combo = Auto.eggCombo()
 	Snap.eggs = eggs
 end
 
@@ -38525,6 +40789,9 @@ task.spawn(function()
 				safe(Auto.collectHunt, "hunt")
 				safe(Auto.collectQuests, "quests")
 				safe(Auto.collectRound, "round")
+				if Auto.collectFishing then
+					safe(Auto.collectFishing, "fishing")
+				end
 			end
 		end
 	end
@@ -38581,10 +40848,27 @@ local function drawEggs()
 	if not eggs then return end
 	if eggs.name ~= "" then
 		setStat(SelectedEggRow, eggs.name, eggs.mode, eggs.visual or GameIcons.Egg)
-		setStat(EggPriceRow, nil, if eggs.free then '<font color="#60d696">FREE</font>' elseif eggs.price then formatNumber(eggs.price) else "?")
+		local priceLabel = "Price"
+		if eggs.event and eggs.event.left and eggs.event.left > 0 then
+			priceLabel = 'Price  <font transparency="0.5">event ends in ' .. Library:FormatDuration(eggs.event.left) .. "</font>"
+		end
+		setStat(EggPriceRow, priceLabel, if eggs.free then '<font color="#60d696">FREE</font>' elseif eggs.price then formatNumber(eggs.price) else "?", CurrencyIcons[eggs.currency or "Coins"] or CurrencyIcons.Coins)
 	else
 		setStat(SelectedEggRow, "No egg selected", "", GameIcons.Egg)
-		setStat(EggPriceRow, nil, "?")
+		setStat(EggPriceRow, "Price", "?", CurrencyIcons.Coins)
+	end
+	local combo = eggs.combo
+	if combo and combo.owned then
+		local percent = string.gsub(string.format("%.2f", combo.bonus * 100), "%.?0+$", "")
+		setStat(UI.EggComboRow, string.format('Egg Luck Combo  <font transparency="0.5">%d/%d</font>', combo.level, combo.max), string.format('<font color="#60d696">+%s%%</font>', percent))
+		local key = math.floor(combo.level / combo.max * 400 + 0.5)
+		if UI.eggComboKey ~= key and pcall(UI.EggComboRow.SetProgress, UI.EggComboRow, combo.level / combo.max) then
+			UI.eggComboKey = key
+		end
+	elseif combo then
+		setStat(UI.EggComboRow, "Egg Luck Combo", '<font transparency="0.5">needs the special upgrade</font>')
+	else
+		setStat(UI.EggComboRow, "Egg Luck Combo", '<font transparency="0.5">-</font>')
 	end
 	local status = eggs.status or "Off"
 	if status == "Off" then
@@ -38952,7 +41236,14 @@ do
 					setStat(UI.UfoHpRow, nil, dim("-"))
 					setProgress(UI.UfoHpRow, 0)
 				end
-				setStat(UI.UfoHitsRow, nil, string.format("%s / %s", formatNumber(Saved.ufoHits), formatNumber(Saved.ufoBroken)))
+				setStat(UI.UfoHitsRow, nil, string.format("%s / %s", formatNumber(Saved.ufoBroken), formatNumber(tonumber(Saved.ufoWon) or 0)))
+				if ufo.active and ufo.rank then
+					setStat(UI.UfoRankRow, nil, colored(if ufo.rank == 1 then GREEN else ORANGE, "#" .. ufo.rank) .. "  " .. formatNumber(ufo.myDmg or 0))
+				elseif ufo.active and ufo.helped then
+					setStat(UI.UfoRankRow, nil, dim("not in the top 3") .. (if ufo.topDmg and ufo.topDmg > 0 then "  " .. dim("#1 has " .. formatNumber(ufo.topDmg)) else ""))
+				else
+					setStat(UI.UfoRankRow, nil, dim("-"))
+				end
 			end
 
 			local worlds = Snap.worlds
@@ -39028,6 +41319,7 @@ do
 			end
 			setStat(UI.HookSentRow, nil, formatNumber(Saved.webhooksSent))
 			setStat(UI.UfoStatRow, nil, formatNumber(Saved.ufoBroken))
+			setStat(UI.UfoWonStatRow, nil, string.format("%s / %s", formatNumber(tonumber(Saved.ufoWon) or 0), formatNumber(tonumber(Saved.ufoTop3) or 0)))
 			setStat(UI.UpgradeStatRow, nil, formatNumber(Saved.upgradesBought))
 			setStat(UI.WorldStatRow, nil, formatNumber(Saved.worldsBought))
 			setStat(UI.TreeStatRow, nil, formatNumber(Saved.treeBought))
@@ -39207,6 +41499,7 @@ task.spawn(function()
 			pcall(Auto.drawAnalytics, false)
 			pcall(Auto.drawLive, false)
 			pcall(Auto.drawUpdate2)
+			pcall(Auto.drawFishing)
 		end
 		pcall(drawQueues)
 	end
@@ -39243,6 +41536,18 @@ Library:AddCommand({
 })
 
 Library:AddCommand({
+	Name = "fish",
+	Aliases = { "fishing" },
+	Args = "[on/off]",
+	Description = "Starts or stops Auto Fish",
+	Callback = function(Args)
+		local State = if Args[1] then Args[1] == "on" else not Toggles.AutoFish.Value
+		Toggles.AutoFish:SetValue(State)
+		return "Auto Fish " .. (if State then "on" else "off")
+	end,
+})
+
+Library:AddCommand({
 	Name = "tap",
 	Args = "[on/off]",
 	Description = "Turns Auto Tap on or off",
@@ -39269,6 +41574,12 @@ Library:OnUnload(function()
 	saveStats(true)
 	if SetAutoBreaking and S.autoFarm then
 		pcall(function() SetAutoBreaking:FireServer(false) end)
+	end
+	if Auto.Fish and Auto.Fish.active and Auto.Fish.own then
+		local remote = Auto.knitRemote("FishingService", "RF", "StopFishing")
+		if remote then
+			task.spawn(Auto.invokeTimeout, remote, 5)
+		end
 	end
 end)
 
@@ -39479,6 +41790,7 @@ if Library.SetQuickBar then
 		{ Toggle = "AutoHatch", Icon = "egg", Label = "Eggs" },
 		{ Toggle = "AutoUfo", Icon = "rocket", Label = "UFO" },
 		{ Toggle = "IndexHunter", Icon = "book-open", Label = "Hunt" },
+		{ Toggle = "AutoFish", Icon = "fish", Label = "Fish", Default = false },
 		{ Toggle = "AutoLucky", Icon = "package-open", Label = "Lucky", Default = false },
 		{ Toggle = "AutoQuests", Icon = "gift", Label = "Quests", Default = false },
 		{ Toggle = "AutoFruitMachine", Icon = "apple", Label = "Fruit", Default = false },
@@ -39627,6 +41939,130 @@ do
 			setStat(UI.ItemCraftDoneRow, nil, formatNumber(tonumber(Saved.itemsCrafted) or 0))
 		end
 	end
+
+	local function trimmed(value, digits)
+		return (string.gsub(string.format("%." .. digits .. "f", tonumber(value) or 0), "%.?0+$", ""))
+	end
+
+	local function statusColor(status, good)
+		status = tostring(status or "Off")
+		if status == "Off" or status == "Waiting" or status == "Nothing to open" or status == "Nothing to do" then
+			return faint(status)
+		end
+		if good[status] or string.find(status, "Buying", 1, true) or string.find(status, "Opening", 1, true) or string.find(status, "Selling", 1, true) then
+			return paint(GOOD, status)
+		end
+		if string.find(status, "failed", 1, true) or string.find(status, "Unavailable", 1, true) then
+			return paint(BAD, status)
+		end
+		return paint(WARN, status)
+	end
+
+	function Auto.drawFishing()
+		setLabel(UI.FishSinceLabel, '<font transparency="0.45">Counting for</font> ' .. Library:FormatDuration(os.time() - (tonumber(Saved.fishSince) or os.time())))
+		setStat(UI.FishCaughtStatRow, nil, formatNumber(tonumber(Saved.fishCaught) or 0))
+		setStat(UI.FishRareStatRow, nil, formatNumber(tonumber(Saved.fishRare) or 0))
+		setStat(UI.FishSoldStatRow, nil, formatNumber(tonumber(Saved.fishSold) or 0))
+		setStat(UI.TokensStatRow, nil, formatNumber(tonumber(Saved.tokensEarned) or 0))
+		setStat(UI.MerchantStatRow, nil, formatNumber(tonumber(Saved.merchantBought) or 0))
+		setStat(UI.FishTreeStatRow, nil, formatNumber(tonumber(Saved.fishTreeBought) or 0))
+		setStat(UI.InvEggStatRow, nil, formatNumber(tonumber(Saved.invEggsOpened) or 0))
+
+		local fish = Snap.fish
+		if not fish then
+			return
+		end
+
+		setStat(UI.FishStateRow, nil, statusColor(fish.status, { Fishing = true, Casting = true }))
+		setStat(UI.FishSpotRow, nil, if fish.world then prettyWorld(fish.world) else faint("where you stand"))
+		if fish.active and fish.left then
+			setStat(UI.FishTimerRow, nil, trimmed(fish.left, 1) .. "s")
+			u2Progress(UI.FishTimerRow, if fish.duration and fish.duration > 0 then 1 - fish.left / fish.duration else 0)
+		else
+			setStat(UI.FishTimerRow, nil, faint("-"))
+			u2Progress(UI.FishTimerRow, 0)
+		end
+		setStat(UI.FishCatchRow, nil, formatNumber(fish.catches or 0) .. "  " .. faint("this session"))
+		local last = fish.last
+		if last and last.kind == "Pet" then
+			local mutation = if last.mutation then (Auto.mutationInfo(last.mutation)) else nil
+			local value = string.format('<font color="%s">%s</font>', RarityColors[last.rarity or "Basic"] or RarityColors.Basic, tostring(last.rarity or "Basic"))
+			setStat(UI.FishLastRow, (if mutation then mutation .. " " else "") .. last.name, value .. (if last.deleted then faint("  auto deleted") else ""), last.icon or "fish")
+		elseif last then
+			local merchant = Auto.GameData.merchant
+			local icon = Items.Icons[last.name] or (type(merchant) == "table" and type(merchant.ICONS) == "table" and merchant.ICONS[last.name]) or "fish"
+			setStat(UI.FishLastRow, UI.MerchantNames[last.name] or Auto.itemDisplayName(last.name), "x" .. formatNumber(last.amount or 1), icon)
+		end
+		setStat(UI.FishStreakRow, nil, formatNumber(fish.streak or 0) .. "  " .. faint(formatNumber(fish.taps or 0) .. " taps"))
+		if fish.luck or fish.speed then
+			setStat(UI.FishBoostRow, nil, string.format("x%s  /  x%s", trimmed(fish.luck or 1, 2), trimmed(fish.speed or 1, 2)))
+		end
+		setStat(UI.FishRodRow, nil, if fish.rod then (string.gsub(fish.rod, "(%l)(%u)", "%1 %2")) else faint("Basic rod"))
+
+		if fish.worm then
+			setStat(UI.WormRow, (UI.MerchantNames[fish.worm] or fish.worm) .. "  " .. faint(formatNumber(fish.wormCount or 0) .. " owned"), paint(GOOD, Library:FormatDuration(fish.wormLeft or 0)))
+		else
+			setStat(UI.WormRow, "Worm  " .. faint(formatNumber(fish.wormCount or 0) .. " owned"), faint("none active"))
+		end
+		local charges = (fish.golden or 0) + (fish.normal or 0)
+		setStat(UI.HookRow, (if (fish.golden or 0) > 0 then "Golden Fishhook" else "Fishhook") .. "  " .. faint(formatNumber(fish.hookCount or 0) .. " owned"), if charges > 0 then paint(GOOD, formatNumber(charges) .. " catches") else faint("none active"))
+
+		setStat(UI.TokensRow, nil, formatNumber(fish.tokens or 0))
+		setStat(UI.SellReadyRow, nil, if (fish.sellCount or 0) > 0 then formatNumber(fish.sellCount) .. " pets  " .. faint("+" .. formatNumber(fish.sellValue or 0)) else faint("nothing"))
+		if fish.restock then
+			setStat(UI.RestockRow, nil, Auto.formatClock(fish.restock))
+			u2Progress(UI.RestockRow, 1 - fish.restock / math.max(1, fish.restockTotal or 1800))
+		end
+		setStat(UI.MerchantStateRow, nil, statusColor(fish.merchant, { Done = true, ["Going to the Merchant"] = true, ["Visiting the Merchant"] = true }))
+
+		local tree = fish.tree
+		if tree and tree.available then
+			setStat(UI.FishTreeOwnedRow, nil, string.format("%d / %d", tree.owned, tree.total))
+			u2Progress(UI.FishTreeOwnedRow, if tree.total > 0 then tree.owned / tree.total else 0)
+			if tree.next and tree.cost then
+				setStat(UI.FishTreeNextRow, tree.title, if tree.affordable then formatNumber(tree.cost) else paint(BAD, formatNumber(tree.cost)), tree.image or UI.TokenIcon)
+			else
+				setStat(UI.FishTreeNextRow, "Next", if tree.allDone and tree.anyPicked then paint(GOOD, "Done") else faint("-"), UI.TokenIcon)
+			end
+		else
+			setStat(UI.FishTreeOwnedRow, nil, faint("-"))
+		end
+		setStat(UI.FishTreeStateRow, nil, statusColor(tree and tree.status, { ["All done"] = true, ["Going to buy"] = true }))
+
+		local inv = fish.inv
+		if inv then
+			setStat(UI.InvEggOwnedRow, nil, formatNumber(inv.owned or 0))
+			setStat(UI.InvEggStateRow, nil, statusColor(inv.status, {}))
+			local changed = false
+			for _, name in ipairs(inv.names or {}) do
+				if not table.find(UI.InvEggNames, name) then
+					table.insert(UI.InvEggNames, name)
+					changed = true
+				end
+			end
+			if changed and Options.InvEggKeep then
+				table.sort(UI.InvEggNames)
+				pcall(Options.InvEggKeep.SetValues, Options.InvEggKeep, UI.InvEggNames)
+			end
+		end
+
+		local moon = fish.moonAuto
+		if moon then
+			local value
+			if moon.on then
+				value = paint(GOOD, "On")
+			elseif not moon.owned then
+				value = faint("needs Auto Buy Upgrades")
+			elseif moon.status then
+				value = paint(WARN, tostring(moon.status))
+			elseif S.moonGameAuto then
+				value = faint("switching on")
+			else
+				value = faint("Off")
+			end
+			setStat(UI.MoonAutoRow, nil, value)
+		end
+	end
 end
 
 function Auto.drawLive(force)
@@ -39735,6 +42171,7 @@ function Auto.applyWizard(values)
 		worlds = { "AutoBuyWorlds" },
 		ufo = { "AutoUfo" },
 		equip = { "AutoEquipBest" },
+		fish = { "AutoFish" },
 	}
 	if tasks.hatch and type(values.egg) == "string" and Options.HatchEgg then
 		pcall(Options.HatchEgg.SetValue, Options.HatchEgg, values.egg)
@@ -39756,25 +42193,22 @@ function Auto.applyWizard(values)
 	if values.device == "phone" then
 		set("CorvusAntiLagLevel", "Balanced")
 		set("CorvusAntiLag", true)
-		set("CorvusAdaptiveLag", true)
 		set("SkipHatchAnim", true)
 	elseif values.device == "afk" then
 		set("CorvusAntiLagLevel", "Ultra")
 		set("CorvusAntiLag", true)
-		set("CorvusAdaptiveLag", true)
 		set("SkipHatchAnim", true)
 		set("CorvusAntiAFK", true)
+		set("StopAfkRejoin", true)
 		set("CorvusAutoReconnect", true)
 		set("KeepOnTeleport", true)
-	else
-		set("CorvusAdaptiveLag", true)
 	end
 	Saved.setupDone = true
 	SaveDirty = true
 	saveStats(true)
-	local labels = { farm = "Farm", hatch = "Eggs", index = "Index", rewards = "Rewards", upgrades = "Upgrades", worlds = "Worlds", ufo = "UFO", equip = "Best pets" }
+	local labels = { farm = "Farm", hatch = "Eggs", index = "Index", rewards = "Rewards", upgrades = "Upgrades", worlds = "Worlds", ufo = "UFO", equip = "Best pets", fish = "Fishing" }
 	local picked = {}
-	for _, key in ipairs({ "farm", "hatch", "index", "rewards", "upgrades", "worlds", "ufo", "equip" }) do
+	for _, key in ipairs({ "farm", "hatch", "index", "rewards", "upgrades", "worlds", "ufo", "equip", "fish" }) do
 		if tasks[key] then
 			table.insert(picked, labels[key])
 		end
@@ -39793,7 +42227,7 @@ function Auto.openWizard()
 		table.insert(eggChoices, {
 			Id = name,
 			Title = name,
-			Description = if free then "Free right now" elseif price then formatNumber(price) .. " coins each" else "Price unknown",
+			Description = if free then "Free right now" elseif price then formatNumber(price) .. " " .. string.lower(known and known.currency or "Coins") .. " each" else "Price unknown",
 			Icon = visuals[name] or GameIcons.Egg,
 			Color = "#3ccf91",
 		})
@@ -39819,6 +42253,7 @@ function Auto.openWizard()
 					{ Id = "worlds", Title = "Unlock worlds", Description = "Buys the next world when you have the coins", Icon = "globe", Color = "#7dffb3" },
 					{ Id = "ufo", Title = "UFO event", Description = "Joins every UFO and helps break it", Icon = "rocket", Color = "#e66767" },
 					{ Id = "equip", Title = "Equip best pets", Description = "Keeps your strongest team on", Icon = "paw-print", Color = "#ffb84d" },
+					{ Id = "fish", Title = "Go fishing", Description = "Casts, taps and catches fish for tokens", Icon = "fish", Color = "#8fe9ff" },
 				},
 			},
 			{
@@ -39834,12 +42269,12 @@ function Auto.openWizard()
 			{
 				Id = "device",
 				Title = "How does your game run?",
-				Description = "Corvus tunes performance for you. Adaptive anti lag stays ready either way.",
+				Description = "Corvus tunes performance for you. Nothing ever kicks you for low FPS.",
 				Default = if Library.IsMobile then "phone" else "smooth",
 				SingleColumn = true,
 				ChoiceHeight = 54,
 				Choices = {
-					{ Id = "smooth", Title = "Runs smooth", Description = "Keep the game as it is. Anti lag steps in only if FPS drops.", Icon = "monitor", Color = "#60d696" },
+					{ Id = "smooth", Title = "Runs smooth", Description = "Keep the game exactly as it is", Icon = "monitor", Color = "#60d696" },
 					{ Id = "phone", Title = "Phone or weak PC", Description = "Anti lag on and the hatch cutscene skipped", Icon = "smartphone", Color = "#ffb84d" },
 					{ Id = "afk", Title = "AFK for hours", Description = "Ultra anti lag, anti AFK, auto reconnect, keeps running after teleports", Icon = "moon", Color = "#9085e9" },
 				},
@@ -39874,7 +42309,7 @@ UI.DonateMethods = {
 	{ Id = "SOL", Icon = "pay-sol", Symbol = "SOL", Name = "Solana", Network = "Solana", Address = "4UriDCT4iBsLAuzLdowpSEL4mZq7Ecrxs4pNrV5ztHxW", Color = "#9945ff", Note = "Only send SOL or Solana tokens" },
 	{ Id = "BNB", Icon = "pay-bnb", Symbol = "BNB", Name = "BNB", Network = "BNB Smart Chain", Address = "0xBa0e07FdDB15fe3c9B7CE42F76cef8F09FEdAB64", Color = "#f0b90b", Note = "Only send on BNB Smart Chain (BEP20)" },
 }
-for _, tab in ipairs({ Tabs.Info, Tabs.Farm, Tabs.Rewards, Tabs.Eggs, Tabs.Items, Tabs.Upgrades, Tabs.Stats, Tabs.Analytics, Tabs.Misc, Tabs.Settings }) do
+for _, tab in ipairs({ Tabs.Info, Tabs.Farm, Tabs.Rewards, Tabs.Eggs, Tabs.Fishing, Tabs.Items, Tabs.Upgrades, Tabs.Stats, Tabs.Analytics, Tabs.Webhook, Tabs.Misc, Tabs.Settings }) do
 	pcall(function()
 		local left = tab == Tabs.Info and tab.Groupboxes.Community or nil
 		if left then
