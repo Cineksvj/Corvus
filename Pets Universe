@@ -30160,7 +30160,7 @@ local S = {
 	tokenReserve = 0,
 	autoFishTree = false,
 	fishTreePick = {},
-	fishTreeOrder = "Cheapest first",
+	fishTreeOrder = "Best value",
 	autoInvEggs = false,
 	invEggKeep = {},
 	moonGameAuto = false,
@@ -31318,7 +31318,9 @@ function Auto.eggEvent(name)
 	local okWorld, world, display = pcall(config.GetRequiredWorld, name)
 	if okWorld and type(world) == "string" then
 		info.world = tostring(display or world)
-		local okMet, met = pcall(config.IsWorldRequirementMet, LocalPlayer, name)
+		local folder = getDataFolder("WorldsData")
+		local flag = folder and folder:FindFirstChild(if world == "Haunted" then "HauntedHouse" else world)
+		local okMet, met = pcall(function() return flag and flag.Value end)
 		info.locked = okMet and met == false
 	end
 	return info
@@ -32536,6 +32538,9 @@ local EggWorlds = {
 	["Castle Egg"] = "PetKingdom",
 	["Mushroom Egg"] = "EnchantedGrove",
 	["Volcano Egg"] = "VolcanoHollow",
+	["Ruby Egg"] = "Spawn",
+	["Ruby Egg x2Luck"] = "VolcanoHollow",
+	["Ruby Egg x5Luck"] = "VolcanoHollow",
 }
 pcall(function()
 	local worlds = require(ReplicatedStorage.Modules:WaitForChild("EggWorldModule", 3))
@@ -32590,6 +32595,20 @@ local function getWorldAt(pos)
 		end
 	end
 	return nil
+end
+
+function Auto.eggWorld(name)
+	if EggWorlds[name] then
+		return EggWorlds[name]
+	end
+	local config = Auto.eventEggConfig()
+	local entry = type(config) == "table" and type(config.Eggs) == "table" and config.Eggs[name] or nil
+	if type(entry) == "table" and type(entry.RequiredWorld) == "string" then
+		return entry.RequiredWorld
+	end
+	local model = getEggModel(name)
+	local ok, world = pcall(function() return model and getWorldAt(model:GetPivot().Position) end)
+	return ok and world or "Spawn"
 end
 
 local function prettyWorld(key)
@@ -33544,10 +33563,11 @@ UI.FishTreeBox:AddDropdown("FishTreePick", {
 })
 UI.FishTreeBox:AddDropdown("FishTreeOrder", {
 	Text = "Order",
-	Values = { "Cheapest first", "Tree order" },
-	Default = "Cheapest first",
+	Values = { "Best value", "Cheapest first", "Tree order" },
+	Default = "Best value",
+	Tooltip = "Best value: buys what gives the most boost per token you can afford right now, and counts the branches a node opens.\nCheapest first: always the cheapest open node.\nTree order: follows the tree from top to bottom.",
 	Callback = function(v)
-		S.fishTreeOrder = tostring(v or "Cheapest first")
+		S.fishTreeOrder = tostring(v or "Best value")
 	end,
 })
 UI.FishTreeOwnedRow = UI.FishTreeBox:AddStat({ Icon = "git-branch", Text = "Nodes owned", Value = "...", Size = 24, Progress = 0 })
@@ -34226,7 +34246,7 @@ do
 
 		local function moveToEgg(name)
 			if name == "" then return false, "Select an egg first" end
-			local world = EggWorlds[name] or "Spawn"
+			local world = Auto.eggWorld(name)
 			local ok, err = travelTo(world)
 			if not ok then return false, err end
 			local model
@@ -38965,7 +38985,7 @@ do
 					return "Index Hunter"
 				end
 				if S.autoHatch and S.eggAutoTravel and S.hatchEggName ~= "" then
-					local eggWorld = EggWorlds[S.hatchEggName] or "Spawn"
+					local eggWorld = Auto.eggWorld(S.hatchEggName)
 					if eggWorld ~= target then
 						return "Hatching in " .. prettyWorld(eggWorld)
 					end
@@ -39119,6 +39139,21 @@ do
 			Auto.Fish = Fish
 			local Merchant = { lastTrip = -1e9, blockedUntil = -1e9, status = "Off", wantAt = -1e9, want = false, sellAt = -1e9, sell = nil }
 			local FishTree = { status = "Off", blocked = {}, last = nil }
+			FishTree.weights = { FishSpeed = 100, FishLuck = 100, TapPower = 30, TapMaxFraction = 60, GoldenCatch = 400, DoubleCatch = 150, TripleCatch = 300, ExtraItem = 25, TokenCatch = 250, TokenPouch = 3, FishRubies = 20, HookSave = 30, HookLuck = 25, WormLuck = 25, MaxEggOpenAdd = 600, MaxEquipAdd = 700 }
+			FishTree.value = function(node)
+				local total = 0
+				for _, effect in ipairs(if type(node.effects) == "table" then node.effects else { node.effect }) do
+					if type(effect) == "table" then
+						local kind, amount = tostring(effect.Type), tonumber(effect.Value) or 0
+						if FishTree.weights[kind] then
+							total += FishTree.weights[kind] * amount
+						elseif string.sub(kind, 1, 6) == "Unlock" then
+							total += if string.find(kind, "Pizza", 1, true) then 60 else 25
+						end
+					end
+				end
+				return if total > 0 then total else 5
+			end
 			local Inv = { lastFire = -1e9, status = "Off", waiting = false }
 			local MoonAuto = { lastTry = -1e9, status = nil }
 			local WormRank = { Worm = 1, Worm1 = 2, Worm2 = 3, UniverseWorm = 4 }
@@ -39635,7 +39670,8 @@ do
 				local balance = tokenBalance()
 				local spend = balance - (S.tokenReserve or 0)
 				info.balance = balance
-				local best, bestCost, bestIndex = nil, nil, nil
+				local best, bestCost, bestIndex, bestKey, bestCan = nil, nil, nil, nil, nil
+				local smart = S.fishTreeOrder == "Best value"
 				local now = os.clock()
 				for index, group in ipairs(tree.Groups) do
 					if group.parent then
@@ -39651,14 +39687,25 @@ do
 							local node = group.levels[level + 1]
 							if (parentDone or level > 0) and node and (FishTree.blocked[group.id] or 0) < now then
 								local cost = tonumber(node.cost) or 0
-								local better
+								local better, key, can = nil, cost, spend >= cost
 								if S.fishTreeOrder == "Tree order" then
 									better = best == nil or index < bestIndex
+								elseif smart then
+									local value = FishTree.value(node)
+									if level + 1 == maxLevel then
+										for _, child in ipairs(tree.Groups) do
+											if child.parent == group.id and S.fishTreePick[child.id] and child.levels[1] and (levels[child.id] or 0) == 0 then
+												value += 0.5 * FishTree.value(child.levels[1])
+											end
+										end
+									end
+									key = -value / math.max(cost, 1)
+									better = best == nil or (can and not bestCan) or (can == bestCan and key < bestKey)
 								else
 									better = best == nil or cost < bestCost
 								end
 								if better then
-									best, bestCost, bestIndex = { group = group, node = node }, cost, index
+									best, bestCost, bestIndex, bestKey, bestCan = { group = group, node = node }, cost, index, key, can
 								end
 							end
 						elseif S.fishTreePick[group.id] then
