@@ -25529,7 +25529,11 @@ function Library:CreateWindow(WindowInfo)
                         pcall(queue_on_teleport, Info.RejoinScript)
                     end
                     pcall(function()
-                        game:GetService("TeleportService"):Teleport(game.PlaceId, LocalPlayer)
+                        if Reconnect.Attempts <= 3 and game.JobId ~= "" then
+                            game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+                        else
+                            game:GetService("TeleportService"):Teleport(game.PlaceId, LocalPlayer)
+                        end
                     end)
                     task.wait(8)
                 end
@@ -25540,6 +25544,7 @@ function Library:CreateWindow(WindowInfo)
         ConnectionBox:AddToggle("CorvusAutoReconnect", {
             Text = "Auto reconnect",
             Description = "Rejoins by itself after a kick or disconnect",
+            Tooltip = "Tries the same server first, so all your accounts end up together again. If that server is gone, it joins a new one.",
             Default = false,
             Callback = function(Value)
                 Reconnect.Enabled = Value
@@ -26388,6 +26393,10 @@ function Library:CreateWindow(WindowInfo)
 
                     task.wait(3)
                     pcall(function()
+                        game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+                    end)
+                    task.wait(10)
+                    pcall(function()
                         game:GetService("TeleportService"):Teleport(game.PlaceId, LocalPlayer)
                     end)
                 end))
@@ -26449,6 +26458,7 @@ function Library:CreateWindow(WindowInfo)
                 "CorvusConfigName",
                 "CorvusConfigList",
                 "CorvusShareCode",
+                "CorvusAutoSave",
             })
             SaveManager:SetFolder(Folder)
             if Info.SubFolder then
@@ -26579,6 +26589,47 @@ function Library:CreateWindow(WindowInfo)
 
             AutoloadLabel = Configs:AddLabel('<font transparency="0.5">Autoload</font>   none')
             RefreshConfigs()
+
+            local AutoSaveFile = tostring(SaveManager.Folder or Folder) .. "/corvus_autosave.txt"
+            local AutoSaveOn = true
+            pcall(function()
+                if isfile(AutoSaveFile) then
+                    AutoSaveOn = readfile(AutoSaveFile) ~= "off"
+                end
+            end)
+            local function AutoSaveNow()
+                if not AutoSaveOn then
+                    return
+                end
+                local Target = "none"
+                pcall(function()
+                    Target = SaveManager:GetAutoloadConfig()
+                end)
+                if typeof(Target) ~= "string" or Target == "" or Target == "none" then
+                    Target = "Auto Save"
+                    pcall(SaveManager.SaveAutoloadConfig, SaveManager, Target)
+                    pcall(RefreshConfigs, ConfigList.Value)
+                end
+                pcall(SaveManager.Save, SaveManager, Target)
+            end
+            Configs:AddToggle("CorvusAutoSave", {
+                Text = "Auto save config",
+                Description = "Your settings load again next time",
+                Tooltip = "Saves your settings every 30 seconds and when the hub closes. It saves into your autoload config, or makes one called Auto Save, so the same setup loads when you come back.",
+                Default = AutoSaveOn,
+                Callback = function(Value)
+                    AutoSaveOn = Value == true
+                    pcall(writefile, AutoSaveFile, if AutoSaveOn then "on" else "off")
+                end,
+            })
+            task.spawn(function()
+                task.wait(15)
+                while not Library.Unloaded do
+                    AutoSaveNow()
+                    task.wait(30)
+                end
+            end)
+            Library:OnUnload(AutoSaveNow)
 
             Configs:AddDivider()
             Configs:AddInput("CorvusShareCode", {
@@ -42393,7 +42444,7 @@ task.spawn(function()
 		return
 	end
 	local ok, autoload = pcall(SaveManager.GetAutoloadConfig, SaveManager)
-	if ok and type(autoload) == "string" and autoload ~= "" and autoload ~= "none" then
+	if ok and type(autoload) == "string" and autoload ~= "" and autoload ~= "none" and autoload ~= "Auto Save" then
 		return
 	end
 	local waited = 0
