@@ -27401,6 +27401,7 @@ N.WeatherData = N.tableOr(safeRequire("GameData.Weather"))
 N.PetAging = N.tableOr(safeRequire("GameServices.PetAging"))
 N.DayNight = N.tableOr(safeRequire("GameServices.DayNight"))
 N.EggCycle = N.tableOr(safeRequire("GameServices.EggCycle"))
+N.VolcanoScale = N.tableOr(safeRequire("GameServices.VolcanoScale"))
 end
 local formatNumber, parseAmount, clockText, character, rootPart, humanoid, allows, selected, on, optionNumber, optionText, count
 local serverNow, flat, Status, setStatus
@@ -28518,7 +28519,7 @@ root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
 root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
 end)
 end
-N.Moves = { snaps = 0, pushes = 0, last = nil }
+N.Moves = { snaps = 0, pushes = 0, blocked = 0, last = nil }
 local function facing(root, from, to)
 local dir = Vector3.new(to.X - from.X, 0, to.Z - from.Z)
 if dir.Magnitude > 0.5 then
@@ -28602,6 +28603,13 @@ if attr and attr > 0 then
 speed = math.min(speed, attr)
 end
 end
+local inside = N.playerAttr("InVolcano") == true
+if inside or N.playerAttr("VolcanoApproach") == true then
+speed *= tonumber(N.VolcanoScale.InsideMultiplier) or 0.75
+end
+if inside and N.isRiding() then
+speed = math.min(speed, tonumber(N.VolcanoScale.RideSpeedCap) or 120)
+end
 return math.max(speed, 16) * math.clamp(optionNumber("SafePercent", 95), 50, 100) / 100
 end
 function N.modeSpeed(mode)
@@ -28632,6 +28640,8 @@ local function glideTo(target, speedFn, keepGoing)
 N.Moves.last = nil
 local last = os.clock()
 local expected
+local startRoot = rootPart()
+local checkAt, checkDistance = os.clock(), startRoot and (target - startRoot.Position).Magnitude or 0
 while alive() do
 local root = rootPart()
 if not root then
@@ -28665,6 +28675,14 @@ local offset = target - root.Position
 local distance = offset.Magnitude
 if distance <= 0.05 then
 break
+end
+if now - checkAt >= 0.75 then
+if checkDistance - distance < math.max(1, math.min(speedFn(), 1000) * (now - checkAt) * 0.2) then
+N.Moves.blocked += 1
+log("MOVE blocked", math.floor(distance) .. " studs left", brief(root.Position), "->", brief(target))
+return false, "blocked"
+end
+checkAt, checkDistance = now, distance
 end
 local step = math.min(distance, speedFn() * dt)
 local nextPos = root.Position + offset.Unit * step
@@ -28718,12 +28736,7 @@ end, 45)
 if cruise <= math.max(from.Y, to.Y) + 2 then
 return { to }
 end
-local dir = Vector3.new(to.X - from.X, 0, to.Z - from.Z).Unit
-local climb = math.min(distance * 0.3, math.max(cruise - from.Y, 0))
-local drop = math.min(distance * 0.3, math.max(cruise - to.Y, 0))
-local up = Vector3.new(from.X, cruise, from.Z) + dir * climb
-local down = Vector3.new(to.X, cruise, to.Z) - dir * drop
-return { up, down, to }
+return { Vector3.new(from.X, cruise, from.Z), Vector3.new(to.X, cruise, to.Z), to }
 end
 local function pathLength(from, to)
 local distance = flat(from, to)
@@ -28776,8 +28789,21 @@ return N.modeSpeed(mode)
 end
 Noclip.travel = on("TravelNoclip") or optionText("TravelPath", "Over terrain") == "Straight line"
 local ok = true
-for _, point in ipairs(planPath(root.Position, target)) do
-if not glideTo(point, speedFn, opts.keepGoing) then
+local path = planPath(root.Position, target)
+for index, point in ipairs(path) do
+local done, why = glideTo(point, speedFn, opts.keepGoing)
+if not done and why == "blocked" then
+if N.isRiding() then
+log("MOVE the ride stops at walls, getting off to noclip through")
+N.dismount()
+end
+Noclip.travel = true
+done = glideTo(point, speedFn, opts.keepGoing)
+if done and index < #path and not N.isRiding() and on("RideOnTrips") then
+N.mount()
+end
+end
+if not done then
 ok = false
 break
 end
@@ -29247,6 +29273,10 @@ for _, child in ipairs(N.basketItems()) do
 table.insert(names, tostring(child:GetAttribute("Egg") or child.Name))
 end
 setStatus("Bringing " .. table.concat(names, ", ") .. " home")
+if mode ~= "Blatant" and N.playerAttr("InVolcano") == true then
+N.leaveVolcano()
+root = rootPart() or root
+end
 if not N.onPlot(root.Position, -2) then
 N.travelTo(home, {
 mode = mode,
@@ -29287,12 +29317,60 @@ end
 return done
 end
 function N.volcanoTop()
-for _, part in ipairs(CollectionService:GetTagged(tostring(N.VolcanoData.Tag or "VolcanoTop"))) do
-if part:IsA("BasePart") and part:IsDescendantOf(workspace) then
-return part
-end
-end
+local serverData = ReplicatedStorage:FindFirstChild("ServerData")
+if serverData and serverData:GetAttribute("VolcanoRevealed") == false then
 return nil
+end
+local best
+for _, part in ipairs(CollectionService:GetTagged(tostring(N.VolcanoData.Tag or "VolcanoTop"))) do
+if part:IsA("BasePart") and part:IsDescendantOf(workspace) and part:FindFirstAncestor("Volcano_Hide") == nil then
+if not best or part.Size.Magnitude > best.Size.Magnitude then
+best = part
+end
+end
+end
+return best
+end
+function N.volcanoHover(top, height)
+return (top.CFrame * CFrame.new(0, top.Size.Y / 2 + height, 0)).Position
+end
+function N.overVolcano(top)
+local root = rootPart()
+if not (root and top) then
+return false
+end
+local ok, over = pcall(isolated, N.VolcanoData.IsOver, top, root.Position, 0)
+if ok and type(over) == "boolean" then
+return over
+end
+local point = top.CFrame:PointToObjectSpace(root.Position)
+local half = top.Size / 2
+return math.abs(point.X) <= half.X and math.abs(point.Z) <= half.Z and point.Y >= half.Y - 15 and point.Y <= half.Y + 250
+end
+function N.enterVolcano(keepGoing)
+if N.playerAttr("InVolcano") == true then
+return true
+end
+local top = N.volcanoTop()
+if not top then
+return false, "the volcano is hidden on this server"
+end
+setStatus("Flying into the volcano")
+N.travelTo(N.volcanoHover(top, 20), { keepGoing = keepGoing })
+return waitFor(function()
+return N.playerAttr("InVolcano") == true
+end, 4)
+end
+function N.leaveVolcano()
+if N.playerAttr("InVolcano") ~= true then
+return true
+end
+local top = N.volcanoTop()
+if not top then
+return false
+end
+setStatus("Leaving the volcano")
+return N.travelTo(N.volcanoHover(top, 40))
 end
 local Volcano = { result = nil, dips = 0, magma = 0 }
 N.onEvent("Net/VolcanoDipResult", function(data)
@@ -29336,7 +29414,7 @@ local home = homePos()
 if not child or not top or not root or not home then
 return false
 end
-local hover = (top.CFrame * CFrame.new(0, top.Size.Y / 2 + 35, 0)).Position
+local hover = N.volcanoHover(top, 35)
 local mode = N.moveMode()
 local deadline = tonumber(child:GetAttribute("BreakAt")) or (serverNow() + 20)
 local bonus = tonumber(N.VolcanoData.BonusSeconds) or 12
@@ -29347,7 +29425,17 @@ log("VOLCANO skipped, not enough time", string.format("need %.0fs", need))
 return false
 end
 setStatus("Dipping " .. name .. " in the volcano")
-N.travelTo(hover, { mode = mode, carry = carry })
+N.travelTo(hover, {
+mode = mode,
+carry = carry,
+keepGoing = function()
+return child.Parent ~= nil
+end,
+})
+if not N.overVolcano(top) then
+log("VOLCANO could not get over the lava pool", brief(hover))
+return false
+end
 Volcano.result = nil
 fire("Net/VolcanoDip")
 Session.dips += 1
@@ -29374,12 +29462,21 @@ return left
 end
 local function goToEgg(info, carry)
 local target = info.pos + Vector3.new(0, N.hrpOffset() + 0.5, 0)
+local function keepGoing()
+return info.cfg.Parent ~= nil and not eggClaimed(info.cfg, info.name) and (on("AutoFarm") or N.manualRunning())
+end
+local cfg = N.eggConfig(info.name)
+if type(cfg) == "table" and cfg.RequiresVolcano == true then
+local inside, why = N.enterVolcano(keepGoing)
+log("VOLCANO entering for", info.name, if inside then "inside" else "not marked inside: " .. tostring(why or "no answer"))
+if not keepGoing() then
+return false
+end
+end
 setStatus(string.format("Going for %s (%s KG, %s)", info.name, formatNumber(info.kg), info.rarity))
 return N.travelTo(target, {
 carry = carry,
-keepGoing = function()
-return info.cfg.Parent ~= nil and not eggClaimed(info.cfg, info.name) and (on("AutoFarm") or N.manualRunning())
-end,
+keepGoing = keepGoing,
 })
 end
 local function grab(info, carry)
@@ -29438,7 +29535,11 @@ if why == "full" then
 break
 end
 end
-volcanoDip()
+for _ = 1, 5 do
+if not volcanoDip() then
+break
+end
+end
 end
 if #N.basketItems() > 0 then
 N.deliverBasket()
@@ -31029,7 +31130,7 @@ MoveBox:AddDropdown("TravelPath", {
 Text = "Path",
 Values = { "Over terrain", "Straight line" },
 Default = "Over terrain",
-Tooltip = "Over terrain climbs above hills and trees first. Straight line goes through everything with noclip.",
+Tooltip = "Over terrain climbs straight up, flies above hills and trees, then drops straight down onto the egg. Straight line goes through everything with noclip. A ridden pet stops at walls, so Corvus gets off and noclips through on foot, then rides again.",
 })
 MoveBox:AddSlider(
 "FlyHeight",
@@ -31091,7 +31192,7 @@ local VolcanoBox = Tabs.Main:AddRightGroupbox("Volcano", "flame")
 VolcanoBox:AddToggle("VolcanoDip", {
 Text = "Dip Eggs In The Volcano",
 Default = false,
-Tooltip = "Flies over the volcano with the egg before going home. 15% chance of Magma (x10 income). Only when the timer allows it.",
+Tooltip = "Drops straight into the crater above the lava with each egg from Dip Rarities before going home. 15% chance of Magma (x10 income). Only when the timer allows it and the volcano is revealed on this server.",
 })
 VolcanoBox:AddDropdown("VolcanoRarities", {
 Text = "Dip Rarities",
@@ -32826,7 +32927,7 @@ tostring(N.tutorialActive()),
 tostring(N.myPlot() and N.myPlot().Name or "none")
 ),
 "Perf: " .. Debug.perfText(),
-"Position drifts: " .. tostring(N.Moves.snaps) .. ", pushed while flying: " .. tostring(N.Moves.pushes),
+"Position drifts: " .. tostring(N.Moves.snaps) .. ", pushed while flying: " .. tostring(N.Moves.pushes) .. ", blocked: " .. tostring(N.Moves.blocked),
 "Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
 string.rep("-", 70),
 }
@@ -33769,7 +33870,9 @@ local top = N.volcanoTop()
 Labels.Volcano:SetText(
 string.format(
 "%s  \u{00B7}  dips <b>%d</b>  \u{00B7}  Magma <b>%d</b>",
-if top then '<font color="#60d696">Volcano open</font>' else '<font transparency="0.4">Volcano hidden</font>',
+if not top then '<font transparency="0.4">Volcano hidden</font>'
+elseif N.playerAttr("InVolcano") == true then '<font color="#ff8a3d">Inside the volcano</font>'
+else '<font color="#60d696">Volcano open</font>',
 Session.dips,
 Session.magma
 )
