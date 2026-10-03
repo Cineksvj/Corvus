@@ -35543,11 +35543,13 @@ do
 			local multi = petsMulti()
 			for _, entry in ipairs(folder:GetChildren()) do
 				local name = entry.Name
-				local base = if kind == "Golden" then name else (string.gsub(name, "^Golden ", ""))
+				local plain = string.match(name, "^[^|]+") or name
+				local base = if kind == "Golden" then plain else (string.gsub(plain, "^Golden ", ""))
 				local info = if type(multi) == "table" then multi[base] else nil
 				local rarity = if type(info) == "table" then info[3] else nil
 				local targetExists = type(multi) ~= "table" or multi[kind .. " " .. base] ~= nil
-				if targetExists and (rarity == nil or S.craftRarity[rarity]) and petStock(folderName, name) >= need then
+				local special = rarity == "Exclusive" or rarity == "Secret"
+				if targetExists and not special and (rarity == nil or S.craftRarity[rarity]) and petStock(folderName, name) >= need then
 					table.insert(list, name)
 				end
 			end
