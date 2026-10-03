@@ -4897,6 +4897,104 @@ function Library:SetSetting(Key: string, Value: any)
     end
 end
 
+Library.QuickButtons = {}
+
+function Library:GetQuickBinds(): { [string]: any }
+    if Library.QuickBinds == nil then
+        local Saved = Library:GetSetting("QuickBinds", {})
+        Library.QuickBinds = if typeof(Saved) == "table" then Saved else {}
+    end
+    return Library.QuickBinds
+end
+
+function Library:SetQuickBind(KeyName: string, Entry: any)
+    local Binds = Library:GetQuickBinds()
+    Binds[KeyName] = Entry
+    Library:SetSetting("QuickBinds", Binds)
+    for _, Callback in Library.QuickBindSignals or {} do
+        task.spawn(Callback)
+    end
+end
+
+function Library:ClearQuickBindsFor(Kind: string, Target: string): number
+    local Removed = 0
+    for KeyName, Entry in Library:GetQuickBinds() do
+        if typeof(Entry) == "table" and Entry.Kind == Kind and Entry.Target == Target then
+            Library:SetQuickBind(KeyName, nil)
+            Removed += 1
+        end
+    end
+    return Removed
+end
+
+function Library:StartQuickBind(Kind: string, Target: string, Label: string)
+    if Library.IsMobile then
+        return
+    end
+    Library.QuickBindPending = { Kind = Kind, Target = Target, Label = Label, At = os.clock() }
+    Library:Notify({
+        Title = "Bind a key",
+        Description = string.format("Press a key for %s. Esc cancels, Backspace removes its bind.", Label),
+        Time = 4,
+    })
+end
+
+function Library:RunQuickBind(Entry: any)
+    if typeof(Entry) ~= "table" then
+        return
+    end
+    if Entry.Kind == "Toggle" then
+        local Toggle = Library.Toggles[Entry.Target]
+        if Toggle and not Toggle.Disabled then
+            Toggle:SetValue(not Toggle.Value)
+            Library:Notify({ Title = tostring(Toggle.Text), Description = if Toggle.Value then "ON" else "OFF", Time = 1.5 })
+        end
+    elseif Entry.Kind == "Button" then
+        local Button = Library.QuickButtons[Entry.Target]
+        if Button and not Button.Disabled then
+            Library:SafeCallback(Button.Func)
+        end
+    elseif Entry.Kind == "Command" then
+        Library:RunCommand(tostring(Entry.Target))
+    end
+end
+
+table.insert(Library.Signals, UserInputService.InputBegan:Connect(function(Input, Processed)
+    if Library.Unloaded or Input.UserInputType ~= Enum.UserInputType.Keyboard or Input.KeyCode == Enum.KeyCode.Unknown then
+        return
+    end
+    local KeyName = Input.KeyCode.Name
+    local Pending = Library.QuickBindPending
+    if Pending then
+        Library.QuickBindPending = nil
+        if os.clock() - Pending.At > 15 or KeyName == "Escape" then
+            Library:Notify({ Title = "Bind a key", Description = "Cancelled", Time = 2 })
+            return
+        end
+        if KeyName == "Backspace" or KeyName == "Delete" then
+            local Removed = Library:ClearQuickBindsFor(Pending.Kind, Pending.Target)
+            Library:Notify({ Title = Pending.Label, Description = if Removed > 0 then "Bind removed" else "Had no bind", Time = 2 })
+            return
+        end
+        local MenuKey = Library.Options and Library.Options.MenuKeybind and Library.Options.MenuKeybind.Value
+        if MenuKey and tostring(MenuKey) == KeyName then
+            Library:Notify({ Title = "Bind a key", Description = KeyName .. " opens the menu, pick another key", Time = 3 })
+            return
+        end
+        Library:ClearQuickBindsFor(Pending.Kind, Pending.Target)
+        Library:SetQuickBind(KeyName, { Kind = Pending.Kind, Target = Pending.Target, Label = Pending.Label })
+        Library:Notify({ Title = Pending.Label, Description = "Bound to " .. KeyName, Time = 3 })
+        return
+    end
+    if Processed or UserInputService:GetFocusedTextBox() then
+        return
+    end
+    local Entry = Library:GetQuickBinds()[KeyName]
+    if Entry then
+        Library:RunQuickBind(Entry)
+    end
+end))
+
 local function GetRequestFunction()
     return (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
 end
@@ -9538,6 +9636,20 @@ do
                 Button.Tween:Play()
             end))
 
+            local QuickKey = tostring(Button.Text)
+            if not Button.DoubleClick and QuickKey ~= "" then
+                Library.QuickButtons[QuickKey] = if Library.QuickButtons[QuickKey] == nil then Button else false
+            end
+            table.insert(Button.Connections, Button.Base.MouseButton2Click:Connect(function()
+                if Button.DoubleClick or Button.Risky then
+                    Library:Notify({ Title = QuickKey, Description = "This button needs a double click, so it can't get a key", Time = 3 })
+                elseif Library.QuickButtons[QuickKey] == false then
+                    Library:Notify({ Title = QuickKey, Description = "Two buttons share this name, so it can't get a key", Time = 3 })
+                else
+                    Library:StartQuickBind("Button", QuickKey, QuickKey)
+                end
+            end))
+
             table.insert(Button.Connections, Button.Base.MouseButton1Click:Connect(function()
                 if Button.Disabled or Button.Locked then
                     return
@@ -9988,6 +10100,12 @@ do
             Label.Text = Text
         end
 
+        table.insert(Toggle.Connections, Button.MouseButton2Click:Connect(function()
+            if typeof(Idx) == "string" then
+                Library:StartQuickBind("Toggle", Idx, tostring(Toggle.Text))
+            end
+        end))
+
         table.insert(Toggle.Connections, Button.MouseButton1Click:Connect(function()
             if Toggle.Disabled then
                 return
@@ -10296,6 +10414,12 @@ do
             Toggle.Text = Text
             Label.Text = Text
         end
+
+        table.insert(Toggle.Connections, Button.MouseButton2Click:Connect(function()
+            if typeof(Idx) == "string" then
+                Library:StartQuickBind("Toggle", Idx, tostring(Toggle.Text))
+            end
+        end))
 
         table.insert(Toggle.Connections, Button.MouseButton1Click:Connect(function()
             if Toggle.Disabled then
@@ -26667,6 +26791,35 @@ function Library:CreateWindow(WindowInfo)
             end
         end
 
+        if not Library.IsMobile then
+            local Binds = Tab:AddRightGroupbox("Quick Binds", "keyboard")
+            Binds:AddLabel({ Text = '<font transparency="0.45">Right click any toggle or button, then press a key. Backspace removes it. In the console: bind B black runs any command with one key.</font>', DoesWrap = true })
+            local BindList = Binds:AddLabel({ Text = "", DoesWrap = true })
+            local function RefreshBinds()
+                local Lines = {}
+                for KeyName, Entry in Library:GetQuickBinds() do
+                    if typeof(Entry) == "table" then
+                        table.insert(Lines, string.format('<b>%s</b>  <font transparency="0.45">%s</font>', KeyName, tostring(Entry.Label or Entry.Target)))
+                    end
+                end
+                table.sort(Lines)
+                BindList:SetText(if #Lines > 0 then table.concat(Lines, "\n") else '<font transparency="0.45">No binds yet</font>')
+            end
+            Library.QuickBindSignals = Library.QuickBindSignals or {}
+            table.insert(Library.QuickBindSignals, RefreshBinds)
+            RefreshBinds()
+            Binds:AddButton({
+                Text = "Clear all binds",
+                DoubleClick = true,
+                Func = function()
+                    for KeyName in Library:GetQuickBinds() do
+                        Library:SetQuickBind(KeyName, nil)
+                    end
+                    RefreshBinds()
+                end,
+            })
+        end
+
         local Hub = Tab:AddRightGroupbox("Hub", "power")
         Hub:AddButton({
             Text = "Unload hub",
@@ -27716,6 +27869,78 @@ function Library:CreateWindow(WindowInfo)
             Description = "Unloads the whole UI",
             Callback = function()
                 task.defer(Library.Unload, Library)
+            end,
+        })
+        Library:AddCommand({
+            Name = "black",
+            Aliases = { "blackscreen", "norender" },
+            Description = "Turns 3D rendering off or on to save GPU",
+            Callback = function()
+                local Toggle = Library.Toggles.CorvusNoRender
+                if not Toggle then
+                    error("Disable 3D rendering is not in this hub", 0)
+                end
+                Toggle:SetValue(not Toggle.Value)
+                return "3D rendering " .. (if Toggle.Value then "off" else "on")
+            end,
+        })
+        Library:AddCommand({
+            Name = "bind",
+            Args = "[key] [command]",
+            Description = "Runs any command with one key, e.g. bind B black",
+            Callback = function(Args)
+                if #Args < 2 then
+                    error("Usage: bind [key] [command]", 0)
+                end
+                local Wanted = string.lower(table.remove(Args, 1))
+                local KeyName = nil
+                for _, Item in Enum.KeyCode:GetEnumItems() do
+                    if string.lower(Item.Name) == Wanted then
+                        KeyName = Item.Name
+                        break
+                    end
+                end
+                if not KeyName then
+                    error("Unknown key: " .. Wanted, 0)
+                end
+                local Text = table.concat(Args, " ")
+                local First = string.lower(Args[1] or "")
+                if First == "bind" or First == "unbind" then
+                    error("A bind can't run bind", 0)
+                end
+                Library:SetQuickBind(KeyName, { Kind = "Command", Target = Text, Label = Text })
+                return string.format("%s \u{2192} %s", KeyName, Text)
+            end,
+        })
+        Library:AddCommand({
+            Name = "unbind",
+            Args = "[key or all]",
+            Description = "Removes a key bind",
+            Callback = function(Args)
+                local Wanted = string.lower(Args[1] or "")
+                local Removed = 0
+                for KeyName in Library:GetQuickBinds() do
+                    if Wanted == "all" or string.lower(KeyName) == Wanted then
+                        Library:SetQuickBind(KeyName, nil)
+                        Removed += 1
+                    end
+                end
+                return if Removed > 0 then string.format("Removed %d bind%s", Removed, if Removed == 1 then "" else "s") else "No bind on that key"
+            end,
+        })
+        Library:AddCommand({
+            Name = "binds",
+            Aliases = { "keys" },
+            Description = "Lists your key binds",
+            Callback = function()
+                local Lines = {}
+                for KeyName, Entry in Library:GetQuickBinds() do
+                    if typeof(Entry) == "table" then
+                        table.insert(Lines, string.format("%s \u{2192} %s", KeyName, tostring(Entry.Label or Entry.Target)))
+                    end
+                end
+                table.sort(Lines)
+                return if #Lines > 0 then table.concat(Lines, "\n") else "No binds yet. Right click a toggle or button, or use bind [key] [command]."
             end,
         })
     end
@@ -30197,6 +30422,8 @@ local S = {
 	webhookMutated = false,
 	autoFish = false,
 	fishSpot = "Best unlocked",
+	fishIndexHunt = false,
+	fishIndexGolden = false,
 	fishTap = true,
 	fishPriority = "Eggs first",
 	autoWorms = false,
@@ -33092,6 +33319,24 @@ UI.FishBox:AddDropdown("FishSpot", {
 		S.fishSpot = UI.FishSpotKeys[v] or "Best unlocked"
 	end,
 })
+UI.FishBox:AddToggle("FishIndexHunt", {
+	Text = "Fish Index Hunter",
+	Description = "Fishes where your missing fish are",
+	Tooltip = "Checks your index against the fish of every world and fishes in the unlocked world with the best chance of a fish you do not have yet. Overrides Fishing spot until your fish index is done.",
+	Default = false,
+	Callback = function(v)
+		S.fishIndexHunt = v
+	end,
+})
+UI.FishBox:AddToggle("FishIndexGolden", {
+	Text = "Count golden fish",
+	Description = "Golden fish also count as missing",
+	Tooltip = "Golden fish only come from Golden Catch in the Fishing Tree, so they are rare. Off means the hunter only looks for normal fish.",
+	Default = false,
+	Callback = function(v)
+		S.fishIndexGolden = v
+	end,
+})
 UI.FishBox:AddToggle("FishTap", {
 	Text = "Auto Tap",
 	Description = "Hits every speed-up for faster catches",
@@ -33115,6 +33360,8 @@ UI.FishBox:AddLabel({ Text = '<font transparency="0.45">You can fish in Spawn, T
 UI.FishStatusBox = Tabs.Fishing:AddRightGroupbox("Fishing Status", "activity")
 UI.FishStateRow = UI.FishStatusBox:AddStat({ Icon = "fish", Text = "Auto Fish", Value = "Off", Size = 26, ValueColor = "FontColor" })
 UI.FishSpotRow = UI.FishStatusBox:AddStat({ Icon = "map-pin", Text = "Spot", Value = "-", Size = 22, ValueColor = "FontColor" })
+UI.FishIndexRow = UI.FishStatusBox:AddStat({ Icon = "book-open", Text = "Fish index", Value = "...", Size = 24, Progress = 0 })
+UI.FishMissingRow = UI.FishStatusBox:AddStat({ Icon = "search", Text = "Hunting", Value = "-", Size = 22, ValueColor = "FontColor" })
 UI.FishTimerRow = UI.FishStatusBox:AddStat({ Icon = "clock", Text = "Next catch", Value = "-", Size = 22, Progress = 0 })
 UI.FishCatchRow = UI.FishStatusBox:AddStat({ Icon = GameIcons.Auto, Text = "Catches", Value = "0", Size = 22 })
 UI.FishLastRow = UI.FishStatusBox:AddStat({ Icon = "fish", Text = "Last catch", Value = "-", Size = 26 })
@@ -39240,7 +39487,58 @@ do
 				{ key = resolveWorld("Spawn"), frame = "Spawn" },
 			}
 
+			Fish.indexPlan = function()
+				local cfg = fishModule("FishingConfig")
+				local loot = type(cfg) == "table" and type(cfg.Loot) == "table" and cfg.Loot or nil
+				if not loot then
+					return nil
+				end
+				local plan = { have = 0, total = 0, missing = {}, chance = 0 }
+				local seen = {}
+				for _, entry in ipairs(FishWorlds) do
+					local list = loot[if entry.frame == "Spawn" then "Default" else entry.frame]
+					local total, want, names = 0, 0, {}
+					for _, item in ipairs(type(list) == "table" and list or {}) do
+						local weight = tonumber(item.Weight) or 0
+						if item.Gate == nil then
+							total += weight
+						end
+						if item.Kind == "Pet" and type(item.Name) == "string" then
+							local variants = { { item.Name, weight } }
+							if S.fishIndexGolden then
+								table.insert(variants, { tostring(item.Golden or ("Golden " .. item.Name)), weight * 0.01 })
+							end
+							for _, variant in ipairs(variants) do
+								local value = readData("IndexData", variant[1])
+								local got = value == true or (type(value) == "number" and value > 0)
+								if not seen[variant[1]] then
+									seen[variant[1]] = true
+									plan.total += 1
+									if got then
+										plan.have += 1
+									else
+										table.insert(plan.missing, variant[1])
+									end
+								end
+								if not got then
+									want += variant[2]
+									table.insert(names, variant[1])
+								end
+							end
+						end
+					end
+					if worldUnlocked(entry.key) and total > 0 and want / total > plan.chance then
+						plan.chance = want / total
+						plan.key, plan.frame, plan.names = entry.key, entry.frame, names
+					end
+				end
+				return plan
+			end
+
 			local function fishTarget()
+				if S.fishIndexHunt and Fish.plan and Fish.plan.key then
+					return Fish.plan.key, Fish.plan.frame
+				end
 				local pick = tostring(S.fishSpot or "Best unlocked")
 				if pick == "Here" then
 					return nil, nil
@@ -40255,7 +40553,9 @@ do
 			end)
 
 			Auto.collectFishing = function()
-				local fish = { status = Fish.status, active = Fish.active, catches = Fish.catches, taps = Fish.taps, streak = Fish.streak, last = Fish.last, error = Fish.error }
+				local okPlan, plan = pcall(Fish.indexPlan)
+				Fish.plan = if okPlan then plan else nil
+				local fish = { status = Fish.status, active = Fish.active, catches = Fish.catches, taps = Fish.taps, streak = Fish.streak, last = Fish.last, error = Fish.error, index = Fish.plan }
 				local target = fishTarget()
 				fish.world = if Fish.active then currentWorld() else target
 				if Fish.active and Fish.endsAt then
@@ -42073,6 +42373,20 @@ do
 
 		setStat(UI.FishStateRow, nil, statusColor(fish.status, { Fishing = true, Casting = true }))
 		setStat(UI.FishSpotRow, nil, if fish.world then prettyWorld(fish.world) else faint("where you stand"))
+		local index = fish.index
+		if index and index.total > 0 then
+			setStat(UI.FishIndexRow, nil, string.format("%d / %d", index.have, index.total))
+			u2Progress(UI.FishIndexRow, index.have / index.total)
+			if #index.missing == 0 then
+				setStat(UI.FishMissingRow, nil, paint("#5ef08a", "Fish index done"))
+			elseif not S.fishIndexHunt then
+				setStat(UI.FishMissingRow, nil, faint(#index.missing .. " missing, hunter off"))
+			elseif index.key then
+				setStat(UI.FishMissingRow, nil, tostring(index.names[1] or "") .. (if #index.names > 1 then faint("  +" .. (#index.names - 1)) else "") .. faint("  1 in " .. formatNumber(math.ceil(1 / index.chance))))
+			else
+				setStat(UI.FishMissingRow, nil, paint("#ffb84d", "Unlock more fishing worlds"))
+			end
+		end
 		if fish.active and fish.left then
 			setStat(UI.FishTimerRow, nil, trimmed(fish.left, 1) .. "s")
 			u2Progress(UI.FishTimerRow, if fish.duration and fish.duration > 0 then 1 - fish.left / fish.duration else 0)
