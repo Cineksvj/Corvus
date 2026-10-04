@@ -1,0 +1,196 @@
+-- Corvus universal loader: picks the hub for the current game and counts players.
+-- Player counts go to ONE Discord message that is edited (never a new message per player):
+--   runs today and in total per game, plus "active now" (players seen in the last 10 minute window).
+-- No usernames or ids are sent, only the game name.
+-- Filled in by tools/github_upload.py when the loader is uploaded (raw URL of the repo that holds the hubs).
+local Repo = "https://raw.githubusercontent.com/Cineksvj/Corvus/refs/heads/main/"
+local Games = {
+	[118805555015549] = { name = "Loot To Forge", file = "%2B1%20Loot%20To%20Forge" },
+	[113290951185459] = { name = "Anime Dice", file = "Anime%20Dice" },
+	[114326934417838] = { name = "Break and Steal an Egg", file = "Break%20and%20Steal%20an%20Egg" },
+	[88047783411976] = { name = "Open Sea For Animals", file = "Open%20Sea%20For%20Animals" },
+	[74629631798007] = { name = "Pets Universe", file = "Pets%20Universe" },
+	[124216119978534] = { name = "Ride A Pet", file = "Ride%20A%20Pet" },
+	[120475074479690] = { name = "Steal From The Rich", file = "Steal%20From%20The%20Rich" },
+}
+-- Stats: a webhook in a private channel and the id of the message it edits (see Loader/README.md).
+local StatsWebhook = "https://discord.com/api/webhooks/1556414053159542787/xZao0O7GEipl7_eD2aUWua233oziMB-SUZIQFXNZ2sl7hnRHgLKDvGWu_qDZY_9Aa7Gl"
+local StatsMessage = "1556415243478114457"
+
+local HttpService = game:GetService("HttpService")
+local Env = (getgenv and getgenv()) or _G
+local entry = Games[game.PlaceId]
+
+local Stats = {}
+do
+	local Window = 600
+	local function httpRequest(options)
+		local fn = (typeof(syn) == "table" and syn.request) or (typeof(http) == "table" and http.request) or http_request or request
+		if type(fn) ~= "function" then
+			return nil
+		end
+		local ok, response = pcall(fn, options)
+		return if ok then response else nil
+	end
+	local function url()
+		return StatsWebhook .. "/messages/" .. StatsMessage
+	end
+	function Stats.enabled()
+		return StatsWebhook ~= "" and StatsMessage ~= ""
+	end
+	function Stats.read()
+		local response = httpRequest({ Url = url(), Method = "GET" })
+		if not response or response.StatusCode ~= 200 then
+			return nil
+		end
+		local ok, message = pcall(HttpService.JSONDecode, HttpService, response.Body)
+		if not ok or type(message) ~= "table" then
+			return nil
+		end
+		local json = string.match(tostring(message.content or ""), "```json\n(.-)\n```")
+		local okData, data = pcall(HttpService.JSONDecode, HttpService, json or "{}")
+		return if okData and type(data) == "table" then data else {}
+	end
+	local function short(n)
+		n = tonumber(n) or 0
+		if n >= 1e6 then
+			return string.format("%.1fM", n / 1e6)
+		elseif n >= 1e4 then
+			return string.format("%.1fK", n / 1e3)
+		end
+		return tostring(math.floor(n))
+	end
+	local function activeOf(g, window)
+		if g.w == window then
+			return math.max(g.a or 0, g.p or 0)
+		elseif g.w == window - 1 then
+			return g.a or 0
+		end
+		return 0
+	end
+	function Stats.write(data)
+		local window = math.floor(os.time() / Window)
+		local names = {}
+		for name in pairs(data) do
+			table.insert(names, name)
+		end
+		table.sort(names, function(a, b)
+			local x, y = activeOf(data[a], window), activeOf(data[b], window)
+			if x ~= y then
+				return x > y
+			end
+			return a < b
+		end)
+		local lines, active, today, total = {}, 0, 0, 0
+		local day = os.date("!%Y-%m-%d")
+		for _, name in ipairs(names) do
+			local g = data[name]
+			local a = activeOf(g, window)
+			local d = if g.day == day then g.d or 0 else 0
+			active += a
+			today += d
+			total += g.t or 0
+			table.insert(lines, string.format("**%s**  ·  🟢 %s now  ·  %s today  ·  %s total", name, short(a), short(d), short(g.t)))
+		end
+		local body = HttpService:JSONEncode({
+			content = "```json\n" .. HttpService:JSONEncode(data) .. "\n```",
+			embeds = {
+				{
+					title = "Corvus live players",
+					description = table.concat(lines, "\n"),
+					color = 6344854,
+					fields = {
+						{ name = "Active now", value = short(active), inline = true },
+						{ name = "Runs today (UTC)", value = short(today), inline = true },
+						{ name = "Runs total", value = short(total), inline = true },
+					},
+					footer = { text = "Active = players seen in the last 10 minutes" },
+					timestamp = DateTime.now():ToIsoDate(),
+				},
+			},
+		})
+		local response = httpRequest({ Url = url(), Method = "PATCH", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+		return response ~= nil and response.StatusCode == 200
+	end
+	-- With many players not everyone writes: each one writes with chance 1/k and counts k, which keeps the
+	-- message under Discord's rate limit (about 5 edits per 2 seconds per webhook).
+	function Stats.bump(name, isRun)
+		local data = Stats.read()
+		if not data then
+			return nil
+		end
+		local window = math.floor(os.time() / Window)
+		local g = data[name] or { t = 0, d = 0, day = "", w = window, a = 0, p = 0 }
+		local k = math.max(1, math.floor(activeOf(g, window) / 20))
+		Stats.k = k
+		if math.random() > 1 / k then
+			return k
+		end
+		if isRun then
+			local day = os.date("!%Y-%m-%d")
+			if g.day ~= day then
+				g.day, g.d = day, 0
+			end
+			g.t = (g.t or 0) + k
+			g.d = (g.d or 0) + k
+		end
+		if g.w ~= window then
+			g.p = if g.w == window - 1 then g.a or 0 else 0
+			g.a = 0
+			g.w = window
+		end
+		g.a = (g.a or 0) + k
+		data[name] = g
+		Stats.write(data)
+		return k
+	end
+	function Stats.start(name)
+		if not Stats.enabled() or Env.CorvusStatsRunning then
+			return
+		end
+		Env.CorvusStatsRunning = true
+		task.spawn(function()
+			task.wait(math.random(5, 40))
+			pcall(Stats.bump, name, true)
+			local last = math.floor(os.time() / Window)
+			while true do
+				task.wait(30 + math.random() * 30)
+				local window = math.floor(os.time() / Window)
+				if window ~= last then
+					last = window
+					task.wait(math.random() * 120)
+					pcall(Stats.bump, name, false)
+				end
+			end
+		end)
+	end
+	-- One time setup for the owner: run with getgenv().CorvusStatsSetup = true and a webhook filled in. It posts
+	-- the message and copies its id; paste it into StatsMessage.
+	if Env.CorvusStatsSetup == true and StatsWebhook ~= "" then
+		local response = httpRequest({
+			Url = StatsWebhook .. "?wait=true",
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode({ content = "```json\n{}\n```" }),
+		})
+		local ok, message = pcall(HttpService.JSONDecode, HttpService, response and response.Body or "")
+		if ok and type(message) == "table" and message.id then
+			pcall(setclipboard, tostring(message.id))
+			warn("[Corvus] Stats message id (copied): " .. tostring(message.id))
+		else
+			warn("[Corvus] Could not create the stats message")
+		end
+	end
+end
+
+if entry then
+	Stats.start(entry.name)
+	local ok, result = pcall(function()
+		return loadstring(game:HttpGet(Repo .. entry.file))()
+	end)
+	if not ok then
+		warn("[Corvus] Failed to load " .. entry.name .. ": " .. tostring(result))
+	end
+else
+	warn("[Corvus] This game is not supported yet: " .. tostring(game.PlaceId))
+end
