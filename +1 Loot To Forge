@@ -30456,9 +30456,13 @@ do
 	local AllowedBindable = {
 		["Stage/ExitFightBE"] = true,
 		["Attack/ATKOnceBE"] = true,
+		["Attack/AttackEnemyBE"] = true,
+		["Attack/EnemyHitBE"] = true,
 	}
 	local Quiet = {
 		["Attack/ATKOnceBE"] = true,
+		["Attack/AttackEnemyBE"] = true,
+		["Attack/EnemyHitBE"] = true,
 		["Profile/GetTotalDataRF"] = true,
 	}
 	function N.remote(path)
@@ -31047,6 +31051,8 @@ N.R = {
 	code = "Code/TryUseCodeRF",
 	exitFight = "Stage/ExitFightBE",
 	attack = "Attack/ATKOnceBE",
+	attackEnemy = "Attack/AttackEnemyBE",
+	enemyHit = "Attack/EnemyHitBE",
 }
 do
 	-- Stages: the enemies live only on this client. Touching StageMap.AreaPart.Stage_N starts the stage, the
@@ -31132,10 +31138,40 @@ do
 		local world = workspace:FindFirstChild("WorldModel")
 		return world and world:FindFirstChild("StageMap")
 	end
-	function N.stagePart(n)
+	-- The map streams in and out (StreamingEnabled), so every stage area seen once is remembered and streamed
+	-- back in around its spot when it is missing.
+	N.StageSpots = {}
+	local function findStagePart(n)
 		local map = N.stageMap()
 		local area = map and map:FindFirstChild("AreaPart")
-		return area and area:FindFirstChild("Stage_" .. n)
+		local part = area and area:FindFirstChild("Stage_" .. n)
+		if part then
+			N.StageSpots[n] = part.CFrame
+		end
+		return part
+	end
+	function N.rememberStages()
+		for _, stage in ipairs(N.stageList()) do
+			findStagePart(stage.n)
+		end
+	end
+	function N.stagePart(n)
+		local part = findStagePart(n)
+		if part then
+			return part
+		end
+		local spot = N.StageSpots[n]
+		if spot then
+			pcall(function()
+				LocalPlayer:RequestStreamAroundAsync(spot.Position, 5)
+			end)
+			N.tp(spot + Vector3.new(0, 2, 0))
+			waitFor(function()
+				return findStagePart(n) ~= nil
+			end, 3)
+			return findStagePart(n)
+		end
+		return nil
 	end
 	function N.stagePoints(n)
 		local map = N.stageMap()
@@ -31225,6 +31261,39 @@ do
 	end
 	function N.attackClick()
 		N.bindable(N.R.attack)
+	end
+	-- Kill Aura: hits every client enemy in range through the game's own damage path (AttackEnemyBE with your
+	-- weapon's basic attack), so the damage is your real damage, just on all of them at once and without
+	-- swinging. Insta-kill sends a hit as big as the enemy's HP (the enemies only exist on your client).
+	-- World bosses are server enemies and are never touched by the aura.
+	N.Aura = { at = 0, hits = 0 }
+	function N.auraStep()
+		if not on("KillAura") or N.dead() or os.clock() - N.Aura.at < math.clamp(optionNumber("AuraSpeed", 0.3), 0.1, 2) then
+			return 0
+		end
+		N.Aura.at = os.clock()
+		local range = math.clamp(optionNumber("AuraRange", 40), 5, 200)
+		local me = N.myPos()
+		if not me then
+			return 0
+		end
+		local insta = optionText("AuraMode", "Real damage") == "Insta-kill"
+		local ids = {}
+		for _, entry in ipairs(N.enemies("EnemyFolder")) do
+			if entry.dist <= range then
+				if insta then
+					N.bindable(N.R.enemyHit, entry.model.Name, N.hpOf(entry.model) + 1, {})
+				else
+					table.insert(ids, entry.model.Name)
+				end
+			end
+		end
+		if #ids > 0 then
+			local weapon = tostring(LocalPlayer:GetAttribute("WeaponType") or "Katana")
+			N.bindable(N.R.attackEnemy, ids, { SkillID = string.sub(weapon, 1, 1) .. "_ATK_1", Phase = 1, Attacker = LocalPlayer })
+		end
+		N.Aura.hits += 1
+		return #ids
 	end
 	-- Ore drops are local models in workspace.OreCache with a "Collect" prompt (0.5 s hold). The prompt's own
 	-- callback asks the server for that ore, so the hub only has to stand next to it and trigger it.
@@ -31389,6 +31458,7 @@ do
 			end
 			setStatus(string.format("Stage %d: fighting %d enemies  \u{00B7}  pack %d/%d", F.stage, #enemies, packNow, packMax))
 			N.standAt(target.pos, 3.5)
+			N.auraStep()
 			task.wait(0.15)
 			return
 		end
@@ -31400,15 +31470,18 @@ do
 			N.bank("pack full")
 			return
 		end
-		if N.collectOne() then
+		local target = N.stageTarget()
+		-- The pack is small and deeper stages drop better ores, so ores are only picked on the deepest stage of
+		-- the run (unless every stage is picked on purpose). Low stages are just cleared to unlock the next one.
+		local pickHere = optionText("PickOres", "Deepest stage only") == "Every stage" or F.stage >= target
+		if pickHere and N.collectOne() then
 			setStatus(string.format("Stage %d: picking ores  \u{00B7}  pack %d/%d", F.stage, N.pack()))
 			return
 		end
-		local target = N.stageTarget()
 		if F.seen[F.stage] then
 			-- The ores drop once the server answers, give them a moment before moving on.
 			F.clearedAt = F.clearedAt or os.clock()
-			if os.clock() - F.clearedAt < 2.5 then
+			if pickHere and os.clock() - F.clearedAt < 2.5 then
 				setStatus(string.format("Stage %d: cleared, waiting for the drops", F.stage))
 				task.wait(0.2)
 				return
@@ -31495,25 +31568,48 @@ do
 		return count
 	end
 	-- The ores for one forge: the strongest first, locked ores and kept rarities are never used.
+	-- The forge window has 4 ore slots: the server refuses a forge with more than 4 different ore stacks
+	-- (seen in the log as "Forge refused: nil" every time the plan used 5 or 6 stacks).
+	N.ForgeSlots = 4
 	function N.forgePlan(kind)
 		local count = N.forgeCount(kind)
 		local keep = N.rarityRank(optionText("ForgeKeepRarity", "Infinite"))
-		local list, total, power = {}, 0, 0
+		local usable = {}
 		for _, ore in ipairs(N.ores()) do
-			if total >= count then
-				break
-			end
 			if not ore.locked and N.rarityRank(ore.rarity) < keep then
+				table.insert(usable, ore)
+			end
+		end
+		local function build(list)
+			local plan, total, power, stacks = {}, 0, 0, 0
+			for _, ore in ipairs(list) do
+				if total >= count or stacks >= N.ForgeSlots then
+					break
+				end
 				local take = math.min(ore.number, count - total)
-				list[ore.uuid] = take
+				plan[ore.uuid] = take
+				stacks += 1
 				total += take
 				power += take * ore.power
 			end
+			return plan, total, power / math.max(total, 1)
+		end
+		-- Strongest ores first. When 4 stacks are not enough ores, fill with the biggest stacks instead.
+		local plan, total, avg = build(usable)
+		if total < count then
+			local big = table.clone(usable)
+			table.sort(big, function(a, b)
+				if a.number ~= b.number then
+					return a.number > b.number
+				end
+				return a.power > b.power
+			end)
+			plan, total, avg = build(big)
 		end
 		if total < count then
 			return nil, total
 		end
-		return list, total, power / math.max(total, 1)
+		return plan, total, avg
 	end
 	local function noteForge(result, kind)
 		local text = kind .. " forged"
@@ -31680,14 +31776,46 @@ do
 		end
 		return { kind = kind, level = level, price = tonumber(row.Price) or math.huge, number = row.Number }
 	end
-	function N.upgradeStep()
-		local best
+	-- How much one level improves its stat, relative to what you have now, per coin:
+	--   Ore Pack: +1 slot = (cap+1)/cap more ores every run.
+	--   Train: +x% train boost on top of (1 + current) = relative gain in training speed.
+	--   Luck: same for ore luck.
+	-- The best gain per coin is bought first (saving for it), cheap ones only while they pay back as well.
+	function N.upgradeValue(nextUp)
+		local levels = N.G.Upgrade[nextUp.kind] or {}
+		local now = levels[nextUp.level] or {}
+		local nowNumber = tonumber(now.Number) or 0
+		local nextNumber = tonumber(nextUp.number) or nowNumber
+		if nextUp.kind == "OrePack" then
+			local _, cap = N.pack()
+			return (nextNumber - nowNumber) / math.max(cap, 1)
+		end
+		return (nextNumber - nowNumber) / (1 + nowNumber)
+	end
+	function N.upgradeOptions()
+		local list = {}
 		for _, kind in ipairs(N.UpgradeKinds) do
 			if allows(Options.UpgradeKinds, N.UpgradeNames[kind]) then
 				local nextUp = N.upgradeNext(kind)
-				if nextUp and (not best or nextUp.price < best.price) then
-					best = nextUp
+				if nextUp then
+					nextUp.gain = N.upgradeValue(nextUp)
+					nextUp.perCoin = nextUp.gain / math.max(nextUp.price, 1)
+					table.insert(list, nextUp)
 				end
+			end
+		end
+		table.sort(list, function(a, b)
+			return a.perCoin > b.perCoin
+		end)
+		return list
+	end
+	function N.upgradeStep()
+		local best
+		local options = N.upgradeOptions()
+		for _, option in ipairs(options) do
+			if option.price <= N.coin() then
+				best = option
+				break
 			end
 		end
 		if best and best.price <= N.coin() then
@@ -31848,6 +31976,7 @@ do
 			setStatus(string.format("Tower floor %s: %d enemies", tostring(round or "?"), #enemies))
 			N.standAt(enemies[1].pos, 3.5)
 			N.attackClick()
+			N.auraStep()
 			task.wait(0.12)
 			return
 		end
@@ -32169,6 +32298,7 @@ do
 	do
 		local QuickBox = Tabs.Farm:AddLeftGroupbox("Quick Farm", "sparkles")
 		N.FarmBestOn = {
+			"KillAura",
 			"AutoStages",
 			"AutoTrain",
 			"AutoForge",
@@ -32187,7 +32317,8 @@ do
 			"AutoUpdateRewards",
 			"AutoPotions",
 		}
-		N.FarmBestOff = { "AutoStages", "AutoTrain", "AutoTower", "AutoWorldBoss" }
+		-- Turning the quick farm off turns off everything it turned on.
+		N.FarmBestOff = N.FarmBestOn
 		QuickBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Best",
 			Default = false,
@@ -32238,7 +32369,27 @@ do
 			Suffix = "% HP",
 			Tooltip = "Dying loses every ore in the pack, so the hub banks them and leaves when your HP drops this low",
 		})
+		StageBox:AddDropdown("PickOres", {
+			Text = "Pick Ores On",
+			Values = { "Deepest stage only", "Every stage" },
+			Default = "Deepest stage only",
+			Tooltip = "Deeper stages drop much better ores and the pack is small, so only the deepest stage of each run fills it",
+		})
 		StageBox:AddSlider("StuckSeconds", { Text = "Give Up On A Stage After", Default = 20, Min = 5, Max = 120, Rounding = 0, Suffix = " s without damage" })
+		local AuraBox = Tabs.Farm:AddLeftGroupbox("Kill Aura", "zap")
+		AuraBox:AddToggle("KillAura", {
+			Text = "Kill Aura",
+			Default = false,
+			Tooltip = "Hits every enemy around you with your real damage, many times a second, in stages and the tower. Works with weak weapons too",
+		})
+		AuraBox:AddDropdown("AuraMode", {
+			Text = "Damage",
+			Values = { "Real damage", "Insta-kill" },
+			Default = "Real damage",
+			Tooltip = "Insta-kill finishes stage and tower enemies at once (they only exist on your screen). Riskier than real damage",
+		})
+		AuraBox:AddSlider("AuraRange", { Text = "Range", Default = 40, Min = 10, Max = 120, Rounding = 0, Suffix = " studs" })
+		AuraBox:AddSlider("AuraSpeed", { Text = "Hit Every", Default = 0.3, Min = 0.1, Max = 1, Rounding = 2, Suffix = " s" })
 		local StatusBox = Tabs.Farm:AddRightGroupbox("Status", "activity")
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
@@ -32338,7 +32489,7 @@ do
 		})
 		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
 		local UpgradeBox = Tabs.Train:AddRightGroupbox("Upgrades", "arrow-big-up")
-		UpgradeBox:AddToggle("AutoUpgrade", { Text = "Auto Buy Upgrades", Default = false, Tooltip = "Buys the cheapest picked upgrade you can afford with coins" })
+		UpgradeBox:AddToggle("AutoUpgrade", { Text = "Auto Buy Upgrades", Default = false, Tooltip = "Buys the upgrade with the best gain per coin: more pack slots, faster training or more luck" })
 		UpgradeBox:AddDropdown("UpgradeKinds", {
 			Text = "Upgrades (none = all)",
 			Values = { "Ore Pack", "Train", "Luck" },
@@ -32562,6 +32713,7 @@ do
 end
 N.AllAutoToggles = {
 	"AutoFarmBest",
+	"KillAura",
 	"AutoStages",
 	"AutoTrain",
 	"AutoForge",
@@ -33269,6 +33421,7 @@ do
 	if not N.loadData() then
 		logProblem("Could not load the player data at start")
 	end
+	N.rememberStages()
 	-- The movement loop owns the character: stages, tower, world boss, forging and training never overlap.
 	-- Priority: whatever fight you are in, then forge, tower, world boss, a stage run, training.
 	loop("main loop", function()
