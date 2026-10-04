@@ -30999,6 +30999,8 @@ do
 			max = tonumber(part:GetAttribute("MaxHealth")) or hp,
 			kg = tonumber(part:GetAttribute("WeightKg")) or 0,
 			bracket = tostring(part:GetAttribute("WeightBracket") or ""),
+			-- The Titanic event egg (every 30 min, 10x HP, 30x luck) and eggs that rolled the TITANIC weight bracket.
+			titanic = part:GetAttribute("Titanic") == true or N.hasTag(part, "TitanicEgg"),
 			luck = tonumber(part:GetAttribute("HatchLuck")) or tonumber(part:GetAttribute("Luck")) or 1,
 			hits = math.ceil(hp / N.damage()),
 			position = part.Position,
@@ -31096,14 +31098,16 @@ do
 			if not (prompt.Parent and prompt.Enabled) then
 				break
 			end
-			if canFire and attempt < 3 then
+			-- A real hold for the full time: an instant trigger counts as "stolen too fast" for the game's anticheat.
+			local held = pcall(prompt.InputHoldBegin, prompt)
+			if held then
+				task.wait((tonumber(prompt.HoldDuration) or 0) + 0.15)
+				pcall(prompt.InputHoldEnd, prompt)
+			elseif canFire then
+				task.wait(tonumber(prompt.HoldDuration) or 0)
 				if not pcall(fireproximityprompt, prompt) then
 					canFire = false
 				end
-			else
-				pcall(prompt.InputHoldBegin, prompt)
-				task.wait((tonumber(prompt.HoldDuration) or 0) + 0.08)
-				pcall(prompt.InputHoldEnd, prompt)
 			end
 			if waitFor(done, 1.2) then
 				return true
@@ -31395,7 +31399,9 @@ do
 			return
 		end
 		local root = rootPart()
-		if root and (root.Position - hold.position).Magnitude > (hold.slack or 3) and (root.Position - hold.position).Magnitude < 60 then
+		-- Walk mode only nudges small slips back, a long snap would look like a teleport to the game's anticheat.
+		local reach = if N.moveMode() == "Walk" then 8 else 60
+		if root and (root.Position - hold.position).Magnitude > (hold.slack or 3) and (root.Position - hold.position).Magnitude < reach then
 			root.CFrame = CFrame.new(hold.position) * root.CFrame.Rotation
 			stopMotion(root)
 		end
@@ -31428,8 +31434,8 @@ do
 		N.Moves.hold = if position then { position = position, slack = slack or 3 } else nil
 	end
 	function N.moveMode()
-		local v = optionText("MoveMode", "Teleport")
-		return if v == "Fast" or v == "Walk" then v else "Teleport"
+		local v = optionText("MoveMode", "Walk")
+		return if v == "Fast" or v == "Teleport" then v else "Walk"
 	end
 	function N.walkSpeed()
 		local hum = humanoid()
@@ -31514,6 +31520,106 @@ do
 		end
 		return placeRoot(target)
 	end
+	-- The game's server anticheat pulls back or explodes anyone who teleports, moves faster than their speed or flies.
+	-- Walk mode lets the Humanoid really walk along a computed path, so the server only sees normal running.
+	local PathOk, Pathfinding = pcall(game.GetService, game, "PathfindingService")
+	local function pathPoints(from, target)
+		if PathOk and Pathfinding then
+			local ok, path = pcall(Pathfinding.CreatePath, Pathfinding, {
+				AgentRadius = 2.5,
+				AgentHeight = 5,
+				AgentCanJump = true,
+				WaypointSpacing = 10,
+			})
+			if ok and path and pcall(path.ComputeAsync, path, from, target) and path.Status == Enum.PathStatus.Success then
+				local list = {}
+				for index, point in ipairs(path:GetWaypoints()) do
+					if index > 1 then
+						table.insert(list, { position = point.Position, jump = point.Action == Enum.PathWaypointAction.Jump })
+					end
+				end
+				if #list > 0 then
+					return list
+				end
+			end
+		end
+		return { { position = target, jump = false } }
+	end
+	local function canWalk(hum)
+		local ok, fn = pcall(function()
+			return hum.MoveTo
+		end)
+		return ok and type(fn) == "function"
+	end
+	local function humanWalk(target, keepGoing)
+		local hum = humanoid()
+		if not hum or not rootPart() or not canWalk(hum) then
+			return nil
+		end
+		local function halt()
+			local root = rootPart()
+			if root and humanoid() then
+				pcall(hum.MoveTo, hum, root.Position)
+			end
+		end
+		for _ = 1, 4 do
+			local stuck = false
+			local points = pathPoints(rootPart().Position, target)
+			for index, point in ipairs(points) do
+				local close = if index == #points then 2.5 else 3.5
+				if point.jump then
+					hum.Jump = true
+				end
+				pcall(hum.MoveTo, hum, point.position)
+				local bestDistance, bestAt, issuedAt, jumped = math.huge, os.clock(), os.clock(), false
+				while true do
+					if not alive() or not rootPart() then
+						return false, "no character"
+					end
+					if keepGoing and not keepGoing() then
+						halt()
+						return false, "stopped"
+					end
+					if N.flung() then
+						return false, "flung"
+					end
+					local distance = flat(rootPart().Position, point.position)
+					if distance <= close then
+						break
+					end
+					local now = os.clock()
+					if distance < bestDistance - 0.5 then
+						bestDistance, bestAt = distance, now
+					elseif now - bestAt > 1.2 and not jumped then
+						hum.Jump = true
+						jumped = true
+					elseif now - bestAt > 3 then
+						stuck = true
+						break
+					end
+					-- MoveTo gives up on its own after 8 seconds.
+					if now - issuedAt > 6 then
+						issuedAt = now
+						pcall(hum.MoveTo, hum, point.position)
+					end
+					task.wait(0.1)
+				end
+				if stuck then
+					N.Moves.blocked += 1
+					log("WALK stuck", brief(rootPart().Position), "->", brief(point.position), "new path")
+					break
+				end
+			end
+			if not stuck then
+				break
+			end
+		end
+		local root = rootPart()
+		if root and flat(root.Position, target) <= 4 and math.abs(root.Position.Y - target.Y) < 8 then
+			return true
+		end
+		return false, "blocked"
+	end
 	-- Long trips go along the ground in a few legs so the character never cuts through the floor.
 	local function planPath(from, to)
 		local distance = flat(from, to)
@@ -31549,6 +31655,21 @@ do
 			task.wait(0.05)
 			Noclip.travel = false
 			return ok
+		end
+		if mode == "Walk" then
+			local done, why = humanWalk(target, opts.keepGoing)
+			if done ~= nil then
+				if done and opts.look then
+					local root2 = rootPart()
+					if root2 then
+						root2.CFrame = CFrame.lookAt(root2.Position, Vector3.new(opts.look.X, root2.Position.Y, opts.look.Z))
+					end
+				end
+				if not done then
+					log("WALK failed", why)
+				end
+				return done
+			end
 		end
 		local speedFn = function()
 			return N.modeSpeed(mode)
@@ -31705,16 +31826,21 @@ do
 		local root = rootPart()
 		local origin = root and root.Position
 		local maxHits = math.max(optionNumber("MaxHits", 80), 1)
+		local titanicFirst = on("TitanicFirst")
 		local best, bestScore
 		for _, info in ipairs(N.eggs()) do
+			-- Titanic eggs may sit outside the picked zone, they only need a zone your speed can escape.
+			-- The event egg has 10x HP and other players hit it too, so it gets a 10x hit limit and ignores players nearby.
+			local event = titanicFirst and info.titanic
+			local special = event or (titanicFirst and info.bracket == "TITANIC")
 			if
-				N.zoneAllowed(info.zone)
-				and info.hits <= maxHits
+				(N.zoneAllowed(info.zone) or (special and N.canEscape(info.zone)))
+				and info.hits <= (if event then maxHits * 10 else maxHits)
 				and (F.failedEggs[info.part] or 0) < os.clock()
-				and allows(Options.EggPick, info.kind)
-				and not (on("AvoidPlayers") and othersNear(info.position, 10))
+				and (event or allows(Options.EggPick, info.kind))
+				and not (not event and on("AvoidPlayers") and othersNear(info.position, 10))
 			then
-				local score = N.eggScore(info, origin)
+				local score = N.eggScore(info, origin) + (if event then 2e15 elseif special then 1e15 else 0)
 				if not bestScore or score > bestScore then
 					best, bestScore = info, score
 				end
@@ -31772,6 +31898,9 @@ do
 		for _, info in ipairs(N.pickups()) do
 			if N.wantedPickup(info, false, worst) and (not near or (info.position - near).Magnitude <= within) then
 				local score = N.cashValue(info) - N.distanceTo(info.position) * 1e-6
+				if on("TitanicFirst") and info.bracket == "TITANIC" then
+					score += 1e18
+				end
 				if not bestScore or score > bestScore then
 					best, bestScore = info, score
 				end
@@ -32734,6 +32863,37 @@ do
 	end
 	N.HitSpeeds = { "Slow", "Normal", "Fast", "Blatant (HIGH RISK OF BAN)" }
 	do
+		-- One switch for people who do not want to set anything: the safe, best settings for a full farm.
+		local QuickBox = Tabs.Farm:AddLeftGroupbox("Quick Farm", "sparkles")
+		N.FarmBestOn = { "AutoFarm", "GrabOwnHatch", "StealPickups", "OnlyBetter", "TitanicFirst", "AvoidGuards", "AutoPlace", "AutoTrain", "AutoMergeEggs", "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill", "AutoIndex", "AutoOffline" }
+		N.FarmBestOff = { "AutoFarm", "StealPickups", "AutoTrain" }
+		QuickBox:AddToggle("AutoFarmBest", {
+			Text = "Auto Farm Best",
+			Default = false,
+			Tooltip = "Turns on everything for you: breaks eggs in the best zone (Titanic first), steals better animals, trains, places the best ones and buys upgrades. Walks safely",
+			Callback = function(value)
+				task.defer(function()
+					for _, name in ipairs(if value then N.FarmBestOn else N.FarmBestOff) do
+						local toggle = Toggles[name]
+						if toggle and toggle.Value ~= value then
+							toggle:SetValue(value)
+						end
+					end
+					if value then
+						if Options.ZoneMode then
+							Options.ZoneMode:SetValue("Best zone")
+						end
+						if Options.MoveMode and N.moveMode() ~= "Walk" then
+							Options.MoveMode:SetValue("Walk")
+						end
+					end
+				end)
+			end,
+		})
+		QuickBox:AddLabel({
+			Text = '<font transparency="0.35">One switch for the whole farm. Everything below still works if you want to fine tune it.</font>',
+			DoesWrap = true,
+		})
 		local EggBox = Tabs.Farm:AddLeftGroupbox("Eggs", "egg")
 		EggBox:AddToggle("AutoFarm", {
 			Text = "Break Eggs In Best Zone",
@@ -32752,6 +32912,11 @@ do
 			Default = {},
 			Multi = true,
 			AllowNull = true,
+		})
+		EggBox:AddToggle("TitanicFirst", {
+			Text = "Titanic Eggs First",
+			Default = true,
+			Tooltip = "Goes for the Titanic event egg (30x luck) and TITANIC weight eggs before anything else, and steals TITANIC animals first. Only in zones your speed can escape",
 		})
 		EggBox:AddDropdown("EggPriority", {
 			Text = "Egg Priority",
@@ -32977,9 +33142,9 @@ do
 		local MoveBox = Tabs.Movement:AddLeftGroupbox("Travel", "route")
 		MoveBox:AddDropdown("MoveMode", {
 			Text = "Movement Type",
-			Values = { "Teleport", "Walk", "Fast" },
-			Default = "Teleport",
-			Tooltip = "Teleport jumps straight to eggs and home, the guard never reaches you. Walk moves at your own run speed",
+			Values = { "Walk", "Fast", "Teleport" },
+			Default = "Walk",
+			Tooltip = "Walk really runs with your own speed and is safe from the game's anticheat. Fast and Teleport get pulled back or exploded by it now",
 		})
 		MoveBox:AddToggle("TeleportSpeedCheck", {
 			Text = "Speed Check With Teleport",
@@ -32987,8 +33152,7 @@ do
 			Tooltip = "Also keeps to zones your speed can escape while teleporting. Off = farms the highest zone you can break eggs in",
 		})
 		MoveBox:AddSlider("FastSpeed", { Text = "Fast Speed", Default = 150, Min = 20, Max = 400, Rounding = 0, Suffix = " studs/s" })
-		MoveBox:AddSlider("WalkPercent", { Text = "Walk Speed", Default = 100, Min = 50, Max = 120, Rounding = 0, Suffix = "%" })
-		MoveBox:AddToggle("TravelNoclip", { Text = "Noclip While Travelling", Default = true })
+		MoveBox:AddToggle("TravelNoclip", { Text = "Noclip While Travelling", Default = true, Tooltip = "Only for Fast mode, Walk goes around walls" })
 		MoveBox:AddToggle("FallRescue", {
 			Text = "Rescue If Under The Map",
 			Default = true,
@@ -33014,9 +33178,9 @@ do
 		})
 		Labels.Move = MoveBox:AddLabel({ Text = "-", DoesWrap = true })
 		local SpeedBox = Tabs.Movement:AddRightGroupbox("Player", "user")
-		SpeedBox:AddToggle("WalkSpeedOn", { Text = "WalkSpeed", Default = false, Tooltip = "Overrides the run speed the game gives you" })
+		SpeedBox:AddToggle("WalkSpeedOn", { Text = "WalkSpeed", Default = false, Tooltip = "Overrides the run speed the game gives you. The game's anticheat catches this" })
 		SpeedBox:AddSlider("WalkSpeedValue", { Text = "Speed", Default = 60, Min = 16, Max = 200, Rounding = 0, Suffix = " studs/s" })
-		SpeedBox:AddToggle("FlyOn", { Text = "Fly", Default = false, Tooltip = "Space goes up, Ctrl or Q goes down" })
+		SpeedBox:AddToggle("FlyOn", { Text = "Fly", Default = false, Tooltip = "Space goes up, Ctrl or Q goes down. The game's anticheat catches flying" })
 		SpeedBox:AddSlider("FlySpeed", { Text = "Fly Speed", Default = 80, Min = 10, Max = 300, Rounding = 0, Suffix = " studs/s" })
 		SpeedBox:AddToggle("InfiniteJump", { Text = "Infinite Jump", Default = false })
 		SpeedBox:AddToggle("Noclip", { Text = "Noclip", Default = false })
@@ -33756,6 +33920,7 @@ do
 	if Library.SetQuickBar then
 		pcall(function()
 			Library:SetQuickBar({
+				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm" },
 				{ Toggle = "AutoFarm", Icon = "egg", Label = "Eggs" },
 				{ Toggle = "StealPickups", Icon = "hand", Label = "Steal" },
 				{ Toggle = "AutoTrain", Icon = "footprints", Label = "Train" },
@@ -33809,13 +33974,13 @@ do
 					Id = "move",
 					Title = "How should Corvus travel?",
 					Description = "You can change this later in the Movement tab.",
-					Default = "Teleport",
+					Default = "Walk",
 					SingleColumn = true,
 					ChoiceHeight = 54,
 					Choices = {
-						{ Id = "Teleport", Title = "Teleport (best)", Description = "Jumps to eggs and home instantly, the guard never catches you, farms the highest zone you can break", Icon = "zap", Color = "#ff5d8f" },
-						{ Id = "Walk", Title = "Walk", Description = "Moves at your own run speed and keeps to zones your speed can escape", Icon = "shield", Color = "#60d696" },
-						{ Id = "Fast", Title = "Fast", Description = "Moves at 150 studs/s, slows down on its own if the server pulls you back", Icon = "wind", Color = "#5fb8ff" },
+						{ Id = "Walk", Title = "Walk (safe)", Description = "Really runs with your own speed, the game's anticheat has nothing to catch", Icon = "shield", Color = "#60d696" },
+						{ Id = "Fast", Title = "Fast (risky)", Description = "Moves at 150 studs/s, the anticheat pulls you back", Icon = "wind", Color = "#5fb8ff" },
+						{ Id = "Teleport", Title = "Teleport (risky)", Description = "Instant, but the anticheat now pulls you back and blocks banking", Icon = "zap", Color = "#ff5d8f" },
 					},
 				},
 			},
@@ -33871,6 +34036,22 @@ else
 		SaveManager:LoadAutoloadConfig()
 	end)
 end
+-- The game added a server anticheat for teleport, speed and fly. Configs saved before that keep Teleport,
+-- so they are moved to Walk once (the player can still pick another mode afterwards).
+pcall(function()
+	if Library.GetSetting and not Library:GetSetting("BSE_AntiCheatWalk", false) then
+		Library:SetSetting("BSE_AntiCheatWalk", true)
+		if N.moveMode() ~= "Walk" then
+			Options.MoveMode:SetValue("Walk")
+			notify("Movement", "The game added an anticheat, Corvus now walks instead of teleporting", 6)
+		end
+		for _, name in ipairs({ "WalkSpeedOn", "FlyOn" }) do
+			if Toggles[name] and Toggles[name].Value then
+				Toggles[name]:SetValue(false)
+			end
+		end
+	end
+end)
 if Window.AddInfoTab then
 	local DonateMethods = {
 		{
