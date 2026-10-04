@@ -31523,13 +31523,53 @@ do
 	-- The game's server anticheat pulls back or explodes anyone who teleports, moves faster than their speed or flies.
 	-- Walk mode lets the Humanoid really walk along a computed path, so the server only sees normal running.
 	local PathOk, Pathfinding = pcall(game.GetService, game, "PathfindingService")
+	-- True when nothing solid stands between the two points at knee and chest height, so a straight run works.
+	local function lineClear(from, to)
+		local flatTo = Vector3.new(to.X, from.Y, to.Z)
+		local offset = flatTo - from
+		if offset.Magnitude < 1 or math.abs(to.Y - from.Y) > 6 then
+			return offset.Magnitude < 1
+		end
+		for _, height in ipairs({ -1.5, 1.5 }) do
+			local start = from + Vector3.new(0, height, 0)
+			local ok, hit = pcall(function()
+				return workspace:Raycast(start, offset, rayParams())
+			end)
+			if not ok or hit then
+				return false
+			end
+		end
+		return true
+	end
+	-- Only the corners of the path are kept, the Humanoid runs straight between them without slowing down.
+	local function simplify(from, list)
+		local out = {}
+		local prevPos = from
+		for index, point in ipairs(list) do
+			local nextPoint = list[index + 1]
+			local keep = nextPoint == nil or point.jump or nextPoint.jump or math.abs(nextPoint.position.Y - point.position.Y) > 2
+			if not keep then
+				local a = Vector3.new(point.position.X - prevPos.X, 0, point.position.Z - prevPos.Z)
+				local b = Vector3.new(nextPoint.position.X - point.position.X, 0, nextPoint.position.Z - point.position.Z)
+				keep = a.Magnitude < 0.1 or b.Magnitude < 0.1 or a.Unit:Dot(b.Unit) < 0.97
+			end
+			if keep then
+				table.insert(out, point)
+				prevPos = point.position
+			end
+		end
+		return out
+	end
 	local function pathPoints(from, target)
+		if lineClear(from, target) then
+			return { { position = target, jump = false } }
+		end
 		if PathOk and Pathfinding then
 			local ok, path = pcall(Pathfinding.CreatePath, Pathfinding, {
 				AgentRadius = 2.5,
 				AgentHeight = 5,
 				AgentCanJump = true,
-				WaypointSpacing = 10,
+				WaypointSpacing = 12,
 			})
 			if ok and path and pcall(path.ComputeAsync, path, from, target) and path.Status == Enum.PathStatus.Success then
 				local list = {}
@@ -31539,7 +31579,7 @@ do
 					end
 				end
 				if #list > 0 then
-					return list
+					return simplify(from, list)
 				end
 			end
 		end
@@ -31551,6 +31591,8 @@ do
 		end)
 		return ok and type(fn) == "function"
 	end
+	-- Runs at the full WalkSpeed the server gives you (it follows your speed stat), the same as holding W.
+	-- The next corner is given before the current one is reached, so the character never stops on the way.
 	local function humanWalk(target, keepGoing)
 		local hum = humanoid()
 		if not hum or not rootPart() or not canWalk(hum) then
@@ -31566,7 +31608,7 @@ do
 			local stuck = false
 			local points = pathPoints(rootPart().Position, target)
 			for index, point in ipairs(points) do
-				local close = if index == #points then 2.5 else 3.5
+				local last = index == #points
 				if point.jump then
 					hum.Jump = true
 				end
@@ -31584,16 +31626,18 @@ do
 						return false, "flung"
 					end
 					local distance = flat(rootPart().Position, point.position)
+					-- Hand over to the next corner about a tenth of a second early.
+					local close = if last then 2.5 else math.max(3.5, (tonumber(hum.WalkSpeed) or 16) * 0.12)
 					if distance <= close then
 						break
 					end
 					local now = os.clock()
 					if distance < bestDistance - 0.5 then
 						bestDistance, bestAt = distance, now
-					elseif now - bestAt > 1.2 and not jumped then
+					elseif now - bestAt > 0.8 and not jumped then
 						hum.Jump = true
 						jumped = true
-					elseif now - bestAt > 3 then
+					elseif now - bestAt > 2.5 then
 						stuck = true
 						break
 					end
@@ -31602,7 +31646,7 @@ do
 						issuedAt = now
 						pcall(hum.MoveTo, hum, point.position)
 					end
-					task.wait(0.1)
+					task.wait()
 				end
 				if stuck then
 					N.Moves.blocked += 1
