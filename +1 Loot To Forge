@@ -25402,7 +25402,22 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             end
     
             Profile:AddDivider()
-            pcall(function() getgenv().CorvusLive = { info = function() if typeof(Library.RenderOverlayInfo) == "function" then local ok, extra = pcall(Library.RenderOverlayInfo) if ok then return extra end end return nil end, anonymous = function() return Library.Anonymous == true end } end)
+            pcall(function()
+getgenv().CorvusLive = {
+info = function()
+if typeof(Library.RenderOverlayInfo) == "function" then
+local ok, extra = pcall(Library.RenderOverlayInfo)
+if ok then
+return extra
+end
+end
+return nil
+end,
+anonymous = function()
+return Library.Anonymous == true
+end,
+}
+end)
             Profile:AddToggle("CorvusAnonymous", {
                 Text = "Anonymous Mode",
                 Description = "Hide your name, id and avatar",
@@ -31268,6 +31283,56 @@ do
 	-- swinging. Insta-kill sends a hit as big as the enemy's HP (the enemies only exist on your client).
 	-- World bosses are server enemies and are never touched by the aura.
 	N.Aura = { at = 0, hits = 0 }
+	-- Player powers. The player's HP only lives on this client (LocalPlayer.HPValue, attribute MaxHP), and the
+	-- game's damage code skips anyone with the "Invincible" attribute, so both work without touching the server.
+	--   God Mode: max HP becomes a trillion and is kept full; turning it off puts the real max HP back.
+	--   Untouchable: sets Invincible, enemy hits never register at all.
+	--   Walk Speed: sets the humanoid's speed while on.
+	N.Powers = { maxHp = nil, invincible = false, speed = nil }
+	local GodHP = 1e12
+	function N.powerStep()
+		local P = N.Powers
+		local hp = LocalPlayer:FindFirstChild("HPValue")
+		if hp then
+			if on("GodMode") then
+				local max = tonumber(hp:GetAttribute("MaxHP")) or 100
+				if max < GodHP then
+					P.maxHp = max
+					hp:SetAttribute("MaxHP", GodHP)
+				end
+				if (tonumber(hp.Value) or 0) < GodHP * 0.9 then
+					hp.Value = GodHP
+				end
+			elseif P.maxHp then
+				hp:SetAttribute("MaxHP", P.maxHp)
+				hp.Value = P.maxHp
+				P.maxHp = nil
+			end
+		end
+		if on("Untouchable") then
+			if LocalPlayer:GetAttribute("Invincible") ~= true then
+				LocalPlayer:SetAttribute("Invincible", true)
+				P.invincible = true
+			end
+		elseif P.invincible then
+			LocalPlayer:SetAttribute("Invincible", nil)
+			P.invincible = false
+		end
+		local char = LocalPlayer.Character
+		local humanoid = char and char:FindFirstChild("Humanoid")
+		if humanoid then
+			if on("SpeedHack") then
+				P.speed = P.speed or humanoid.WalkSpeed
+				local want = math.clamp(optionNumber("WalkSpeed", 60), 16, 250)
+				if humanoid.WalkSpeed ~= want then
+					humanoid.WalkSpeed = want
+				end
+			elseif P.speed then
+				humanoid.WalkSpeed = P.speed
+				P.speed = nil
+			end
+		end
+	end
 	function N.auraStep()
 		if not on("KillAura") or N.dead() or os.clock() - N.Aura.at < math.clamp(optionNumber("AuraSpeed", 0.3), 0.1, 2) then
 			return 0
@@ -31574,10 +31639,9 @@ do
 	N.ForgeSlots = 4
 	function N.forgePlan(kind)
 		local count = N.forgeCount(kind)
-		local keep = N.rarityRank(optionText("ForgeKeepRarity", "Infinite"))
 		local usable = {}
 		for _, ore in ipairs(N.ores()) do
-			if not ore.locked and N.rarityRank(ore.rarity) < keep then
+			if not ore.locked and not selected(Options.ForgeKeepRarities, ore.rarity) then
 				table.insert(usable, ore)
 			end
 		end
@@ -32300,6 +32364,8 @@ do
 		local QuickBox = Tabs.Farm:AddLeftGroupbox("Quick Farm", "sparkles")
 		N.FarmBestOn = {
 			"KillAura",
+			"GodMode",
+			"Untouchable",
 			"AutoStages",
 			"AutoTrain",
 			"AutoForge",
@@ -32389,8 +32455,13 @@ do
 			Default = "Real damage",
 			Tooltip = "Insta-kill finishes stage and tower enemies at once (they only exist on your screen). Riskier than real damage",
 		})
-		AuraBox:AddSlider("AuraRange", { Text = "Range", Default = 40, Min = 10, Max = 120, Rounding = 0, Suffix = " studs" })
+		AuraBox:AddSlider("AuraRange", { Text = "Range", Default = 40, Min = 10, Max = 500, Rounding = 0, Suffix = " studs", Tooltip = "500 hits every enemy of the stage you are on" })
 		AuraBox:AddSlider("AuraSpeed", { Text = "Hit Every", Default = 0.3, Min = 0.1, Max = 1, Rounding = 2, Suffix = " s" })
+		local PowerBox = Tabs.Farm:AddLeftGroupbox("Player", "shield-plus")
+		PowerBox:AddToggle("GodMode", { Text = "God Mode", Default = false, Tooltip = "Your HP becomes a trillion and stays full, nothing can kill you, so ores are never lost" })
+		PowerBox:AddToggle("Untouchable", { Text = "Untouchable", Default = false, Tooltip = "Enemy attacks never hit you at all (stages, the tower and the world boss)" })
+		PowerBox:AddToggle("SpeedHack", { Text = "Walk Speed", Default = false })
+		PowerBox:AddSlider("WalkSpeed", { Text = "Speed", Default = 60, Min = 16, Max = 250, Rounding = 0 })
 		local StatusBox = Tabs.Farm:AddRightGroupbox("Status", "activity")
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
@@ -32430,11 +32501,13 @@ do
 			Rounding = 0,
 			Tooltip = "More ores give bigger items: weapons 4 (Katana) to 13 (Great sword), armor 4 (light hat) to 23 (heavy armor)",
 		})
-		ForgeBox:AddDropdown("ForgeKeepRarity", {
-			Text = "Never Forge Ores From",
+		ForgeBox:AddDropdown("ForgeKeepRarities", {
+			Text = "Never Forge These Ores",
 			Values = N.RarityOrder,
-			Default = "Infinite",
-			Tooltip = "Ores of this rarity and better stay in your backpack",
+			Default = { "Infinite", "Exclusive" },
+			Multi = true,
+			AllowNull = true,
+			Tooltip = "Pick any rarities: ores of the picked rarities always stay in your backpack",
 		})
 		ForgeBox:AddButton({
 			Text = "Forge Now",
@@ -32715,6 +32788,9 @@ end
 N.AllAutoToggles = {
 	"AutoFarmBest",
 	"KillAura",
+	"GodMode",
+	"Untouchable",
+	"SpeedHack",
 	"AutoStages",
 	"AutoTrain",
 	"AutoForge",
@@ -33521,6 +33597,7 @@ do
 			N.potionStep()
 		end
 		N.classStep()
+		N.powerStep()
 		if choreDue("reload", 180) and N.fightMode() == nil then
 			N.loadData()
 		end
