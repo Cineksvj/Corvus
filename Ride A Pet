@@ -22582,7 +22582,9 @@ Library:SetAnonymous(Value)
 end,
 })
 local SupportedGames = Info.SupportedGames or {
+	{ Name = "Anime Dice", PlaceId = 113290951185459 },
 	{ Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
+	{ Name = "Loot To Forge", PlaceId = 118805555015549 },
 	{ Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
 	{ Name = "Pets Universe", PlaceId = 74629631798007 },
 	{ Name = "Ride A Pet", PlaceId = 124216119978534 },
@@ -22594,31 +22596,56 @@ GamesBox:AddLabel({
 	Text = '<font transparency="0.35">Every game Corvus supports. Teleport takes you there and starts the hub again.</font>',
 	DoesWrap = true,
 })
+local GameNames, GameByName, CurrentGame = {}, {}, nil
 for _, Entry in SupportedGames do
-	local Here = game.PlaceId == Entry.PlaceId
-	GamesBox:AddButton({
-		Text = if Here then Entry.Name .. "  (you are here)" else Entry.Name,
-		Disabled = Here,
-		Func = function()
-			if Here then
-				return
-			end
-			pcall(function()
-				local Queue = queue_on_teleport or queueonteleport or (typeof(syn) == "table" and syn.queue_on_teleport)
-				if typeof(Queue) == "function" then
-					Queue("if not game:IsLoaded() then game.Loaded:Wait() end\n" .. GamesLoader)
-				end
-			end)
-			Library:Notify({ Title = "Teleporting", Description = Entry.Name, Time = 4 })
-			local Ok, Error = pcall(function()
-				game:GetService("TeleportService"):Teleport(Entry.PlaceId, LocalPlayer)
-			end)
-			if not Ok then
-				Library:Notify({ Title = "Teleport failed", Description = tostring(Error), Time = 5 })
-			end
-		end,
-	})
+	table.insert(GameNames, Entry.Name)
+	GameByName[Entry.Name] = Entry
+	if game.PlaceId == Entry.PlaceId then
+		CurrentGame = Entry.Name
+	end
 end
+GamesBox:AddLabel({
+	Text = string.format(
+		'<font transparency="0.35">%d games supported%s</font>',
+		#GameNames,
+		if CurrentGame then ", you are in <b>" .. CurrentGame .. "</b>" else ""
+	),
+	DoesWrap = true,
+})
+local GamePick = GamesBox:AddDropdown("CorvusGamePick", {
+	Text = "Game",
+	Values = GameNames,
+	Default = nil,
+	AllowNull = true,
+	Searchable = true,
+})
+GamesBox:AddButton({
+	Text = "Teleport",
+	Func = function()
+		local Entry = GameByName[GamePick.Value or ""]
+		if not Entry then
+			Library:Notify({ Title = "Supported Games", Description = "Pick a game first", Time = 3 })
+			return
+		end
+		if game.PlaceId == Entry.PlaceId then
+			Library:Notify({ Title = "Supported Games", Description = "You are already in " .. Entry.Name, Time = 3 })
+			return
+		end
+		pcall(function()
+			local Queue = queue_on_teleport or queueonteleport or (typeof(syn) == "table" and syn.queue_on_teleport)
+			if typeof(Queue) == "function" then
+				Queue("if not game:IsLoaded() then game.Loaded:Wait() end\n" .. GamesLoader)
+			end
+		end)
+		Library:Notify({ Title = "Teleporting", Description = Entry.Name, Time = 4 })
+		local Ok, Error = pcall(function()
+			game:GetService("TeleportService"):Teleport(Entry.PlaceId, LocalPlayer)
+		end)
+		if not Ok then
+			Library:Notify({ Title = "Teleport failed", Description = tostring(Error), Time = 5 })
+		end
+	end,
+})
 pcall(function()
 	GamesBox.BoxHolder.LayoutOrder = -200
 end)
@@ -27275,8 +27302,7 @@ return gameFolder and gameFolder:FindFirstChild("Plot")
 end,
 Net = function()
 local packages = ReplicatedStorage:FindFirstChild("packages")
-local net = packages and packages:FindFirstChild("Net")
-return net and net:FindFirstChild("RE")
+return packages and packages:FindFirstChild("Net")
 end,
 Dialogue = function()
 local dialogue = ReplicatedStorage:FindFirstChild("Dialogue")
@@ -27286,7 +27312,6 @@ end,
 local Allowed = {
 ["Game/EggPickup"] = true,
 ["Game/BasketDrop"] = true,
-["Game/EggArrivalClaim"] = true,
 ["Game/EggPlaced"] = true,
 ["Game/Hatch"] = true,
 ["Game/PlacePet"] = true,
@@ -27318,7 +27343,12 @@ local function remoteOf(path)
 local root, name = string.match(path, "^(%w+)/(.+)$")
 local getter = root and RemoteRoots[root]
 local folder = getter and getter()
-return folder and folder:FindFirstChild(name)
+if not folder then
+return nil
+end
+-- packages.Net keeps its remotes as "RE/<Name>" right in the Net folder (older builds used an RE subfolder).
+local sub = folder:FindFirstChild("RE")
+return folder:FindFirstChild(name) or folder:FindFirstChild("RE/" .. name) or (sub and sub:FindFirstChild(name))
 end
 local LastFire = {}
 function fire(path, ...)
@@ -28822,6 +28852,11 @@ if not root or not target then
 return false
 end
 local mode = opts.mode or N.moveMode()
+-- The game now checks how carried eggs reach the base ("Egg Delivery Failed | CODE AT"): with eggs in the
+-- basket the trip always goes at the pet's own speed, never Fast or a teleport.
+if mode ~= "Safe" and #N.basketItems() > 0 then
+mode = "Safe"
+end
 if mode == "Blatant" or (target - root.Position).Magnitude < 0.5 then
 Noclip.travel = true
 local ok = placeRoot(target)
@@ -28891,6 +28926,27 @@ N.unequipTools()
 end
 return ok
 end
+task.spawn(function()
+local gui = LocalPlayer:WaitForChild("PlayerGui", 30)
+if not gui then
+return
+end
+local seenAt = -1e9
+Library:GiveSignal(gui.DescendantAdded:Connect(function(d)
+if d:IsA("TextLabel") then
+task.defer(function()
+local ok, text = pcall(function()
+return d.Text
+end)
+if ok and type(text) == "string" and string.find(text, "Delivery Failed", 1, true) and os.clock() - seenAt > 2 then
+seenAt = os.clock()
+N.Moves.deliveryFails = (N.Moves.deliveryFails or 0) + 1
+logProblem("Game refused an egg delivery: " .. string.sub(text, 1, 80) .. " (mode " .. N.moveMode() .. ")")
+end
+end)
+end
+end))
+end)
 function N.dismount()
 if not N.isRiding() then
 return true
@@ -29113,6 +29169,15 @@ end
 local function homePos()
 return N.plotSpot(0, 0)
 end
+-- The server only accepts a delivery once it has seen you on your plot itself, before the egg breaks, with a little
+-- grace for ping (EggDeliveryRules.ClaimDeadline/GraceForPing). Plan with the carry speed and keep that margin free.
+function N.deliveryMargin()
+local ping = 0
+pcall(function()
+ping = LocalPlayer:GetNetworkPing()
+end)
+return math.clamp(optionNumber("ReturnMargin", 2), 0, 10) + math.clamp(ping * 2, 0, 1) + 0.5
+end
 function N.reachInfo(info, from)
 local mode = N.moveMode()
 local home = homePos()
@@ -29120,10 +29185,8 @@ if not home then
 return false, 0, 0
 end
 local toEgg = travelSeconds(from, info.pos, mode, 1)
-local back = travelSeconds(info.pos, home, mode, N.carryMultiplier(info.weight, info.name))
-local limit = info.breakSeconds
-- math.clamp(optionNumber("ReturnMargin", 2), 0, 10)
-- (if mode == "Blatant" then 0 else optionNumber("PickupDelay", 0.2))
+local back = travelSeconds(info.pos, home, "Safe", N.carryMultiplier(info.weight, info.name))
+local limit = info.breakSeconds - N.deliveryMargin() - optionNumber("PickupDelay", 0.2)
 return back <= limit, toEgg, back
 end
 local function targetList(from, extraCheck)
@@ -29137,7 +29200,7 @@ if maxDistance <= 0 or info.distance <= maxDistance then
 local ok, toEgg, back = N.reachInfo(info, from)
 info.reachable, info.toEgg, info.back = ok, toEgg, back
 info.waitDrop = math.max(0, info.dropEndsAt - now)
-if (ok or on("TeleportIfFar")) and (not extraCheck or extraCheck(info)) then
+if ok and (not extraCheck or extraCheck(info)) then
 info.score = N.eggScore(info, from)
 table.insert(list, info)
 end
@@ -29309,12 +29372,8 @@ local mode = N.moveMode()
 local deadline = N.soonestBreak()
 if mode ~= "Blatant" and deadline then
 local need = travelSeconds(root.Position, home, mode, carrySlowdown())
-if serverNow() + need > deadline - 0.3 and on("TeleportIfFar") then
-log(
-"DELIVER too far for " .. mode .. ", teleporting home",
-string.format("need %.1fs, have %.1fs", need, deadline - serverNow())
-)
-mode = "Blatant"
+if serverNow() + need > deadline - 0.3 then
+log("DELIVER may be late", string.format("need %.1fs, have %.1fs", need, deadline - serverNow()))
 end
 end
 local names = {}
@@ -29335,27 +29394,13 @@ return #N.basketItems() > 0
 end,
 })
 end
+-- Stand still on the plot so the server sees you there, the game's own client then claims the eggs.
+N.holdStill(0.6, function()
+return #N.basketItems() > 0
+end)
 local done = waitFor(function()
 return #N.basketItems() == 0
-end, 2.5)
-root = rootPart()
-if not done and root and N.onPlot(root.Position, 1) then
-local now = serverNow()
-local list = {}
-for _, child in ipairs(N.basketItems()) do
-local at = tonumber(child:GetAttribute("BreakAt"))
-if at and now <= at + 0.5 and not child:GetAttribute("Delivering") then
-table.insert(list, child.Name)
-end
-end
-if #list > 0 then
-log("DELIVER nudging the arrival check", #list .. " egg(s)")
-fire("Game/EggArrivalClaim", now, root.Position, list)
-end
-done = waitFor(function()
-return #N.basketItems() == 0
-end, 3)
-end
+end, 5)
 if not done and #N.basketItems() > 0 then
 local child = N.basketItems()[1]
 local at = tonumber(child:GetAttribute("BreakAt"))
@@ -29468,8 +29513,8 @@ local mode = N.moveMode()
 local deadline = tonumber(child:GetAttribute("BreakAt")) or (serverNow() + 20)
 local bonus = tonumber(N.VolcanoData.BonusSeconds) or 12
 local carry = carrySlowdown()
-local need = travelSeconds(root.Position, hover, mode, carry) + 11 + travelSeconds(hover, home, mode, carry) + 1
-if serverNow() + need > deadline + bonus - 1 and not on("TeleportIfFar") then
+local need = travelSeconds(root.Position, hover, "Safe", carry) + 11 + travelSeconds(hover, home, "Safe", carry) + N.deliveryMargin()
+if serverNow() + need > deadline + bonus - 1 then
 log("VOLCANO skipped, not enough time", string.format("need %.0fs", need))
 return false
 end
@@ -29573,8 +29618,8 @@ if mode == "Blatant" then
 return true
 end
 local arrive = travelSeconds(root.Position, info.pos, mode, carry) + optionNumber("PickupDelay", 0.2) + 0.5
-local back = travelSeconds(info.pos, home, mode, math.min(carry, N.carryMultiplier(info.weight, info.name)))
-return serverNow() + arrive + back <= deadline - optionNumber("ReturnMargin", 2)
+local back = travelSeconds(info.pos, home, "Safe", math.min(carry, N.carryMultiplier(info.weight, info.name)))
+return serverNow() + arrive + back <= deadline - N.deliveryMargin()
 end)[1]
 if not nextEgg then
 break
@@ -31125,7 +31170,7 @@ Tooltip = "0 means any distance",
 FarmBox:AddToggle("TeleportIfFar", {
 Text = "Teleport Home If Too Far",
 Default = false,
-Tooltip = "Eggs your pet cannot bring back in time still get picked, the way home is a teleport",
+Tooltip = "Turned off by the game's new delivery check: carried eggs now always travel at your pet's speed",
 })
 FarmBox:AddToggle(
 "AdminFirst",
