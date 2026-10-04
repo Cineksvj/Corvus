@@ -29282,6 +29282,15 @@ local BootOk, BootError = xpcall(function()
 		local function instantCycle()
 			local I = Sea.instant
 			Game.callGap = 0.03
+			if not inSpawn() then
+				-- the server takes the catch on the shore, so the farm starts there (after the plot or training)
+				setStatus("Blatant: going to the shore")
+				closeWindows()
+				travelTo(spawnSpot(), { mode = "Teleport" })
+				if not waitFor(inSpawn, 2) then
+					return false
+				end
+			end
 			local before = inventoryCount()
 			local capacity = math.min(maxPickup(), math.max(inventoryLimit() - before, 0))
 			if capacity <= 0 then
@@ -30051,6 +30060,31 @@ local BootOk, BootError = xpcall(function()
 			table.sort(list, function(a, b)
 				return a.info.value < b.info.value
 			end)
+			if (Options.SellMode and Options.SellMode.Value) == "Smart" then
+				-- Smart ignores the sell filters: the best eggs (two plot loads) and a few animals stay, the rest is cash
+				local smart = {}
+				for key, entry in pairs(data and data.Inventory or {}) do
+					local info = entryInfo(entry)
+					if info and entry.innerEntity.locked ~= true and not info.special and not isProtected(info) then
+						table.insert(smart, { key = key, info = info, kind = entry.itemType })
+					end
+				end
+				table.sort(smart, function(a, b)
+					return a.info.value > b.info.value
+				end)
+				local keepEggs = if on("AutoPlaceEggs") then eggCap() * 2 else 0
+				local keepAnimals = 5
+				list = {}
+				for _, item in ipairs(smart) do
+					if item.kind == "Egg" and keepEggs > 0 then
+						keepEggs -= 1
+					elseif item.kind ~= "Egg" and keepAnimals > 0 then
+						keepAnimals -= 1
+					else
+						table.insert(list, 1, item)
+					end
+				end
+			end
 			return list
 		end
 		Sea.fullHint = function()
@@ -30208,7 +30242,7 @@ local BootOk, BootError = xpcall(function()
 				local move = Options.SeaMove and Options.SeaMove.Value
 				local useless = id == "MovementSpeed" and (move == "Blatant" or move == "Teleport")
 				if not useless and allows(Options.UpgradeFilter, label) and (UpgradeBackoff[id] or 0) <= os.clock() then
-					local amount = maxBuyable(id, spendable())
+					local amount = maxBuyable(id, if id == "Carry" then cash() else spendable())
 					if amount > 0 then
 						local level = upgradeLevel(id)
 						setStatus("Buying " .. label .. " x" .. amount)
@@ -30996,6 +31030,50 @@ local BootOk, BootError = xpcall(function()
 		Labels = {}
 		do
 			local SeaBox = Tabs.Main:AddLeftGroupbox("Open the Sea", "waves-horizontal")
+			local FarmAllSet = {
+				"AutoSea", "AutoSell", "AutoEquipBest", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff",
+				"AutoEquipStaff", "AutoBuyDumbbell", "AutoEquipDumbbell", "AutoTrain", "AutoBonus", "AutoRebirth",
+				"AutoPotions", "SmartPotions", "AutoLock", "AutoOffline", "SkipEmpty", "EquipBeforeSell", "SaveForRebirth",
+				"AutoPlaytime", "AutoDaily", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoCodes", "AutoStars",
+			}
+			local FarmAllMain = { "AutoSea", "AutoSell", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff", "AutoBuyDumbbell", "AutoTrain", "AutoRebirth", "AutoPotions" }
+			local FarmAllTurned = {}
+			local function farmAll(value)
+				if value then
+					table.clear(FarmAllTurned)
+					for _, name in ipairs(FarmAllSet) do
+						local toggle = Toggles[name]
+						if toggle and not toggle.Value then
+							table.insert(FarmAllTurned, name)
+							toggle:SetValue(true)
+						end
+					end
+					for name, value2 in pairs({ SeaMove = "Blatant", SeaCharge = "Perfect (+5s)", SellMode = "Smart", SellAt = 190, TrainMode = "Alternate with the sea", SeaMinutes = 10, TrainMinutes = 3, UpgradeSpend = 100 }) do
+						local option = Options[name]
+						if option then
+							pcall(option.SetValue, option, value2)
+						end
+					end
+					log("FARM ALL on, turned on", #FarmAllTurned, "toggles")
+				else
+					local list = if #FarmAllTurned > 0 then FarmAllTurned else FarmAllMain
+					for _, name in ipairs(list) do
+						if Toggles[name] then
+							Toggles[name]:SetValue(false)
+						end
+					end
+					table.clear(FarmAllTurned)
+					log("FARM ALL off")
+				end
+			end
+			SeaBox:AddToggle("AutoFarmAll", {
+				Text = "Auto Farm Everything",
+				Default = false,
+				Tooltip = "The fastest farm: Blatant sea, smart selling, eggs, best animals, Carry first, rebirths, training, potions and every reward. Turning it off stops what it started.",
+				Callback = function(value)
+					task.spawn(farmAll, value)
+				end,
+			})
 			SeaBox:AddToggle("AutoSea", {
 				Text = "Auto Open Sea",
 				Default = false,
@@ -31227,9 +31305,9 @@ local BootOk, BootError = xpcall(function()
 			)
 			SellBox:AddDropdown("SellMode", {
 				Text = "Sell Mode",
-				Values = { "Filtered", "Sell All Unlocked" },
-				Default = "Filtered",
-				Tooltip = "Filtered sells only what matches below, one by one. Sell All Unlocked uses the game's Sell All, locked items and your protected ones stay.",
+				Values = { "Smart", "Filtered", "Sell All Unlocked" },
+				Default = "Smart",
+				Tooltip = "Smart keeps your best eggs for the plot and sells the rest by value. Filtered sells only what matches below. Sell All Unlocked uses the game's Sell All, locked items and your protected ones stay.",
 			})
 			SellBox:AddDropdown(
 				"SellKinds",
@@ -32245,7 +32323,8 @@ local BootOk, BootError = xpcall(function()
 		if Library.SetQuickBar then
 			pcall(function()
 				Library:SetQuickBar({
-					{ Toggle = "AutoSea", Icon = "waves-horizontal", Label = "Sea" },
+					{ Toggle = "AutoFarmAll", Icon = "zap", Label = "Farm All" },
+				{ Toggle = "AutoSea", Icon = "waves-horizontal", Label = "Sea" },
 					{ Toggle = "AutoSell", Icon = "banknote", Label = "Sell" },
 					{ Toggle = "AutoEquipBest", Icon = "star", Label = "Best" },
 					{ Toggle = "AutoPlaceEggs", Icon = "egg", Label = "Eggs" },
