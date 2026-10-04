@@ -31970,7 +31970,23 @@ do
 		local maxHits = math.max(optionNumber("MaxHits", 80), 1)
 		local titanicFirst = on("TitanicFirst")
 		local best, bestScore
+		-- Eggs in your zones that only fail the hit limit: when nothing else fits, the fewest-hits one is broken anyway,
+		-- so the last zone is never skipped just because its eggs are tough.
+		local tough, toughHits = nil, math.huge
+		N.EggSeen = 0
 		for _, info in ipairs(N.eggs()) do
+			if N.zoneAllowed(info.zone) then
+				N.EggSeen += 1
+				if
+					info.hits > maxHits
+					and info.hits < toughHits
+					and (F.failedEggs[info.part] or 0) < os.clock()
+					and allows(Options.EggPick, info.kind)
+					and not (on("AvoidPlayers") and othersNear(info.position, 10))
+				then
+					tough, toughHits = info, info.hits
+				end
+			end
 			-- Titanic eggs may sit outside the picked zone, they only need a zone your speed can escape.
 			-- The event egg has 10x HP and other players hit it too, so it gets a 10x hit limit and ignores players nearby.
 			local event = titanicFirst and info.titanic
@@ -31988,7 +32004,46 @@ do
 				end
 			end
 		end
-		return best
+		return best or tough
+	end
+	-- The game only streams in eggs near you, so a far zone looks empty until you go there.
+	function N.farmZoneTarget()
+		local mode = optionText("ZoneMode", "Best zone")
+		if mode == "Picked zones" then
+			local top
+			for index, zone in ipairs(N.Cat.zones) do
+				if selected(Options.ZonePick, zone.label) then
+					top = index
+				end
+			end
+			return top
+		end
+		return N.bestZone()
+	end
+	F.lookAt = {}
+	function N.goLookForEggs()
+		local index = N.farmZoneTarget()
+		local model = index and N.zoneModel(index)
+		local ok, pivot = false, nil
+		if model then
+			ok, pivot = pcall(model.GetPivot, model)
+		end
+		if not ok or not pivot then
+			setStatus("No egg fits your settings right now")
+			return false
+		end
+		local spot = N.standAt(pivot.Position)
+		if N.distanceTo(spot) < 120 or os.clock() - (F.lookAt[index] or -1e9) < 20 then
+			setStatus(string.format("Waiting for eggs to spawn in zone %d", index))
+			return false
+		end
+		F.lookAt[index] = os.clock()
+		setStatus(string.format("Going to zone %d to find eggs", index))
+		log("FARM no eggs seen in zone", index, "walking there")
+		N.travelTo(spot, { keepGoing = function()
+			return on("AutoFarm") and not N.carrying()
+		end })
+		return true
 	end
 	-- worst = $/s of the weakest placed animal (0 while the plot has room), passed in so it is read once per scan.
 	-- Returns ok, reason. The reason is shown in the Animals box so it is clear why an animal was left.
@@ -32437,7 +32492,7 @@ do
 			if info then
 				return N.breakEgg(info)
 			end
-			setStatus("No egg fits your settings right now")
+			return N.goLookForEggs()
 		end
 		return false
 	end
@@ -33114,7 +33169,7 @@ do
 			Max = 1000,
 			Rounding = 0,
 			Suffix = " hits",
-			Tooltip = "Eggs that need more hits with your pickaxe are skipped",
+			Tooltip = "Eggs that need more hits are left for later. When nothing else fits, the easiest one is broken anyway",
 		})
 		EggBox:AddDropdown("HitSpeed", {
 			Text = "Hit Speed",
