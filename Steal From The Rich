@@ -33,7 +33,7 @@ ReplicatedStorage:WaitForChild("Shared", 20)
 task.wait(0.5)
 end
 local BootOk, BootError = xpcall(function()
-local HubRepo = "https://raw.githubusercontent.com/Cineksvj/Corvus/main/"
+local HubRepo = "https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/"
 local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/"
 local Library = (function()
 local cloneref = (cloneref or clonereference or function(instance: any)
@@ -22556,6 +22556,48 @@ Callback = function(Value)
 Library:SetAnonymous(Value)
 end,
 })
+local SupportedGames = Info.SupportedGames or {
+	{ Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
+	{ Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
+	{ Name = "Pets Universe", PlaceId = 74629631798007 },
+	{ Name = "Ride A Pet", PlaceId = 124216119978534 },
+	{ Name = "Steal From The Rich", PlaceId = 120475074479690 },
+}
+local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
+local GamesBox = Tab:AddRightGroupbox("Supported Games", "gamepad-2")
+GamesBox:AddLabel({
+	Text = '<font transparency="0.35">Every game Corvus supports. Teleport takes you there and starts the hub again.</font>',
+	DoesWrap = true,
+})
+for _, Entry in SupportedGames do
+	local Here = game.PlaceId == Entry.PlaceId
+	GamesBox:AddButton({
+		Text = if Here then Entry.Name .. "  (you are here)" else Entry.Name,
+		Disabled = Here,
+		Func = function()
+			if Here then
+				return
+			end
+			pcall(function()
+				local Queue = queue_on_teleport or queueonteleport or (typeof(syn) == "table" and syn.queue_on_teleport)
+				if typeof(Queue) == "function" then
+					Queue("if not game:IsLoaded() then game.Loaded:Wait() end\n" .. GamesLoader)
+				end
+			end)
+			Library:Notify({ Title = "Teleporting", Description = Entry.Name, Time = 4 })
+			local Ok, Error = pcall(function()
+				game:GetService("TeleportService"):Teleport(Entry.PlaceId, LocalPlayer)
+			end)
+			if not Ok then
+				Library:Notify({ Title = "Teleport failed", Description = tostring(Error), Time = 5 })
+			end
+		end,
+	})
+end
+pcall(function()
+	GamesBox.BoxHolder.LayoutOrder = -200
+end)
+
 local Session = Tab:AddRightGroupbox("Session", "activity")
 local GameRow = InfoRow(Session, "Game", "Loading...")
 local PlayersRow = InfoRow(Session, "Players", "-")
@@ -23628,11 +23670,17 @@ end,
 local General = Tab:AddRightGroupbox("General", "sliders-horizontal")
 local KeybindLabel = General:AddLabel("Menu keybind")
 KeybindLabel:AddKeyPicker("MenuKeybind", {
-Default = Info.MenuKeybind or "RightShift",
+Default = Library:GetSetting("MenuKeybind", Info.MenuKeybind or "RightShift"),
 NoUI = true,
 Text = "Menu keybind",
 })
 Library.ToggleKeybind = Library.Options.MenuKeybind
+Library.Options.MenuKeybind:OnChanged(function()
+	local Key = Library.Options.MenuKeybind.Value
+	if typeof(Key) == "string" and Key ~= "Unknown" and Key ~= "None" then
+		Library:SetSetting("MenuKeybind", Key)
+	end
+end)
 if Library.IsMobile then
 pcall(KeybindLabel.SetVisible, KeybindLabel, false)
 task.defer(function()
@@ -27030,7 +27078,7 @@ local SaveManager = loadAddon("SaveManager.lua")
 local Options = Library.Options
 local Toggles = Library.Toggles
 local Discord = "https://discord.gg/PdQvN2bDCu"
-local LoaderScript = 'loadstring(game:HttpGet("' .. HubRepo .. 'Steal%20From%20The%20Rich"))()'
+local LoaderScript = 'loadstring(game:HttpGet("' .. HubRepo .. 'Loader"))()'
 local Env = getgenv()
 if Env.StealFromTheRichInstance then
 pcall(function()
@@ -27208,6 +27256,22 @@ RarityList = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Cos
 end
 for i, name in ipairs(RarityList) do
 RarityRank[name] = i
+end
+end
+local CrateRarities = { list = {}, rank = {} }
+do
+for _, area in ipairs(Areas) do
+for _, tier in ipairs(type(area.CrateTiers) == "table" and area.CrateTiers or {}) do
+if type(tier) == "string" and not table.find(CrateRarities.list, tier) then
+table.insert(CrateRarities.list, tier)
+end
+end
+end
+if #CrateRarities.list == 0 then
+CrateRarities.list = table.clone(RarityList)
+end
+for i, name in ipairs(CrateRarities.list) do
+CrateRarities.rank[name] = i
 end
 end
 local Trails = {}
@@ -27508,6 +27572,45 @@ homeX = 2436,
 search = 0,
 coastK = 0.0011,
 }
+function Nav.arenaParts()
+local list = {}
+pcall(function()
+local map = workspace:FindFirstChild("Steal Map")
+local arena = map and (map:FindFirstChild("Arena") or map:WaitForChild("Arena", 5))
+for _, part in ipairs(arena and arena:GetChildren() or {}) do
+if part:IsA("BasePart") and part:GetAttribute("AreaId") then
+table.insert(list, part)
+end
+end
+end)
+return list
+end
+pcall(function()
+local x0, x1, z0, z1 = Nav.minX, Nav.maxX, Nav.minZ, Nav.maxZ
+for _, part in ipairs(Nav.arenaParts()) do
+local half = part.Size / 2
+x0 = math.min(x0, part.Position.X - half.X - 40)
+x1 = math.max(x1, part.Position.X + half.X + 40)
+z0 = math.min(z0, part.Position.Z - half.Z - 40)
+z1 = math.max(z1, part.Position.Z + half.Z + 40)
+end
+if (x1 - x0) * (z1 - z0) / (Nav.cell * Nav.cell) <= 4000000 then
+Nav.minX, Nav.maxX, Nav.minZ, Nav.maxZ = x0, x1, z0, z1
+end
+end)
+Nav.streamedAt = -1e9
+function Nav.streamArena(areaIds)
+if not workspace.StreamingEnabled or os.clock() - Nav.streamedAt < 15 then
+return false
+end
+Nav.streamedAt = os.clock()
+for _, part in ipairs(Nav.arenaParts()) do
+if not areaIds or areaIds[part:GetAttribute("AreaId")] then
+pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, part.Position, 5)
+end
+end
+return true
+end
 local CELL = Nav.cell
 local NX = math.floor((Nav.maxX - Nav.minX) / CELL)
 local NZ = math.floor((Nav.maxZ - Nav.minZ) / CELL)
@@ -27739,6 +27842,8 @@ if Nav.building then
 return
 end
 Nav.building = true
+Nav.streamedAt = -1e9
+Nav.streamArena(nil)
 local newFlags, newGround = buffer.create(COUNT), buffer.create(COUNT)
 local parts = collectParts()
 local treadmills = workspace:FindFirstChild("Treadmills")
@@ -28262,7 +28367,7 @@ local jumpedAt = 0
 local lookAt = 0
 local coasting = nil
 while true do
-RunService.Heartbeat:Wait()
+local dt = RunService.Heartbeat:Wait()
 if generation ~= TravelGeneration or not alive() then
 return "stopped"
 end
@@ -28285,7 +28390,7 @@ leaveTreadmill()
 lastPos = nil
 end
 local position = root.Position
-if lastPos and (position - lastPos).Magnitude > 18 then
+if lastPos and (position - lastPos).Magnitude > math.max(18, hum.WalkSpeed * dt * 2.5 + 8) then
 return "pulled"
 end
 lastPos = position
@@ -28416,11 +28521,14 @@ if flat(position, target) < 30 then
 points = { position, target }
 else
 failures += 1
-if failures >= 3 then
+if failures >= 6 then
 return false
 end
+if failures < 2 then
 task.wait(0.3)
 continue
+end
+points = { position, Vector3.new(target.X, position.Y, target.Z) }
 end
 end
 local result, stuckAt = follow(points, options, arrive)
@@ -28536,6 +28644,12 @@ Cosmic = "#3cdcdc",
 Secret = "#c9b8ff",
 Eternal = "#ff78c8",
 Divine = "#fffad2",
+Godly = "#ffd84a",
+Celestial = "#9be7ff",
+Demon = "#d2283c",
+Hacked = "#39ff6a",
+Rainbow = "#ff6ad5",
+OG = "#f5f5f5",
 }
 pcall(function()
 for _, tier in ipairs(ItemData.Tiers) do
@@ -28755,16 +28869,16 @@ Session.zones[area] = (Session.zones[area] or 0) + 1
 end
 Metrics.cum.Crates += 1
 SaveDirty = true
-local rank = RarityRank[rarity] or 0
-local big = rank >= (RarityRank.Legendary or 5)
+local rank = CrateRarities.rank[rarity] or 0
+local big = rank >= (CrateRarities.rank.Legendary or 4)
 feedPush({
 Title = rarity .. " crate",
 Sub = zoneName(area) .. (if seconds then string.format("  \u{00B7}  %ds trip", math.floor(seconds)) else ""),
 Right = rarity,
 Image = "package",
 Color = rarityColor(rarity),
-Badge = if rank >= (RarityRank.Secret or 8) then "JACKPOT" elseif big then "RARE" else nil,
-BadgeColor = if rank >= (RarityRank.Secret or 8) then "#ff78c8" else "#fab428",
+Badge = if rank >= (CrateRarities.rank.Hacked or 9) then "JACKPOT" elseif big then "RARE" else nil,
+BadgeColor = if rank >= (CrateRarities.rank.Hacked or 9) then "#ff78c8" else "#fab428",
 })
 if big then
 Metrics.event("Crate", rarity .. " crate", rarityColor(rarity))
@@ -28805,7 +28919,11 @@ local function crateInfo(crate)
 local area = crate:GetAttribute("AreaId")
 local rarity = crate:GetAttribute("CrateTier") or crate:GetAttribute("Rarity")
 local nameArea, nameRarity = crate.Name:match("^Crate_([^_]+)_([^_]+)_")
-return area or nameArea, rarity or nameRarity
+area = area or nameArea
+if area and not AreaById[area] and AreaData and type(AreaData.LEGACY_IDS) == "table" and AreaData.LEGACY_IDS[area] then
+area = AreaData.LEGACY_IDS[area]
+end
+return area, rarity or nameRarity
 end
 local function stealPrompt(crate)
 for _, d in ipairs(crate:GetDescendants()) do
@@ -28851,7 +28969,7 @@ local priority = Options.StealPriority and Options.StealPriority.Value or "Best 
 for _, crate in ipairs(folder:GetChildren()) do
 if crate:GetAttribute("IsCrate") ~= false and crate:IsA("Model") and (FailedCrates[crate.Name] or 0) < os.clock() then
 local area, rarity = crateInfo(crate)
-if area and rarity and zoneAllowed(area) and selected(Options.StealRarities, rarity) then
+if area and rarity and zoneAllowed(area) and selected(Options.StealCrateRarities, rarity) then
 local prompt = stealPrompt(crate)
 if prompt then
 local distance = (crate:GetPivot().Position - root.Position).Magnitude
@@ -28859,7 +28977,7 @@ local score
 if priority == "Nearest" then
 score = -distance
 else
-local rank = (AreaById[area] and AreaById[area].Order or 0) * 100 + (RarityRank[rarity] or 0)
+local rank = (AreaById[area] and AreaById[area].Order or 0) * 100 + (CrateRarities.rank[rarity] or 0)
 score = rank * 100000 - distance
 end
 if not bestScore or score > bestScore then
@@ -28992,6 +29110,17 @@ return false
 end
 keepSlowModeOff()
 local target = pickCrate()
+if not target then
+local wanted = {}
+for label, id in pairs(ZoneByLabel) do
+if selected(Options.StealZones, label) then
+wanted[id] = true
+end
+end
+if Nav.streamArena(wanted) then
+target = pickCrate()
+end
+end
 if not target then
 local text = "No crate matches your filters"
 local left = arenaResetIn()
@@ -30128,10 +30257,10 @@ Multi = true,
 Searchable = true,
 Tooltip = "Which zones to steal from",
 })
-StealBox:AddDropdown("StealRarities", {
+StealBox:AddDropdown("StealCrateRarities", {
 Text = "Rarity Filter",
-Values = RarityList,
-Default = RarityList,
+Values = CrateRarities.list,
+Default = CrateRarities.list,
 Multi = true,
 Searchable = true,
 Tooltip = "Which crate rarities to steal",
