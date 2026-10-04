@@ -25407,6 +25407,48 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 end,
             })
     
+            local SupportedGames = Info.SupportedGames or {
+                { Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
+                { Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
+                { Name = "Pets Universe", PlaceId = 74629631798007 },
+                { Name = "Ride A Pet", PlaceId = 124216119978534 },
+                { Name = "Steal From The Rich", PlaceId = 120475074479690 },
+            }
+            local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
+            local GamesBox = Tab:AddRightGroupbox("Supported Games", "gamepad-2")
+            GamesBox:AddLabel({
+                Text = '<font transparency="0.35">Every game Corvus supports. Teleport takes you there and starts the hub again.</font>',
+                DoesWrap = true,
+            })
+            for _, Entry in SupportedGames do
+                local Here = game.PlaceId == Entry.PlaceId
+                GamesBox:AddButton({
+                    Text = if Here then Entry.Name .. "  (you are here)" else Entry.Name,
+                    Disabled = Here,
+                    Func = function()
+                        if Here then
+                            return
+                        end
+                        pcall(function()
+                            local Queue = queue_on_teleport or queueonteleport or (typeof(syn) == "table" and syn.queue_on_teleport)
+                            if typeof(Queue) == "function" then
+                                Queue("if not game:IsLoaded() then game.Loaded:Wait() end\n" .. GamesLoader)
+                            end
+                        end)
+                        Library:Notify({ Title = "Teleporting", Description = Entry.Name, Time = 4 })
+                        local Ok, Error = pcall(function()
+                            game:GetService("TeleportService"):Teleport(Entry.PlaceId, LocalPlayer)
+                        end)
+                        if not Ok then
+                            Library:Notify({ Title = "Teleport failed", Description = tostring(Error), Time = 5 })
+                        end
+                    end,
+                })
+            end
+            pcall(function()
+                GamesBox.BoxHolder.LayoutOrder = -200
+            end)
+
             local Session = Tab:AddRightGroupbox("Session", "activity")
             local GameRow = InfoRow(Session, "Game", "Loading...")
             local PlayersRow = InfoRow(Session, "Players", "-")
@@ -30365,6 +30407,7 @@ do
 		GroupRewardRemote = true,
 		TreadmillSessionRemote = true,
 		DropCarriedRemote = true,
+		MergeMachineRemote = true,
 	}
 	local AllowedInvoke = { BackpackSellRemote = true }
 	local Quiet = { EggHitRequest = true }
@@ -32365,6 +32408,58 @@ do
 		end
 		return false
 	end
+	-- Merge machine eggs: placing on the plot and hatching when grown repeat forever, so they are automated.
+	-- Merging pets into an egg uses up pets and stays manual.
+	N.Merge = { hatchAt = {}, placeAt = -1e9, hatched = 0, placed = 0 }
+	function N.mergeStep()
+		if not on("AutoMergeEggs") or N.carrying() then
+			return false
+		end
+		local M = N.Merge
+		local did = false
+		for _, egg in ipairs(N.tagged("MergeEggPlaced")) do
+			if egg:GetAttribute("OwnerUserId") == LocalPlayer.UserId and egg:GetAttribute("Ready") == true then
+				local id = egg:GetAttribute("EggId")
+				if id ~= nil and os.clock() - (M.hatchAt[id] or -1e9) > 8 then
+					M.hatchAt[id] = os.clock()
+					fire("MergeMachineRemote", "HatchEgg", id)
+					M.hatched += 1
+					did = true
+				end
+			end
+		end
+		if os.clock() - M.placeAt < 6 then
+			return did
+		end
+		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+		local tool
+		for _, item in ipairs(backpack and backpack:GetChildren() or {}) do
+			if item:IsA("Tool") and N.hasTag(item, "MergeEggTool") then
+				tool = item
+				break
+			end
+		end
+		local hitbox = N.plotHitbox()
+		if not (tool and hitbox) then
+			return did
+		end
+		M.placeAt = os.clock()
+		if not N.atHome() then
+			N.goHome("Taking a merge egg home")
+		end
+		local half = hitbox.Size / 2
+		local spot = hitbox.CFrame:PointToWorldSpace(Vector3.new((math.random() - 0.5) * half.X, 0, (math.random() - 0.5) * half.Z))
+		local ground = N.groundAt(spot.X, spot.Z, hitbox.Position.Y + half.Y)
+		spot = Vector3.new(spot.X, ground or (hitbox.Position.Y - half.Y), spot.Z)
+		setStatus("Placing a merge egg on your plot")
+		fire("MergeMachineRemote", "PlaceEgg", tool, spot)
+		if waitFor(function()
+			return tool.Parent == nil or not tool:IsDescendantOf(LocalPlayer)
+		end, 2) then
+			M.placed += 1
+		end
+		return true
+	end
 	local RewardAt = {}
 	local function due(key, seconds)
 		if os.clock() >= (RewardAt[key] or 0) then
@@ -32814,6 +32909,13 @@ do
 			end,
 		})
 		Labels.Sell = SellBox:AddLabel({ Text = "-", DoesWrap = true })
+		local MergeBox = Tabs.Base:AddRightGroupbox("Merge Eggs", "egg")
+		MergeBox:AddToggle("AutoMergeEggs", {
+			Text = "Auto Place And Hatch Merge Eggs",
+			Default = true,
+			Tooltip = "Puts eggs from the merge machine on your plot and hatches them when they are grown. Merging pets stays manual",
+		})
+		Labels.Merge = MergeBox:AddLabel({ Text = "-", DoesWrap = true })
 		local TrainBox = Tabs.Base:AddLeftGroupbox("Treadmill", "footprints")
 		TrainBox:AddToggle("AutoTrain", {
 			Text = "Auto Train",
@@ -33917,6 +34019,9 @@ do
 				if choreDue("shop", 4) and N.shopStep() then
 					return
 				end
+				if choreDue("merge", 3) and N.mergeStep() then
+					return
+				end
 				local farmOn = on("AutoFarm") or on("StealPickups")
 				if not N.carrying() and N.wantTrain(nil) then
 					if N.trainStep() then
@@ -34096,6 +34201,16 @@ do
 					N.capacity(),
 					if N.capacity() == 1 then "" else "s"
 				)
+				local growing, ready = 0, 0
+				for _, egg in ipairs(N.tagged("MergeEggPlaced")) do
+					if egg:GetAttribute("OwnerUserId") == LocalPlayer.UserId then
+						growing += 1
+						if egg:GetAttribute("Ready") == true then
+							ready += 1
+						end
+					end
+				end
+				I.merge = string.format("<b>%d</b> merge eggs on your plot, <b>%d</b> ready\nPlaced <b>%d</b>  \u{00B7}  hatched <b>%d</b>", growing, ready, N.Merge.placed, N.Merge.hatched)
 				I.move = string.format(
 					"Speed now <b>%s</b> studs/s%s\nSnapbacks <b>%d</b>  \u{00B7}  blocked <b>%d</b>",
 					if N.moveMode() == "Teleport" then "\u{221E}" else formatNumber(math.floor(N.modeSpeed())),
@@ -34150,6 +34265,7 @@ do
 						Labels.Plot:SetText(I.plot or "-")
 						Labels.Sell:SetText(I.sell or "-")
 						Labels.Train:SetText(I.train or "-")
+						Labels.Merge:SetText(I.merge or "-")
 					end)
 				end
 				if shown(Tabs.Upgrades) then
