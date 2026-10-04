@@ -29746,12 +29746,13 @@ end
 end
 return list
 end
+N.GroundEggLimit = 10
 function N.placeEggsDue()
 if not nestsReady() then
 return false
 end
 if N.playerAttr("NoNest") == true then
-return #N.plotEggModels() < 5 and #placeableEggs() > 0
+return #N.plotEggModels() < N.GroundEggLimit and #placeableEggs() > 0
 end
 return #freeNests() > 0 and #placeableEggs() > 0
 end
@@ -29770,14 +29771,42 @@ if not base then
 return 0
 end
 N.dismount()
-local slots = { { -12, -12 }, { 12, -12 }, { -12, 12 }, { 12, 12 }, { 0, -20 } }
-for i = 1, math.min(#slots, 5 - #N.plotEggModels()) do
-local info = eggs[i]
+local spreadX = math.clamp(base.Size.X / 2 - 8, 8, 24)
+local spreadZ = math.clamp(base.Size.Z / 2 - 8, 6, 16)
+local taken = {}
+for _, model in ipairs(N.plotEggModels()) do
+local ok, pivot = pcall(model.GetPivot, model)
+if ok then
+table.insert(taken, pivot.Position)
+end
+end
+local free = {}
+for row = 0, 1 do
+for column = 0, 4 do
+local spot = N.plotSpot(-spreadX + column * spreadX / 2, if row == 0 then -spreadZ else spreadZ)
+local clear = spot ~= nil
+for _, position in ipairs(taken) do
+if clear and flat(position, spot + Vector3.new(3, 0, 0)) < 5 then
+clear = false
+end
+end
+if clear then
+table.insert(free, spot)
+end
+end
+end
+local index = 0
+for _, spot in ipairs(free) do
+if #N.plotEggModels() >= N.GroundEggLimit then
+break
+end
+index += 1
+local info = eggs[index]
 if not info then
 break
 end
-local spot = N.plotSpot(slots[i][1], slots[i][2])
-if spot and N.travelTo(spot) and N.equipTool(info.item) then
+setStatus(string.format("Placing %s (%s KG) on the ground", info.name, formatNumber(info.kg)))
+if N.travelTo(spot) and N.equipTool(info.item) then
 local ground = spot - Vector3.new(0, N.hrpOffset() + 0.3, 0) + Vector3.new(3, 0, 0)
 fire("Game/EggPlaced", { PlantPosition = ground })
 if waitFor(function()
@@ -29785,6 +29814,9 @@ return N.toolGone(info.item)
 end, 3) then
 placed += 1
 Session.placedEggs += 1
+else
+PlotState.placeFails[info.item] = (PlotState.placeFails[info.item] or 0) + 1
+log("GROUND place failed", info.name)
 end
 end
 end
@@ -33906,12 +33938,14 @@ break
 end
 end
 local soon = N.nextHatch()
+local ground = N.playerAttr("NoNest") == true
 Labels.Nests:SetText(
 string.format(
-"Nests <b>%d/%d</b>  \u{00B7}  in use <b>%d</b>  \u{00B7}  ready <b>%d</b>%s\nEggs in backpack <b>%d</b>%s",
-unlocked,
-#nests,
-occupied,
+"%s <b>%d/%d</b>  \u{00B7}  in use <b>%d</b>  \u{00B7}  ready <b>%d</b>%s\nEggs in backpack <b>%d</b>%s",
+if ground then "Eggs on the ground" else "Nests",
+if ground then #N.plotEggModels() else unlocked,
+if ground then N.GroundEggLimit else #nests,
+if ground then #N.plotEggModels() else occupied,
 ready,
 if soon and soon > 0 then "  \u{00B7}  next in " .. clockText(soon) else "",
 #N.eggTools(),
