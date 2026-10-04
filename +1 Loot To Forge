@@ -31338,7 +31338,11 @@ do
 			return 0
 		end
 		N.Aura.at = os.clock()
-		local range = math.clamp(optionNumber("AuraRange", 40), 5, 200)
+		local range = math.clamp(optionNumber("AuraRange", 40), 5, 500)
+		-- The tower arena is its own small map: every enemy there counts, wherever you stand.
+		if N.fightMode() == "Dungeon" then
+			range = math.huge
+		end
 		local me = N.myPos()
 		if not me then
 			return 0
@@ -33571,6 +33575,16 @@ do
 			setStatus("Idle")
 		end
 		task.wait(0.5)
+	end)
+	-- The aura runs on its own, so it also works when you play a stage or the tower yourself.
+	loop("aura", function()
+		local mode = N.fightMode()
+		if on("KillAura") and (mode == "Stage" or mode == "Dungeon") then
+			N.auraStep()
+			task.wait(0.05)
+		else
+			task.wait(0.3)
+		end
 	end)
 	-- Remote-only chores: they never move the character, so they run next to the movement loop.
 	loop("chores", function()
