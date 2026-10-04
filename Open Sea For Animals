@@ -39,7 +39,7 @@ LocalPlayer:WaitForChild("PlayerGui", 20)
 task.wait(0.5)
 end
 local BootOk, BootError = xpcall(function()
-local HubRepo = "https://raw.githubusercontent.com/Cineksvj/Corvus/main/"
+local HubRepo = "https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/"
 local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/"
 local Library = (function()
 local cloneref = (cloneref or clonereference or function(instance: any)
@@ -22574,6 +22574,48 @@ Callback = function(Value)
 Library:SetAnonymous(Value)
 end,
 })
+local SupportedGames = Info.SupportedGames or {
+	{ Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
+	{ Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
+	{ Name = "Pets Universe", PlaceId = 74629631798007 },
+	{ Name = "Ride A Pet", PlaceId = 124216119978534 },
+	{ Name = "Steal From The Rich", PlaceId = 120475074479690 },
+}
+local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
+local GamesBox = Tab:AddRightGroupbox("Supported Games", "gamepad-2")
+GamesBox:AddLabel({
+	Text = '<font transparency="0.35">Every game Corvus supports. Teleport takes you there and starts the hub again.</font>',
+	DoesWrap = true,
+})
+for _, Entry in SupportedGames do
+	local Here = game.PlaceId == Entry.PlaceId
+	GamesBox:AddButton({
+		Text = if Here then Entry.Name .. "  (you are here)" else Entry.Name,
+		Disabled = Here,
+		Func = function()
+			if Here then
+				return
+			end
+			pcall(function()
+				local Queue = queue_on_teleport or queueonteleport or (typeof(syn) == "table" and syn.queue_on_teleport)
+				if typeof(Queue) == "function" then
+					Queue("if not game:IsLoaded() then game.Loaded:Wait() end\n" .. GamesLoader)
+				end
+			end)
+			Library:Notify({ Title = "Teleporting", Description = Entry.Name, Time = 4 })
+			local Ok, Error = pcall(function()
+				game:GetService("TeleportService"):Teleport(Entry.PlaceId, LocalPlayer)
+			end)
+			if not Ok then
+				Library:Notify({ Title = "Teleport failed", Description = tostring(Error), Time = 5 })
+			end
+		end,
+	})
+end
+pcall(function()
+	GamesBox.BoxHolder.LayoutOrder = -200
+end)
+
 local Session = Tab:AddRightGroupbox("Session", "activity")
 local GameRow = InfoRow(Session, "Game", "Loading...")
 local PlayersRow = InfoRow(Session, "Players", "-")
@@ -23646,11 +23688,17 @@ end,
 local General = Tab:AddRightGroupbox("General", "sliders-horizontal")
 local KeybindLabel = General:AddLabel("Menu keybind")
 KeybindLabel:AddKeyPicker("MenuKeybind", {
-Default = Info.MenuKeybind or "RightShift",
+Default = Library:GetSetting("MenuKeybind", Info.MenuKeybind or "RightShift"),
 NoUI = true,
 Text = "Menu keybind",
 })
 Library.ToggleKeybind = Library.Options.MenuKeybind
+Library.Options.MenuKeybind:OnChanged(function()
+	local Key = Library.Options.MenuKeybind.Value
+	if typeof(Key) == "string" and Key ~= "Unknown" and Key ~= "None" then
+		Library:SetSetting("MenuKeybind", Key)
+	end
+end)
 if Library.IsMobile then
 pcall(KeybindLabel.SetVisible, KeybindLabel, false)
 task.defer(function()
@@ -27052,7 +27100,7 @@ Options = Library.Options
 Toggles = Library.Toggles
 Discord = "https://discord.gg/PdQvN2bDCu"
 GameName = "Open the Sea for Animals"
-LoaderScript = 'loadstring(game:HttpGet("' .. HubRepo .. 'Open%20The%20Sea%20For%20Animals"))()'
+LoaderScript = 'loadstring(game:HttpGet("' .. HubRepo .. 'Loader"))()'
 local Env = getgenv()
 if Env.OpenTheSeaInstance then
 pcall(function()
@@ -29982,7 +30030,7 @@ end
 return false
 end
 end
-local buyStaffTick, equipStaffTick, buyDumbbellTick, equipDumbbellTick, rebirthTick, trainTick, trainTurn, playtimeTick, nextPlaytimeGift, dailyTick, freeShopTick, foreverTick
+local buyStaffTick, equipStaffTick, buyDumbbellTick, equipDumbbellTick, rebirthTick, trainTick, trainTurn, playtimeTick, nextPlaytimeGift, dailyTick, freeShopTick, foreverTick, limitedTick
 local seasonLevel, seasonTick, groupReward, rsvpReward, discordReward, redeemCode, codesTick, activePotionTypes, potionCount, potionTick, clockText, eventsText
 local setIdleRejoinBlocked, skipTutorial, plotIncome, currentLuck
 do
@@ -30384,6 +30432,20 @@ local ok, result = call("ForeverPackService", "ClaimForeverPack")
 if ok and result then
 Session.claimed += 1
 Track.event("Pack", "Free Forever Pack reward", nil, "package", "#7dd3fc")
+return true
+end
+return false
+end
+function limitedTick()
+local data = Data()
+local reward = data and data.LimitedTimeReward
+if type(reward) == "table" and reward.Claimed then
+return false
+end
+local ok, result = call("RewardService", "ClaimLimitedReward")
+if ok and result then
+Session.claimed += 1
+Track.event("Gift", "25 minute reward claimed", nil, "gift", "#ff5d8f")
 return true
 end
 return false
@@ -31127,6 +31189,7 @@ FreeBox:AddToggle("AutoDaily", { Text = "Auto Claim Daily Reward", Default = tru
 FreeBox:AddToggle("AutoSeasonPass", { Text = "Auto Claim Season Pass (free)", Default = true })
 FreeBox:AddToggle("AutoFreeShop", { Text = "Auto Claim Free Shop Animal", Default = true })
 FreeBox:AddToggle("AutoForever", { Text = "Auto Claim Free Forever Pack", Default = true })
+FreeBox:AddToggle("AutoLimited", { Text = "Auto Claim 25 Min Reward", Default = true, Tooltip = "The Play for 25 Mins / Win 5 Games reward on your plot" })
 FreeBox:AddToggle(
 "AutoGroup",
 { Text = "Auto Claim Group Reward", Default = true, Tooltip = "Only when you are in the game's group" }
@@ -31794,7 +31857,7 @@ toggleCommand("farm", { "autofarm" }, FarmToggles, "The full farm (sea, equip be
 toggleCommand(
 "rewards",
 { "free" },
-{ "AutoPlaytime", "AutoDaily", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoGroup", "AutoCodes" },
+{ "AutoPlaytime", "AutoDaily", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoGroup", "AutoCodes" },
 "Every free reward"
 )
 Library:AddCommand({
@@ -32571,106 +32634,13 @@ timestamp = DateTime.now():ToIsoDate(),
 notify("Feedback", if ok then "Thanks! Cinek got your message." else "Could not send, try again later", 5)
 end)
 end
-Hook.debugAt = -1e9
-function Debug.send(reasons, auto)
-if not auto and os.clock() - Hook.debugAt < 20 then
-notify("Debug log", "Wait a few seconds before sending again", 3)
-return false
-end
-Hook.debugAt = os.clock()
-flushLog(true)
-local executor = "Unknown"
-pcall(function()
-executor = table.concat({ identifyexecutor() }, " ")
-end)
-local lines = {}
-for i, reason in ipairs(reasons) do
-table.insert(lines, i .. ". " .. (string.gsub(reason, "@", "@\u{200B}")))
-end
-local ok = postWebhook(FeedbackWebhook, {
-username = if auto then "Corvus Auto Debug" else "Corvus Debug",
-allowed_mentions = { parse = {} },
-embeds = {
-{
-author = { name = GameName, url = GameLink },
-title = "\u{2726}  " .. (if auto then "Auto debug report" else "Debug log") .. "  \u{00B7}  " .. GameName,
-description = string.sub(table.concat(lines, "\n"), 1, 1800),
-color = 16739978,
-fields = {
-{ name = "From", value = string.format("%s (@%s)", LocalPlayer.DisplayName, LocalPlayer.Name), inline = true },
-gameField(),
-{ name = "Executor", value = executor, inline = true },
-{ name = "Status", value = string.sub(tostring(Status), 1, 200), inline = false },
-{ name = "Performance", value = string.sub(Debug.perfText(), 1, 300), inline = false },
-},
-footer = { text = "Corvus debug  \u{00B7}  " .. GameName },
-timestamp = DateTime.now():ToIsoDate(),
-},
-},
-}, LogFile, Debug.text())
-log("DEBUG log sent", tostring(ok), if auto then "(auto)" else "(by hand)")
-return ok
-end
-local function sendDebugByHand()
-task.spawn(function()
-notify("Debug log", "Sending...", 2)
-local ok = Debug.send({ "Sent by hand. Status: " .. tostring(Status) }, false)
-notify("Debug log", if ok then "Sent, thanks! Cinek got the log." else "Could not send, use Copy Debug Log instead", 5)
-end)
-end
 pcall(function()
 Labels.PerfTab = Tabs.Misc or Tabs.Main
-local DebugBox = Labels.PerfTab:AddLeftGroupbox("Debug", "bug")
-Labels.Perf = DebugBox:AddLabel({ Text = "Measuring...", DoesWrap = true })
-DebugBox:AddButton({
-Text = "Copy Debug Log",
-Func = function()
-notify("Debug log", Debug.copy(), 5)
-end,
-}):AddButton({
-Text = "Send Debug Log",
-Tooltip = "Sends the log to Cinek so the problem can be fixed",
-Func = sendDebugByHand,
-})
-DebugBox:AddToggle("AutoSendDebug", {
-Text = "Auto Send Debug Reports",
-Default = false,
-Tooltip = "When something goes wrong the log goes to Cinek on its own, at most once every 5 minutes",
-})
-DebugBox:AddLabel({
-Text = '<font transparency="0.4">The log is also saved as ' .. LogFile .. " in your executor workspace folder.</font>",
-DoesWrap = true,
-})
-end)
-pcall(function()
-StatusBox:AddButton({
-Text = "Copy Debug Log",
-Func = function()
-notify("Debug log", Debug.copy(), 5)
-end,
-}):AddButton({
-Text = "Send Debug Log",
-Func = sendDebugByHand,
-})
+local PerfBox = Labels.PerfTab:AddLeftGroupbox("Performance", "gauge")
+Labels.Perf = PerfBox:AddLabel({ Text = "Measuring...", DoesWrap = true })
 end)
 if Library.AddCommand then
 pcall(function()
-Library:AddCommand({
-Name = "log",
-Aliases = { "debuglog", "debug" },
-Description = "Copies the debug log",
-Source = GameName,
-Callback = Debug.copy,
-})
-Library:AddCommand({
-Name = "sendlog",
-Description = "Sends the debug log to Cinek",
-Source = GameName,
-Callback = function()
-sendDebugByHand()
-return "Sending the debug log"
-end,
-})
 Library:AddCommand({
 Name = "perf",
 Aliases = { "fps", "lag" },
@@ -32682,7 +32652,6 @@ end)
 end
 task.spawn(function()
 local windowStart = os.clock()
-local auto = { lastAt = -1e9, sent = 0, seen = {} }
 local seaSince, lastCaught = nil, 0
 while alive() do
 task.wait(5)
@@ -32737,29 +32706,6 @@ end
 else
 seaSince = nil
 end
-if not on("AutoSendDebug") then
-return
-end
-local reasons = {}
-for _, reason in ipairs(Log.problems) do
-if not auto.seen[reason] then
-table.insert(reasons, reason)
-end
-end
-if #reasons == 0 or os.clock() - auto.lastAt < 300 or auto.sent >= 12 then
-return
-end
-auto.lastAt = os.clock()
-auto.sent += 1
-for _, reason in ipairs(reasons) do
-auto.seen[reason] = true
-end
-local sent = Debug.send(reasons, true)
-notify(
-"Debug report",
-if sent then "Sent the log to Cinek: " .. string.sub(reasons[1], 1, 90) else "Could not send the debug report",
-5
-)
 end)
 if not ok then
 log("ERROR", "debug loop", tostring(err))
@@ -32852,10 +32798,6 @@ FeedbackBox:AddInput(
 { Text = "Message", Placeholder = "Tell Cinek what to add or fix...", Finished = false, Default = "" }
 )
 FeedbackBox:AddToggle("FeedbackAnon", { Text = "Send anonymously", Default = false })
-FeedbackBox:AddToggle(
-"FeedbackLog",
-{ Text = "Attach debug log", Default = true, Tooltip = "Shows Cinek every step the farm took, helps a lot with bugs" }
-)
 FeedbackBox:AddButton({
 Text = "Send feedback",
 Func = function()
@@ -32863,7 +32805,7 @@ sendFeedback(
 Options.FeedbackType.Value,
 Options.FeedbackText.Value,
 Toggles.FeedbackAnon.Value,
-Toggles.FeedbackLog.Value
+false
 )
 pcall(Options.FeedbackText.SetValue, Options.FeedbackText, "")
 end,
@@ -33090,6 +33032,7 @@ local Jobs = {
 { "AutoDaily", "daily", 60, dailyTick },
 { "AutoFreeShop", "freeshop", 120, freeShopTick },
 { "AutoForever", "forever", 45, foreverTick },
+{ "AutoLimited", "limited", 60, limitedTick },
 { "AutoSeasonPass", "season", 15, seasonTick },
 { "AutoCodes", "codes", 20, codesTick },
 { "AutoPotions", "potions", 10, potionTick },
