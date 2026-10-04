@@ -31450,7 +31450,8 @@ do
 		elseif mode == "Teleport" then
 			return math.huge
 		end
-		return math.max(N.walkSpeed() * math.clamp(optionNumber("WalkPercent", 100), 50, 120) / 100, 16) * factor
+		-- Walk = the WalkSpeed the server gives you from your speed stat, a hair under it so the anticheat never trips.
+		return math.max(N.walkSpeed() * 0.97, 16) * factor
 	end
 	local function noteSnap(distance)
 		N.Moves.snaps += 1
@@ -31523,8 +31524,55 @@ do
 	-- The game's server anticheat pulls back or explodes anyone who teleports, moves faster than their speed or flies.
 	-- Walk mode lets the Humanoid really walk along a computed path, so the server only sees normal running.
 	local PathOk, Pathfinding = pcall(game.GetService, game, "PathfindingService")
+	-- The Hell event portal stands in zone 7 (Build.ZoneBuilds.Zone7.JoinHell). Touching it sends you to the boss map,
+	-- far from every zone, so walking keeps clear of it.
+	local PortalCache = { part = nil, at = -1e9 }
+	function N.hellPortal()
+		if PortalCache.part and PortalCache.part.Parent then
+			return PortalCache.part
+		end
+		if os.clock() - PortalCache.at < 5 then
+			return nil
+		end
+		PortalCache.at = os.clock()
+		local node = workspace
+		for _, name in ipairs({ "Build", "ZoneBuilds", "Zone7", "JoinHell" }) do
+			node = node and node:FindFirstChild(name)
+		end
+		local tp = node and node:FindFirstChild("TP", true)
+		PortalCache.part = if tp and tp:IsA("BasePart") then tp else nil
+		if PortalCache.part then
+			pcall(function()
+				if not PortalCache.part:FindFirstChild("CorvusAvoid") then
+					local modifier = Instance.new("PathfindingModifier")
+					modifier.Name = "CorvusAvoid"
+					modifier.Label = "CorvusAvoid"
+					modifier.PassThrough = false
+					modifier.Parent = PortalCache.part
+				end
+			end)
+		end
+		return PortalCache.part
+	end
+	local function nearPortal(from, to)
+		local portal = N.hellPortal()
+		if not portal then
+			return false
+		end
+		local radius = math.max(portal.Size.X, portal.Size.Z) / 2 + 10
+		local a = Vector3.new(from.X, 0, from.Z)
+		local b = Vector3.new(to.X, 0, to.Z)
+		local p = Vector3.new(portal.Position.X, 0, portal.Position.Z)
+		local ab = b - a
+		local t = if ab.Magnitude > 0.01 then math.clamp((p - a):Dot(ab) / ab:Dot(ab), 0, 1) else 0
+		return (a + ab * t - p).Magnitude < radius
+	end
+	N.nearPortal = nearPortal
 	-- True when nothing solid stands between the two points at knee and chest height, so a straight run works.
 	local function lineClear(from, to)
+		if nearPortal(from, to) then
+			return false
+		end
 		local flatTo = Vector3.new(to.X, from.Y, to.Z)
 		local offset = flatTo - from
 		if offset.Magnitude < 1 or math.abs(to.Y - from.Y) > 6 then
@@ -31570,6 +31618,7 @@ do
 				AgentHeight = 5,
 				AgentCanJump = true,
 				WaypointSpacing = 12,
+				Costs = { CorvusAvoid = math.huge },
 			})
 			if ok and path and pcall(path.ComputeAsync, path, from, target) and path.Status == Enum.PathStatus.Success then
 				local list = {}
@@ -31604,9 +31653,36 @@ do
 				pcall(hum.MoveTo, hum, root.Position)
 			end
 		end
-		for _ = 1, 4 do
+		local startPos, startAt, pathTime, legs, passes = rootPart().Position, os.clock(), 0, 0, 0
+		local function walkSpeed()
+			return math.max((tonumber(hum.WalkSpeed) or 16) * 0.95, 16)
+		end
+		-- Something blocks the way (fence, plot wall, decoration): pass it at your own WalkSpeed with collisions
+		-- off for that short bit, then walk on. Same speed as running, so the anticheat sees nothing odd.
+		local function passObstacle(goal)
+			local root = rootPart()
+			if not root then
+				return
+			end
+			local offset = Vector3.new(goal.X - root.Position.X, 0, goal.Z - root.Position.Z)
+			if offset.Magnitude < 1 then
+				return
+			end
+			local aim = root.Position + offset.Unit * math.min(offset.Magnitude, 30)
+			local ground = groundAt(aim.X, aim.Z, root.Position.Y + 4)
+			local y = if ground and math.abs(ground + N.standHeight() - root.Position.Y) < 8 then ground + N.standHeight() else root.Position.Y
+			passes += 1
+			N.Moves.pushes += 1
+			Noclip.travel = true
+			glideTo(Vector3.new(aim.X, y, aim.Z), walkSpeed, keepGoing)
+			Noclip.travel = false
+		end
+		for _ = 1, 2 do
 			local stuck = false
+			local computeAt = os.clock()
 			local points = pathPoints(rootPart().Position, target)
+			pathTime += os.clock() - computeAt
+			legs += #points
 			for index, point in ipairs(points) do
 				local last = index == #points
 				if point.jump then
@@ -31634,12 +31710,18 @@ do
 					local now = os.clock()
 					if distance < bestDistance - 0.5 then
 						bestDistance, bestAt = distance, now
-					elseif now - bestAt > 0.8 and not jumped then
+					elseif now - bestAt > 0.4 and not jumped then
 						hum.Jump = true
 						jumped = true
-					elseif now - bestAt > 2.5 then
-						stuck = true
-						break
+					elseif now - bestAt > 0.9 then
+						if passes >= 40 or now - startAt > 180 then
+							stuck = true
+							break
+						end
+						passObstacle(point.position)
+						pcall(hum.MoveTo, hum, point.position)
+						issuedAt = os.clock()
+						bestDistance, bestAt, jumped = math.huge, os.clock(), false
 					end
 					-- MoveTo gives up on its own after 8 seconds.
 					if now - issuedAt > 6 then
@@ -31659,13 +31741,36 @@ do
 			end
 		end
 		local root = rootPart()
+		local took = os.clock() - startAt
+		local walked = if root then flat(startPos, root.Position) else 0
+		if walked > 30 then
+			log(string.format("WALK %d studs in %.1fs = %d/s (WalkSpeed %d, %d points, path %dms, %d obstacles passed)", walked, took, walked / math.max(took, 0.01), tonumber(hum.WalkSpeed) or 0, legs, pathTime * 1000, passes))
+		end
 		if root and flat(root.Position, target) <= 4 and math.abs(root.Position.Y - target.Y) < 8 then
 			return true
 		end
 		return false, "blocked"
 	end
+	N.humanWalk = humanWalk
 	-- Long trips go along the ground in a few legs so the character never cuts through the floor.
-	local function planPath(from, to)
+	local function planPath(from, to, depth)
+		-- Go around the Hell portal in zone 7 instead of through it.
+		local portal = N.hellPortal()
+		if portal and (depth or 0) < 2 and nearPortal(from, to) then
+			local radius = math.max(portal.Size.X, portal.Size.Z) / 2 + 22
+			local dir = Vector3.new(to.X - from.X, 0, to.Z - from.Z)
+			local side = if dir.Magnitude > 0.1 then Vector3.new(-dir.Z, 0, dir.X).Unit else Vector3.new(1, 0, 0)
+			local toFrom = Vector3.new(from.X - portal.Position.X, 0, from.Z - portal.Position.Z)
+			if toFrom:Dot(side) < 0 then
+				side = -side
+			end
+			local detour = N.standAt(portal.Position + side * radius)
+			local first = planPath(from, detour, (depth or 0) + 1)
+			for _, point in ipairs(planPath(detour, to, (depth or 0) + 1)) do
+				table.insert(first, point)
+			end
+			return first
+		end
 		local distance = flat(from, to)
 		if distance < 60 then
 			return { to }
@@ -31700,25 +31805,12 @@ do
 			Noclip.travel = false
 			return ok
 		end
-		if mode == "Walk" then
-			local done, why = humanWalk(target, opts.keepGoing)
-			if done ~= nil then
-				if done and opts.look then
-					local root2 = rootPart()
-					if root2 then
-						root2.CFrame = CFrame.lookAt(root2.Position, Vector3.new(opts.look.X, root2.Position.Y, opts.look.Z))
-					end
-				end
-				if not done then
-					log("WALK failed", why)
-				end
-				return done
-			end
-		end
+		-- Humanoid:MoveTo runs far below your speed in this game, so Walk glides along the ground at your own WalkSpeed.
 		local speedFn = function()
 			return N.modeSpeed(mode)
 		end
-		Noclip.travel = on("TravelNoclip")
+		local startPos, startAt = root.Position, os.clock()
+		Noclip.travel = mode == "Walk" or on("TravelNoclip")
 		local ok = true
 		for _, point in ipairs(planPath(root.Position, target)) do
 			local done, why = glideTo(point, speedFn, opts.keepGoing)
@@ -31734,6 +31826,12 @@ do
 		Noclip.travel = false
 		if ok and opts.look then
 			placeRoot(target, opts.look)
+		end
+		local after = rootPart()
+		local walked = if after then flat(startPos, after.Position) else 0
+		if walked > 30 then
+			local took = math.max(os.clock() - startAt, 0.01)
+			log(string.format("MOVE %s %d studs in %.1fs = %d/s (WalkSpeed %d)", mode, walked, took, walked / took, N.walkSpeed()))
 		end
 		return ok
 	end
@@ -31992,6 +32090,39 @@ do
 		F.failedPickups[info.model] = os.clock() + 15
 		log("STEAL failed", info.name)
 		return false
+	end
+	function N.inHell()
+		return LocalPlayer:GetAttribute("InHell") == true
+	end
+	function N.leaveHell()
+		if not on("LeaveHell") then
+			setStatus("In the Hell event (Leave Hell Event is off)")
+			task.wait(1)
+			return false
+		end
+		local exit
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d.Name == "LeaveHell" and d:IsA("Model") then
+				exit = d
+				break
+			end
+		end
+		local tp = exit and exit:FindFirstChild("TP", true)
+		if not (tp and tp:IsA("BasePart")) or exit:GetAttribute("HellLeaveRemoved") or workspace:GetAttribute("HellLeaveRemoved") then
+			setStatus("In the Hell event, the way out is closed until the boss is beaten")
+			task.wait(2)
+			return false
+		end
+		setStatus("Leaving the Hell event")
+		log("HELL leaving through", brief(tp.Position))
+		N.travelTo(tp.Position, { mode = "Walk" })
+		waitFor(function()
+			return not N.inHell()
+		end, 4)
+		if not N.inHell() then
+			log("HELL left")
+		end
+		return true
 	end
 	function N.goHome(why)
 		local hitbox = N.plotHitbox()
@@ -33197,6 +33328,11 @@ do
 		})
 		MoveBox:AddSlider("FastSpeed", { Text = "Fast Speed", Default = 150, Min = 20, Max = 400, Rounding = 0, Suffix = " studs/s" })
 		MoveBox:AddToggle("TravelNoclip", { Text = "Noclip While Travelling", Default = true, Tooltip = "Only for Fast mode, Walk goes around walls" })
+		MoveBox:AddToggle("LeaveHell", {
+			Text = "Leave Hell Event",
+			Default = true,
+			Tooltip = "If you end up in the Hell boss map, Corvus walks out through the exit and goes back to farming. The farm also keeps away from the Hell portal in zone 7",
+		})
 		MoveBox:AddToggle("FallRescue", {
 			Text = "Rescue If Under The Map",
 			Default = true,
@@ -34232,6 +34368,12 @@ do
 					N.holdAt(nil)
 					setStatus("Caught by a guard, waiting to get up")
 					task.wait(0.5)
+					return
+				end
+				-- Inside the Hell event every zone is out of reach: walk out through LeaveHell first.
+				if N.inHell() then
+					N.holdAt(nil)
+					N.leaveHell()
 					return
 				end
 				N.rewardStep()
