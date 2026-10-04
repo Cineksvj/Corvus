@@ -22575,7 +22575,9 @@ Library:SetAnonymous(Value)
 end,
 })
 local SupportedGames = Info.SupportedGames or {
+	{ Name = "Anime Dice", PlaceId = 113290951185459 },
 	{ Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
+	{ Name = "Loot To Forge", PlaceId = 118805555015549 },
 	{ Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
 	{ Name = "Pets Universe", PlaceId = 74629631798007 },
 	{ Name = "Ride A Pet", PlaceId = 124216119978534 },
@@ -22587,31 +22589,56 @@ GamesBox:AddLabel({
 	Text = '<font transparency="0.35">Every game Corvus supports. Teleport takes you there and starts the hub again.</font>',
 	DoesWrap = true,
 })
+local GameNames, GameByName, CurrentGame = {}, {}, nil
 for _, Entry in SupportedGames do
-	local Here = game.PlaceId == Entry.PlaceId
-	GamesBox:AddButton({
-		Text = if Here then Entry.Name .. "  (you are here)" else Entry.Name,
-		Disabled = Here,
-		Func = function()
-			if Here then
-				return
-			end
-			pcall(function()
-				local Queue = queue_on_teleport or queueonteleport or (typeof(syn) == "table" and syn.queue_on_teleport)
-				if typeof(Queue) == "function" then
-					Queue("if not game:IsLoaded() then game.Loaded:Wait() end\n" .. GamesLoader)
-				end
-			end)
-			Library:Notify({ Title = "Teleporting", Description = Entry.Name, Time = 4 })
-			local Ok, Error = pcall(function()
-				game:GetService("TeleportService"):Teleport(Entry.PlaceId, LocalPlayer)
-			end)
-			if not Ok then
-				Library:Notify({ Title = "Teleport failed", Description = tostring(Error), Time = 5 })
-			end
-		end,
-	})
+	table.insert(GameNames, Entry.Name)
+	GameByName[Entry.Name] = Entry
+	if game.PlaceId == Entry.PlaceId then
+		CurrentGame = Entry.Name
+	end
 end
+GamesBox:AddLabel({
+	Text = string.format(
+		'<font transparency="0.35">%d games supported%s</font>',
+		#GameNames,
+		if CurrentGame then ", you are in <b>" .. CurrentGame .. "</b>" else ""
+	),
+	DoesWrap = true,
+})
+local GamePick = GamesBox:AddDropdown("CorvusGamePick", {
+	Text = "Game",
+	Values = GameNames,
+	Default = nil,
+	AllowNull = true,
+	Searchable = true,
+})
+GamesBox:AddButton({
+	Text = "Teleport",
+	Func = function()
+		local Entry = GameByName[GamePick.Value or ""]
+		if not Entry then
+			Library:Notify({ Title = "Supported Games", Description = "Pick a game first", Time = 3 })
+			return
+		end
+		if game.PlaceId == Entry.PlaceId then
+			Library:Notify({ Title = "Supported Games", Description = "You are already in " .. Entry.Name, Time = 3 })
+			return
+		end
+		pcall(function()
+			local Queue = queue_on_teleport or queueonteleport or (typeof(syn) == "table" and syn.queue_on_teleport)
+			if typeof(Queue) == "function" then
+				Queue("if not game:IsLoaded() then game.Loaded:Wait() end\n" .. GamesLoader)
+			end
+		end)
+		Library:Notify({ Title = "Teleporting", Description = Entry.Name, Time = 4 })
+		local Ok, Error = pcall(function()
+			game:GetService("TeleportService"):Teleport(Entry.PlaceId, LocalPlayer)
+		end)
+		if not Ok then
+			Library:Notify({ Title = "Teleport failed", Description = tostring(Error), Time = 5 })
+		end
+	end,
+})
 pcall(function()
 	GamesBox.BoxHolder.LayoutOrder = -200
 end)
@@ -28875,16 +28902,25 @@ end
 sortTargets(list)
 return list, total
 end
-local function visitOrder(route, mode)
+-- Teleport order: what is already reachable first (the wave opens plate by plate), so the hub never parks at a
+-- deep item waiting for its plate while near items are ready. "deadline" order is the fallback when the ready
+-- order cannot make every deadline.
+local function visitOrder(route, mode, byDeadline)
 table.sort(route, function(a, b)
 if mode == "Teleport" then
 if a.boss ~= b.boss then
 return b.boss ~= nil
 end
+if byDeadline then
 if math.abs(a.deadline - b.deadline) > 0.05 then
 return a.deadline < b.deadline
 end
 return a.readyAt < b.readyAt
+end
+if math.abs(a.readyAt - b.readyAt) > 0.05 then
+return a.readyAt < b.readyAt
+end
+return a.deadline < b.deadline
 end
 return a.pos.X > b.pos.X
 end)
@@ -28919,7 +28955,12 @@ end
 local trial = table.clone(route)
 table.insert(trial, target)
 visitOrder(trial, mode)
-if simulate(trial, wave, mode, speed, startPos) then
+local fits = simulate(trial, wave, mode, speed, startPos)
+if not fits and mode == "Teleport" then
+visitOrder(trial, mode, true)
+fits = simulate(trial, wave, mode, speed, startPos)
+end
+if fits then
 route = trial
 end
 end
