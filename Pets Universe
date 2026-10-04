@@ -25410,7 +25410,9 @@
             })
     
             local SupportedGames = Info.SupportedGames or {
+                { Name = "Anime Dice", PlaceId = 113290951185459 },
                 { Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
+                { Name = "Loot To Forge", PlaceId = 118805555015549 },
                 { Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
                 { Name = "Pets Universe", PlaceId = 74629631798007 },
                 { Name = "Ride A Pet", PlaceId = 124216119978534 },
@@ -25422,31 +25424,56 @@
                 Text = '<font transparency="0.35">Every game Corvus supports. Teleport takes you there and starts the hub again.</font>',
                 DoesWrap = true,
             })
+            local GameNames, GameByName, CurrentGame = {}, {}, nil
             for _, Entry in SupportedGames do
-                local Here = game.PlaceId == Entry.PlaceId
-                GamesBox:AddButton({
-                    Text = if Here then Entry.Name .. "  (you are here)" else Entry.Name,
-                    Disabled = Here,
-                    Func = function()
-                        if Here then
-                            return
-                        end
-                        pcall(function()
-                            local Queue = queue_on_teleport or queueonteleport or (typeof(syn) == "table" and syn.queue_on_teleport)
-                            if typeof(Queue) == "function" then
-                                Queue("if not game:IsLoaded() then game.Loaded:Wait() end\n" .. GamesLoader)
-                            end
-                        end)
-                        Library:Notify({ Title = "Teleporting", Description = Entry.Name, Time = 4 })
-                        local Ok, Error = pcall(function()
-                            game:GetService("TeleportService"):Teleport(Entry.PlaceId, LocalPlayer)
-                        end)
-                        if not Ok then
-                            Library:Notify({ Title = "Teleport failed", Description = tostring(Error), Time = 5 })
-                        end
-                    end,
-                })
+            	table.insert(GameNames, Entry.Name)
+            	GameByName[Entry.Name] = Entry
+            	if game.PlaceId == Entry.PlaceId then
+            		CurrentGame = Entry.Name
+            	end
             end
+            GamesBox:AddLabel({
+            	Text = string.format(
+            		'<font transparency="0.35">%d games supported%s</font>',
+            		#GameNames,
+            		if CurrentGame then ", you are in <b>" .. CurrentGame .. "</b>" else ""
+            	),
+            	DoesWrap = true,
+            })
+            local GamePick = GamesBox:AddDropdown("CorvusGamePick", {
+            	Text = "Game",
+            	Values = GameNames,
+            	Default = nil,
+            	AllowNull = true,
+            	Searchable = true,
+            })
+            GamesBox:AddButton({
+            	Text = "Teleport",
+            	Func = function()
+            		local Entry = GameByName[GamePick.Value or ""]
+            		if not Entry then
+            			Library:Notify({ Title = "Supported Games", Description = "Pick a game first", Time = 3 })
+            			return
+            		end
+            		if game.PlaceId == Entry.PlaceId then
+            			Library:Notify({ Title = "Supported Games", Description = "You are already in " .. Entry.Name, Time = 3 })
+            			return
+            		end
+            		pcall(function()
+            			local Queue = queue_on_teleport or queueonteleport or (typeof(syn) == "table" and syn.queue_on_teleport)
+            			if typeof(Queue) == "function" then
+            				Queue("if not game:IsLoaded() then game.Loaded:Wait() end\n" .. GamesLoader)
+            			end
+            		end)
+            		Library:Notify({ Title = "Teleporting", Description = Entry.Name, Time = 4 })
+            		local Ok, Error = pcall(function()
+            			game:GetService("TeleportService"):Teleport(Entry.PlaceId, LocalPlayer)
+            		end)
+            		if not Ok then
+            			Library:Notify({ Title = "Teleport failed", Description = tostring(Error), Time = 5 })
+            		end
+            	end,
+            })
             pcall(function()
                 GamesBox.BoxHolder.LayoutOrder = -200
             end)
@@ -40538,7 +40565,8 @@
     				if anchor then
     					Mover.task = "Visiting the Merchant"
     					pcall(standAt, anchor, 4)
-    					task.wait(0.7)
+    					-- The server checks the distance on its own copy of your position, which lags a moment after a fast trip.
+    					task.wait(1.4)
     				end
     				local done = {}
     				local tooFar = false
@@ -40548,6 +40576,17 @@
     					if summary.count > 0 then
     						Mover.task = "Selling fish"
     						local okCall, result = Auto.invokeTimeout(sell, 10, summary.list)
+    						-- "TooFar" right after arriving: stand at the Merchant again, let the server catch up and retry,
+    						-- like the game's own merchant code does.
+    						for _ = 1, 3 do
+    							if not (okCall and type(result) == "table" and result.Error == "TooFar") or not anchor then
+    								break
+    							end
+    							Mover.task = "Getting closer to the Merchant"
+    							pcall(standAt, anchor, 2.5)
+    							task.wait(1.2)
+    							okCall, result = Auto.invokeTimeout(sell, 10, summary.list)
+    						end
     						if okCall and type(result) == "table" and result.Ok == true then
     							Saved.fishSold = (tonumber(Saved.fishSold) or 0) + summary.count
     							Saved.tokensEarned = (tonumber(Saved.tokensEarned) or 0) + summary.value
