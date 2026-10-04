@@ -25409,6 +25409,48 @@
                 end,
             })
     
+            local SupportedGames = Info.SupportedGames or {
+                { Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
+                { Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
+                { Name = "Pets Universe", PlaceId = 74629631798007 },
+                { Name = "Ride A Pet", PlaceId = 124216119978534 },
+                { Name = "Steal From The Rich", PlaceId = 120475074479690 },
+            }
+            local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
+            local GamesBox = Tab:AddRightGroupbox("Supported Games", "gamepad-2")
+            GamesBox:AddLabel({
+                Text = '<font transparency="0.35">Every game Corvus supports. Teleport takes you there and starts the hub again.</font>',
+                DoesWrap = true,
+            })
+            for _, Entry in SupportedGames do
+                local Here = game.PlaceId == Entry.PlaceId
+                GamesBox:AddButton({
+                    Text = if Here then Entry.Name .. "  (you are here)" else Entry.Name,
+                    Disabled = Here,
+                    Func = function()
+                        if Here then
+                            return
+                        end
+                        pcall(function()
+                            local Queue = queue_on_teleport or queueonteleport or (typeof(syn) == "table" and syn.queue_on_teleport)
+                            if typeof(Queue) == "function" then
+                                Queue("if not game:IsLoaded() then game.Loaded:Wait() end\n" .. GamesLoader)
+                            end
+                        end)
+                        Library:Notify({ Title = "Teleporting", Description = Entry.Name, Time = 4 })
+                        local Ok, Error = pcall(function()
+                            game:GetService("TeleportService"):Teleport(Entry.PlaceId, LocalPlayer)
+                        end)
+                        if not Ok then
+                            Library:Notify({ Title = "Teleport failed", Description = tostring(Error), Time = 5 })
+                        end
+                    end,
+                })
+            end
+            pcall(function()
+                GamesBox.BoxHolder.LayoutOrder = -200
+            end)
+
             local Session = Tab:AddRightGroupbox("Session", "activity")
             local GameRow = InfoRow(Session, "Game", "Loading...")
             local PlayersRow = InfoRow(Session, "Players", "-")
@@ -26397,11 +26439,17 @@
             local General = Tab:AddRightGroupbox("General", "sliders-horizontal")
             local KeybindLabel = General:AddLabel("Menu keybind")
             KeybindLabel:AddKeyPicker("MenuKeybind", {
-                Default = Info.MenuKeybind or "RightShift",
+                Default = Library:GetSetting("MenuKeybind", Info.MenuKeybind or "RightShift"),
                 NoUI = true,
                 Text = "Menu keybind",
             })
             Library.ToggleKeybind = Library.Options.MenuKeybind
+            Library.Options.MenuKeybind:OnChanged(function()
+                local Key = Library.Options.MenuKeybind.Value
+                if typeof(Key) == "string" and Key ~= "Unknown" and Key ~= "None" then
+                    Library:SetSetting("MenuKeybind", Key)
+                end
+            end)
             if Library.IsMobile then
                 pcall(KeybindLabel.SetVisible, KeybindLabel, false)
                 task.defer(function()
@@ -30180,7 +30228,7 @@
     local Discord = "https://discord.gg/PdQvN2bDCu"
     local CorvusConfig = {
     	FeedbackWebhook = "https://discord.com/api/webhooks/1553750054823657556/GptorSTOkdcDO9cZyYJOIM6f0crrWmemuUzIlwTynetcaypqXaF1XAvipsE5ywrt1xXk",
-    	LoaderUrl = "",
+    	LoaderUrl = "https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader",
     	CodesUrl = "",
     	KnownCodes = { "Release", "Update1", "DroverQ", "Russo", "DarkRose", "AG64", "Cupcake", "E11opoppet", "Ellopoppet", "Olopomidoro", "Ostrichh", "Update2", "1mvisits" },
     	HubVersion = "2.2",
@@ -30356,6 +30404,12 @@
     	autoFruitMachine = false,
     	autoGroupChest = false,
     	autoMoonChest = false,
+    	autoVipChest = false,
+    	autoKeyCraft = false,
+    	autoPartner = false,
+    	autoUniverseZone = false,
+    	autoEventCraft = false,
+    	eventCraftPick = {},
     	returnAfter = true,
     	autoFruits = false,
     	fruitMode = "Keep active",
@@ -30426,6 +30480,7 @@
     	fishIndexGolden = false,
     	fishTap = true,
     	fishTapSpeed = "Normal",
+    	fishHideTaps = false,
     	fishPriority = "Eggs first",
     	autoWorms = false,
     	autoHooks = false,
@@ -32606,6 +32661,72 @@
     UI.MCStateRow = UI.MoonChestBox:AddStat({ Icon = GameIcons.MoonChest, Text = "Moon Chest", Value = "...", Size = 30, Progress = 0 })
     UI.MCLuckRow = UI.MoonChestBox:AddStat({ Icon = GameIcons.Luck, Text = "Item luck", Value = "?", Size = 22, ValueColor = "FontColor" })
     UI.MCClaimedRow = UI.MoonChestBox:AddStat({ Icon = GameIcons.MoonChest, Text = "Claimed", Value = "0", Size = 22 })
+
+    UI.VipChestBox = Tabs.Rewards:AddLeftGroupbox("VIP Chest", "crown")
+    UI.VipChestBox:AddToggle("AutoKeyCraft", {
+    	Text = "Auto Craft VIP Keys",
+    	Description = "Joins upper and lower halves into keys",
+    	Default = false,
+    	Callback = function(v)
+    		S.autoKeyCraft = v
+    	end,
+    })
+    UI.VipChestBox:AddToggle("AutoVipChest", {
+    	Text = "Auto Open VIP Chest",
+    	Description = "Uses your VIP keys at the chest in Pet Kingdom, needs the VIP gamepass",
+    	Default = false,
+    	Callback = function(v)
+    		S.autoVipChest = v
+    	end,
+    })
+    UI.ExtrasBox = Tabs.Rewards:AddRightGroupbox("Extras", "sparkles")
+    UI.ExtrasBox:AddToggle("AutoPartner", {
+    	Text = "Auto Claim Partner Rewards",
+    	Description = "Only for players with a partner rank",
+    	Default = false,
+    	Callback = function(v)
+    		S.autoPartner = v
+    	end,
+    })
+    UI.ExtrasBox:AddToggle("AutoUniverseZone", {
+    	Text = "Auto Unlock Universe Zone",
+    	Description = "Uses your Universe Key on the zone at spawn",
+    	Default = false,
+    	Callback = function(v)
+    		S.autoUniverseZone = v
+    	end,
+    })
+    UI.ExtrasBox:AddDivider()
+    UI.ExtrasBox:AddToggle("AutoEventCraft", {
+    	Text = "Auto Event Craft",
+    	Description = "Turns the picked event pets into 1M Lucky Blocks",
+    	Tooltip = "This uses up the pets you pick below. Nothing is crafted until you pick a recipe.",
+    	Default = false,
+    	Callback = function(v)
+    		S.autoEventCraft = v
+    	end,
+    })
+    UI.ExtrasBox:AddDropdown("EventCraftPick", {
+    	Text = "Craft From",
+    	Values = { "Ruby Hedgehog", "Golden Ruby Hedgehog", "Diamond Ruby Hedgehog", "Ruby Majesty", "Golden Ruby Majesty", "Diamond Ruby Majesty", "Ruby Chest", "Golden Ruby Chest", "Diamond Ruby Chest" },
+    	Default = {},
+    	Multi = true,
+    	AllowNull = true,
+    	Callback = function(value)
+    		local pick = {}
+    		if type(value) == "table" then
+    			for name, on in pairs(value) do
+    				if on then
+    					pick[name] = true
+    				end
+    			end
+    		end
+    		S.eventCraftPick = pick
+    	end,
+    })
+
+    UI.VipKeysRow = UI.VipChestBox:AddStat({ Icon = "key-round", Text = "VIP keys", Value = "0", Size = 26 })
+    UI.VipOpenedRow = UI.VipChestBox:AddStat({ Icon = "crown", Text = "Opened / crafted", Value = "0 / 0", Size = 22, ValueColor = "FontColor" })
     
     UI.QuestBox = Tabs.Rewards:AddLeftGroupbox("Quests", "list-checks")
     UI.QuestBox:AddToggle("AutoQuests", {
@@ -33354,6 +33475,23 @@
     	Tooltip = "How quickly each speed-up is tapped after it shows up. Slow 0.55-0.85s, Normal 0.35-0.55s, Fast 0.24-0.34s. Blatant taps on the next frame, the game warns twice, then kicks, and can ban for near instant taps.",
     	Callback = function(v)
     		S.fishTapSpeed = v
+    	end,
+    })
+    UI.FishBox:AddToggle("FishHideTaps", {
+    	Text = "Hide Tap Circles",
+    	Default = false,
+    	Tooltip = "Hides the speed-up circles from your screen while fishing, taps keep going in the background",
+    	Callback = function(v)
+    		S.fishHideTaps = v
+    		pcall(function()
+    			local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    			local frame = gui and gui:FindFirstChild("FishingGui") and gui.FishingGui:FindFirstChild("Fishing")
+    			for _, child in ipairs(frame and frame:GetChildren() or {}) do
+    				if child.Name == "ClickSpeedUpActive" or child.Name == "TapHalo" or child.Name == "TapTimer" then
+    					child.Visible = not v
+    				end
+    			end
+    		end)
     	end,
     })
     UI.FishBox:AddDropdown("FishPriority", {
@@ -35160,6 +35298,71 @@
     			end
     		end
     
+    		local VC = { lastTry = -1e9, noVipUntil = 0, opened = 0, crafted = 0, keys = 0, halves = 0, status = "" }
+    		Auto.VipChest = VC
+    		local function vipKeys()
+    			return tonumber(readData("MiscData", "VIPKey")) or 0
+    		end
+    		-- VIP Chest in Pet Kingdom: workspace.Map.Machines.VipChest, opened from within 30 studs with VIPChestService.Open(1/3/8 keys).
+    		local function doVipChest()
+    			VC.lastTry = os.clock()
+    			VC.status = ""
+    			local keys = vipKeys()
+    			local open = Auto.knitRemote("VIPChestService", "RE", "Open")
+    			if keys < 1 or not open then
+    				VC.status = if open then "No VIP keys" else "Unavailable"
+    				return
+    			end
+    			local okVip, hasVip = Auto.invokeTimeout(Auto.knitRemote("VIPChestService", "RF", "HasVIP"), 6)
+    			if okVip and hasVip == false then
+    				VC.status = "Needs the VIP gamepass"
+    				VC.noVipUntil = os.clock() + 1800
+    				return
+    			end
+    			local map = workspace:FindFirstChild("Map")
+    			local machines = map and map:FindFirstChild("Machines")
+    			local chest = machines and machines:FindFirstChild("VipChest")
+    			local ui = chest and chest:FindFirstChild("UI")
+    			if not (ui and ui:IsA("BasePart")) then
+    				VC.status = "Chest not found"
+    				return
+    			end
+    			local okWorld, world = pcall(getWorldAt, ui.Position)
+    			if okWorld and world then
+    				local ok, err = travelTo(world)
+    				if not ok then
+    					VC.status = "Travel failed"
+    					queueToast("VIP Chest", err)
+    					return
+    				end
+    			end
+    			Mover.task = "Opening VIP chest"
+    			standAt(ui, 8)
+    			task.wait(0.5)
+    			local amount = if keys >= 8 then 8 elseif keys >= 3 then 3 else 1
+    			pcall(function()
+    				open:FireServer(amount)
+    			end)
+    			local waited = 0
+    			while waited < 6 and vipKeys() >= keys do
+    				waited += task.wait(0.2) or 0.2
+    			end
+    			local used = keys - vipKeys()
+    			if used > 0 then
+    				VC.opened += used
+    				queueToast("VIP Chest", "Opened with " .. used .. " key" .. (if used == 1 then "" else "s"))
+    				task.wait(1.5)
+    				hideGameFrame({ "OtherView", "VIPInfo" })
+    			else
+    				VC.status = "Needs the VIP gamepass, retry in 10 min"
+    				VC.noVipUntil = os.clock() + 600
+    			end
+    		end
+    		Auto.vipChestDue = function(now)
+    			return S.autoVipChest and now - VC.lastTry > 30 and now > VC.noVipUntil and vipKeys() >= 1
+    		end
+    		Auto.doVipChest = doVipChest
+
     		local function runErrand(label, fn)
     			Mover.busy = true
     			Mover.task = label
@@ -38101,6 +38304,75 @@
     					end
     				end
     			end
+    			do
+    				local VC = Auto.VipChest
+    				local upper = tonumber(readData("MiscData", "VIPUpper")) or 0
+    				local lower = tonumber(readData("MiscData", "VIPLower")) or 0
+    				if VC then
+    					VC.keys = tonumber(readData("MiscData", "VIPKey")) or 0
+    					VC.halves = math.min(upper, lower)
+    				end
+    				-- KeyCraftService:Craft("VIPKey", amount) joins an upper and a lower half into one key, max 500 per call.
+    				if S.autoKeyCraft and VC and math.min(upper, lower) >= 1 and now - (VC.craftAt or -1e9) > 5 then
+    					VC.craftAt = now
+    					local amount = math.min(upper, lower, 500)
+    					local ok = Auto.invokeTimeout(Auto.knitRemote("KeyCraftService", "RF", "Craft"), 8, "VIPKey", amount)
+    					if ok then
+    						VC.crafted += amount
+    					end
+    				end
+    			end
+    			do
+    				Auto.Extras = Auto.Extras or { partnerAt = -1e9, zoneAt = -1e9, craftAt = -1e9, crafted = 0 }
+    				local X = Auto.Extras
+    				-- PartnerRewardsService: ClaimRequest works only for partner ranks, the server answers NotPartner otherwise.
+    				if S.autoPartner and now - X.partnerAt > 600 then
+    					X.partnerAt = now
+    					local claim = Auto.knitRemote("PartnerRewardsService", "RE", "ClaimRequest")
+    					if claim then
+    						pcall(function()
+    							claim:FireServer()
+    						end)
+    					end
+    				end
+    				-- UniverseZoneService.Purchase: one time unlock with a Universe Key (UniverseData).
+    				if S.autoUniverseZone and now - X.zoneAt > 30 and readData("UniverseData", "UniverseZoneUnlocked") ~= true and (tonumber(readData("UniverseData", "UniverseKey")) or 0) >= 1 then
+    					X.zoneAt = now
+    					local buy = Auto.knitRemote("UniverseZoneService", "RE", "Purchase")
+    					if buy then
+    						pcall(function()
+    							buy:FireServer()
+    						end)
+    						queueToast("Universe Zone", "Unlocking with your Universe Key")
+    					end
+    				end
+    				-- EventCraftService:Craft(id, amount): turns event pets into 1M Lucky Blocks, max 100 per call.
+    				if S.autoEventCraft and now - X.craftAt > 10 then
+    					X.craftAt = now
+    					local config = Auto.lazyRequire("EventCraftConfig", function()
+    						local modules = ReplicatedStorage:FindFirstChild("Modules")
+    						return modules and modules:FindFirstChild("EventCraftConfig")
+    					end)
+    					local craft = Auto.knitRemote("EventCraftService", "RF", "Craft")
+    					if type(config) == "table" and type(config.Recipes) == "table" and type(config.Owned) == "function" and craft then
+    						for _, recipe in ipairs(config.Recipes) do
+    							if S.eventCraftPick[tostring(recipe.Pet)] then
+    								local okOwned, owned = pcall(config.Owned, LocalPlayer, recipe)
+    								local cost = math.max(tonumber(recipe.Cost) or 1, 1)
+    								local amount = if okOwned then math.min(math.floor((tonumber(owned) or 0) / cost), tonumber(config.MAX_CRAFT_PER_REQUEST) or 100) else 0
+    								if amount >= 1 then
+    									local ok = Auto.invokeTimeout(craft, 8, recipe.Id, amount)
+    									if ok then
+    										X.crafted += amount
+    										queueToast("Event Craft", string.format("Crafted %d x %s", amount, tostring(config.RESULT_TITLE or "Lucky Block")))
+    									end
+    									break
+    								end
+    							end
+    						end
+    					end
+    				end
+    			end
     			if S.autoEquip then
     				local total = petSignature()
     				if total and ((Equip.lastSig ~= total and (not Equip.fired or now - Equip.lastFire >= 6)) or now - Equip.lastFire >= 90) then
@@ -38210,6 +38482,8 @@
     							runErrand("Group Chest", doGroupChest)
     						elseif S.autoMoonChest and moon.unlocked ~= false and moon.ready and now - MC.lastTry > 45 then
     							runErrand("Moon Chest", doMoonChest)
+    						elseif Auto.vipChestDue(now) then
+    							runErrand("VIP Chest", Auto.doVipChest)
     						elseif S.indexHunt and Hunter.craftPending and now - Hunter.lastCraftTry > 10 then
     							runErrand("Index Hunter", doCraftTrip)
     						elseif wantsAutoCraft(now) then
@@ -39884,14 +40158,21 @@
     				end
     				Fish.tapFrame = frame
     				Library:GiveSignal(frame.ChildAdded:Connect(function(child)
-    					if child.Name ~= "ClickSpeedUpActive" or not Fish.canPressButtons() then
+    					if S.fishHideTaps and (child.Name == "ClickSpeedUpActive" or child.Name == "TapHalo" or child.Name == "TapTimer") then
+    						pcall(function()
+    							child.Visible = false
+    						end)
+    					end
+    					if child.Name ~= "ClickSpeedUpActive" then
     						return
     					end
-    					if not (S.autoFish and S.fishTap and Fish.active) then
+    					-- The game's own tap loop is running, so presses go through its button (they show on screen).
+    					Fish.lastButtonAt = os.clock()
+    					if not (S.autoFish and S.fishTap and Fish.active and Fish.canPressButtons()) then
     						return
     					end
     					task.wait(Fish.reaction())
-    					if child.Parent and child.Visible and Fish.active and S.fishTap and Fish.pressButton(child) then
+    					if child.Parent and Fish.active and S.fishTap and Fish.pressButton(child) then
     						Fish.taps += 1
     						Fish.streak = (tonumber(Fish.streak) or 0) + 1
     					end
@@ -39901,7 +40182,9 @@
     			local function tapStep(now)
     				if S.fishTap and Fish.canPressButtons() then
     					Fish.hookTapButtons()
-    					if Fish.tapFrame and Fish.tapFrame.Parent then
+    					-- Only lean on the game's button while it is really spawning them. When the hub started the cast
+    					-- or the fishing GUI is closed, no buttons come and the taps go straight to the server instead.
+    					if Fish.tapFrame and Fish.tapFrame.Parent and os.clock() - (Fish.lastButtonAt or -1e9) < 3 then
     						return
     					end
     				end
@@ -41516,6 +41799,11 @@
     				end
     				setStat(UI.MCLuckRow, nil, if mc.luck then string.format("%.1f%%", mc.luck) else "?")
     				setStat(UI.MCClaimedRow, nil, formatNumber(Saved.moonChests))
+    				local VC = Auto.VipChest
+    				if VC then
+    					setStat(UI.VipKeysRow, nil, formatNumber(VC.keys) .. (if VC.halves > 0 then "  +" .. formatNumber(VC.halves) .. " to craft" else "") .. (if VC.status ~= "" then "  " .. VC.status else ""))
+    					setStat(UI.VipOpenedRow, nil, formatNumber(VC.opened) .. " / " .. formatNumber(VC.crafted))
+    				end
     			end
     
     			local quests = Snap.quests
