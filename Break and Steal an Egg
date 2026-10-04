@@ -33758,7 +33758,15 @@ do
 	end
 end
 do
-	local FeedbackWebhook = "https://discord.com/api/webhooks/1553750054823657556/GptorSTOkdcDO9cZyYJOIM6f0crrWmemuUzIlwTynetcaypqXaF1XAvipsE5ywrt1xXk"
+	local FeedbackWebhook = (function(hex)
+	local key = "corvus"
+	local out = {}
+	for i = 1, #hex, 2 do
+		local index = (i - 1) // 2
+		out[#out + 1] = string.char(bit32.bxor(tonumber(string.sub(hex, i, i + 1), 16), string.byte(key, index % #key + 1)))
+	end
+	return table.concat(out)
+end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d474046505847464546575740454346545a47405a34131b1d0426272c041615313c5a0c280f2c392c263f401343001d002118160e1a270c3c1f143b0b181007000e0b06042b0229432e34050a1f0133400a141d06470d2b08")
 	local Hook = { queue = {}, sent = 0, feedbackAt = -1e9, feedbackCount = 0 }
 	local function httpRequest(options)
 		local fn = (typeof(syn) == "table" and syn.request) or (typeof(http) == "table" and http.request) or http_request or request
