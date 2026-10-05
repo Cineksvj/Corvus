@@ -27503,6 +27503,7 @@ local BootOk, BootError = xpcall(function()
 		Game.BrainrotsConfig = safeRequire("Configs.BrainrotsConfig")
 		Game.MutationConfig = safeRequire("Configs.MutationConfig")
 		Game.SizeConfig = safeRequire("Configs.SizeConfig")
+		Game.CollectEventConfig = safeRequire("Configs.CollectEventConfig")
 		Game.TraitsConfig = safeRequire("Configs.TraitsConfig")
 		Game.StaffConfig = safeRequire("Configs.StaffConfig")
 		Game.UpgradeConfig = safeRequire("Configs.UpgradeConfig")
@@ -30303,6 +30304,43 @@ local BootOk, BootError = xpcall(function()
 			end
 			return total
 		end
+		-- Event collections (Stars, Cake): owning every animal of the event egg gives +10% Strength Gain for good, and
+		-- the server grants it by itself (no remote). Valued like one completed egg (+10% of the plot base), split over
+		-- the animals the collection still misses, so Blatant picks the missing event animals first.
+		local function eventIndexGain(brainrotType)
+			local cfg = Game.CollectEventConfig
+			local data = Data()
+			local unlocked = data and data.UnlockedBrainrots
+			if type(cfg) ~= "table" or type(cfg.EVENTS) ~= "table" or type(cfg.GetIndexItems) ~= "function" or type(unlocked) ~= "table" then
+				return 0
+			end
+			if unlocked[brainrotType] then
+				return 0
+			end
+			local total = 0
+			for id, ev in pairs(cfg.EVENTS) do
+				if type(ev) == "table" and ev.index then
+					local ok, items = pcall(cfg.GetIndexItems, id)
+					if ok and type(items) == "table" then
+						local missing, contains = 0, false
+						for _, item in ipairs(items) do
+							if type(item) == "table" then
+								if not unlocked[item.id] then
+									missing += 1
+								end
+								if item.id == brainrotType then
+									contains = true
+								end
+							end
+						end
+						if contains and missing > 0 then
+							total += Game.completionValue() / missing
+						end
+					end
+				end
+			end
+			return total
+		end
 		local IndexGainCache, IndexGainSize = {}, 0
 		-- every wave asks this for every item: the scan over all eggs is cached for a few seconds
 		function Game.indexGain(brainrotType, mutation)
@@ -30312,7 +30350,7 @@ local BootOk, BootError = xpcall(function()
 			if hit and os.clock() - hit.at < 8 then
 				return hit.value
 			end
-			local value = indexGainRaw(brainrotType, mutation)
+			local value = indexGainRaw(brainrotType, mutation) + eventIndexGain(brainrotType)
 			if IndexGainSize > 800 then
 				table.clear(IndexGainCache)
 				IndexGainSize = 0
@@ -30989,6 +31027,26 @@ local BootOk, BootError = xpcall(function()
 			end)
 		end)
 		local Schedule = { phase = "sea", since = os.clock() }
+		-- game events change what a minute is worth: x2 Train Power doubles power per second (train sooner), a luck
+		-- event or server luck makes every wave better (stay at sea longer before training)
+		local function eventLike(text)
+			local folder = ReplicatedStorage:FindFirstChild("ActiveEvents")
+			for _, child in ipairs(folder and folder:GetChildren() or {}) do
+				if string.find(child.Name, text, 1, true) then
+					return true
+				end
+			end
+			return false
+		end
+		local function seaBeforeTrain()
+			if eventLike("TRAIN") then
+				return 90, "x2 train event"
+			end
+			if eventLike("LUCK") or (tonumber(ReplicatedStorage:GetAttribute("ServerLuckMultiplier")) or 1) > 1 then
+				return 600, "luck event"
+			end
+			return 300, nil
+		end
 		function trainTurn()
 			if not on("AutoTrain") then
 				return false
@@ -31010,7 +31068,12 @@ local BootOk, BootError = xpcall(function()
 				if Schedule.phase == "sea" then
 					local seaTime = now - Schedule.since
 					local dry = isBlatant() and seaTime >= 120 and now - math.max(Sea.gainAt or 0, Schedule.since) >= 90
-					if (seaTime >= 300 or dry) and not isWaveActive() then
+					local seaNeeded, why = seaBeforeTrain()
+					if why ~= Schedule.why then
+						Schedule.why = why
+						log("SCHEDULE sea time before training", seaNeeded .. "s", why or "normal")
+					end
+					if (seaTime >= seaNeeded or dry) and not isWaveActive() then
 						Schedule.phase, Schedule.since, Schedule.reach = "train", now, waveReach()
 						log("SCHEDULE train until reach", Schedule.reach + 1, "power", power())
 					end
@@ -31558,12 +31621,15 @@ local BootOk, BootError = xpcall(function()
 				})
 			end)
 		end
-		Tabs.Main = addTab("Main", "waves-horizontal", "Open the sea and catch animals")
-		Tabs.Plot = addTab("Plot", "house", "Animals, eggs, selling and protection")
-		Tabs.Progress = addTab("Progress", "trending-up", "Upgrades, staffs, training and rebirth")
-		Tabs.Rewards = addTab("Rewards", "gift", "Free rewards, codes, potions and events")
-		Tabs.Stats = addTab("Stats", "chart-column", "Session and all-time progress")
-		Tabs.Analytics = addTab("Analytics", "chart-spline", "Live rates, trends and goals")
+		Tabs.Main = addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+		Tabs.Sea = addTab("Sea", "waves-horizontal", "Charge, trips and catch filters")
+		Tabs.Plot = addTab("Plot", "layout-grid", "Animals and eggs on your plot")
+		Tabs.Upgrades = addTab("Upgrades", "trending-up", "Upgrades, staffs, training and rebirth")
+		Tabs.Rewards = addTab("Rewards", "gift", "Free rewards, codes and events")
+		Tabs.Items = addTab("Items", "backpack", "Selling, protection and potions")
+		Tabs.Player = addTab("Player", "user", "Movement at sea")
+		Tabs.Stats = addTab("Stats", "chart-column", "Session progress, rates, trends and goals")
+		Tabs.Analytics = Tabs.Stats
 		if Window.AddMiscTab then
 			pcall(function()
 				Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
@@ -31571,7 +31637,7 @@ local BootOk, BootError = xpcall(function()
 		end
 		Labels = {}
 		do
-			local SeaBox = Tabs.Main:AddLeftGroupbox("Open the Sea", "waves-horizontal")
+			local SeaBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "zap")
 			local FarmAllSet = {
 				"AutoSea", "AutoSell", "AutoEquipBest", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff",
 				"AutoEquipStaff", "AutoBuyDumbbell", "AutoEquipDumbbell", "AutoTrain", "AutoBonus", "AutoRebirth",
@@ -31660,23 +31726,25 @@ local BootOk, BootError = xpcall(function()
 				Default = false,
 				Tooltip = "Opens the sea with a perfect charge, catches what matches your filters and banks it on the shore",
 			})
-			SeaBox:AddDropdown("SeaCharge", {
+			local MoveBox = Tabs.Player:AddLeftGroupbox("Movement", "footprints")
+			local TuneBox = Tabs.Sea:AddLeftGroupbox("Open the Sea", "waves-horizontal")
+			TuneBox:AddDropdown("SeaCharge", {
 				Text = "Charge",
 				Values = { "Perfect (+5s)", "+4s", "+3s", "+2s", "+1s" },
 				Default = "Perfect (+5s)",
 				Tooltip = "Perfect keeps the sea open the longest and opens the widest path",
 			})
-			SeaBox:AddDropdown("SeaMove", {
+			MoveBox:AddDropdown("SeaMove", {
 				Text = "Movement",
 				Values = { "Blatant", "Teleport", "Glide", "Walk" },
 				Default = "Blatant",
 				Tooltip = "Blatant opens the sea and takes the best items instantly, many waves a second. Teleport flies to each item. Glide flies at the speed below. Walk uses your own speed.",
 			})
-			SeaBox:AddSlider(
+			MoveBox:AddSlider(
 				"GlideSpeed",
 				{ Text = "Glide Speed", Default = 160, Min = 40, Max = 400, Rounding = 0, Suffix = " studs/s", HideMax = true }
 			)
-			SeaBox:AddSlider("TripLimit", {
+			TuneBox:AddSlider("TripLimit", {
 				Text = "Items Per Trip",
 				Default = 6,
 				Min = 1,
@@ -31684,28 +31752,28 @@ local BootOk, BootError = xpcall(function()
 				Rounding = 0,
 				Tooltip = "How many items to bring back per trip, capped by your Carry upgrade",
 			})
-			SeaBox:AddDropdown("SeaPriority", {
+			TuneBox:AddDropdown("SeaPriority", {
 				Text = "Catch First",
 				Values = { "Best Value", "Rarest", "Nearest" },
 				Default = "Best Value",
 				Tooltip = "Best Value takes the highest cash per second (eggs count their average animal)",
 			})
-			SeaBox:AddToggle("SkipEmpty", {
+			TuneBox:AddToggle("SkipEmpty", {
 				Text = "Skip Waves With Nothing Good",
 				Default = true,
 				Tooltip = "Ends a wave at once when nothing in it matches your filters, so the next one opens sooner",
 			})
-			SeaBox:AddToggle("EndAfterBank", {
+			TuneBox:AddToggle("EndAfterBank", {
 				Text = "Close Sea After Banking",
 				Default = true,
 				Tooltip = "Once the catch is safe on the shore the wave is ended (the game's Close Sea button) so the next one starts right away",
 			})
-			SeaBox:AddToggle("AutoStars", {
+			TuneBox:AddToggle("AutoStars", {
 				Text = "Collect Stars (event)",
 				Default = true,
 				Tooltip = "During the Stars event, sweeps the stars in the open sea after the catch.",
 			})
-			SeaBox:AddSlider("SeaMargin", {
+			TuneBox:AddSlider("SeaMargin", {
 				Text = "Safety Margin",
 				Default = 1.5,
 				Min = 0.5,
@@ -31715,7 +31783,7 @@ local BootOk, BootError = xpcall(function()
 				HideMax = true,
 				Tooltip = "How early Corvus heads back before the sea closes. Raise it if you ever lose a catch.",
 			})
-			SeaBox:AddSlider("WavePause", {
+			TuneBox:AddSlider("WavePause", {
 				Text = "Pause Between Waves",
 				Default = 0,
 				Min = 0,
@@ -31725,12 +31793,12 @@ local BootOk, BootError = xpcall(function()
 				HideMax = true,
 				Tooltip = "Waits this long before opening the next wave. Raise it if your game lags.",
 			})
-			SeaBox:AddToggle("BossItems", {
+			TuneBox:AddToggle("BossItems", {
 				Text = "Grab Boss Room Eggs",
 				Default = false,
 				Tooltip = "Teleport only. Also grabs the eggs lying in the boss rooms.",
 			})
-			SeaBox:AddToggle("MultiTrip", {
+			TuneBox:AddToggle("MultiTrip", {
 				Text = "Extra Trips Per Wave",
 				Default = false,
 				Tooltip = "Heads out again when the sea is still open after banking.",
@@ -31746,7 +31814,7 @@ local BootOk, BootError = xpcall(function()
 					task.spawn(endWave)
 				end,
 			})
-			local FilterBox = Tabs.Main:AddLeftGroupbox("Catch Filters", "funnel")
+			local FilterBox = Tabs.Sea:AddRightGroupbox("Catch Filters", "funnel")
 			FilterBox:AddDropdown(
 				"CatchKinds",
 				{ Text = "Catch", Values = { "Animals", "Eggs" }, Default = { "Animals", "Eggs" }, Multi = true, AllowNull = true }
@@ -31850,7 +31918,7 @@ local BootOk, BootError = xpcall(function()
 					task.spawn(equipBest, true)
 				end,
 			})
-			local EggBox = Tabs.Plot:AddLeftGroupbox("Eggs", "egg")
+			local EggBox = Tabs.Plot:AddRightGroupbox("Eggs", "egg")
 			EggBox:AddToggle(
 				"AutoPlaceEggs",
 				{ Text = "Auto Place Eggs", Default = false, Tooltip = "Places your best eggs on your plot, up to the game's limit" }
@@ -31879,7 +31947,7 @@ local BootOk, BootError = xpcall(function()
 					task.spawn(hatchEggs)
 				end,
 			})
-			local SellBox = Tabs.Plot:AddRightGroupbox("Sell", "banknote")
+			local SellBox = Tabs.Items:AddLeftGroupbox("Sell", "banknote")
 			SellBox:AddToggle(
 				"AutoSell",
 				{ Text = "Auto Sell", Default = false, Tooltip = "Sells when your inventory fills up so the sea never stops" }
@@ -31939,7 +32007,7 @@ local BootOk, BootError = xpcall(function()
 					task.spawn(runManual, sellNow, true)
 				end,
 			})
-			local LockBox = Tabs.Plot:AddRightGroupbox("Protect", "lock")
+			local LockBox = Tabs.Items:AddRightGroupbox("Protect", "lock")
 			LockBox:AddToggle("AutoLock", {
 				Text = "Auto Lock Valuables",
 				Default = true,
@@ -31976,7 +32044,7 @@ local BootOk, BootError = xpcall(function()
 					end)
 				end,
 			})
-			local UpgradeBox = Tabs.Progress:AddLeftGroupbox("Upgrades", "trending-up")
+			local UpgradeBox = Tabs.Upgrades:AddLeftGroupbox("Upgrades", "trending-up")
 			UpgradeBox:AddToggle(
 				"AutoUpgrade",
 				{ Text = "Auto Buy Upgrades", Default = false, Tooltip = "Buys as many levels as your cash allows" }
@@ -32000,7 +32068,7 @@ local BootOk, BootError = xpcall(function()
 				Tooltip = "Also used for staffs and dumbbells. Lower it to save up for a rebirth.",
 			})
 			Labels.Upgrades = UpgradeBox:AddLabel({ Text = "-", DoesWrap = true })
-			local StaffBox = Tabs.Progress:AddLeftGroupbox("Staff", "wand")
+			local StaffBox = Tabs.Upgrades:AddLeftGroupbox("Staff", "wand")
 			StaffBox:AddToggle(
 				"AutoBuyStaff",
 				{ Text = "Auto Buy Staffs", Default = false, Tooltip = "Buys the best staff you can afford (cash staffs only)" }
@@ -32013,7 +32081,7 @@ local BootOk, BootError = xpcall(function()
 				Tooltip = "Luck brings rarer animals, time keeps the sea open longer",
 			})
 			Labels.Staff = StaffBox:AddLabel({ Text = "-", DoesWrap = true })
-			local TrainBox = Tabs.Progress:AddRightGroupbox("Training", "dumbbell")
+			local TrainBox = Tabs.Upgrades:AddRightGroupbox("Training", "dumbbell")
 			TrainBox:AddToggle("AutoTrain", {
 				Text = "Auto Train",
 				Default = false,
@@ -32036,7 +32104,7 @@ local BootOk, BootError = xpcall(function()
 			TrainBox:AddToggle("AutoBuyDumbbell", { Text = "Auto Buy Dumbbells", Default = false })
 			TrainBox:AddToggle("AutoEquipDumbbell", { Text = "Auto Equip Best Dumbbell", Default = true })
 			Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
-			local RebirthBox = Tabs.Progress:AddRightGroupbox("Rebirth", "refresh-cw")
+			local RebirthBox = Tabs.Upgrades:AddRightGroupbox("Rebirth", "refresh-cw")
 			RebirthBox:AddToggle(
 				"AutoRebirth",
 				{ Text = "Auto Rebirth", Default = false, Tooltip = "Rebirths as soon as you have the cash, never in the middle of a wave" }
@@ -32093,7 +32161,7 @@ local BootOk, BootError = xpcall(function()
 					task.spawn(redeemCode, Options.CodeInput and Options.CodeInput.Value, true)
 				end,
 			})
-			local PotionBox = Tabs.Rewards:AddRightGroupbox("Potions", "flask-conical")
+			local PotionBox = Tabs.Items:AddRightGroupbox("Potions", "flask-conical")
 			PotionBox:AddToggle("AutoPotions", { Text = "Auto Use Potions", Default = false })
 			PotionBox:AddDropdown(
 				"PotionTypes",
@@ -32272,7 +32340,7 @@ local BootOk, BootError = xpcall(function()
 				end
 			end)
 			pcall(function()
-				local RatesBox = Tabs.Analytics:AddLeftGroupbox("Live Rates", "activity")
+				local RatesBox = Tabs.Analytics:AddLeftGroupbox("Rates Over Time", "chart-spline")
 				if RatesBox.AddStatTiles then
 					Analytics.tiles = RatesBox:AddStatTiles({
 						Tiles = {
@@ -32686,6 +32754,7 @@ local BootOk, BootError = xpcall(function()
 		end
 		local FarmToggles = { "AutoSea", "AutoEquipBest", "AutoPlaceEggs", "AutoHatch", "AutoSell" }
 		AllAutoToggles = {
+			"AutoFarmAll",
 			"AutoSea",
 			"AutoEquipBest",
 			"AutoPlaceEggs",
@@ -32700,6 +32769,7 @@ local BootOk, BootError = xpcall(function()
 		}
 		if Library.AddCommand then
 			pcall(function()
+				toggleCommand("farmall", { "afe", "everything", "fa" }, { "AutoFarmAll" }, "Auto Farm Everything")
 				toggleCommand("sea", { "autosea", "opensea" }, { "AutoSea" }, "Auto Open Sea")
 				toggleCommand("autosell", { "as" }, { "AutoSell" }, "Auto Sell")
 				toggleCommand("equipbest", { "best" }, { "AutoEquipBest" }, "Auto Equip Best")
@@ -32947,8 +33017,15 @@ local BootOk, BootError = xpcall(function()
 						Description = "Pick everything you want running. Tap again to unpick.",
 						Multi = true,
 						Required = true,
-						Default = { "sea", "plot", "sell", "progress" },
+						Default = { "farmall" },
 						Choices = {
+							{
+								Id = "farmall",
+								Title = "Auto Farm Everything",
+								Description = "Recommended. One switch: the best farm with a calculated plan for sea, selling, eggs, upgrades, training, rebirth and rewards",
+								Icon = "zap",
+								Color = "#ffd166",
+							},
 							{
 								Id = "sea",
 								Title = "Open the sea",
@@ -32996,7 +33073,7 @@ local BootOk, BootError = xpcall(function()
 					{
 						Id = "move",
 						Title = "How should Corvus move at sea?",
-						Description = "You can change this later in the Main tab.",
+						Description = "You can change this later in the Player tab.",
 						Default = "Teleport",
 						SingleColumn = true,
 						ChoiceHeight = 54,
@@ -33024,7 +33101,7 @@ local BootOk, BootError = xpcall(function()
 							},
 						},
 						Visible = function(state)
-							return type(state.tasks) == "table" and state.tasks.sea == true
+							return type(state.tasks) == "table" and state.tasks.sea == true and state.tasks.farmall ~= true
 						end,
 					},
 					{
@@ -33052,18 +33129,26 @@ local BootOk, BootError = xpcall(function()
 							{
 								Id = "keep",
 								Title = "Keep my filters",
-								Description = "Uses the Catch Filters in the Main tab",
+								Description = "Uses the Catch Filters in the Sea tab",
 								Icon = "funnel",
 								Color = "#9085e9",
 							},
 						},
 						Visible = function(state)
-							return type(state.tasks) == "table" and state.tasks.sea == true
+							return type(state.tasks) == "table" and state.tasks.sea == true and state.tasks.farmall ~= true
 						end,
 					},
 				},
 				Finish = function(values)
 					local picked = type(values.tasks) == "table" and values.tasks or {}
+					if picked.farmall then
+						pcall(function()
+							Toggles.AutoFarmAll:SetValue(true)
+						end)
+						markSetupDone()
+						notify("Quick setup done", "Auto Farm Everything is on. Change anything in the tabs any time", 5)
+						return
+					end
 					local groups = {
 						sea = { "AutoSea" },
 						plot = { "AutoEquipBest", "AutoPlaceEggs", "AutoHatch" },
@@ -33785,11 +33870,13 @@ local BootOk, BootError = xpcall(function()
 		for _, tab in ipairs({
 			Tabs.Info,
 			Tabs.Main,
+			Tabs.Sea,
 			Tabs.Plot,
-			Tabs.Progress,
+			Tabs.Upgrades,
 			Tabs.Rewards,
+			Tabs.Items,
+			Tabs.Player,
 			Tabs.Stats,
-			Tabs.Analytics,
 			Tabs.Misc,
 			Tabs.Settings,
 		}) do
@@ -33996,7 +34083,7 @@ local BootOk, BootError = xpcall(function()
 			end)
 			local data = Data()
 			local reach = math.floor(tonumber(waveReach()) or 5)
-			if shown(Tabs.Main) then
+			if shown(Tabs.Main) or shown(Tabs.Sea) then
 				group(function()
 					Labels.Status:SetText(Status)
 				end)
@@ -34073,7 +34160,7 @@ local BootOk, BootError = xpcall(function()
 					)
 				end)
 			end
-			if shown(Tabs.Progress) then
+			if shown(Tabs.Upgrades) then
 				group(function()
 					local upgradeLines = {}
 					for _, label in ipairs(UpgradeOrder) do
@@ -34163,7 +34250,7 @@ local BootOk, BootError = xpcall(function()
 					)
 				end)
 			end
-			if shown(Tabs.Rewards) then
+			if shown(Tabs.Rewards) or shown(Tabs.Items) then
 				group(function()
 					local gift, left = nextPlaytimeGift()
 					local daily = data and data.DailyReward
