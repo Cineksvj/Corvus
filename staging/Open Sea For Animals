@@ -31853,6 +31853,7 @@ end
 			end
 			return false
 		end
+		local NoticeSeen = {}
 		function onEvent(service, name, fn)
 			task.spawn(function()
 				local folder = KnitServices and KnitServices:FindFirstChild(service)
@@ -33919,6 +33920,122 @@ end
 		function isBlatant()
 			return (Options.SeaMove and Options.SeaMove.Value) == "Blatant" and not Sea.instant.off
 		end
+		-- Wave probes (blatant.md 1, 2, 3, 7): the same remotes the instant catch already uses, each tried on one Blatant
+		-- wave. The server's real inventory change decides: an accepted mine is used every wave (and dropped again after 3
+		-- waves without the extra items), a refused one is never tried again until the game updates (PlaceVersion).
+		local Probe = { file = "Corvus/OSFA_Probe.json", pv = tostring(game.PlaceVersion), state = {}, tried = {}, misses = {} }
+		Game.probe = Probe
+		pcall(function()
+			if type(isfile) == "function" and type(readfile) == "function" and isfile(Probe.file) then
+				local data = HttpService:JSONDecode(readfile(Probe.file))
+				if type(data) == "table" and tostring(data.pv) == Probe.pv and type(data.state) == "table" then
+					Probe.state = data.state
+				end
+			end
+		end)
+		function Probe.save()
+			pcall(function()
+				if type(writefile) ~= "function" then
+					return
+				end
+				if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder("Corvus") then
+					makefolder("Corvus")
+				end
+				writefile(Probe.file, HttpService:JSONEncode({ pv = Probe.pv, state = Probe.state }))
+			end)
+		end
+		function Probe.active()
+			return on("WaveProbes") and isBlatant()
+		end
+		function Probe.ready(name)
+			return Probe.active() and Probe.state[name] == nil and not Probe.tried[name]
+		end
+		function Probe.use(name)
+			local s = Probe.state[name]
+			return Probe.active() and type(s) == "table" and s.ok == true
+		end
+		function Probe.gain(name)
+			return if Probe.use(name) then tonumber(Probe.state[name].gain) or 0 else 0
+		end
+		function Probe.round(x)
+			return math.floor(x * 100 + 0.5) / 100
+		end
+		function Probe.unique(ids)
+			local seen, n = {}, 0
+			for _, id in ipairs(ids) do
+				if not seen[id] then
+					seen[id] = true
+					n += 1
+				end
+			end
+			return n
+		end
+		function Probe.result(name, accepted, gain, detail)
+			Probe.tried[name] = true
+			Probe.misses[name] = 0
+			Probe.state[name] = { ok = accepted == true, gain = if accepted then gain or 0 else 0 }
+			log(string.format("PROBE %s result=%s gain=%s%s", name, if accepted then "accepted" else "rejected", tostring(if accepted then gain or 0 else 0), if detail then " " .. detail else ""))
+			Probe.save()
+		end
+		-- an accepted mine is checked every time it is used: 3 misses in a row and it is off until the game updates
+		function Probe.check(name, extra, gain)
+			local s = Probe.state[name]
+			if type(s) ~= "table" or not s.ok then
+				return
+			end
+			if extra > 0 then
+				Probe.misses[name] = 0
+				if gain then
+					s.gain = Probe.round((tonumber(s.gain) or gain) * 0.9 + gain * 0.1)
+				end
+				return
+			end
+			Probe.misses[name] = (Probe.misses[name] or 0) + 1
+			if Probe.misses[name] >= 3 then
+				Probe.result(name, false, 0, "stopped after 3 tries without extra items")
+			end
+		end
+		-- Smart Planner: what one more Carry level and one wave are worth with the accepted mines
+		function Probe.carryScale()
+			if Probe.use("overcapall") then
+				return 0
+			end
+			local s = if Probe.use("overcap2k") then 2 else 1
+			if Probe.use("finished2") then
+				s *= 2
+			end
+			return s
+		end
+		function Probe.waveFactor()
+			local over = math.max(Probe.gain("overcapall"), Probe.gain("overcap2k"), Probe.gain("overcap"))
+			return (1 + over) * (1 + math.max(Probe.gain("finished2same"), Probe.gain("finished2")))
+		end
+		local ProbeNames = {
+			finished2 = "Second finish", finished2same = "Same items twice", overcap = "Carry +2", overcap2k = "Carry x2",
+			overcapall = "Whole wave", dup = "Best item twice", bonus = "Bonus twice",
+		}
+		local ProbeOrder = { "finished2", "finished2same", "overcap", "overcap2k", "overcapall", "dup", "bonus" }
+		function Probe.text()
+			if not on("WaveProbes") then
+				return '<font transparency="0.4">Wave probes are off</font>'
+			end
+			if not isBlatant() then
+				return '<font transparency="0.4">Wave probes run with Blatant movement</font>'
+			end
+			local parts = {}
+			for _, name in ipairs(ProbeOrder) do
+				local s = Probe.state[name]
+				if type(s) == "table" and s.ok then
+					table.insert(parts, string.format('<font color="#5ad25a">%s +%d%%</font>', ProbeNames[name], math.floor((tonumber(s.gain) or 0) * 100 + 0.5)))
+				elseif type(s) == "table" then
+					table.insert(parts, '<font transparency="0.45">' .. ProbeNames[name] .. ": no</font>")
+				end
+			end
+			if #parts == 0 then
+				return "Testing on the next Blatant waves"
+			end
+			return table.concat(parts, "  \u{00B7}  ")
+		end
 		local BossLogAt, BossBlockUntil = {}, {}
 		function Game.bossLeft(id)
 			if id == nil then
@@ -34131,7 +34248,8 @@ end
 			end
 			trainAlongside(I)
 			local before = inventoryCount()
-			local capacity = math.min(maxPickup(), math.max(inventoryLimit() - before, 0))
+			local free = math.max(inventoryLimit() - before, 0)
+			local capacity = math.min(maxPickup(), free)
 			if capacity <= 0 then
 				return false
 			end
@@ -34228,6 +34346,36 @@ end
 			end
 			Sea.preview = { matching = #list, total = total, at = os.clock() }
 			pcall(Game.rates.observe, list, maxPickup(), waveReach())
+			-- wave probes (blatant.md 1, 2, 3): one per wave, so the inventory change says which one the server took
+			local P, probe, level = Game.probe, nil, nil
+			local k = math.max(math.floor(maxPickup()), 1)
+			if P.active() and evCount == 0 then
+				if P.ready("finished2") and #list > k and free >= 2 * k then
+					probe = "finished2"
+				elseif P.use("finished2") and P.ready("finished2same") and #list >= 1 and free >= 2 * k then
+					probe = "finished2same"
+				elseif P.ready("overcap") and #list >= k + 2 and free >= k + 2 then
+					probe = "overcap"
+				elseif P.use("overcap") and P.ready("overcap2k") and #list >= 2 * k and free >= 2 * k then
+					probe = "overcap2k"
+				elseif P.use("overcap2k") and P.ready("overcapall") and #list > 2 * k and free >= #list then
+					probe = "overcapall"
+				elseif P.ready("dup") and k >= 2 and #list >= 1 and free >= k then
+					probe = "dup"
+				end
+			end
+			local take = k
+			if probe == "overcap" then
+				take = k + 2
+			elseif probe == "overcap2k" then
+				take = 2 * k
+			elseif probe == "overcapall" then
+				take = #list
+			elseif probe == nil then
+				level = if P.use("overcapall") then "overcapall" elseif P.use("overcap2k") then "overcap2k" elseif P.use("overcap") then "overcap" else nil
+				take = if level == "overcapall" then math.max(#list, k) elseif level == "overcap2k" then 2 * k elseif level == "overcap" then k + 2 else k
+			end
+			capacity = math.min(take, free)
 			if anyIndex and pr == "Best Value" and capacity > 1 and #list > 1 then
 				-- six copies of one missing animal unlock the index entry once: the copies after the first count without it
 				local chosen, seen, pool = {}, {}, list
@@ -34255,11 +34403,14 @@ end
 						seen[item.info.type .. "|" .. item.info.mutation] = true
 					end
 				end
+				for _, item in ipairs(pool) do
+					table.insert(chosen, item)
+				end
 				list = chosen
 			end
 			local ids, infos = {}, {}
 			-- while rushing the event items keep their slots: lucky blocks only get what is left
-			for _, id in ipairs(Game.lucky.take(blocks, capacity - math.min(evCount, capacity))) do
+			for _, id in ipairs(if probe then {} else Game.lucky.take(blocks, capacity - math.min(evCount, capacity))) do
 				table.insert(ids, id)
 			end
 			local blockCount = #ids
@@ -34275,6 +34426,26 @@ end
 				end
 			end
 			Sea.pendingBoss = { at = os.clock(), ids = bossIds }
+			-- blatant.md 3: the best item's id twice (probe), every slot the best item once the server takes copies
+			local dupMode = #infos >= 1 and (probe == "dup" or (probe == nil and P.use("dup") and not anyIndex and evCount == 0 and blockCount == 0))
+			if dupMode then
+				local best = list[1]
+				if probe == "dup" then
+					table.insert(ids, 1, best.id)
+					table.insert(infos, 1, best.info)
+					if #ids > capacity then
+						table.remove(ids)
+						table.remove(infos)
+					end
+				else
+					local n = #ids
+					ids, infos = {}, {}
+					for _ = 1, n do
+						table.insert(ids, best.id)
+						table.insert(infos, best.info)
+					end
+				end
+			end
 			if #ids == 0 then
 				Session.rerolled += 1
 				setStatus("Blatant: nothing worth taking in this wave, rerolling")
@@ -34290,6 +34461,21 @@ end
 			local got = waitFor(function()
 				return inventoryCount() >= before + #infos
 				end, 1.5)
+			if probe == "overcap" or probe == "overcap2k" or probe == "overcapall" or probe == "dup" then
+				task.wait(if got then 0.4 else 0)
+				local delta = inventoryCount() - before
+				local normal = if probe == "dup" then P.unique(ids) elseif probe == "overcap2k" then k + 2 elseif probe == "overcapall" then 2 * k else k
+				local base = if probe == "dup" then normal else k
+				P.result(probe, delta > normal, P.round((delta - base) / math.max(base, 1)), string.format("carry=%d sent=%d got=%d", k, #ids, delta))
+			elseif probe == nil and #infos > 0 then
+				local delta = inventoryCount() - before
+				if level and #infos > k then
+					P.check(level, delta - k, (delta - k) / k)
+				end
+				if dupMode then
+					P.check("dup", delta - P.unique(ids))
+				end
+			end
 			if #infos == 0 then
 				task.wait(0.3)
 				Game.lucky.shot(blockCount)
@@ -34315,6 +34501,44 @@ end
 			for _, info in ipairs(infos) do
 				Track.caught(info)
 				emit("caught", info)
+			end
+			if probe == "finished2" or probe == "finished2same" or (probe == nil and P.use("finished2")) then
+				-- blatant.md 1: a second Finished in the same wave, the next best ids (or the same ids once that works)
+				local same = probe == "finished2same" or (probe == nil and P.use("finished2same"))
+				local name = probe or (if same then "finished2same" else "finished2")
+				local mid = inventoryCount()
+				local room = math.max(inventoryLimit() - mid, 0)
+				local ids2, infos2 = {}, {}
+				if same then
+					if room >= #infos then
+						ids2, infos2 = ids, infos
+					end
+				else
+					for j = #infos + 1, math.min(#infos + k, #list, #infos + room) do
+						table.insert(ids2, list[j].id)
+						table.insert(infos2, list[j].info)
+					end
+				end
+				if #infos2 > 0 then
+					call("WaveService", "Finished", ids2)
+					waitFor(function()
+						return inventoryCount() >= mid + #infos2
+					end, if probe then 1.5 else 0.8)
+					if probe then
+						task.wait(0.3)
+					end
+					local extra = inventoryCount() - mid
+					local gain = extra / math.max(#infos, 1)
+					if probe then
+						P.result(name, extra > 0, P.round(gain), string.format("sent=%d extra=%d", #ids2, extra))
+					else
+						P.check(name, extra, gain)
+					end
+					for j = 1, math.min(math.max(extra, 0), #infos2) do
+						Track.caught(infos2[j])
+						emit("caught", infos2[j])
+					end
+				end
 			end
 			if I.ok == 1 then
 				log("INSTANT works:", #ids, "item(s) per wave, gap", string.format("%.2fs", I.gap))
@@ -36333,6 +36557,22 @@ end
 			local ok, success = call("TrainingService", "ClaimBonus", id)
 			if ok and success then
 				Session.bonus += 1
+				-- blatant.md 7: the same bonus id once more (probe), every bonus once the server pays it twice
+				local P = Game.probe
+				local probing = P.ready("bonus")
+				if probing or P.use("bonus") then
+					local p0 = power()
+					local ok2, again = call("TrainingService", "ClaimBonus", id)
+					local accepted = ok2 and again == true
+					if accepted then
+						Session.bonus += 1
+					end
+					if probing then
+						P.result("bonus", accepted, if accepted then 1 else 0, string.format("power=%s->%s", formatNumber(p0), formatNumber(power())))
+					else
+						P.check("bonus", if accepted then 1 else 0)
+					end
+				end
 			end
 			-- the game only hides its x2 button when you click it: hide it here, or it stays on screen and a click later fails
 			pcall(function()
@@ -36976,7 +37216,7 @@ end
 			local window = math.min(900, mNow - (Metrics.sessionStart or mNow))
 			local catch = if window >= 60 then (Metrics.rate("Sold", mNow, window) or 0) / 3600 else 0
 			if catch <= 0 and R.takenV and R.waveGap and R.waveGap > 0 then
-				catch = R.takenV * 30 / R.waveGap * seaShare
+				catch = R.takenV * 30 / R.waveGap * seaShare * Game.probe.waveFactor()
 			end
 			local catchBase = catch / (boost ^ e * wmAvg)
 			local H = 86400 -- rolling 24 h: the farm never ends, so the horizon never shrinks
@@ -36992,7 +37232,7 @@ end
 				end
 			end
 			local k = math.max(maxPickup(), 1)
-			add("Carry", nextUpgradePrice("Carry"), catchBase * (R.carry or 1 / k), "Carry")
+			add("Carry", nextUpgradePrice("Carry"), catchBase * (R.carry or 1 / k) * Game.probe.carryScale(), "Carry")
 			local q = 1 + 0.1 * sumValues(modifier("CompletedEggs"))
 			local slotGain = if placedAmount >= maxAnimals() then worst * multi else 0
 			add("PlotUpgrade", nextUpgradePrice("PlotUpgrade"), slotGain + base * 0.05 * q, "Upgrade Base")
@@ -37516,6 +37756,12 @@ end
 				Default = false,
 				Tooltip = "Heads out again when the sea is still open after banking.",
 			})
+			TuneBox:AddToggle("WaveProbes", {
+				Text = "Wave Probes",
+				Default = true,
+				Tooltip = "Blatant only. Tries a few ways to take more from each wave (a second finish, more items than Carry, the best item twice, the training bonus twice), each once. What the server accepts is used every wave, what it refuses is not tried again until the game updates.",
+			})
+			Labels.Probes = TuneBox:AddLabel({ Text = "-", DoesWrap = true })
 			local FilterBox = Tabs.Sea:AddRightGroupbox("Catch Filters", "funnel")
 			FilterBox:AddDropdown(
 				"CatchKinds",
@@ -40068,6 +40314,7 @@ end
 			if shown(Tabs.Sea) then
 				group(function()
 					Labels.Hunt:SetText(Game.huntText())
+					Labels.Probes:SetText(Game.probe.text())
 				end)
 			end
 			local data = Data()
