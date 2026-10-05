@@ -31313,9 +31313,13 @@ do
 		end
 	end))
 	-- Only the game's own player actions through SkippingNetwork.Request (action, payload). Never the admin tools
-	-- (AdminGrant, AdminAbuse, code editing, polls, global messages, ResetProgress), Robux prompts (win packs, special
-	-- eggs, skill packs, player gifts, SimulatePurchase) or anything that deletes pets (DiscardPet, delete kinds).
+	-- (AdminGrant, AdminAbuse, code editing, polls, global messages, ResetProgress) or Robux prompts (win packs, special
+	-- eggs, skill packs, player gifts, SimulatePurchase). Pet deletion only through N.deletePets (Auto Delete with its
+	-- protect rules), never DeleteBelow.
 	local Allowed = {
+		DiscardPet = true,
+		RevealPets = true,
+		UpdateSetting = true,
 		Sync = true,
 		Throw = true,
 		CancelThrow = true,
@@ -31339,8 +31343,12 @@ do
 		PlayerGiftsReady = true,
 	}
 	local Quiet = { Sync = true, StopPractice = true }
-	-- PetEquipment kinds the hub may send: equip best and golden/diamond fusion. Never the delete kinds.
-	local PetKinds = { Best = true, Fuse = true, ClaimFusion = true }
+	-- PetEquipment kinds the hub may send: equip best, golden/diamond fusion and DeleteSelected (only with the token
+	-- N.deletePets sets for one call, and never an empty list). Never DeleteBelow.
+	local PetKinds = { Best = true, Fuse = true, ClaimFusion = true, DeleteSelected = true }
+	-- Game settings the hub may change (the game's own Settings page).
+	local SettingNames = { AutoEquipBestPetsEnabled = true, EffectsEnabled = true, CameraShakeEnabled = true }
+	N.DeleteToken = nil
 	N.Sent = { count = 0, byAction = {} }
 	function N.net(name)
 		local folder = ReplicatedStorage:FindFirstChild("SkippingNetwork")
@@ -31352,6 +31360,22 @@ do
 			return false
 		end
 		if action == "PetEquipment" and not (type(payload) == "table" and PetKinds[payload.Kind]) then
+			log("BLOCKED", action, payload)
+			return false
+		end
+		if action == "PetEquipment" and payload.Kind == "DeleteSelected" then
+			local token = N.DeleteToken
+			N.DeleteToken = nil
+			if token ~= payload or type(payload.Ids) ~= "table" or #payload.Ids == 0 then
+				log("BLOCKED", action, "delete without the Auto Delete rules")
+				return false
+			end
+		end
+		if action == "UpdateSetting" and not (type(payload) == "table" and SettingNames[payload.Name] and type(payload.Value) == "boolean") then
+			log("BLOCKED", action, payload)
+			return false
+		end
+		if action == "DiscardPet" and not (type(payload) == "table" and type(payload.PetId) == "string" and type(payload.Enabled) == "boolean") then
 			log("BLOCKED", action, payload)
 			return false
 		end
@@ -31533,6 +31557,20 @@ do
 	end
 	function N.opActive()
 		return on("AutoFarmOP")
+	end
+	-- "Exclude from OP" (Auto OP tab): resources OP never sells, deletes, fuses or uses. Keys like "Pets: Legendary",
+	-- "Golden pets", "Egg: Dragon", "Potion: Luck". Only while OP runs; in Normal mode the player's own picks decide.
+	N.OPSkipped = { count = 0, last = "" }
+	function N.opExcluded(key)
+		if not N.opActive() then
+			return false
+		end
+		local yes = selected(Options.ExcludeOP, key)
+		if yes then
+			N.OPSkipped.count += 1
+			N.OPSkipped.last = key
+		end
+		return yes
 	end
 	-- Max throw rate (Blatant): no pause between throws beyond the game's own cooldown.
 	function N.blatant()
@@ -31772,6 +31810,8 @@ local Session = {
 	claims = 0,
 	potions = 0,
 	codes = 0,
+	deleted = 0,
+	revealed = 0,
 	winsStart = nil,
 	skillStart = nil,
 	rebirthStart = nil,
@@ -32403,6 +32443,9 @@ function N.petDefs()
 			order = tonumber(model:GetAttribute("DisplayOrder")) or 0,
 			name = tostring(model:GetAttribute("DisplayName") or id),
 			exclusive = model:GetAttribute("Exclusive") == true,
+			rarity = tostring(model:GetAttribute("Rarity") or "Common"),
+			bonus = tonumber(model:GetAttribute("BestPetBonusPercent")),
+			fusion = model:GetAttribute("FusionEligible"),
 		}
 		defs.byId[id] = def
 		if type(egg) == "string" and egg ~= "" and not def.exclusive and def.chance > 0 then
@@ -32424,6 +32467,17 @@ function N.petDefs()
 	return defs
 end
 local Variants = { golden__ = 1.5, diamond__ = 2 }
+-- The game's PetCatalog.BaseId: "golden__x" -> x, "Golden".
+function N.petBase(petId)
+	local id = tostring(petId or "")
+	if string.sub(id, 1, 8) == "golden__" then
+		return string.sub(id, 9), "Golden", Variants.golden__
+	elseif string.sub(id, 1, 9) == "diamond__" then
+		return string.sub(id, 10), "Diamond", Variants.diamond__
+	end
+	return id, "Normal", 1
+end
+-- The game's PetCatalog.Power: the entry's own Power, else pets with BestPetBonusPercent scale with the best fixed pet.
 function N.petPower(entry)
 	if type(entry) ~= "table" then
 		return 0
@@ -32431,16 +32485,63 @@ function N.petPower(entry)
 	if tonumber(entry.Power) then
 		return tonumber(entry.Power)
 	end
-	local id = tostring(entry.PetId or "")
-	local mult = 1
-	for prefix, m in pairs(Variants) do
-		if string.sub(id, 1, #prefix) == prefix then
-			id = string.sub(id, #prefix + 1)
-			mult = m
-		end
-	end
+	local id, _, mult = N.petBase(entry.PetId)
 	local def = N.petDefs().byId[id]
+	if def and def.bonus then
+		local best = 1
+		for _, other in ipairs(N.coll("Pets")) do
+			local otherDef = type(other) == "table" and N.petDefs().byId[(N.petBase(other.PetId))]
+			if otherDef and not otherDef.bonus then
+				best = math.max(best, tonumber(other.Power) or otherDef.power * select(3, N.petBase(other.PetId)))
+			end
+		end
+		return best * (1 + def.bonus / 100)
+	end
 	return (def and def.power or 1) * mult
+end
+-- One pet: base id, variant, template, rarity, power.
+function N.petInfo(entry)
+	local base, variant = N.petBase(type(entry) == "table" and entry.PetId)
+	local def = N.petDefs().byId[base]
+	return {
+		entry = entry,
+		id = type(entry) == "table" and entry.Id or nil,
+		petId = type(entry) == "table" and tostring(entry.PetId) or "",
+		base = base,
+		variant = variant,
+		def = def,
+		rarity = if def and def.exclusive then "Exclusive" else (def and def.rarity or "Common"),
+		name = def and def.name or base,
+		power = N.petPower(entry),
+	}
+end
+-- The game's PetCatalog.CanFuseBase: Normal pets of fusion rarities, never Admin or premium egg pets.
+local FusionRarity = { Common = true, Uncommon = true, Rare = true, Epic = true, Legendary = true, Mythical = true, Divine = true, Ascended = true, Eternal = true }
+local PremiumEgg = { Special = true, PirateSpecial = true, Astronaut = true, Chocolatier = true, Dragon = true, HackedAdmin = true }
+function N.canFuse(info)
+	local def = info.def
+	if not def or def.exclusive or PremiumEgg[def.egg or ""] then
+		return false
+	end
+	if info.variant == "Diamond" then
+		return false
+	end
+	if def.fusion ~= nil then
+		return def.fusion == true
+	end
+	return FusionRarity[def.rarity] == true
+end
+-- Storage: the server's PetCapacity (100 free, more for Robux).
+function N.petCapacity()
+	local storage = N.G.Balance.Pets and N.G.Balance.Pets.Storage
+	return math.max(1, N.num("PetCapacity", tonumber(storage and storage.Slots) or 100))
+end
+function N.storageFree()
+	return N.petCapacity() - #N.coll("Pets")
+end
+-- Pet index: 1 = discovered, 2 = revealed (only revealed entries count for the luck milestones).
+function N.indexed(petId)
+	return (tonumber(N.coll("PetIndex")[petId]) or 0) >= 1
 end
 -- Equipped pets add up; the planner compares a new pet with the weakest of the best N.
 function N.petPowers()
@@ -32533,8 +32634,16 @@ function N.hatch(egg)
 			task.wait(0.3)
 		end
 	end
-	N.Egg.req += 1
 	local count = N.hatchCount()
+	if N.storageFree() < count then
+		if os.clock() - (N.Egg.fullLogAt or -1e9) > 300 then
+			N.Egg.fullLogAt = os.clock()
+			log("HATCH skipped", "pet storage full", #N.coll("Pets") .. "/" .. N.petCapacity())
+		end
+		N.Egg.last = "Pet storage full (" .. #N.coll("Pets") .. "/" .. N.petCapacity() .. ")"
+		return false
+	end
+	N.Egg.req += 1
 	local before = #N.coll("Pets")
 	N.Egg.result = nil
 	send("HatchEgg", { EggId = egg.id, Count = count, RequestId = N.Egg.req })
@@ -32554,7 +32663,27 @@ end
 function N.equipBestPets()
 	send("PetEquipment", { Kind = "Best" })
 end
--- Golden (x1.5) and Diamond (x2) fusion of 3 identical pets the player does not use. Then the claim after the timer.
+-- The game's own Settings page has "Auto Equip Best Pets" (Settings.AutoEquipBestPetsEnabled): Equip Best turns it on
+-- once so new hatches are equipped by the game itself.
+function N.gameSettingOn(name)
+	local settings = N.coll("Settings")
+	if settings[name] == true or (N.Sent.settingAt and os.clock() - N.Sent.settingAt < 60) then
+		return false
+	end
+	N.Sent.settingAt = os.clock()
+	send("UpdateSetting", { Name = name, Value = true })
+	log("SETTING", name, "on")
+	return true
+end
+local function equippedSet()
+	local set = {}
+	for _, id in ipairs(N.coll("EquippedPets")) do
+		set[id] = true
+	end
+	return set
+end
+-- Golden (x1.5) and Diamond (x2) fusion of 3 identical spare pets: when the result beats the weakest equipped pet, or
+-- (Fuse For Index) when the new variant is missing from the pet index (+1% luck per 10 entries). Then the claim.
 N.Fuse = { last = "", at = -1e9 }
 function N.fusionStep()
 	local fusions = N.coll("PetFusions")
@@ -32571,10 +32700,7 @@ function N.fusionStep()
 	if os.clock() - N.Fuse.at < 20 then
 		return false
 	end
-	local equipped = {}
-	for _, id in ipairs(N.coll("EquippedPets")) do
-		equipped[id] = true
-	end
+	local equipped = equippedSet()
 	local _, weakest = N.petTotal()
 	local groups = {}
 	for _, entry in ipairs(N.coll("Pets")) do
@@ -32584,32 +32710,234 @@ function N.fusionStep()
 			table.insert(groups[key], entry)
 		end
 	end
-	local bestKey, bestGain, bestVariant = nil, 0, nil
+	local forIndex = on("FuseForIndex") or N.opActive()
+	local best, bestScore = nil, 0
 	for key, list in pairs(groups) do
-		if #list >= 3 then
-			local variant = if string.sub(key, 1, 8) == "golden__" then "Diamond" elseif string.sub(key, 1, 9) == "diamond__" then nil else "Golden"
-			if variant and fusions[variant] == nil then
-				local power = N.petPower(list[1])
-				local result = if variant == "Golden" then power * 1.5 else power / 1.5 * 2
-				local gain = result - weakest
-				if gain > bestGain then
-					bestKey, bestGain, bestVariant = key, gain, variant
-				end
+		local info = N.petInfo(list[1])
+		local variant = if info.variant == "Normal" then "Golden" elseif info.variant == "Golden" then "Diamond" else nil
+		if #list >= 3 and variant and fusions[variant] == nil and N.canFuse(info) and not N.opExcluded("Pets: " .. info.rarity) and not (info.variant == "Golden" and N.opExcluded("Golden pets")) then
+			local result = if variant == "Golden" then info.power * 1.5 else info.power / 1.5 * 2
+			local gain = result - weakest
+			local newId = string.lower(variant) .. "__" .. info.base
+			local indexNew = forIndex and not N.indexed(newId)
+			-- Power first, then index entries (worth less than any power gain, more than nothing).
+			local score = if gain > 0 then 1e6 + gain elseif indexNew then 1 else 0
+			if score > bestScore then
+				best, bestScore = { key = key, variant = variant, gain = gain, index = indexNew, list = list }, score
 			end
 		end
 	end
-	if bestKey then
+	if best then
 		N.Fuse.at = os.clock()
 		local ids = {}
 		for i = 1, 3 do
-			table.insert(ids, groups[bestKey][i].Id)
+			table.insert(ids, best.list[i].Id)
 		end
-		send("PetEquipment", { Kind = "Fuse", Variant = bestVariant, Ids = ids })
-		N.Fuse.last = string.format("Fusing 3 %s into %s (+%s power)", bestKey, bestVariant, formatNumber(bestGain))
-		log("FUSE", bestKey, bestVariant, "gain", brief(bestGain))
+		send("PetEquipment", { Kind = "Fuse", Variant = best.variant, Ids = ids })
+		N.Fuse.last = string.format("Fusing 3 %s into %s (%s)", best.key, best.variant, if best.gain > 0 then "+" .. formatNumber(best.gain) .. " power" else "new index entry")
+		log("FUSE", best.key, best.variant, "gain", brief(best.gain), "index", tostring(best.index))
 		return true
 	end
 	return false
+end
+-- Auto Delete --------------------------------------------------------------------------------------------------------
+-- Deletes spare pets the player does not need, through the game's own Delete Selected (PetEquipment DeleteSelected).
+-- Never: equipped pets, the best N by power, protected pets, Golden/Diamond (unless allowed), pets missing from the
+-- index, 3 copies kept for a fusion that still pays (Auto Fuse on). Normal: picked rarities (and weaker than the team
+-- when "Only weaker than my team" is on). OP: any rarity not in "Exclude from OP", always only weaker than the team.
+N.Del = { deleted = 0, last = "", refusedUntil = 0, fails = 0, discards = {}, discardFile = "Corvus/STONE_discard_" .. tostring(LocalPlayer.UserId) .. ".txt" }
+local function deleteRule(info, weakest)
+	local op = N.opActive()
+	if op then
+		if N.opExcluded("Pets: " .. info.rarity) then
+			return false
+		end
+		if info.variant == "Golden" and N.opExcluded("Golden pets") then
+			return false
+		end
+		if info.variant == "Diamond" and N.opExcluded("Diamond pets") then
+			return false
+		end
+		return info.power < weakest
+	end
+	if info.variant ~= "Normal" and on("KeepVariants") then
+		return false
+	end
+	if not selected(Options.DeleteRarities, info.rarity) then
+		return false
+	end
+	if selected(Options.ProtectPets, info.name) then
+		return false
+	end
+	return not on("DeleteOnlyWeaker") or info.power < weakest
+end
+function N.deleteCandidates()
+	local pets = N.coll("Pets")
+	local equipped = equippedSet()
+	local infos = {}
+	for _, entry in ipairs(pets) do
+		if type(entry) == "table" and entry.Id then
+			table.insert(infos, N.petInfo(entry))
+		end
+	end
+	table.sort(infos, function(a, b)
+		if a.power ~= b.power then
+			return a.power > b.power
+		end
+		return tostring(a.id) < tostring(b.id)
+	end)
+	local keepBest = math.max(N.petSlots(), math.floor(optionNumber("KeepBestPets", 10)))
+	local _, weakest = N.petTotal()
+	if #N.petPowers() < N.petSlots() then
+		-- Free slots: every pet helps, nothing is "weaker than the team".
+		weakest = 0
+	end
+	local fuseKeep = {}
+	local list, names = {}, {}
+	for rank, info in ipairs(infos) do
+		local keep = rank <= keepBest or equipped[info.id] or info.entry.Locked == true or not N.indexed(info.petId)
+		if not keep and on("AutoFuse") and N.canFuse(info) then
+			-- Keep 3 copies for a fusion while its next variant is still useful.
+			local nextId = (if info.variant == "Normal" then "golden__" else "diamond__") .. info.base
+			if not N.indexed(nextId) or info.power * 1.5 > weakest then
+				fuseKeep[info.petId] = (fuseKeep[info.petId] or 0) + 1
+				keep = fuseKeep[info.petId] <= 3
+			end
+		end
+		if not keep and deleteRule(info, weakest) then
+			table.insert(list, info.id)
+			names[info.name] = (names[info.name] or 0) + 1
+		end
+	end
+	return list, names
+end
+function N.deletePets(ids)
+	if #ids == 0 then
+		return false
+	end
+	local payload = { Kind = "DeleteSelected", Ids = ids }
+	N.DeleteToken = payload
+	local before = #N.coll("Pets")
+	send("PetEquipment", payload)
+	local ok = waitFor(function()
+		return #N.coll("Pets") < before
+	end, 4)
+	return ok, before - #N.coll("Pets")
+end
+function N.deleteStep()
+	if os.clock() < N.Del.refusedUntil or N.activity() ~= "Idle" then
+		return false
+	end
+	local list, names = N.deleteCandidates()
+	if #list == 0 then
+		return false
+	end
+	local batch = table.move(list, 1, math.min(#list, 50), 1, {})
+	local ok, removed = N.deletePets(batch)
+	if ok then
+		N.Del.fails = 0
+		N.Del.deleted += removed
+		Session.deleted = (Session.deleted or 0) + removed
+		local parts = {}
+		for name, n in pairs(names) do
+			table.insert(parts, n .. "x " .. name)
+		end
+		table.sort(parts)
+		N.Del.last = "Deleted " .. removed .. ": " .. table.concat(parts, ", ")
+		log("DELETE", removed, "pets", table.concat(parts, ", "), "storage", #N.coll("Pets") .. "/" .. N.petCapacity())
+		return true
+	end
+	N.Del.fails += 1
+	if N.Del.fails >= 3 then
+		N.Del.fails = 0
+		N.Del.refusedUntil = os.clock() + 600
+		logProblem("Pet delete refused 3 times (DeleteSelected)")
+	end
+	return false
+end
+-- Auto-delete on hatch: the game's own "AUTO-DELETED" mark on egg pets (DiscardPet{PetId, Enabled}). The hub marks only
+-- species of this world's eggs that match the delete rule at species level and are already in the index, and removes
+-- only marks it set itself (remembered in a file, so a player's own marks are never touched).
+local function readDiscards()
+	local ok, text = pcall(function()
+		return readfile(N.Del.discardFile)
+	end)
+	local set = {}
+	if ok and type(text) == "string" then
+		for id in string.gmatch(text, "[^,%s]+") do
+			set[id] = true
+		end
+	end
+	N.Del.discards = set
+	N.Del.loaded = true
+end
+local function saveDiscards()
+	local list = {}
+	for id in pairs(N.Del.discards) do
+		table.insert(list, id)
+	end
+	table.sort(list)
+	pcall(function()
+		if makefolder and isfolder and not isfolder("Corvus") then
+			makefolder("Corvus")
+		end
+		writefile(N.Del.discardFile, table.concat(list, ","))
+	end)
+end
+function N.discardWanted()
+	local want = {}
+	if not (on("AutoDeletePets") and (on("DiscardOnHatch") or N.opActive())) then
+		return want
+	end
+	local _, weakest = N.petTotal()
+	if #N.petPowers() < N.petSlots() then
+		return want
+	end
+	local cfg = N.worldCfg()
+	for _, eggId in ipairs(cfg and cfg.EggIds or {}) do
+		for _, def in ipairs(N.petDefs().byEgg[eggId] or {}) do
+			local info = { def = def, base = def.id, petId = def.id, variant = "Normal", rarity = def.rarity, name = def.name, power = def.power }
+			local fuseUseful = on("AutoFuse") and N.canFuse(info) and not N.indexed("golden__" .. def.id)
+			if N.indexed(def.id) and not def.bonus and not fuseUseful and deleteRule(info, weakest) and def.power < weakest then
+				want[def.id] = true
+			end
+		end
+	end
+	return want
+end
+function N.discardStep()
+	if not N.Del.loaded then
+		readDiscards()
+	end
+	local want = N.discardWanted()
+	local marked = N.coll("DiscardedPets")
+	local changed = false
+	for id in pairs(want) do
+		if marked[id] ~= true then
+			send("DiscardPet", { PetId = id, Enabled = true })
+			N.Del.discards[id] = true
+			changed = true
+			log("DISCARD on hatch", id)
+			break
+		end
+	end
+	if not changed then
+		for id in pairs(N.Del.discards) do
+			if not want[id] then
+				if marked[id] == true then
+					send("DiscardPet", { PetId = id, Enabled = false })
+					log("DISCARD off", id)
+				end
+				N.Del.discards[id] = nil
+				changed = true
+				break
+			end
+		end
+	end
+	if changed then
+		saveDiscards()
+	end
+	return changed
 end
 -- Rebirth and worlds --------------------------------------------------------------------------------------------
 N.Reb = { last = "", resets = nil, at = -1e9 }
@@ -32686,7 +33014,7 @@ function N.potionStep(mode)
 	local now = N.serverTime()
 	local want = { Skill = mode == "train" or mode == "throw", Win = mode == "throw", Luck = mode == "hatch" }
 	for id, yes in pairs(want) do
-		if yes and allows(Options.PotionKinds, id) and (tonumber(potions[id]) or 0) > 0 and (tonumber(expires[id]) or 0) <= now then
+		if yes and allows(Options.PotionKinds, id) and not N.opExcluded("Potion: " .. id) and (tonumber(potions[id]) or 0) > 0 and (tonumber(expires[id]) or 0) <= now then
 			send("UsePotion", id)
 			Session.potions += 1
 			log("POTION", id, "left", (tonumber(potions[id]) or 1) - 1)
@@ -32783,25 +33111,59 @@ function N.rewardStep()
 			rewardNote("Group reward")
 		end
 	end
-	if on("AutoIndex") and due("index", 30) then
-		local count = 0
-		for _ in pairs(N.coll("PetIndex")) do
-			count += 1
-		end
-		local step = tonumber(N.G.Balance.PetIndex and N.G.Balance.PetIndex.MilestoneStep) or 10
-		if count // step > N.num("PetIndexClaimed", 0) then
-			send("ClaimPetIndex", nil)
-			rewardNote("Pet index milestone (" .. count .. " pets)")
+	if on("AutoIndex") and due("index", 5) then
+		N.indexStep()
+	end
+end
+-- Pet index (the game's PetIndex util): a hatched pet is "discovered" (1); the player reveals it in the index page
+-- (RevealPets, batches of 50) and only revealed entries count. Every MilestoneStep revealed = one ClaimPetIndex
+-- (+1% luck each). Eggs in PetIndex.ExcludedEggs (Divine) do not count.
+function N.indexCounts()
+	local index = N.coll("PetIndex")
+	local excluded = N.G.Balance.PetIndex and N.G.Balance.PetIndex.ExcludedEggs or {}
+	local revealed, discovered, hidden = 0, 0, {}
+	for id, stage in pairs(index) do
+		local base = N.petBase(id)
+		local def = N.petDefs().byId[base]
+		local listed = not (def and excluded[def.egg or ""])
+		stage = tonumber(stage) or 0
+		if stage >= 2 and listed then
+			revealed += 1
+		elseif stage == 1 then
+			discovered += 1
+			table.insert(hidden, id)
 		end
 	end
+	table.sort(hidden)
+	return revealed, discovered, hidden
+end
+function N.indexStep()
+	local revealed, _, hidden = N.indexCounts()
+	if #hidden > 0 then
+		local batch = table.move(hidden, 1, math.min(#hidden, 50), 1, {})
+		send("RevealPets", batch)
+		Session.revealed += #batch
+		log("INDEX reveal", #batch)
+		return true
+	end
+	local step = tonumber(N.G.Balance.PetIndex and N.G.Balance.PetIndex.MilestoneStep) or 10
+	if revealed // step > N.num("PetIndexClaimed", 0) and due("indexClaim", 20) then
+		send("ClaimPetIndex", nil)
+		rewardNote("Pet index milestone (" .. revealed .. " revealed)")
+		return true
+	end
+	return false
 end
 -- Eggs from gifts and the daily reward sit in the inventory: opening them is free.
 function N.openInventoryEggs()
 	if N.activity() ~= "Idle" and N.activity() ~= "Practice" then
 		return false
 	end
+	if N.storageFree() < 1 then
+		return false
+	end
 	for id, count in pairs(N.coll("Eggs")) do
-		if (tonumber(count) or 0) >= 1 and due("egg" .. tostring(id), 6) then
+		if (tonumber(count) or 0) >= 1 and not N.opExcluded("Egg: " .. tostring(id)) and due("egg" .. tostring(id), 6) then
 			send("HatchInventoryEgg", id)
 			Session.eggsOpened += 1
 			rewardNote("Opened a " .. tostring(id) .. " egg")
@@ -32810,20 +33172,206 @@ function N.openInventoryEggs()
 	end
 	return false
 end
+-- Codes: the game's RedeemCode(code) request, answered by the CodeResult event {Success, Message}. Known codes come from
+-- the hub (list below) and the online list HubRepo .. "Codes" (JSON {game: [codes]}). Each code is tried once per
+-- account; redeemed, used and invalid codes are remembered in Corvus/STONE_codes_<UserId>.txt.
+N.Codes = {
+	known = { "SECRET", "10KCCU", "5KCCU", "WORLD4", "WELCOME" },
+	state = {},
+	pending = nil,
+	queue = {},
+	fetchedAt = -1e9,
+	loaded = false,
+	last = "-",
+	file = "Corvus/STONE_codes_" .. tostring(LocalPlayer.UserId) .. ".txt",
+	tries = {},
+}
+local C = N.Codes
+local function codesLoad()
+	C.loaded = true
+	local ok, text = pcall(function()
+		return readfile(C.file)
+	end)
+	if ok and type(text) == "string" then
+		for code, status in string.gmatch(text, "([^=\n]+)=([^\n]+)") do
+			C.state[code] = status
+		end
+	end
+end
+local function codesSave()
+	local lines = {}
+	for code, status in pairs(C.state) do
+		table.insert(lines, code .. "=" .. status)
+	end
+	table.sort(lines)
+	pcall(function()
+		if makefolder and isfolder and not isfolder("Corvus") then
+			makefolder("Corvus")
+		end
+		writefile(C.file, table.concat(lines, "\n"))
+	end)
+end
+local function addKnown(code)
+	code = tostring(code or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if code ~= "" and #code <= 40 and not table.find(C.known, code) then
+		table.insert(C.known, code)
+		return true
+	end
+	return false
+end
+function N.httpGet(url)
+	return game:HttpGet(url)
+end
+-- The online list: {"+1 Stone Skipping": [...]} (also accepts the keys StoneSkipping, stone and the PlaceId).
+function N.codesFetch()
+	C.fetchedAt = os.clock()
+	if type(HubRepo) ~= "string" then
+		return 0
+	end
+	local ok, body = pcall(N.httpGet, HubRepo .. "Codes?t=" .. tostring(os.time()))
+	if not ok or type(body) ~= "string" or body == "" then
+		return 0
+	end
+	local okJson, data = pcall(function()
+		return HttpService:JSONDecode(body)
+	end)
+	if not okJson or type(data) ~= "table" then
+		log("CODES list unreadable")
+		return 0
+	end
+	local added = 0
+	for _, key in ipairs({ GameName, "StoneSkipping", "stone", tostring(game.PlaceId) }) do
+		local list = data[key]
+		if type(list) == "table" then
+			for _, code in ipairs(list) do
+				if addKnown(code) then
+					added += 1
+				end
+			end
+		end
+	end
+	if added > 0 then
+		log("CODES online", added, "new")
+	end
+	return added
+end
+function N.codeCounts()
+	local ok, used, bad = 0, 0, 0
+	for _, status in pairs(C.state) do
+		if status == "ok" then
+			ok += 1
+		elseif status == "used" then
+			used += 1
+		elseif status == "invalid" then
+			bad += 1
+		end
+	end
+	return ok, used, bad
+end
+local function sendCode(code)
+	C.pending = { code = code, at = os.clock() }
+	C.tries[code] = (C.tries[code] or 0) + 1
+	send("RedeemCode", code)
+end
 function N.redeemCode(text)
 	text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	if text == "" then
 		notify("Codes", "Type a code first", 3)
 		return
 	end
-	send("RedeemCode", text)
-	Session.codes += 1
-	notify("Codes", "Sent " .. text, 3)
+	if not C.loaded then
+		codesLoad()
+	end
+	addKnown(text)
+	table.insert(C.queue, 1, text)
+	notify("Codes", "Redeeming " .. text .. "...", 3)
+end
+-- "Redeem all known": every known code this account has not redeemed yet, even with Auto Redeem off.
+function N.redeemAllCodes()
+	if not C.loaded then
+		codesLoad()
+	end
+	local n = 0
+	for _, code in ipairs(C.known) do
+		if C.state[code] == nil and not table.find(C.queue, code) then
+			table.insert(C.queue, code)
+			n += 1
+		end
+	end
+	notify("Codes", if n > 0 then n .. " codes to redeem" else "All known codes are done on this account", 4)
+	return n
+end
+-- One step: answer timeout, then the queue, then (Auto Redeem) the next untried known code. One code every 3 s.
+function N.codeStep()
+	if not C.loaded then
+		codesLoad()
+	end
+	local P = C.pending
+	if P then
+		if os.clock() - P.at < 10 then
+			return false
+		end
+		C.pending = nil
+		log("CODE no answer", P.code)
+		if (C.tries[P.code] or 0) >= 3 then
+			C.state[P.code] = "invalid"
+			codesSave()
+		end
+	end
+	if os.clock() - (C.sentAt or -1e9) < 3 then
+		return false
+	end
+	local code = table.remove(C.queue, 1)
+	if not code and on("AutoCodes") then
+		if os.clock() - C.fetchedAt > 1800 then
+			N.codesFetch()
+		end
+		for _, known in ipairs(C.known) do
+			if C.state[known] == nil and (C.tries[known] or 0) < 3 then
+				code = known
+				break
+			end
+		end
+	end
+	if not code then
+		return false
+	end
+	C.sentAt = os.clock()
+	sendCode(code)
+	return true
 end
 N.onEvent("CodeResult", function(data)
 	log("CODE", brief(data))
-	if type(data) == "table" and data.Message then
-		notify("Codes", tostring(data.Message), 4)
+	local P = C.pending
+	if type(data) ~= "table" then
+		return
+	end
+	local message = tostring(data.Message or "")
+	local lower = string.lower(message)
+	if P then
+		C.pending = nil
+		local status
+		if data.Success then
+			status = "ok"
+			Session.codes += 1
+			if N.Events.code then
+				pcall(N.Events.code, P.code, message)
+			end
+		elseif string.find(lower, "already", 1, true) or string.find(lower, "claimed", 1, true) or string.find(lower, "used", 1, true) then
+			status = "used"
+		elseif string.find(lower, "wait", 1, true) or string.find(lower, "slow", 1, true) or string.find(lower, "try again", 1, true) or string.find(lower, "too many", 1, true) then
+			status = nil
+		else
+			status = "invalid"
+		end
+		if status then
+			C.state[P.code] = status
+			codesSave()
+		end
+		C.last = P.code .. ": " .. (if message ~= "" then message elseif data.Success then "redeemed" else "failed")
+	end
+	if message ~= "" then
+		notify("Codes", message, 4)
 	end
 end)
 -- Profit engine v2 (CLAUDE.md.txt 8.00). One scale: Wins per second gained per Win spent, rolling 24 h horizon.
@@ -33094,7 +33642,8 @@ do
 				end
 			end
 		end
-		if on("AutoHatch") then
+		-- Eggs only with room in the pet storage (Auto Delete frees it first).
+		if on("AutoHatch") and N.storageFree() >= N.hatchCount() then
 			local count = N.hatchCount()
 			for _, egg in ipairs(N.worldEggs()) do
 				if allows(Options.HatchEggs, egg.id) or N.opActive() then
