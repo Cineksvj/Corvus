@@ -29376,6 +29376,34 @@ local BootOk, BootError = xpcall(function()
 			end
 			return true
 		end
+		-- Event pickups (stars): every opened sea sends their ids (OnPickupsCreated, pickup id -> plate) and the game
+		-- claims one with CollectEventService.Collect(eventId, id) when you walk close. Blatant claims all of them at once.
+		local StarClaims = {}
+		onEvent("CollectEventService", "OnPickupsCreated", function(payload)
+			if not (on("AutoStars") and isBlatant()) or type(payload) ~= "table" or type(payload.events) ~= "table" then
+				return
+			end
+			for eventId, event in pairs(payload.events) do
+				for pickupId in pairs(type(event) == "table" and type(event.pickups) == "table" and event.pickups or {}) do
+					local now = os.clock()
+					while #StarClaims > 0 and StarClaims[1] < now - 60 do
+						table.remove(StarClaims, 1)
+					end
+					if #StarClaims >= 300 then
+						return
+					end
+					table.insert(StarClaims, now)
+					task.spawn(function()
+						local ok, result = call("CollectEventService", "Collect", eventId, pickupId)
+						if ok and result ~= false then
+							Session.stars += 1
+							Saved.stars += 1
+							SaveDirty = true
+						end
+					end)
+				end
+			end
+		end)
 		function seaCycle(manual)
 			local keep = function()
 				return alive() and (manual == true or on("AutoSea"))
@@ -30102,7 +30130,7 @@ local BootOk, BootError = xpcall(function()
 				local smart = {}
 				for key, entry in pairs(data and data.Inventory or {}) do
 					local info = entryInfo(entry)
-					local locked = entry.innerEntity.locked == true
+					local locked = info ~= nil and entry.innerEntity.locked == true
 					if info and not info.special and (not locked or isProtected(info)) then
 						table.insert(smart, { key = key, info = info, kind = entry.itemType, locked = locked })
 					end
@@ -31112,6 +31140,7 @@ local BootOk, BootError = xpcall(function()
 			local function farmAll(value)
 				if value then
 					table.clear(FarmAllTurned)
+					FarmAllTurned.active = true
 					for _, name in ipairs(FarmAllSet) do
 						local toggle = Toggles[name]
 						if toggle and not toggle.Value then
@@ -31152,7 +31181,9 @@ local BootOk, BootError = xpcall(function()
 						end
 					end
 					log("FARM ALL on, turned on", #FarmAllTurned, "toggles")
-				else
+				elseif FarmAllTurned.active then
+					-- only a real switch off stops the farm (a config load with Farm All off must not touch your toggles)
+					FarmAllTurned.active = nil
 					local list = if #FarmAllTurned > 0 then FarmAllTurned else FarmAllMain
 					for _, name in ipairs(list) do
 						if Toggles[name] then
