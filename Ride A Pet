@@ -29229,12 +29229,35 @@ end
 if on("SkipMazeEggs") and info.maze then
 return false
 end
+local targets = Options.TargetPets and Options.TargetPets.Value
+if type(targets) == "table" and next(targets) ~= nil and N.targetChance(info.name) * 100 < optionNumber("TargetPetChance", 0.01) then
+return false
+end
 if on("NewPetsOnly") and N.newPetChance(info.name) <= 0.0005 then
 return false
 end
 return true
 end
+-- Chance (0..1) that this egg hatches one of the Target Pets, from the game's own odds with your luck.
+function N.targetChance(eggName)
+local targets = Options.TargetPets and Options.TargetPets.Value
+if type(targets) ~= "table" or next(targets) == nil then
+return 0
+end
+local sum = 0
+for _, entry in ipairs(N.eggOdds(eggName) or {}) do
+if targets[entry.name] then
+sum += entry.chance
+end
+end
+return sum
+end
 function N.eggScore(info, from)
+local chance = N.targetChance(info.name)
+if chance > 0 then
+-- with Target Pets the best chance wins
+return chance * 1e25 + info.luck * math.max(info.weight, 0.5)
+end
 local pick = optionText("FarmPriority", "Best Value")
 local mutated = N.mutationFactor(info.mutation) * N.mutationFactor(info.spawnMutation)
 local value = info.luck * mutated * math.max(info.weight, 0.5)
@@ -31300,6 +31323,34 @@ FilterBox:AddDropdown(
 "FarmRarities",
 { Text = "Rarities", Values = N.EggRarities, Default = N.EggRarities, Multi = true, AllowNull = true }
 )
+do
+local petNames = {}
+for name in pairs(N.PetsData) do
+if type(name) == "string" then
+table.insert(petNames, name)
+end
+end
+table.sort(petNames)
+FilterBox:AddDropdown("TargetPets", {
+Text = "Target Pets",
+Values = petNames,
+Default = {},
+Multi = true,
+AllowNull = true,
+Searchable = true,
+Tooltip = "Only eggs that can hatch these pets (odds with your luck). Empty = any pet",
+})
+FilterBox:AddSlider("TargetPetChance", {
+Text = "Min Chance For Target Pets",
+Default = 0.01,
+Min = 0,
+Max = 50,
+Rounding = 2,
+Suffix = "%",
+HideMax = true,
+Tooltip = "The egg must give at least this much chance (all picked pets together)",
+})
+end
 FilterBox:AddToggle(
 "OnlySelectedEggs",
 { Text = "Only These Eggs", Default = false, Tooltip = "Grabs only the eggs picked in the list below" }
