@@ -4646,11 +4646,12 @@ function Library:ShowConfirmCard(Opts)
 if Library.ConfirmCard and Library.ConfirmCard.Parent then
 return
 end
+local Extra = if Opts.Warning then 64 else 0
 local Root = New("Frame", {
 AnchorPoint = Vector2.new(0.5, 0.5),
 BackgroundTransparency = 1,
 Position = UDim2.fromScale(0.5, 0.5),
-Size = UDim2.fromOffset(320, 196),
+Size = UDim2.fromOffset(320, 196 + Extra),
 ZIndex = 70,
 Parent = Library.ScreenGui,
 })
@@ -4707,13 +4708,29 @@ TextYAlignment = Enum.TextYAlignment.Top,
 ZIndex = 73,
 Parent = Content,
 })
+if Opts.Warning then
+	New("TextLabel", {
+		BackgroundTransparency = 1,
+		FontFace = GetBoldFont,
+		Position = UDim2.fromOffset(14, 126),
+		Size = UDim2.new(1, -28, 0, 60),
+		Text = tostring(Opts.Warning),
+		TextColor3 = Color3.fromRGB(255, 140, 60),
+		TextSize = 12,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		ZIndex = 73,
+		Parent = Content,
+	})
+end
 local Confirm = New("TextButton", {
 AutoButtonColor = false,
 BackgroundColor3 = "AccentColor",
 FontFace = GetBoldFont,
-Position = UDim2.fromOffset(14, 148),
+Position = UDim2.fromOffset(14, 148 + Extra),
 Size = UDim2.new(0.5, -20, 0, 34),
-Text = Opts.ConfirmText or "Confirm",
+Text = Opts.ConfirmText or "Confirm", TextWrapped = true,
 TextColor3 = "BackgroundColor",
 TextSize = 14,
 ZIndex = 73,
@@ -4723,7 +4740,7 @@ local Cancel = New("TextButton", {
 AutoButtonColor = false,
 BackgroundColor3 = "BackgroundColor",
 FontFace = GetBoldFont,
-Position = UDim2.new(0.5, 6, 0, 148),
+Position = UDim2.new(0.5, 6, 0, 148 + Extra),
 Size = UDim2.new(0.5, -20, 0, 34),
 Text = Opts.CancelText or "Cancel",
 TextColor3 = "FontColor",
@@ -32764,7 +32781,7 @@ Tooltip = "The switches Auto Farm Everything turns on, with your own filters. Th
 FarmBox:AddToggle("AutoFarmOP", {
 Text = "Auto Farm Everything OP",
 Default = false,
-Tooltip = "Full automatic: the planner buys, feeds, sells and spends for max profit. Can sell your pets and eggs.",
+Tooltip = "The planner buys, feeds, sells and spends for max profit and can sell your pets and eggs. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
 Callback = function(value)
 if N.opBusy or not Toggles.AutoFarmOP then
 return
@@ -34277,7 +34294,8 @@ end
 Library:ShowConfirmCard({
 Title = "Enable Auto Farm Everything OP?",
 Text = "Full automatic: the planner buys, feeds, sells and spends for max profit. It can sell your pets and eggs. If you only want your own switches, use Auto Farm Everything (Normal).",
-ConfirmText = "Enable OP",
+ConfirmText = "I understand, enable OP",
+Warning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
 CancelText = "Cancel",
 OnConfirm = function()
 log("OP confirmed")
