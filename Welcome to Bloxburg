@@ -30496,7 +30496,7 @@ do
 		return found
 	end
 	-- Only the job actions a worker sends. Never purchases, trading, admin or anything for other players.
-	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true }
+	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true }
 	local AllowedJobInvoke = { CleanSchoolJanitorObject = true }
 	function N.jobFire(packet)
 		local jh = N.jobHandler()
@@ -31450,6 +31450,135 @@ do
 		log("CASHIER served", if answered then status.Value else "no answer")
 	end
 end
+
+-- Pizza Planet Baker: BakerWorkstations (Order = topping wanted, "" when no order, then "true"/"false"; Order.IngredientsLeft).
+-- Each ingredient click is UseWorkstation {Workstation}; Done = JobCompleted {Workstation, Order = {true, true, true,
+-- "Ham" | "Pepperoni" | "Vegetable"}}. No ingredients: TakeIngredientCrate {Object = Interior.IngredientCrates child},
+-- then RestockIngredients {Workstation}. The game says "too far" over 10 studs from the station.
+N.Baker = { last = "" }
+do
+	local Toppings = { Ham = "Ham", Pepperoni = "Pepperoni", Vegetable = "Vegetable", Vegetables = "Vegetable" }
+	local function pizzaPlanet()
+		local env = workspace:FindFirstChild("Environment")
+		local node = env and env:FindFirstChild("Locations")
+		node = node and node:FindFirstChild("City")
+		return node and node:FindFirstChild("PizzaPlanet")
+	end
+	local function holding()
+		local jh = N.jobHandler()
+		local item = isolated(function()
+			return jh.Shared.EquipmentService:GetEquipped(LocalPlayer)
+		end)
+		return item and tostring(item) or ""
+	end
+	local function posOf(instance)
+		if not instance then
+			return nil
+		end
+		if instance:IsA("BasePart") then
+			return instance.Position
+		end
+		local ok, pivot = pcall(instance.GetPivot, instance)
+		return if ok then pivot.Position else nil
+	end
+	local function topping(order)
+		local value = tostring(order.Value)
+		for word in string.gmatch(value, "%a+") do
+			if Toppings[word] then
+				return Toppings[word]
+			end
+		end
+		for key, v in pairs(order:GetAttributes()) do
+			if Toppings[tostring(v)] then
+				return Toppings[tostring(v)]
+			elseif Toppings[key] then
+				return Toppings[key]
+			end
+		end
+		return nil
+	end
+	function N.bakerStep()
+		if not N.ensureShift("PizzaPlanetBaker") then
+			return
+		end
+		local place = pizzaPlanet()
+		local interior = place and place:FindFirstChild("Interior")
+		local stations = interior and interior:FindFirstChild("BakerWorkstations")
+		if not stations then
+			setStatus("Baker: waiting for Pizza Planet to load")
+			task.wait(1)
+			return
+		end
+		local ws, order
+		for _, station in ipairs(stations:GetChildren()) do
+			local o = station:FindFirstChild("Order")
+			local inUse = station:FindFirstChild("InUse")
+			if o and o.Value ~= "" and o.Value ~= "true" and o.Value ~= "false" and not (inUse and inUse.Value and inUse.Value ~= LocalPlayer) then
+				ws, order = station, o
+				break
+			end
+		end
+		if not ws then
+			setStatus(string.format("Baker: waiting for orders (%d baked)", Session.done))
+			task.wait(0.3)
+			return
+		end
+		local spot = posOf(ws.PrimaryPart) or posOf(ws)
+		local left = order:FindFirstChild("IngredientsLeft")
+		if left and left.Value < 1 then
+			if holding() ~= "Ingredient Crate" then
+				local crates = interior:FindFirstChild("IngredientCrates")
+				local crate = crates and crates:GetChildren()[1]
+				if not crate then
+					setStatus("Baker: no ingredient crate found")
+					task.wait(1)
+					return
+				end
+				setStatus("Baker: getting ingredients")
+				N.walkTo(posOf(crate), 4, 12)
+				task.wait(N.actionDelay())
+				N.jobFire({ Type = "TakeIngredientCrate", Object = crate })
+				waitFor(function()
+					return holding() == "Ingredient Crate"
+				end, 2)
+			end
+			N.walkTo(spot, 4, 12)
+			task.wait(N.actionDelay())
+			N.jobFire({ Type = "RestockIngredients", Workstation = ws })
+			waitFor(function()
+				return left.Value >= 1
+			end, 2)
+			return
+		end
+		local wanted = topping(order)
+		if not wanted then
+			log("BAKER could not read the order", tostring(order.Value))
+			task.wait(1)
+			return
+		end
+		setStatus("Baker: " .. wanted .. " pizza")
+		if spot then
+			N.walkTo(spot, 4, 10)
+		end
+		for _ = 1, 4 do
+			task.wait(N.actionDelay() * 0.5)
+			N.jobFire({ Type = "UseWorkstation", Workstation = ws })
+		end
+		task.wait(N.actionDelay())
+		N.jobFire({ Type = "JobCompleted", Workstation = ws, Order = { true, true, true, wanted } })
+		local answered = waitFor(function()
+			return order.Value == "true" or order.Value == "false"
+		end, 3)
+		Session.done += 1
+		if answered and order.Value == "true" then
+			Session.correct += 1
+		elseif answered and order.Value == "false" then
+			Session.wrong += 1
+			logProblem("Pizza judged wrong: " .. wanted)
+		end
+		log("BAKER", wanted, if answered then order.Value else "no answer")
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -31506,7 +31635,7 @@ do
 	})
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream", "Supermarket Cashier" },
+		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream", "Supermarket Cashier", "Pizza Baker" },
 		Default = "Hairdresser",
 		Tooltip = "The Pay box shows what every job really paid you per hour",
 	})
@@ -32211,7 +32340,7 @@ do
 	if not N.jobHandler() then
 		logProblem("The game's JobHandler was not found, job farms cannot start")
 	end
-	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep }
+	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep }
 	local wasWorking = false
 	loop("main loop", function()
 		if N.manualRunning() then
