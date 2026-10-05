@@ -32014,6 +32014,22 @@ do
 		local t = Toggles[name]
 		return t ~= nil and t.Value == true
 	end
+	-- Smart Planner drives the same systems as the single toggles while it is on, without flipping them
+	function N.planOn()
+		return on("SmartPlanner")
+	end
+	function N.workOn()
+		return on("AutoJob") or on("SmartPlanner")
+	end
+	function N.needsOn()
+		return on("AutoNeeds") or on("SmartPlanner")
+	end
+	function N.dailyOn()
+		return on("Objectives") or on("SmartPlanner")
+	end
+	function N.bestOn()
+		return on("BestPay") or on("SmartPlanner")
+	end
 	function optionNumber(name, default)
 		local option = Options[name]
 		return tonumber(option and option.Value) or default
@@ -35121,7 +35137,7 @@ do
 		local mode = optionText("JobSpeed", "Blatant")
 		local topSpeed = if mode == "Legit" then 0.75 else 1
 		local deadline = os.clock() + 1
-		while alive() and on("AutoJob") and os.clock() < deadline and N.Taxi.task == T do
+		while alive() and N.workOn() and os.clock() < deadline and N.Taxi.task == T do
 			local cf = car.PrimaryPart.CFrame
 			local target = T.spot
 			while T.path[N.Taxi.waypoint] do
@@ -35334,7 +35350,7 @@ do
 				reason = "bobber moved"
 				break
 			end
-			if not on("AutoJob") or N.currentJob() ~= "HutFisherman" then
+			if not N.workOn() or N.currentJob() ~= "HutFisherman" then
 				return
 			end
 			task.wait(0.1)
@@ -35460,7 +35476,7 @@ do
 		N.walkTo(Vector3.new(stand.X, root.Position.Y, stand.Z), 1.5, 25)
 		face(bestPos)
 		for swing = 1, 10 do
-			if not alive() or not on("AutoJob") or N.currentJob() ~= "LumberWoodcutter" or W.down[best] then
+			if not alive() or not N.workOn() or N.currentJob() ~= "LumberWoodcutter" or W.down[best] then
 				break
 			end
 			N.jobFire({ Type = "UseHatchet", Tree = best })
@@ -36499,7 +36515,7 @@ do
 	local MAX_RESTORE = 25 * 60
 	-- trips run while Auto Needs, Auto Work or Daily Objectives is on, or for the manual "Restore needs now"
 	local function keep()
-		return alive() and (on("AutoNeeds") or on("AutoJob") or on("Objectives") or Q.manual == true)
+		return alive() and (N.needsOn() or N.workOn() or N.dailyOn() or Q.manual == true)
 	end
 	local Keys = {
 		Energy = { "I_Sleep" },
@@ -36790,7 +36806,7 @@ do
 	-- Buying a missing bed, fridge, shower or TV is part of Auto Needs (and the manual restore), above the money reserve.
 	local function buyOk(need)
 		local choice = buyChoice(need)
-		if not (on("AutoNeeds") or Q.manual) then
+		if not (N.needsOn() or Q.manual) then
 			return false, choice, "turn on Auto Needs to buy " .. choice.name .. " $" .. choice.price .. ", or place " .. NeedThing[need] .. " yourself"
 		end
 		local reserve = (N.reserve and N.reserve()) or 0
@@ -37311,13 +37327,13 @@ do
 			Q.workAt = nil
 		end
 		local maxWork = optionNumber("WorkSessionMax", 210) * 60
-		if maxWork > 0 and Q.workSeconds >= maxWork and on("AutoNeeds") then
+		if maxWork > 0 and Q.workSeconds >= maxWork and N.needsOn() then
 			return "break"
 		end
 		-- Daily Objectives: the quick meal task (task 3 "Take a quick meal of X from a fridge"), once, on your fridge
 		local foodId = N.dailyFoodId()
 		local third = string.lower(tostring(Q.objTexts and Q.objTexts[3] or ""))
-		if on("Objectives") and Q.objQuickFoodOpen and foodId > 0 and string.find(third, "quick meal", 1, true) and Q.objMealSkip ~= foodId and now - (Q.objMealAt or -1e9) > 900 then
+		if N.dailyOn() and Q.objQuickFoodOpen and foodId > 0 and string.find(third, "quick meal", 1, true) and Q.objMealSkip ~= foodId and now - (Q.objMealAt or -1e9) > 900 then
 			local have = plotHas()
 			if Q.have and have.Hunger and N.spendOk(20) then
 				Q.objMealAt = now
@@ -37325,7 +37341,7 @@ do
 				return "objective meal"
 			end
 		end
-		if not on("AutoNeeds") then
+		if not N.needsOn() then
 			Q.text = nil
 			return nil
 		end
@@ -37436,9 +37452,9 @@ do
 			reason = "floor " .. floorHit .. " " .. math.floor(values[floorHit]) .. "%"
 		elseif effHit then
 			reason = string.format("efficiency %.2f < %.2f '%s'", if effZero then 0 else eff, effFloor, effWhy)
-		elseif gain > cost then
+		elseif gain > cost and not N.planOn() then
 			reason = string.format("profit: loss $%d/%dh > cost $%d", math.floor(gain), HORIZON_H, math.floor(cost))
-		elseif job == "" and not on("AutoJob") then
+		elseif job == "" and not N.workOn() then
 			-- Auto Needs on its own: no shift to lose, so any mood under the refill point is restored
 			reason = string.format("idle: %s %d%%", lowest, lowestV)
 		end
@@ -37529,11 +37545,21 @@ do
 				table.sort(names)
 				return table.concat(names, ", ")
 			end)())
+			-- Smart Planner: the planned furniture upgrade is bought while already at home, before restoring
+			if N.smartAtHome and N.planOn() and reason ~= "objective meal" then
+				local okHome, bought = pcall(N.smartAtHome, objects)
+				if not okHome then
+					log("ERROR", "plan home", tostring(bought))
+				elseif bought then
+					Q.haveAt = -1e9
+					objects = plotObjects()
+				end
+			end
 			local values, _, moodName = N.moods()
 			values = values or {}
 			local order, firstBy = needOrder(effWhy, moodName)
 			log("NEEDS order", table.concat(order, ">"), "| reason '" .. tostring(effWhy) .. "' mood '" .. tostring(moodName) .. "'", if firstBy then "-> " .. firstBy .. " first" else "")
-			local limit = if isBreak or reason == "manual" then 90 else REFILL
+			local limit = if isBreak or reason == "manual" or string.sub(tostring(reason), 1, 4) == "plan" then 90 else REFILL
 			-- the daily objective meal: only the fridge, also when Hunger is full
 			Q.objMeal = reason == "objective meal"
 			if Q.objMeal then
@@ -37632,8 +37658,20 @@ do
 		Q.manual = false
 		local eff = N.efficiency()
 		log("NEEDS done", reason, "eff=" .. tostring(eff), N.moodText(), "took", math.floor(os.clock() - started), "s", "money", N.money())
-		setStatus(if on("AutoJob") then "Needs done, back to work" else "Needs done")
+		setStatus(if N.workOn() then "Needs done, back to work" else "Needs done")
 	end
+	-- Smart Planner inputs: measured decay and restore per minute, the mood -> efficiency slope, travel seconds
+	function N.needsModel()
+		local values, rates = N.moods()
+		local m = { values = values, decay = {}, restore = {}, measured = {}, k = Q.model.k, kn = Q.model.n, travel = Q.travel }
+		for _, name in ipairs(Q.names) do
+			m.decay[name] = decayOf(name, rates)
+			m.restore[name] = restoreRate(name)
+			m.measured[name] = Q.restore[name] ~= nil and Q.restore[name].n >= 1
+		end
+		return m
+	end
+	N.plotObjects = plotObjects
 	-- the need that reaches the safety floor first: name, minutes (Hunger only when meals may be bought)
 	function N.needsEta()
 		local values, rates = N.moods()
@@ -37732,7 +37770,7 @@ do
 	end
 	-- the job Auto Work should do now for task 1, or nil
 	function N.objectiveJob()
-		if not on("Objectives") or type(O.states) ~= "table" or completed(1) then
+		if not N.dailyOn() or type(O.states) ~= "table" or completed(1) then
 			return nil
 		end
 		if not completed(2) then
@@ -37764,7 +37802,7 @@ do
 	-- Up next / Jobs tab text
 	function N.objectiveText(short)
 		if type(O.states) ~= "table" then
-			return if on("Objectives") then "Daily objectives: reading..." else nil
+			return if N.dailyOn() then "Daily objectives: reading..." else nil
 		end
 		local lines = {}
 		local head = string.format("Daily reward $%s: %d/%d done", formatNumber(N.objectivesReward()), O.done or 0, #O.states)
@@ -37789,6 +37827,361 @@ do
 			table.insert(lines, '<font transparency="0.35">Task 2 is done by you (Corvus does task 1 once task 2 is done, and the quick meal)</font>')
 		end
 		return table.concat(lines, "\n")
+	end
+end
+-- Smart Planner (toggle SmartPlanner, default OFF, Jobs tab + Quick Start mirror). One switch that runs the job farm,
+-- Auto Needs, Daily Objectives and furniture upgrades through the same functions as the single toggles (N.workOn,
+-- N.needsOn, N.dailyOn, N.bestOn in p02), never flipping them. Its own loop (p10) runs only while it is on and logs
+-- one `PLAN <plain words>` line per decision (again only when the decision changes, or after its repeat time), and
+-- `PLAN idle reason=<why>` when it cannot act. Every number is $ over a rolling 24 h:
+--   job:   Best Pay engine v2 (p05_jobs6_plan: measured $/h incl. efficiency, level rewards and pay growth inside 24 h,
+--          knowledge gradient for measuring, switch cost); daily task 1 is worked only when reward > detour cost.
+--   needs: economic order quantity. Low moods cost R * k/4 * sum(100 - mood)/100 per hour (k = measured slope of
+--          efficiency over the mean mood), a trip costs travel time at R * efficiency plus the meal. With D = sum of
+--          the measured decays (points/min) the best time between trips is tau = sqrt(2 C / (R/60 * k/4 * D/100))
+--          minutes, so a trip is due when the moods are down D * tau points in total. Floors stay in needsDue.
+--   build: a better bed / shower / TV (item stat Comfort / Hygiene / Fun, server restore 2 + 0.3 C, 2 + 0.25 H,
+--          1.5 + 0.2 F per minute, scaled by the measured restore) saves restore minutes every day:
+--          d * 1440 * (1/r_now - 1/r_new) minutes worth R * eff; bought when that minus the price minus one day of
+--          house bills (0.6 % of the value, BillService) is positive within 24 h, above the money reserve, on the next
+--          trip home (no extra travel).
+--   school / skills: valued and logged; not automated (minigames graded on the server, no verified packets).
+N.Smart = { text = "Smart Planner is off", headline = nil, last = {}, lastAt = {}, wasOn = false, jobAt = -1e9, dueAt = -1e9, buildAt = -1e9, skillAt = -1e9, catalog = {}, failed = {}, upgrade = nil }
+do
+	local S = N.Smart
+	local BILL = 0.006
+	local Restore = { Energy = { 2, 0.3, "Comfort" }, Hygiene = { 2, 0.25, "Hygiene" }, Fun = { 1.5, 0.2, "Fun" } }
+	local Kinds = { Energy = { "Beds" }, Hygiene = { "Shower" }, Fun = { "TV" } }
+	local Verb = { Energy = "sleep", Hygiene = "shower", Fun = "TV" }
+	local Skills = { "Intelligence", "Athletic", "Cooking", "Gaming", "Gardening", "Writing", "Art", "Music" }
+	local LevelMoney = { 100, 100, 400, 1000, 2000, 4000, 7000, 10000, 15000, 21000 }
+	local parts = {}
+
+	local function money(n)
+		return (if n < 0 then "-$" else "$") .. formatNumber(math.floor(math.abs(n) + 0.5))
+	end
+	-- one PLAN line per decision: logged when the decision key changes, the same decision again after `every` s
+	local function decide(topic, key, text, every)
+		local now = os.clock()
+		if S.last[topic] ~= key or now - (S.lastAt[topic] or -1e9) > (every or 600) then
+			S.last[topic], S.lastAt[topic] = key, now
+			log("PLAN", text)
+		end
+	end
+	local function idle(reason)
+		decide("idle", reason, "idle reason=" .. reason, 300)
+		S.text = "Waiting: " .. reason
+		S.headline = "Plan: waiting (" .. reason .. ")"
+	end
+	local function eff()
+		local e = N.efficiency()
+		return if type(e) == "number" and e > 0 then e else 0.8
+	end
+	-- $/h the planner values time at: the Best Pay pick's 24 h value, else the measured job rate
+	local function rate()
+		local P = N.Plan
+		if P and P.pickRate and P.pickRate > 0 then
+			return P.pickRate
+		end
+		return math.max(N.payRate and N.payRate() or 0, 0)
+	end
+	local function jobRate(name)
+		local entry = N.Pay.jobs[N.JobKeys[name]]
+		if type(entry) == "table" and (entry.seconds or 0) >= 120 then
+			return entry.money / entry.seconds * 3600
+		end
+		return nil
+	end
+	local function startup()
+		local list, sum = N.Plan and N.Plan.startups or {}, 0
+		for _, s in ipairs(list) do
+			sum += s
+		end
+		return if #list > 0 then sum / #list else 60
+	end
+	local function stat(path)
+		local jh = N.jobHandler()
+		return jh and tonumber(isolated(function()
+			local ok, v = pcall(function()
+				return jh.Modules.ClientStats:Get(path)
+			end)
+			return if ok then v else nil
+		end)) or nil
+	end
+
+	-- Daily objective task 1: worth the detour when the reward beats the pay lost on the objective's job (capped 30 min)
+	function N.smartObjectiveWorth(job)
+		local R = rate()
+		local reward = N.objectivesReward()
+		local objRate = jobRate(job) or 0
+		local loss = math.max(R - objRate, 0) * 0.5 + R * 2 * startup() / 3600
+		local worth = reward > loss
+		decide("daily", (if worth then "do " else "skip ") .. job, string.format("%s daily task 1 on %s: reward %s vs detour cost %s (30 min at most, two shift changes)", if worth then "do" else "skip", job, money(reward), money(loss)))
+		return worth
+	end
+
+	-- Needs trip timing (called by the main loop when needsDue has no floor/break/meal reason)
+	function N.smartTripDue()
+		local Q = N.Needs
+		local now = os.clock()
+		if not N.planOn() or Q.active or now - S.dueAt < 30 then
+			return nil
+		end
+		S.dueAt = now
+		local m = N.needsModel()
+		local values = m.values
+		if not values then
+			return nil
+		end
+		local R, e = rate(), eff()
+		local meal = N.spendOk(15)
+		local D, deficit, low, lowV = 0, 0, nil, 101
+		for _, name in ipairs(Q.names) do
+			local v = values[name]
+			if v and (name ~= "Hunger" or meal) then
+				D += m.decay[name]
+				deficit += math.max(95 - v, 0)
+				if v < lowV then
+					low, lowV = name, v
+				end
+			end
+		end
+		local C = R * e * m.travel / 3600 + (if meal then 15 else 0)
+		local a = R / 60 * m.k / 4 * D / 100
+		local tau = if a > 0 then math.clamp(math.sqrt(2 * C / a), 10, 480) else 480
+		local trigger = D * tau
+		local lossNow = R * m.k / 4 * deficit / 100
+		parts.needs = string.format("Needs: home every ~%s, next in ~%s", N.longTime(tau * 60), N.longTime(math.max(trigger - deficit, 0) / math.max(D, 0.01) * 60))
+		if R <= 0 then
+			decide("needs", "norate", "needs: no pay measured yet, trips only at the safety floors and breaks")
+			return nil
+		end
+		if deficit >= trigger and now - Q.tripAt > 300 and low then
+			decide("needs", "trip", string.format("go home now: moods down %d points (trip every ~%dm is cheapest: trip %s vs low moods %s/h, k %.2f, %s lowest %d%%)", math.floor(deficit), math.floor(tau), money(C), money(lossNow), m.k, low, math.floor(lowV)), 0)
+			return "plan: moods down " .. math.floor(deficit)
+		end
+		decide("needs", "keep", string.format("keep working: needs trip every ~%dm (trip costs %s, low moods cost %s/h now, k %.2f n %d), next in ~%dm", math.floor(tau), money(C), money(lossNow), m.k, m.kn, math.floor(math.max(trigger - deficit, 0) / math.max(D, 0.01))))
+		return nil
+	end
+
+	-- every money bed / shower / TV you can buy, with its restore stat (read once from the game's item list)
+	local function catalog(need)
+		if S.catalog[need] then
+			return S.catalog[need]
+		end
+		local jh = N.jobHandler()
+		local list = jh and isolated(function()
+			local out = {}
+			for _, item in pairs(jh.Items._IDList or {}) do
+				if type(item) == "table" and type(item.IsType) == "function" then
+					local fits = false
+					for _, kind in ipairs(Kinds[need]) do
+						local ok, yes = pcall(item.IsType, item, kind)
+						if ok and yes then
+							fits = true
+						end
+					end
+					local price = tonumber(item.Price)
+					if fits and price and price > 0 and not item.BSPrice and not item.ECPrice then
+						local okH, hidden = pcall(item.IsHidden, item, LocalPlayer)
+						local okL, locked = pcall(item.IsLocked, item, LocalPlayer)
+						local okS, value = pcall(item.GetStat, item, Restore[need][3], 0)
+						value = okS and tonumber(value) or 0
+						if okH and okL and not hidden and not locked and value > 0 then
+							table.insert(out, { name = tostring(item.Name), price = price, stat = value })
+						end
+					end
+				end
+			end
+			return out
+		end)
+		if type(list) == "table" and #list > 0 then
+			S.catalog[need] = list
+			log("PLAN catalog", need, #list, "items you can buy")
+			return list
+		end
+		return {}
+	end
+
+	local function buildPlan()
+		local objects = N.plotObjects()
+		if #objects == 0 then
+			decide("build", "noplot", "build: no furniture readable on your plot yet, no upgrade planned")
+			parts.build = nil
+			return
+		end
+		local m = N.needsModel()
+		local R, e = rate(), eff()
+		if R <= 0 then
+			decide("build", "norate", "build: no pay measured yet, upgrades wait for a job rate")
+			return
+		end
+		local budget = N.money() - N.reserve()
+		local best, bestAny
+		for need, f in pairs(Restore) do
+			local cur
+			for _, o in ipairs(objects) do
+				if o.need == need and (not cur or o.stat > cur) then
+					cur = o.stat
+				end
+			end
+			-- a missing object is Auto Needs' cheapest buy, the planner only upgrades
+			if cur then
+				local formulaNow = f[1] + f[2] * cur
+				local scale = if m.measured[need] then math.clamp(m.restore[need] / formulaNow, 0.2, 5) else 1
+				local rNow = formulaNow * scale
+				for _, item in ipairs(catalog(need)) do
+					if item.stat > cur and os.clock() - (S.failed[item.name] or -1e9) > 21600 then
+						local rNew = (f[1] + f[2] * item.stat) * scale
+						local saved = m.decay[need] * 1440 * (1 / rNow - 1 / rNew)
+						local gain = saved / 60 * R * e
+						local net = gain - item.price - item.price * BILL
+						local c = { need = need, name = item.name, price = item.price, stat = item.stat, cur = cur, saved = saved, gain = gain, net = net, payback = if gain > 0 then item.price * (1 + BILL) / gain * 24 else math.huge }
+						if not bestAny or c.net > bestAny.net then
+							bestAny = c
+						end
+						if net > 0 and item.price <= budget and (not best or net > best.net) then
+							best = c
+						end
+					end
+				end
+			end
+		end
+		S.upgrade = best
+		if best then
+			parts.build = string.format("Build: %s %s on the next trip home", best.name, money(best.price))
+			decide("build", "buy " .. best.name, string.format("buy %s %s on the next trip home: %s %s -> %s saves %s of %s a day = %s/day, pays back in %.1fh", best.name, money(best.price), best.need, tostring(best.cur), tostring(best.stat), N.longTime(best.saved * 60), Verb[best.need], money(best.gain), best.payback))
+		else
+			parts.build = nil
+			if bestAny then
+				decide("build", "none", string.format("build: no upgrade pays back in 24 h (best %s %s would save %s/day, payback %.0fh, money above reserve %s)", bestAny.name, money(bestAny.price), money(bestAny.gain), math.min(bestAny.payback, 9999), money(budget)), 1800)
+			else
+				decide("build", "none", "build: your bed, shower and TV are the best you can buy with money", 1800)
+			end
+		end
+	end
+
+	-- called by needsRun at home (before restoring): buys the planned upgrade, true when it was placed
+	function N.smartAtHome(objects)
+		local u = S.upgrade
+		if not u then
+			return false
+		end
+		for _, o in ipairs(objects or {}) do
+			if o.need == u.need and o.stat >= u.stat then
+				S.upgrade = nil
+				return false
+			end
+		end
+		if not N.spendOk(u.price) then
+			decide("build", "wait " .. u.name, string.format("build: %s %s waits, money %s is under its price + reserve", u.name, money(u.price), money(N.money())))
+			return false
+		end
+		log("PLAN", string.format("buying %s %s now (at home anyway)", u.name, money(u.price)))
+		setStatus("Plan: buying " .. u.name)
+		local ok, err = N.buyPlace(u.name, u.price)
+		S.upgrade = nil
+		S.buildAt = -1e9
+		if ok then
+			log("PLAN", "bought", u.name, "for", u.need, "stat", u.cur, "->", u.stat)
+		else
+			S.failed[u.name] = os.clock()
+			log("PLAN", "buy failed", u.name, tostring(err), "| next try in 6 h")
+		end
+		return ok == true
+	end
+
+	local function skillsPlan()
+		local list = {}
+		for _, skill in ipairs(Skills) do
+			local level = stat("SkillData/" .. skill)
+			if level and level < 10 then
+				table.insert(list, string.format("%s %d (next %s)", skill, level, money(LevelMoney[level + 1])))
+			end
+		end
+		if #list > 0 then
+			decide("skills", "skip", "skills skipped reason=XP only from furniture minigames on the server, no verified action; levels " .. table.concat(list, ", "), 3600)
+		end
+		local school = N.Plan and N.Plan.school
+		if school and school.text then
+			decide("school", if (school.net or 0) > 0 then "worth" else "no", "school: " .. school.text .. (if (school.net or 0) > 0 then " (classes are minigames, attend them yourself)" else ""), 3600)
+		end
+	end
+
+	local function jobPlan()
+		local P = N.Plan
+		local objective = N.objectiveJob()
+		if objective then
+			parts.job = "Work " .. objective .. " for daily task 1"
+			return
+		end
+		if P.lastPick and P.pickRate then
+			local measuring = P.text and string.find(P.text, "measuring", 1, true) ~= nil
+			parts.job = string.format("Work %s, %s/h over 24 h%s", P.lastPick, money(P.pickRate), if measuring then " (measuring)" else "")
+			decide("job", P.lastPick .. tostring(measuring), string.format("work %s: worth %s/h over the next 24 h incl. level rewards%s", P.lastPick, money(P.pickRate), if measuring then ", still measuring which job pays best" else ""))
+		elseif P.lastPick then
+			parts.job = "Work " .. P.lastPick .. " (measuring)"
+			decide("job", "measure " .. P.lastPick, "work " .. P.lastPick .. ": no job measured yet, measuring its pay first")
+		else
+			parts.job = "Choosing the first job"
+		end
+	end
+
+	function N.smartTick()
+		if not S.wasOn then
+			S.wasOn = true
+			table.clear(S.last)
+			log("PLAN", "on: job by 24 h value, needs trips at the cheapest moment, daily objectives, furniture upgrades with 24 h payback")
+		end
+		local now = os.clock()
+		if not N.jobHandler() then
+			return idle("the game's JobHandler is not loaded")
+		end
+		if N.dead() then
+			return idle("waiting for your character")
+		end
+		if N.manualRunning() then
+			return idle("a manual action (Copy a Plot build) is running")
+		end
+		if N.Needs.pausedUntil and now < N.Needs.pausedUntil then
+			return idle("no way home, needs paused")
+		end
+		S.last.idle = nil
+		if now - S.jobAt >= 15 then
+			S.jobAt = now
+			jobPlan()
+		end
+		if now - S.buildAt >= 600 then
+			S.buildAt = now
+			buildPlan()
+		end
+		if now - S.skillAt >= 600 then
+			S.skillAt = now
+			skillsPlan()
+		end
+		local lines = {}
+		if N.Needs.active then
+			table.insert(lines, "Now: at home (" .. tostring(N.Needs.reason) .. ")")
+		end
+		for _, key in ipairs({ "job", "needs", "build" }) do
+			if parts[key] then
+				table.insert(lines, parts[key])
+			end
+		end
+		local daily = N.objectiveText(true)
+		if daily then
+			table.insert(lines, daily)
+		end
+		S.text = if #lines > 0 then table.concat(lines, "\n") else "Planning..."
+		S.headline = lines[1]
+		return
+	end
+	function N.smartOff()
+		S.wasOn = false
+		S.upgrade = nil
+		S.text = "Smart Planner is off"
+		S.headline = nil
+		table.clear(parts)
 	end
 end
 local Window, Tabs, Labels
@@ -37853,7 +38246,7 @@ do
 	-- never under the money reserve.
 	local ReserveLogAt = -1e9
 	function N.spendOk(price)
-		if not (on("AutoNeeds") or on("Objectives") or (N.Needs and N.Needs.manual)) then
+		if not (N.needsOn() or N.dailyOn() or (N.Needs and N.Needs.manual)) then
 			return false
 		end
 		local reserve = N.reserve()
@@ -37884,6 +38277,7 @@ do
 			end,
 		})
 	end
+	mirror("QS_SmartPlanner", "SmartPlanner", "Smart Planner", "One switch that runs everything by the numbers: the job worth the most over 24 h, needs trips at the cheapest moment, daily objectives, furniture upgrades that pay back in 24 h")
 	mirror("QS_AutoJob", "AutoJob", "Auto Work", "Goes to work and does the job picked in the Jobs tab")
 	mirror("QS_BestPay", "BestPay", "Best Pay", "Switches to the job that pays you the most over the next 24 h (measured, not guessed)")
 	mirror("QS_AutoNeeds", "AutoNeeds", "Auto Needs", "Sleeps, eats, showers and watches TV at home so low moods never cut your pay. Buys quick meals and missing furniture")
@@ -37907,6 +38301,13 @@ do
 	StatusBox:AddDivider()
 	Labels.Next = StatusBox:AddLabel({ Text = "Up next: switch something on in Quick Start", DoesWrap = true })
 
+	local SmartBox = Tabs.Jobs:AddLeftGroupbox("Smart Planner", "brain")
+	SmartBox:AddToggle("SmartPlanner", {
+		Text = "Smart Planner",
+		Default = false,
+		Tooltip = "Works, eats, sleeps, does daily objectives and buys furniture upgrades by profit math, without touching the other switches. Uses Speed, Money reserve, Never below, Restore before efficiency and Work session max from this tab",
+	})
+	Labels.Smart = SmartBox:AddLabel({ Text = "Smart Planner is off", DoesWrap = true })
 	local JobBox = Tabs.Jobs:AddLeftGroupbox("Job Farm", "briefcase")
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
@@ -38174,6 +38575,7 @@ Library.OnUserToggle = function(name, value)
 	log("CLICK", name .. "=" .. tostring(value))
 end
 N.AllAutoToggles = {
+	"SmartPlanner",
 	"AutoJob",
 	"BestPay",
 	"AutoNeeds",
@@ -38776,6 +39178,9 @@ do
 	-- which job Auto Work does: the open daily objective job task first, then Best Pay, then the dropdown
 	function N.workPick()
 		local objective = N.objectiveJob()
+		if objective and N.planOn() and N.smartObjectiveWorth and not N.smartObjectiveWorth(objective) then
+			objective = nil
+		end
 		if objective then
 			-- Best Pay must not count the detour as its own pick failing to start
 			if N.Plan and not N.Plan.started then
@@ -38784,7 +39189,7 @@ do
 			return objective, "objective"
 		end
 		local pick = optionText("JobPick", "Hairdresser")
-		if on("BestPay") or pick == "Best Pay (auto)" then
+		if N.bestOn() or pick == "Best Pay (auto)" then
 			return N.bestJobPick(), "best pay"
 		end
 		return pick, "job pick"
@@ -38806,7 +39211,7 @@ do
 			task.wait(0.5)
 			return
 		end
-		local working = on("AutoJob")
+		local working = N.workOn()
 		if not working and wasWorking then
 			-- Auto Work was turned off: clock out so nothing keeps running
 			wasWorking = false
@@ -38815,8 +39220,11 @@ do
 		end
 		-- needs, breaks and the daily meal come first, with or without Auto Work: the trip leaves the job, the next
 		-- pass clocks in again
-		if N.Needs.forced or on("AutoNeeds") or on("Objectives") then
+		if N.Needs.forced or N.needsOn() or N.dailyOn() then
 			local due = if N.Needs.forced then "manual" else N.needsDue()
+			if not due and N.smartTripDue then
+				due = N.smartTripDue()
+			end
 			if due then
 				N.Needs.forced = nil
 				N.needsRun(due)
@@ -38844,18 +39252,18 @@ do
 			task.wait(0.05)
 			return
 		end
-		setStatus(if on("AutoNeeds") then "Auto Needs: moods are fine, waiting" else "Idle")
+		setStatus(if N.needsOn() then "Auto Needs: moods are fine, waiting" else "Idle")
 		task.wait(0.5)
 	end)
 	-- Every change of the main toggles is logged with the others' state, so a silent stop has a visible reason.
 	task.spawn(function()
-		local names = { "AutoJob", "BestPay", "AutoNeeds", "Objectives" }
+		local names = { "SmartPlanner", "AutoJob", "BestPay", "AutoNeeds", "Objectives" }
 		local last = {}
 		while alive() do
 			for _, name in ipairs(names) do
 				local v = on(name)
 				if last[name] ~= nil and last[name] ~= v then
-					log("TOGGLE", name, tostring(v), "| work=" .. tostring(on("AutoJob")), "best=" .. tostring(on("BestPay")), "needs=" .. tostring(on("AutoNeeds")), "daily=" .. tostring(on("Objectives")), "job=" .. tostring(N.currentJob()), "status=" .. tostring(Status))
+					log("TOGGLE", name, tostring(v), "| plan=" .. tostring(on("SmartPlanner")), "work=" .. tostring(on("AutoJob")), "best=" .. tostring(on("BestPay")), "needs=" .. tostring(on("AutoNeeds")), "daily=" .. tostring(on("Objectives")), "job=" .. tostring(N.currentJob()), "status=" .. tostring(Status))
 					if name == "Objectives" and v then
 						task.spawn(N.objectivesLog, "toggle")
 					end
@@ -38885,7 +39293,7 @@ do
 					rate = "$" .. formatNumber(math.floor(Session.earned / elapsed * 3600)) .. "/h",
 					time = string.format("%dh %02dm", elapsed // 3600, (elapsed % 3600) // 60),
 				}
-				local working = on("AutoJob")
+				local working = N.workOn()
 				if working then
 					N.paySample()
 				end
@@ -38903,22 +39311,22 @@ do
 						log("EFF", N.currentJob(), "efficiency", eff, "reason", tostring(tip), "'" .. why .. "'", if needsRelated then "(needs)" else "", "level", N.Levels[N.currentJob()], "shift pay", N.shiftEarnings())
 					end
 				end
-				if working and on("BestPay") then
+				if working and N.bestOn() then
 					N.planTick()
 				end
 				-- moods every 10 s: decay and efficiency model samples, the MOOD log line every 60 s (only with Auto Needs)
-				if on("AutoNeeds") and os.clock() - (N.Needs.sampleAt or -1e9) >= 10 then
+				if N.needsOn() and os.clock() - (N.Needs.sampleAt or -1e9) >= 10 then
 					N.Needs.sampleAt = os.clock()
 					N.moodTick((N.efficiency()))
 				end
 				-- daily objectives state: every 2 min with Daily Objectives on, hourly in the log with Auto Needs
-				local objEvery = if on("Objectives") then 120 elseif on("AutoNeeds") then 3600 else nil
+				local objEvery = if N.dailyOn() then 120 elseif N.needsOn() then 3600 else nil
 				if objEvery and os.clock() - N.Needs.objAt >= objEvery then
 					N.Needs.objAt = os.clock()
-					task.spawn(N.objectivesLog, if on("Objectives") then "check" else "hourly")
+					task.spawn(N.objectivesLog, if N.dailyOn() then "check" else "hourly")
 				end
-				N.InfoText.obj = if on("Objectives") then N.objectiveText(false) or "-" else "Daily Objectives is off"
-				N.InfoText.needs = if on("AutoNeeds") or N.Needs.active then N.needsStatus() else "Auto Needs is off"
+				N.InfoText.obj = if N.dailyOn() then N.objectiveText(false) or "-" else "Daily Objectives is off"
+				N.InfoText.needs = if N.needsOn() or N.Needs.active then N.needsStatus() else "Auto Needs is off"
 				N.InfoText.pay = N.payText()
 				-- the first pass runs inside task.spawn before N.upNextText below is defined (ERROR info: attempt to call a nil value)
 				N.InfoText.next = if N.upNextText then N.upNextText() else N.InfoText.next
@@ -38946,9 +39354,12 @@ do
 	function N.upNextText()
 		local Q = N.Needs
 		local lines = {}
-		local working, needs, daily = on("AutoJob"), on("AutoNeeds"), on("Objectives")
+		local working, needs, daily = N.workOn(), N.needsOn(), N.dailyOn()
 		if not (working or needs or daily or Q.active) then
-			return "Switch on Auto Work, Auto Needs or Daily Objectives in Quick Start"
+			return "Switch on Smart Planner, or Auto Work, Auto Needs or Daily Objectives in Quick Start"
+		end
+		if N.planOn() and N.Smart.headline then
+			table.insert(lines, N.Smart.headline)
 		end
 		if Q.active then
 			table.insert(lines, if Q.reason == "break" then "Now: break at home" elseif Q.reason == "objective meal" then "Now: eating the daily quick meal" else "Now: restoring needs at home")
@@ -38961,7 +39372,7 @@ do
 			local objective = N.objectiveJob()
 			if objective then
 				table.insert(lines, "Work " .. objective .. " for the daily objective")
-			elseif on("BestPay") then
+			elseif N.bestOn() then
 				local P = N.Plan
 				if P.lastPick and P.pickRate and P.pickRate > 0 then
 					table.insert(lines, string.format("Work %s (best pay $%s/h)", P.lastPick, formatNumber(math.floor(P.pickRate))))
@@ -39020,6 +39431,7 @@ do
 			end
 			if shown(Tabs.Jobs) then
 				group(function()
+					Labels.Smart:SetText(N.Smart.text or "-")
 					Labels.Needs:SetText(N.InfoText.needs or "-")
 					Labels.Obj:SetText(N.InfoText.obj or "-")
 				end)
@@ -39068,11 +39480,25 @@ do
 					table.clear(Perf.work)
 					flushLog(false)
 				end
-				if Log.statusAt and os.clock() - Log.statusAt > 600 and Log.stuckAt ~= Log.statusAt and on("AutoJob") and not N.Needs.active then
+				if Log.statusAt and os.clock() - Log.statusAt > 600 and Log.stuckAt ~= Log.statusAt and N.workOn() and not N.Needs.active then
 					Log.stuckAt = Log.statusAt
 					logProblem("Stuck for 10 minutes on: " .. tostring(Status))
 				end
 			end)
+		end
+	end)
+	-- Smart Planner: its own loop, silent while the toggle is off
+	task.spawn(function()
+		while alive() do
+			if N.planOn() then
+				local ok, err = xpcall(N.smartTick, debug.traceback)
+				if not ok then
+					reportError("plan", err)
+				end
+			elseif N.Smart.wasOn then
+				N.smartOff()
+			end
+			task.wait(5)
 		end
 	end)
 	pcall(function()
@@ -39082,7 +39508,7 @@ do
 	notify("Corvus", if Library.IsMobile then "Loaded and ready. The round Corvus button opens and closes the hub." else "Loaded. Press RightControl to hide or show the menu.", 5)
 	if Library.ShowWizard and not N.setupDone() then
 		task.delay(1.5, function()
-			if on("AutoJob") then
+			if N.workOn() then
 				N.markSetupDone()
 				return
 			end
