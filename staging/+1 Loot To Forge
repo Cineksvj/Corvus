@@ -4991,6 +4991,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             local Toggle = Library.Toggles[Entry.Target]
             if Toggle and not Toggle.Disabled then
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Entry.Target) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Entry.Target, Toggle.Value)
+                end
                 Library:Notify({ Title = tostring(Toggle.Text), Description = if Toggle.Value then "ON" else "OFF", Time = 1.5 })
             end
         elseif Entry.Kind == "Button" then
@@ -5701,6 +5704,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
 				Close(false, "outside")
 			end)
 		end
+		local ModalOpenedAt = os.clock()
 		pcall(function()
 			KeyConnection = UserInputService.InputBegan:Connect(function(Input, Processed)
 				if Input.UserInputType ~= Enum.UserInputType.Keyboard then
@@ -5708,7 +5712,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
 				end
 				if Input.KeyCode == Enum.KeyCode.Escape then
 					Close(false, "close")
-				elseif not Processed and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
+				elseif not Processed and not Opts.Warning and os.clock() - ModalOpenedAt > 0.8 and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
 					Close(true, "key")
 				end
 			end)
@@ -10756,6 +10760,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 end
     
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Idx) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+                end
             end))
     
             if typeof(Toggle.Tooltip) == "string" or typeof(Toggle.DisabledTooltip) == "string" then
@@ -11071,6 +11078,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 end
     
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Idx) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+                end
             end))
     
             table.insert(Toggle.Connections, Button.MouseButton1Down:Connect(function()
@@ -17639,6 +17649,28 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             return nil, false
         end
     
+        function Library:ResetHubOptions(Ignore: any): (boolean, any)
+        	local Ok, Json = pcall(HttpService.JSONEncode, HttpService, { v = 1, g = game.GameId, d = {} })
+        	if not Ok then
+        		return false, "Could not reset"
+        	end
+        	return Library:ImportShareCode("CORVUS-" .. Library.Base64Encode(Json), Ignore)
+        end
+
+        function Library:AskResetHubOptions(Ignore: any)
+        	return Library:ShowModal({
+        		Icon = "rotate-ccw",
+        		Title = "Reset all options to defaults?",
+        		Text = "Every toggle, dropdown, slider and input of this hub goes back to its default value. Saved configs are not deleted.",
+        		ConfirmText = "Reset",
+        		CancelText = "Cancel",
+        		OnConfirm = function()
+        			local Ok, Result = Library:ResetHubOptions(Ignore)
+        			Library:Notify({ Title = "Reset Hub Options", Description = if Ok then string.format("%d options reset", Result) else tostring(Result), Time = 4 })
+        		end,
+        	})
+        end
+
         function Library:ExportShareCode(Ignore: any): (string?, any)
             local Changed = {}
             local Count = 0
@@ -27404,7 +27436,6 @@ end
                     "CorvusConfigList",
                     "CorvusShareCode",
                     "CorvusAutoSave",
-                    "FarmAll",
                 })
                 SaveManager:SetFolder(Folder)
                 if Info.SubFolder then
@@ -27609,6 +27640,7 @@ end
                 if Info.AutoLoad ~= false then
                     task.defer(function()
                         pcall(SaveManager.LoadAutoloadConfig, SaveManager)
+                        if Library.OnAutoload then pcall(Library.OnAutoload) end
                     end)
                 end
             end
@@ -29979,6 +30011,9 @@ end
                         local Toggle = Library.Toggles[Item.Toggle]
                         if Toggle and not Toggle.Disabled then
                             Toggle:SetValue(not Toggle.Value)
+                            if typeof(Item.Toggle) == "string" and Library.OnUserToggle then
+                            	pcall(Library.OnUserToggle, Item.Toggle, Toggle.Value)
+                            end
                         end
                     end)
                     table.insert(DockButtons, Entry)
@@ -31773,20 +31808,14 @@ do
 		local value = option and option.Value
 		return if type(value) == "string" and value ~= "" then value else default
 	end
-	-- Auto Farm Everything = full automatic: the planner overrides the manual picks (stage, forge kind, class target).
-	function N.mode()
-		return optionText("FarmMode", "Best value")
-	end
+	-- No master switch: every automation is its own toggle and uses the options exactly as set.
 	function N.opActive()
-		return on("AutoFarmBest") and N.mode() ~= "My filters"
+		return false
 	end
 	function N.farmMode()
-		return if N.opActive() then "Auto Farm Everything" elseif on("AutoFarmBest") then "My filters" else "Manual"
+		return "Toggles"
 	end
 	function N.pickText(name, default)
-		if N.opActive() then
-			return default
-		end
 		return optionText(name, default)
 	end
 	Status = "Idle"
@@ -33008,7 +33037,7 @@ do
 			end
 			-- When the expected forged item is worth less than the same ores sold, the ores are sold.
 			local choice = autoChoice()
-			if choice and choice.perOre < choice.salePerOre and (N.opActive() or on("AutoSellGear")) then
+			if choice and choice.perOre < choice.salePerOre and on("AutoSellGear") then
 				log("PLAN forge", "selling", total, "ores: forged item", formatNumber(choice.perOre), "per ore < sale", formatNumber(choice.salePerOre))
 				for uuid, n in pairs(plan) do
 					fire(N.R.sell, uuid, n)
@@ -34080,7 +34109,7 @@ do
 			})
 		end)
 	end
-	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything, status and what comes next")
+	Tabs.Main = N.addTab("Main", "house", "Quick start, status and what comes next")
 	Tabs.Farm = N.addTab("Farm", "swords", "Stages, training, tower, world boss, Kill Aura and player")
 	Tabs.Forge = N.addTab("Forge", "hammer", "Forging, best gear and selling")
 	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Upgrades, rebirth, gear enhance, potions and class rolls")
@@ -34094,234 +34123,91 @@ do
 	end
 	Labels = {}
 	do
-		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm Everything", "sparkles")
-		N.BootAt = os.clock()
-		-- Start-up guard: nothing may switch Auto Farm Everything on in the first 10 s (a loaded config, a stray call).
-		N.FarmGuard = true
-		task.delay(10, function()
-			N.FarmGuard = false
-		end)
-		-- Every toggle the planner runs while Auto Farm Everything is on. Exclude keeps the valuables out of selling, forging, enhancing and spending.
-		N.FarmOPOn = {
+		local QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "sparkles")
+		-- No master switch: every automation is its own toggle. The list is what Stop Everything switches off.
+		N.AllAutoToggles2 = {
 			"KillAura", "GodMode", "Untouchable", "AutoStages", "AutoSuperLoot", "AutoTrain", "AutoForge", "AutoEquip", "AutoSellGear", "AutoUpgrade",
 			"AutoEnhance", "AutoRebirth", "AutoTower", "AutoWorldBoss", "AutoOnline", "AutoOffline", "AutoFriend", "AutoIndex", "AutoSeason",
 			"AutoSeasonLuck", "AutoSeasonShop", "AutoTowerTicket", "AutoQuests", "AutoUpdateRewards", "AutoPotions", "AutoClassRoll",
 		}
-		N.FarmApplied = nil
-		-- My filters: the loops picked in "Run" map to these toggles. Nothing destructive (no forge, sell, enhance, class roll, season buys).
-		N.RunMap = {
-			["Farm stages"] = { "AutoStages", "KillAura" },
-			["Train"] = { "AutoTrain" },
-			["Tower"] = { "AutoTower", "AutoTowerTicket" },
-			["Boss"] = { "AutoWorldBoss" },
-			["Online gifts"] = { "AutoOnline" },
-			["Offline reward"] = { "AutoOffline" },
-			["Index"] = { "AutoIndex" },
-			["Quests"] = { "AutoQuests", "AutoUpdateRewards" },
-			["Season claims"] = { "AutoSeason" },
-			["Auto Friend"] = { "AutoFriend" },
-		}
-		N.RunValues = { "Farm stages", "Train", "Tower", "Boss", "Online gifts", "Offline reward", "Index", "Quests", "Season claims", "Auto Friend" }
-		function N.farmList()
-			if N.mode() ~= "My filters" then
-				return N.FarmOPOn
-			end
-			local picks = Options.FarmRun and Options.FarmRun.Value or {}
-			local list = {}
-			for _, key in ipairs(N.RunValues) do
-				if picks[key] then
-					for _, name in ipairs(N.RunMap[key]) do
-						table.insert(list, name)
-					end
-				end
-			end
-			return list
-		end
-		function N.applyFarm(value)
-			local list
-			if value then
-				list = N.farmList()
-				if N.mode() == "My filters" then
-					-- only what this switch flips is switched off again later
-					local flipped = {}
-					for _, name in ipairs(list) do
-						local toggle = Toggles[name]
-						if toggle and not toggle.Value then
-							table.insert(flipped, name)
-						end
-					end
-					N.FarmApplied = flipped
-				else
-					N.FarmApplied = list
-				end
-			else
-				list = N.FarmApplied or {}
-				N.FarmApplied = nil
-			end
-			for _, name in ipairs(list) do
-				local toggle = Toggles[name]
-				if toggle and toggle.Value ~= value then
-					toggle:SetValue(value)
-				end
-			end
-			log("FARM", if value then "on" else "off", N.mode(), #list)
-		end
-		-- The master switch is never saved or restored (no Remember).
-		function N.farmEnable()
-			N.FarmQuiet = true
-			Toggles.AutoFarmBest:SetValue(true)
-			N.FarmQuiet = false
-			N.applyFarm(true)
-		end
-		N.OPText = "Full automatic: the planner trains, farms, forges, enhances, rolls classes and spends for max profit. Can consume or sell your items (Exclude protects the ones you pick)."
-		N.OPWarn = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
-		QuickBox:AddToggle("AutoFarmBest", {
-			Text = "Auto Farm Everything",
-			Default = false,
-			Tooltip = N.OPText .. " " .. N.OPWarn,
-			Callback = function(value)
-				if N.FarmQuiet then
-					return
-				end
-				if value and N.FarmGuard then
-					task.defer(function()
-						N.FarmQuiet = true
-						Toggles.AutoFarmBest:SetValue(false)
-						N.FarmQuiet = false
-					end)
-					log("FARM blocked by the start-up guard")
-					return
-				end
-				task.defer(function()
-					if not value then
-						N.applyFarm(false)
-						return
-					end
-					if N.mode() == "My filters" then
-						-- no planner, no destructive action: no card needed
-						N.applyFarm(true)
-						return
-					end
-					-- The toggle stays off until the card is confirmed.
-					N.FarmQuiet = true
-					Toggles.AutoFarmBest:SetValue(false)
-					N.FarmQuiet = false
-					N.confirmOP(function()
-						log("OP confirmed")
-						N.farmEnable()
-					end)
-				end)
-			end,
-		})
-		QuickBox:AddDropdown("FarmMode", {
-			Text = "Mode",
-			Values = { "Best value", "My filters" },
-			Default = "Best value",
-			Tooltip = "Best value: the planner decides everything (buys, sells, targets) within Exclude. My filters: no planner and nothing destroyed, only the loops picked in Run, with your own settings",
-			Callback = function()
-				if N.RunDrop then
-					N.RunDrop:SetVisible(N.mode() == "My filters")
-				end
-				if N.FarmModeSeen ~= nil and N.FarmModeSeen ~= N.mode() and on("AutoFarmBest") then
-					-- the running set belongs to the old mode: stop it, the player starts again
-					N.applyFarm(false)
-					N.FarmQuiet = true
-					Toggles.AutoFarmBest:SetValue(false)
-					N.FarmQuiet = false
-					notify("Auto Farm Everything", "Mode changed, switch it on again", 4)
-				end
-				N.FarmModeSeen = N.mode()
-			end,
-		})
-		N.RunDrop = QuickBox:AddDropdown("FarmRun", {
-			Text = "Run",
-			Values = N.RunValues,
-			Default = N.RunValues,
-			Multi = true,
-			AllowNull = true,
-			Visible = false,
-			Tooltip = "My filters: the loops Auto Farm Everything starts. Forging, selling, enhancing, class rolls and season purchases are never started from here. Your other settings stay as you set them",
-			Callback = function()
-				if N.mode() == "My filters" and on("AutoFarmBest") and N.FarmApplied ~= nil then
-					N.applyFarm(false)
-					N.applyFarm(true)
-				end
-			end,
-		})
-		N.FarmModeSeen = "Best value"
+		-- Protected items: ores, gear, Season Coins and potions picked here are never sold, forged, enhanced or spent by any toggle.
 		QuickBox:AddDropdown("FarmExclude", {
-			Text = "Exclude",
+			Text = "Protected items",
 			Values = N.ExcludeValues,
 			Default = N.ExcludeDefault,
 			Multi = true,
 			AllowNull = true,
-			Tooltip = "Never sold, forged, enhanced or spent, by Auto Farm Everything or by any toggle: ores and gear of the picked tiers, Season Coins (no Season Shop buys) and potions (none used)",
-		})
-		QuickBox:AddButton({
-			Text = "Recommended Settings",
-			Tooltip = "Sets every option to the values the planner works best with. Does not switch Auto Farm Everything on",
-			Func = function()
-				N.recommended()
-			end,
+			Tooltip = "Never sold, forged, enhanced or spent by any toggle: ores and gear of the picked tiers, Season Coins (no Season Shop buys) and potions (none used)",
 		})
 		QuickBox:AddButton({
 			Text = "Stop Everything",
+			Tooltip = "Turns every automation off",
 			Func = function()
 				N.stopAll()
 			end,
 		})
+		QuickBox:AddButton({
+			Text = "Reset Hub Options",
+			Tooltip = "Puts every toggle, dropdown, slider and input back to its default. Saved configs are not deleted",
+			Func = function()
+				N.askReset()
+			end,
+		})
 		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">One switch, fully automatic. Everything in the other tabs still works on its own when this is off.</font>',
+			Text = '<font transparency="0.35">Every automation is its own switch in the other tabs. Nothing turns on by itself.</font>',
 			DoesWrap = true,
 		})
-		-- The confirmation card: the library modal (Library:ShowModal), the same pop-up every Corvus hub uses.
-		function N.confirmOP(onYes)
-			local shown = Library.ShowModal and Library:ShowModal({
-				Icon = "sparkles",
-				Title = "Auto Farm Everything",
-				Text = N.OPText,
-				Warning = N.OPWarn,
-				ConfirmText = "I understand, enable",
-				CancelText = "Cancel",
-				OnConfirm = onYes,
-			})
-			if not shown then
-				notify("Auto Farm Everything", "The confirmation could not be shown, nothing was changed", 5)
+		-- Reset Hub Options: every toggle, dropdown, slider and input back to the default it was registered with. Saved configs stay.
+		function N.resetOptions()
+			local ignore = (SaveManager and SaveManager.Ignore) or {}
+			local function skip(name)
+				return ignore[name] == true or name == "MenuKeybind" or string.find(name, "^SaveManager") ~= nil or string.find(name, "^Corvus") ~= nil or string.find(name, "^ThemeManager") ~= nil
 			end
-		end
-		-- Recommended Settings: the values the planner works best with (no automation is switched on or off here).
-		function N.recommended()
-			local function set(name, value)
-				local holder = Toggles[name] or Options[name]
-				if holder then
-					pcall(holder.SetValue, holder, value)
+			N.quiet = true
+			local changed = 0
+			for name, toggle in pairs(Toggles) do
+				local default = toggle.Default
+				if not skip(name) and type(default) == "boolean" and toggle.Value ~= default then
+					pcall(toggle.SetValue, toggle, default)
+					changed += 1
 				end
 			end
-			set("StageMode", "Auto (by power)")
-			set("StageMargin", 100)
-			set("BankHP", 35)
-			set("PickOres", "Deepest stage only")
-			set("StuckSeconds", 20)
-			set("AuraMode", "Real damage")
-			set("ForgeType", "Auto (best value)")
-			set("SellKeepBest", 2)
-			set("SellKeepRarity", "Legendary")
-			set("SellOresBelow", "Off")
-			set("TrainArea", "Best open")
-			set("TowerStart", "Highest unlocked")
-			set("UpgradeKinds", { ["Ore Pack"] = true, Train = true, Luck = true })
-			set("EnhanceMax", 20)
-			set("ClassTarget", "Auto (expected value)")
-			set("PotionKinds", { Train = true, Coin = true, Luck = true, Damage = true, HP = true })
-			local exclude = {}
-			for _, name in ipairs(N.ExcludeDefault) do
-				exclude[name] = true
+			for name, option in pairs(Options) do
+				local kind = option.Type
+				local default = option.Default
+				if not skip(name) and default ~= nil and kind ~= "KeyPicker" and kind ~= "ColorPicker" then
+					local value = default
+					if type(default) == "table" and option.Multi then
+						value = {}
+						for k, v in pairs(default) do
+							if type(k) == "number" then
+								value[v] = true
+							elseif v then
+								value[k] = true
+							end
+						end
+					elseif type(default) == "table" then
+						value = default[1]
+					end
+					pcall(option.SetValue, option, value)
+					changed += 1
+				end
 			end
-			set("FarmExclude", exclude)
-			set("AutoEquip", true)
-			set("AutoCodes", true)
-			log("RECOMMENDED settings applied")
-			notify("Recommended Settings", "Options set. Switch Auto Farm Everything on when you are ready.", 5)
+			N.quiet = false
+			log("RESET options to defaults", "controls", changed)
+			notify("Corvus", "All hub options are back to their defaults. Saved configs are untouched", 5)
+		end
+		function N.askReset()
+			Library:ShowConfirmPrompt({
+				Title = "Reset Hub Options",
+				Text = "Reset all options to defaults?",
+				Warning = "Saved configs are not deleted",
+				ConfirmText = "Reset",
+				CancelText = "Cancel",
+				OnConfirm = function()
+					N.resetOptions()
+				end,
+			})
 		end
 		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
@@ -34862,7 +34748,6 @@ do
 	Log.header = Debug.header
 end
 N.AllAutoToggles = {
-	"AutoFarmBest",
 	"KillAura",
 	"GodMode",
 	"Untouchable",
@@ -34898,10 +34783,12 @@ do
 		end
 	end
 	function N.stopAll()
-		for _, name in ipairs(N.AllAutoToggles) do
-			local toggle = Toggles[name]
-			if toggle and toggle.Value then
-				toggle:SetValue(false)
+		for _, list in ipairs({ N.AllAutoToggles, N.AllAutoToggles2 or {} }) do
+			for _, name in ipairs(list) do
+				local toggle = Toggles[name]
+				if toggle and toggle.Value then
+					toggle:SetValue(false)
+				end
 			end
 		end
 		notify("Corvus", "Everything is off", 3)
@@ -35692,7 +35579,20 @@ do
 		end)
 		return list
 	end
+	-- The planner only works (and logs) while a toggle that uses its numbers is on.
+	local PlannerToggles = { "AutoTrain", "AutoStages", "AutoTower", "AutoWorldBoss", "AutoForge", "AutoUpgrade", "AutoEnhance", "AutoRebirth", "AutoClassRoll", "AutoSeasonShop", "AutoPotions" }
+	function N.plannerWanted()
+		for _, name in ipairs(PlannerToggles) do
+			if on(name) then
+				return true
+			end
+		end
+		return false
+	end
 	function N.planRefresh(force)
+		if not N.plannerWanted() then
+			return P.best
+		end
 		local now = os.clock()
 		if not force and now - P.at < 5 then
 			return P.best
@@ -35741,6 +35641,9 @@ do
 		return nil
 	end
 	function N.planTick()
+		if not N.plannerWanted() then
+			return
+		end
 		local ok, err = pcall(sample)
 		if not ok then
 			log("ERROR", "plan sample", tostring(err))
@@ -36255,7 +36158,6 @@ do
 			toggleCommand("rebirth", {}, { "AutoRebirth" }, "Auto Rebirth")
 			toggleCommand("tower", { "dungeon" }, { "AutoTower" }, "Auto Tower")
 			toggleCommand("boss", { "worldboss" }, { "AutoWorldBoss" }, "Auto World Boss")
-			toggleCommand("farmall", { "farmbest", "all", "farm", "op", "farmop" }, { "AutoFarmBest" }, "Auto Farm Everything")
 			Library:AddCommand({
 				Name = "bank",
 				Description = "Banks the ores in your pack and leaves the stage",
@@ -36318,7 +36220,6 @@ do
 	if Library.SetQuickBar then
 		pcall(function()
 			Library:SetQuickBar({
-				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm All" },
 				{ Toggle = "AutoStages", Icon = "swords", Label = "Stages" },
 				{ Toggle = "AutoTrain", Icon = "dumbbell", Label = "Train" },
 				{ Toggle = "AutoForge", Icon = "hammer", Label = "Forge" },
@@ -36342,25 +36243,6 @@ do
 		end)
 		return not ok or done == true
 	end
-	-- One-time notice after the Auto Farm Everything redesign (new players already see the quick setup instead).
-	function N.farmToast()
-		local flag = "Corvus/LTF_farmset_toast.txt"
-		local ok, seen = pcall(function()
-			return isfile(flag)
-		end)
-		if not ok or seen then
-			return
-		end
-		pcall(function()
-			if makefolder and isfolder and not isfolder("Corvus") then
-				makefolder("Corvus")
-			end
-			writefile(flag, "1")
-		end)
-		if N.setupDone() then
-			notify("Auto Farm Everything", "Auto Farm Everything on Main is now one full-automatic switch. Exclude keeps your valuables safe.", 9)
-		end
-	end
 	function N.openWizard()
 		if not Library.ShowWizard then
 			return
@@ -36375,15 +36257,14 @@ do
 					Description = "Pick everything you want running. Tap again to unpick.",
 					Multi = true,
 					Required = true,
-					Default = { "farm" },
+					Default = { "stages", "train", "events", "rewards" },
 					Choices = {
-						{ Id = "farm", Title = "Auto Farm Everything", Description = "Full automatic: the planner trains, farms, forges, enhances, rolls classes and spends for max profit. Can consume or sell your items (Exclude on Main protects the ones you pick), you confirm it first", Icon = "sparkles", Color = "#60d696" },
 						{ Id = "stages", Title = "Farm stages", Description = "Fights the best stage for your power, picks every ore and banks them safely", Icon = "swords", Color = "#fab428" },
 						{ Id = "train", Title = "Train", Description = "Trains in the best open area when the next rebirth pays more than a run", Icon = "dumbbell", Color = "#3ccf91" },
 						{ Id = "forge", Title = "Forge and gear", Description = "Forges from your strongest ores and equips the best weapon, armor and hat", Icon = "hammer", Color = "#5fb8ff" },
 						{ Id = "upgrades", Title = "Upgrades and rebirth", Description = "Ore Pack, Train and Luck upgrades, rebirths when your level allows", Icon = "arrow-big-up", Color = "#ff9a3c" },
 						{ Id = "events", Title = "Tower and world boss", Description = "Uses your tower tickets and joins every world boss", Icon = "castle", Color = "#c77dff" },
-						{ Id = "rewards", Title = "Claim rewards", Description = "Online gifts, offline, index, season, quests and potions", Icon = "gift", Color = "#ff5d8f" },
+						{ Id = "rewards", Title = "Claim rewards", Description = "Online gifts, offline, index, season, quests (spends nothing)", Icon = "gift", Color = "#ff5d8f" },
 					},
 				},
 			},
@@ -36395,16 +36276,15 @@ do
 					forge = { "AutoForge", "AutoEquip" },
 					upgrades = { "AutoUpgrade", "AutoEnhance", "AutoRebirth" },
 					events = { "AutoTower", "AutoWorldBoss" },
-					rewards = { "AutoOnline", "AutoOffline", "AutoIndex", "AutoSeason", "AutoSeasonLuck", "AutoSeasonShop", "AutoTowerTicket", "AutoQuests", "AutoUpdateRewards", "AutoPotions" },
+					rewards = { "AutoOnline", "AutoOffline", "AutoIndex", "AutoSeason", "AutoTowerTicket", "AutoQuests", "AutoUpdateRewards" },
 				}
 				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] and not chosen.farm then "on" else "off" })
+					if chosen[id] then
+						setToggles(names, { "on" })
+					end
 				end
 				N.markSetupDone()
-				if chosen.farm then
-					N.FarmGuard = false
-					setToggles({ "AutoFarmBest" }, { "on" })
-				end
+
 				notify("Quick setup done", "Change anything in the tabs any time", 5)
 			end,
 			Skipped = function()
@@ -36414,13 +36294,6 @@ do
 		})
 	end
 end
--- Auto Farm Everything is never part of a saved config (never restored); Mode and Run are normal options.
-pcall(function()
-	if type(SaveManager) == "table" then
-		SaveManager.Ignore = SaveManager.Ignore or {}
-		SaveManager.Ignore.AutoFarmBest = true
-	end
-end)
 if Window.AddSettingsTab then
 	local ok, tab = pcall(Window.AddSettingsTab, Window, {
 		ThemeManager = ThemeManager,
@@ -36528,6 +36401,24 @@ pcall(function()
 		return string.format("power %s  \u{00B7}  rebirth %d", formatNumber(N.power()), N.rebirth())
 	end
 end)
+
+-- What changed a toggle is always in the log: the saved config at start (AUTOLOAD) or the player (CLICK).
+-- Changes made by the hub itself (Stop Everything, Reset Hub Options) set N.quiet and stay out of CLICK.
+Library.OnAutoload = function()
+	local names = {}
+	for name, toggle in pairs(Toggles) do
+		if toggle.Value == true then
+			table.insert(names, name)
+		end
+	end
+	table.sort(names)
+	log("AUTOLOAD toggles=" .. (if #names > 0 then table.concat(names, ",") else "-"))
+end
+Library.OnUserToggle = function(name, value)
+	if not N.quiet then
+		log("CLICK", name .. "=" .. tostring(value))
+	end
+end
 do
 	local ErrorLogAt = {}
 	local function reportError(where, err)
@@ -36739,7 +36630,7 @@ do
 				table.insert(next, "Rebirth " .. (r + 1) .. " at level " .. tostring(m.need))
 			end
 		end
-		return if #next > 0 then "\u{2022} " .. table.concat(next, "\n\u{2022} ") else "Turn on Auto Farm Everything to get a plan"
+		return if #next > 0 then "\u{2022} " .. table.concat(next, "\n\u{2022} ") else "Turn on Auto Farm Stages or Auto Train to get a plan"
 	end
 	-- Builds every label text here, the draw thread below only copies strings.
 	N.InfoText = {}
@@ -37080,14 +36971,10 @@ do
 			5
 		)
 	end
-	task.delay(4, function()
-		if alive() then
-			pcall(N.farmToast)
-		end
-	end)
+
 	if Library.ShowWizard and not N.setupDone() then
 		task.delay(1.5, function()
-			if on("AutoStages") or on("AutoFarmBest") or on("AutoTrain") then
+			if on("AutoStages") or on("AutoTrain") then
 				N.markSetupDone()
 				return
 			end
