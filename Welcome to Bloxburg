@@ -30924,6 +30924,7 @@ do
 	-- Returns the style and color names the customer wants, or nil.
 	function N.hairOrder(customer)
 		N.Hair.key = nil
+		N.Hair.noBubble = false
 		local folder = assets()
 		local order = bubbleOrder(customer)
 		if folder and order then
@@ -31003,7 +31004,9 @@ do
 			end
 			return nil
 		end
-		return N.hairOrderFromHat(customer)
+		-- no bubble yet: the order appears a few seconds after the customer sits down
+		N.Hair.noBubble = true
+		return nil
 	end
 	-- Old guess (the customer's own hat): kept as a fallback only.
 	function N.hairOrderFromHat(customer)
@@ -31117,7 +31120,7 @@ do
 		end
 		local style, color = N.hairOrder(item.customer)
 		if not style then
-			N.Hair.skip[item.customer] = os.clock() + 20
+			N.Hair.skip[item.customer] = os.clock() + (if N.Hair.noBubble then 2 else 20)
 			task.wait(0.5)
 			return
 		end
