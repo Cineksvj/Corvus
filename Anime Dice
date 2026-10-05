@@ -26845,6 +26845,21 @@ end
                 end,
             })
     
+            local DiagBox = Tab:AddRightGroupbox("Diagnostics", "activity")
+            DiagBox:AddToggle("CorvusDiagnostics", {
+            	Text = "Send anonymous diagnostics",
+            	Description = "Helps fix bugs. Sends only the hub's own status lines, no nickname or account data.",
+            	Default = Library:GetSetting("Diagnostics", true) ~= false,
+            	Callback = function(Value)
+            		if Library.SetDiagnostics then
+            			Library:SetDiagnostics(Value)
+            		else
+            			Library:SetSetting("Diagnostics", Value)
+            		end
+            	end,
+            })
+            Library.DiagnosticsLabel = DiagBox:AddLabel({ Text = Library.DiagnosticsStatus or "On", DoesWrap = true })
+
             if not Window.MiscTab and Info.Utility ~= false then
                 local Utility = Tab:AddRightGroupbox("Utility", "wrench")
                 local AntiIdleCount = 0
@@ -26966,6 +26981,7 @@ end
                     "CorvusFont",
                     "CorvusAccent",
                     "CorvusAntiAFK",
+                    "CorvusDiagnostics",
                     "CorvusTheme",
                     "CorvusConfigName",
                     "CorvusConfigList",
@@ -30550,6 +30566,274 @@ end
         Fallback = "wallet",
         Data = "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",
     }
+    -- CORVUS-DIAG-BEGIN: opt-out anonymous diagnostics (Settings > Diagnostics). Reads the hub's own status lines from the log file writes.
+    do
+    	local DiagStats = { Url = nil }
+    	local DiagTags = {
+    		START = true, PLAN = true, RATE = true, BUY = true, SELL = true, REBIRTH = true, ADMIN = true, EVENT = true, FRIEND = true,
+    		HOP = true, NEEDS = true, MOOD = true, PAUSE = true, LUCKY = true, STARS = true, PROBLEM = true,
+    	}
+    	local DiagOn = Library:GetSetting("Diagnostics", true) ~= false
+    	local Pending, PendingCount, Seen = {}, 0, {}
+    	local HourStart, HourBytes, LastLuaError = os.clock(), 0, nil
+    	local function stats()
+    		local value = getgenv().CorvusStats
+    		return if type(value) == "table" then value else {}
+    	end
+    	local function playerKey()
+    		local value = stats().playerKey
+    		if type(value) == "function" then
+    			local ok, key = pcall(value)
+    			if ok and type(key) == "string" and #key >= 8 then
+    				return key
+    			end
+    		end
+    		return nil
+    	end
+    	local function setStatus(text)
+    		Library.DiagnosticsStatus = text
+    		local label = Library.DiagnosticsLabel
+    		if label and label.SetText then
+    			pcall(label.SetText, label, text)
+    		end
+    	end
+    	local function post(path, body, countBudget)
+    		local url = stats().url
+    		local fn = GetRequestFunction()
+    		if type(url) ~= "string" or url == "" or type(fn) ~= "function" then
+    			return false
+    		end
+    		local okEnc, text = pcall(HttpService.JSONEncode, HttpService, body)
+    		if not okEnc or type(text) ~= "string" then
+    			return false
+    		end
+    		if countBudget then
+    			if os.clock() - HourStart >= 3600 then
+    				HourStart, HourBytes = os.clock(), 0
+    			end
+    			if HourBytes + #text > 20000 then
+    				return false
+    			end
+    			HourBytes += #text
+    		end
+    		local ok, response = pcall(fn, { Url = url .. path, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = text })
+    		if ok and response ~= nil then
+    			if countBudget then
+    				setStatus(string.format("Last sent %s, %.1f KB", os.date("%H:%M"), #text / 1024))
+    			end
+    			return true
+    		end
+    		return false
+    	end
+    	local function maskIds(part)
+    		part = string.gsub(part, "%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x", "<id>")
+    		part = string.gsub(part, "%f[%w]%x+%f[%W]", function(word)
+    			if #word >= 12 then
+    				return "<id>"
+    			end
+    			return nil
+    		end)
+    		return part
+    	end
+    	local function maskPart(part)
+    		return (string.gsub(maskIds(part), "%d+[%.,]?%d*", "<n>"))
+    	end
+    	-- numbers -> <n>, long hex/ids -> <id>, quoted strings are kept
+    	local function template(text)
+    		local out, pos, quoted = {}, 1, false
+    		while pos <= #text + 1 do
+    			local stop = string.find(text, '"', pos, true) or (#text + 1)
+    			local piece = string.sub(text, pos, stop - 1)
+    			out[#out + 1] = if quoted then piece else maskPart(piece)
+    			if stop <= #text then
+    				out[#out + 1] = '"'
+    			end
+    			quoted = not quoted
+    			pos = stop + 1
+    		end
+    		return string.sub(table.concat(out), 1, 160)
+    	end
+    	local function scrub(text)
+    		local player = game:GetService("Players").LocalPlayer
+    		if player then
+    			for _, name in ipairs({ player.Name, player.DisplayName }) do
+    				if type(name) == "string" and #name >= 3 then
+    					local from = 1
+    					while true do
+    						local a, b = string.find(string.lower(text), string.lower(name), from, true)
+    						if not a then
+    							break
+    						end
+    						text = string.sub(text, 1, a - 1) .. "<player>" .. string.sub(text, b + 1)
+    						from = a + 8
+    					end
+    				end
+    			end
+    		end
+    		return text
+    	end
+    	local function add(text, forced)
+    		text = maskIds(scrub(text))
+    		local key = template(text)
+    		local item = Pending[key]
+    		if not item then
+    			if PendingCount >= 150 then
+    				return
+    			end
+    			item = { t = key, n = 0, s = {}, problem = forced == true or string.find(string.lower(key), "problem", 1, true) ~= nil }
+    			Pending[key] = item
+    			PendingCount += 1
+    		end
+    		item.n += 1
+    		table.insert(item.s, string.sub(text, 1, 200))
+    		if #item.s > 3 then
+    			table.remove(item.s, 1)
+    		end
+    	end
+    	local function ingest(content, append)
+    		if type(content) ~= "string" then
+    			return
+    		end
+    		local current = {}
+    		for line in string.gmatch(content, "[^\r\n]+") do
+    			current[line] = true
+    			if not Seen[line] and DiagOn then
+    				local text = string.gsub(line, "^%[[^%]]*%]%s*", "")
+    				local tag = string.match(text, "^(%a+)")
+    				if tag then
+    					local up = string.upper(tag)
+    					if DiagTags[up] then
+    						add(text, up == "PROBLEM")
+    					end
+    				end
+    			end
+    			if append then
+    				Seen[line] = true
+    			end
+    		end
+    		if not append then
+    			Seen = current
+    		end
+    	end
+    	local function flush()
+    		if not DiagOn then
+    			return
+    		end
+    		local luaError = getgenv().CorvusLastError
+    		if type(luaError) == "string" and luaError ~= "" and luaError ~= LastLuaError then
+    			LastLuaError = luaError
+    			add("LUAERROR " .. string.sub(string.match(luaError, ":\n([^\n]+)") or luaError, 1, 150), true)
+    		end
+    		if PendingCount == 0 then
+    			return
+    		end
+    		local stat = stats()
+    		local key = playerKey()
+    		if not stat.game or not key then
+    			return
+    		end
+    		local list = {}
+    		for _, item in pairs(Pending) do
+    			table.insert(list, item)
+    		end
+    		table.sort(list, function(a, b)
+    			if a.problem ~= b.problem then
+    				return a.problem
+    			end
+    			return a.n > b.n
+    		end)
+    		local body = { g = stat.game, h = tostring(Library.HubVersion or Library.Version or "?"), k = key, l = {} }
+    		local size = #HttpService:JSONEncode(body)
+    		local taken = {}
+    		for _, item in ipairs(list) do
+    			local entry = { t = item.t, n = item.n, s = item.s }
+    			local cost = #HttpService:JSONEncode(entry) + 1
+    			if size + cost <= 4000 then
+    				size += cost
+    				table.insert(body.l, entry)
+    				table.insert(taken, item)
+    			end
+    		end
+    		if #taken == 0 then
+    			return
+    		end
+    		for _, item in ipairs(taken) do
+    			Pending[item.t] = nil
+    			PendingCount -= 1
+    		end
+    		post("/logs", body, true)
+    	end
+    	function Library:SetDiagnostics(Value)
+    		DiagOn = Value == true
+    		Library:SetSetting("Diagnostics", DiagOn)
+    		if not DiagOn then
+    			table.clear(Pending)
+    			PendingCount = 0
+    			setStatus("Off, nothing is sent")
+    		else
+    			setStatus("On, first send within a minute")
+    		end
+    	end
+    	function Library:GetDiagnostics()
+    		return DiagOn
+    	end
+    	setStatus(if DiagOn then "On, first send within a minute" else "Off, nothing is sent")
+    	-- every hub writes its status log with writefile/appendfile to Corvus_<GAME>_log.txt: read the new lines there
+    	local env = getgenv()
+    	local function isLog(name)
+    		return type(name) == "string" and string.match(name, "Corvus_[^/\\]*_log%.txt$") ~= nil
+    	end
+    	local baseWrite = env.CorvusRealWriteFile or writefile
+    	if type(baseWrite) == "function" then
+    		env.CorvusRealWriteFile = baseWrite
+    		env.writefile = function(name, content, ...)
+    			if isLog(name) then
+    				pcall(ingest, content, false)
+    			end
+    			return baseWrite(name, content, ...)
+    		end
+    	end
+    	local baseAppend = env.CorvusRealAppendFile or appendfile
+    	if type(baseAppend) == "function" then
+    		env.CorvusRealAppendFile = baseAppend
+    		env.appendfile = function(name, content, ...)
+    			if isLog(name) then
+    				pcall(ingest, content, true)
+    			end
+    			return baseAppend(name, content, ...)
+    		end
+    	end
+    	task.spawn(function()
+    		while not Library.Unloaded do
+    			task.wait(60)
+    			pcall(flush)
+    		end
+    	end)
+    	DiagStats.flush = flush
+    	Library.DiagnosticsInternal = DiagStats
+    	-- the hub's feedback sender calls this next to its Discord post (anonymous = the worker does not store the key)
+    	function Library.PostFeedback(kind, text, anonymous, executor)
+    		local stat = stats()
+    		local key = playerKey()
+    		if not key or not stat.game then
+    			return false
+    		end
+    		local lowered = string.lower(tostring(kind or "other"))
+    		if lowered ~= "bug" and lowered ~= "idea" then
+    			lowered = "other"
+    		end
+    		return post("/feedback", {
+    			k = key,
+    			g = stat.game,
+    			kind = lowered,
+    			text = string.sub(tostring(text or ""), 1, 1500),
+    			e = string.sub(tostring(executor or "?"), 1, 40),
+    			hv = tostring(Library.HubVersion or Library.Version or "?"),
+    			a = anonymous == true,
+    		}, false)
+    	end
+    end
+    -- CORVUS-DIAG-END
     getgenv().Library = Library
     getgenv().CorvusLibrary = Library
     return Library
@@ -34284,6 +34568,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 				executor = table.concat({ identifyexecutor() }, " ")
 			end)
 			local colors = { Idea = 7995310, Bug = 16739978, Question = 6275327, Other = 14146792 }
+			pcall(Library.PostFeedback, kind, text, anonymous, executor)
 			local ok = postWebhook(FeedbackWebhook, {
 				username = "Corvus Feedback",
 				allowed_mentions = { parse = {} },
