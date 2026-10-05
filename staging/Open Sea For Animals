@@ -33362,13 +33362,12 @@ local BootOk, BootError = xpcall(function()
 			end)
 		end
 		Tabs.Main = addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
-		Tabs.OP = addTab("Auto OP", "zap", "Full automatic planner and what it must never touch")
-		Tabs.Sea = addTab("Sea", "waves-horizontal", "Charge, trips and catch filters")
-		Tabs.Plot = addTab("Plot", "layout-grid", "Animals and eggs on your plot")
+		Tabs.Sea = addTab("Sea", "waves-horizontal", "Charge, trips, catch filters and movement")
 		Tabs.Upgrades = addTab("Upgrades", "trending-up", "Upgrades, staffs, training and rebirth")
 		Tabs.Rewards = addTab("Rewards", "gift", "Free rewards, codes and events")
-		Tabs.Items = addTab("Items", "backpack", "Selling, protection and potions")
-		Tabs.Player = addTab("Player", "user", "Movement at sea")
+		Tabs.Items = addTab("Items", "backpack", "Your animals and eggs, selling, protection and potions")
+		Tabs.Plot = Tabs.Items
+		Tabs.Player = Tabs.Sea
 		Tabs.Stats = addTab("Stats", "chart-column", "Session progress, rates, trends and goals")
 		Tabs.Analytics = Tabs.Stats
 		if Window.AddMiscTab then
@@ -33378,7 +33377,7 @@ local BootOk, BootError = xpcall(function()
 		end
 		Labels = {}
 		do
-			local SeaBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "zap")
+			local SeaBox = Tabs.Main:AddLeftGroupbox("Auto Farm Everything", "zap")
 			local FarmAllSet = {
 				"AutoSea", "AutoSell", "AutoEquipBest", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff",
 				"AutoEquipStaff", "AutoBuyDumbbell", "AutoEquipDumbbell", "AutoTrain", "AutoBonus", "AutoRebirth",
@@ -33386,32 +33385,8 @@ local BootOk, BootError = xpcall(function()
 				"AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoCodes", "AutoStars", "AutoLucky", "EventRush",
 			}
 			local FarmAllMain = { "AutoSea", "AutoSell", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff", "AutoBuyDumbbell", "AutoTrain", "AutoRebirth", "AutoPotions" }
-			-- every main farm toggle by its visible name; safe = on by default (nothing that sells, hatches, spends money or hops servers)
-			local FarmEvery = {
-				{ "Auto Open Sea", "AutoSea", true }, { "Skip Waves With Nothing Good", "SkipEmpty", true }, { "Collect Stars (event)", "AutoStars", true },
-				{ "Event Rush", "EventRush", true }, { "Auto Lucky Blocks", "AutoLucky", true }, { "Auto Free Ad Reward", "AutoAd", true },
-				{ "Auto Equip Best", "AutoEquipBest", true }, { "Auto Train", "AutoTrain", true }, { "Auto Claim Training Bonus", "AutoBonus", true },
-				{ "Auto Equip Best Staff", "AutoEquipStaff", true }, { "Auto Equip Best Dumbbell", "AutoEquipDumbbell", true },
-				{ "Auto Collect Offline Cash", "AutoOffline", true }, { "Auto Claim Playtime Gifts", "AutoPlaytime", true },
-				{ "Auto Claim Daily Reward", "AutoDaily", true }, { "Auto Spin Lucky Wheel", "AutoSpin", true },
-				{ "Auto Claim Season Pass (free)", "AutoSeasonPass", true }, { "Auto Claim Free Shop Animal", "AutoFreeShop", true },
-				{ "Auto Claim Free Forever Pack", "AutoForever", true }, { "Auto Claim 25 Min Reward", "AutoLimited", true },
-				{ "Auto Claim Group Reward", "AutoGroup", true }, { "Auto Redeem Known Codes", "AutoCodes", true },
-				{ "Auto Place Eggs", "AutoPlaceEggs", false }, { "Auto Hatch Eggs", "AutoHatch", false }, { "Auto Sell", "AutoSell", false },
-				{ "Equip Best Before Selling", "EquipBeforeSell", false }, { "Auto Buy Upgrades", "AutoUpgrade", false },
-				{ "Auto Buy Staffs", "AutoBuyStaff", false }, { "Auto Buy Dumbbells", "AutoBuyDumbbell", false },
-				{ "Auto Rebirth", "AutoRebirth", false }, { "Save Cash For Rebirth", "SaveForRebirth", false },
-				{ "Auto Use Potions", "AutoPotions", false }, { "Smart Timing (potions)", "SmartPotions", false }, { "Luck Hop", "LuckHop", false },
-			}
-			local FarmEveryNames, FarmEveryDefault, FarmEveryKey = {}, {}, {}
-			for _, row in ipairs(FarmEvery) do
-				table.insert(FarmEveryNames, row[1])
-				FarmEveryKey[row[1]] = row[2]
-				if row[3] then
-					table.insert(FarmEveryDefault, row[1])
-				end
-			end
-			local FarmTurned = { Normal = {}, OP = {} }
+			local FarmTurned = { OP = {} }
+			local OPPreset = { SeaMove = "Blatant", SeaCharge = "Perfect (+5s)", SellMode = "Smart", SellAt = 190, TrainMode = "Alternate with the sea", SeaMinutes = 10, TrainMinutes = 3, UpgradeSpend = 100 }
 			local function farmApply(kind, value)
 				local turned = FarmTurned[kind]
 				local settingKey = if kind == "OP" then "OSFA_FarmOP" else "OSFA_FarmAll"
@@ -33419,17 +33394,6 @@ local BootOk, BootError = xpcall(function()
 					table.clear(turned)
 					turned.active = true
 					local list = FarmAllSet
-					if kind == "Normal" then
-						list = {}
-						local picked = Options.FarmSet and Options.FarmSet.Value
-						if type(picked) == "table" then
-							for _, row in ipairs(FarmEvery) do
-								if picked[row[1]] then
-									table.insert(list, row[2])
-								end
-							end
-						end
-					end
 					for _, name in ipairs(list) do
 						local toggle = Toggles[name]
 						if toggle and not toggle.Value then
@@ -33440,7 +33404,7 @@ local BootOk, BootError = xpcall(function()
 					log("MODE", kind)
 					if kind == "OP" then
 						-- OP: the planner overrides the sea, sell and train settings and the catch, egg and priority picks
-						for name, pair in pairs({ SeaMove = "Blatant", SeaCharge = "Perfect (+5s)", SellMode = "Smart", SellAt = 190, TrainMode = "Alternate with the sea", SeaMinutes = 10, TrainMinutes = 3, UpgradeSpend = 100 }) do
+						for name, pair in pairs(OPPreset) do
 							local option = Options[name]
 							if option then
 								pcall(option.SetValue, option, pair)
@@ -33545,8 +33509,8 @@ local BootOk, BootError = xpcall(function()
 					l.Parent = card
 					return l
 				end
-				label("Enable Auto Farm Everything OP?", 12, 22, 16, true)
-				label("Full automatic: the planner picks what to catch, sells, spends and trains for max profit. Can sell your animals. Use the normal Auto Farm Everything if you want to keep control.", 40, 96, 13, false, 0.2)
+				label("Enable Auto Farm Everything?", 12, 22, 16, true)
+				label("Full automatic: the planner picks what to catch, sells, spends and trains for max profit. Can sell your animals. Use Exclude to keep what matters.", 40, 96, 13, false, 0.2)
 				label("Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.", 138, 82, 12, true).TextColor3 = Color3.fromRGB(255, 140, 60)
 				local function button(text, x, w, fill, textColor, action)
 					local b = Instance.new("TextButton")
@@ -33582,36 +33546,12 @@ local BootOk, BootError = xpcall(function()
 					log("OP cancelled")
 				end)
 			end
-			SeaBox:AddToggle("AutoFarmAll", {
+			local OPBox = SeaBox
+			local OPExcludeBox = Tabs.Main:AddLeftGroupbox("Exclude", "shield-check")
+			OPBox:AddToggle("AutoFarmOP", {
 				Text = "Auto Farm Everything",
 				Default = false,
-				Tooltip = "Normal: switches on the farm toggles picked below, with your own Catch Filters and priorities. Nothing is planned for you and nothing is sold or spent unless you picked it. Turning it off stops what it started.",
-				Callback = function(value)
-					if value and Toggles.AutoFarmOP and Toggles.AutoFarmOP.Value then
-						Toggles.AutoFarmOP:SetValue(false)
-					end
-					task.spawn(farmApply, "Normal", value)
-				end,
-			})
-			SeaBox:AddDropdown("FarmSet", {
-				Text = "Farm Everything includes",
-				Values = FarmEveryNames,
-				Default = FarmEveryDefault,
-				Multi = true,
-				AllowNull = true,
-				Searchable = true,
-				Tooltip = "The toggles Auto Farm Everything switches on. Default: everything safe. Selling, hatching, spending and luck hops are off until you pick them.",
-			})
-			SeaBox:AddLabel({
-				Text = '<font transparency="0.35">Full automatic mode (planner) lives in the </font><font color="#59cdff">Auto OP</font><font transparency="0.35"> tab.</font>',
-				DoesWrap = true,
-			})
-			local OPBox = Tabs.OP:AddLeftGroupbox("Auto Farm Everything OP", "zap")
-			local OPExcludeBox = Tabs.OP:AddRightGroupbox("Exclude from OP", "shield-check")
-			OPBox:AddToggle("AutoFarmOP", {
-				Text = "Auto Farm Everything OP",
-				Default = false,
-				Tooltip = "The planner picks what to catch, sells, spends and trains for max profit and can sell your animals. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
+				Tooltip = "Full automatic: the planner picks what to catch, sells, spends and trains for max profit, with the fastest legal path for everything, and can sell your animals. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
 				Callback = function(value)
 					if value and not OPConfirmed and not OPSkipCard then
 						-- stays off until the player confirms
@@ -33622,9 +33562,6 @@ local BootOk, BootError = xpcall(function()
 						return
 					end
 					OPConfirmed = false
-					if value and Toggles.AutoFarmAll and Toggles.AutoFarmAll.Value then
-						Toggles.AutoFarmAll:SetValue(false)
-					end
 					task.spawn(farmApply, "OP", value)
 				end,
 			})
@@ -33633,13 +33570,43 @@ local BootOk, BootError = xpcall(function()
 				DoesWrap = true,
 			})
 			OPBox:AddToggle("RememberOP", {
-				Text = "Remember Auto OP",
+				Text = "Remember Auto Farm Everything",
 				Default = false,
-				Tooltip = "Off (default): Auto OP always starts off after a rejoin or a config load. On: it comes back by itself after a rejoin (needs the confirmation once). Warning: OP runs unattended and can sell your animals, so turn this on only on an alt you leave AFK.",
+				Tooltip = "Off (default): it always starts off after a rejoin or a config load. On: it comes back by itself after a rejoin (needs the confirmation once). Warning: it runs unattended and can sell your animals, so turn this on only on an alt you leave AFK.",
 			})
 			OPBox:AddLabel({
-				Text = '<font color="#ff8c3c">Remember Auto OP: when on, OP restarts by itself after every rejoin, without asking. Keep it off on your main account.</font>',
+				Text = '<font color="#ff8c3c">Remember: when on, Auto Farm Everything restarts by itself after every rejoin, without asking. Keep it off on your main account.</font>',
 				DoesWrap = true,
+			})
+			OPBox:AddButton({
+				Text = "Recommended Settings",
+				Tooltip = "Sets the sea, sell, training and spending options to the values the planner uses (Blatant movement, Perfect charge, Smart Sell)",
+				Func = function()
+					for name, value in pairs(OPPreset) do
+						local option = Options[name]
+						if option then
+							pcall(option.SetValue, option, value)
+						end
+					end
+					notify("Recommended Settings", "Applied", 3)
+				end,
+			}):AddButton({
+				Text = "Stop Everything",
+				Tooltip = "Turns Auto Farm Everything and every automation toggle off",
+				Func = function()
+					task.spawn(function()
+						if Toggles.AutoFarmOP then
+							Toggles.AutoFarmOP:SetValue(false)
+						end
+						for _, name in ipairs(Game.AllAuto or {}) do
+							local toggle = Toggles[name]
+							if toggle and toggle.Value then
+								toggle:SetValue(false)
+							end
+						end
+						notify("Stop Everything", "All automation is off", 4)
+					end)
+				end,
 			})
 			do
 				local excludeValues = {}
@@ -33666,17 +33633,17 @@ local BootOk, BootError = xpcall(function()
 				table.insert(excludeValues, Game.OPReserveLabel)
 				table.insert(excludeValues, "Stars (event)")
 				OPExcludeBox:AddDropdown("OPExclude", {
-					Text = "Exclude from OP",
+					Text = "Never sell or spend",
 					Values = excludeValues,
 					Default = {},
 					Multi = true,
 					AllowNull = true,
 					Searchable = true,
-					Tooltip = "Auto Farm Everything OP never sells, replaces or spends these: animal rarities, mutations and sizes, event animals, egg types, a 25% cash reserve, and the event stars.",
+					Tooltip = "Auto Farm Everything never sells, replaces or spends these: animal rarities, mutations and sizes, event animals, egg types, a 25% cash reserve, and the event stars.",
 				})
 			end
 			OPExcludeBox:AddLabel({
-				Text = '<font transparency="0.35">Picked animals and eggs are never sold or picked up by OP (Smart Sell, plot swaps). The cash reserve keeps 25% of your money out of every purchase. Stars: OP leaves the event stars alone.</font>',
+				Text = '<font transparency="0.35">Picked animals and eggs are never sold or picked up (Smart Sell, plot swaps). The cash reserve keeps 25% of your money out of every purchase. Stars: the event stars are left alone.</font>',
 				DoesWrap = true,
 			})
 			SeaBox:AddToggle("AutoSea", {
@@ -33904,6 +33871,7 @@ local BootOk, BootError = xpcall(function()
 					end)
 				end,
 			})
+			Labels.UpNext = Tabs.Main:AddRightGroupbox("Up next", "list-checks"):AddLabel({ Text = "Switch on Auto Farm Everything to see the plan", DoesWrap = true })
 			local AnimalBox = Tabs.Plot:AddLeftGroupbox("Animals", "paw-print")
 			AnimalBox:AddToggle("AutoEquipBest", {
 				Text = "Auto Equip Best",
@@ -34762,7 +34730,6 @@ local BootOk, BootError = xpcall(function()
 		end
 		local FarmToggles = { "AutoSea", "AutoEquipBest", "AutoPlaceEggs", "AutoHatch", "AutoSell" }
 		AllAutoToggles = {
-			"AutoFarmAll",
 			"AutoFarmOP",
 			"AutoSea",
 			"AutoEquipBest",
@@ -34778,8 +34745,7 @@ local BootOk, BootError = xpcall(function()
 		}
 		if Library.AddCommand then
 			pcall(function()
-				toggleCommand("farmall", { "afe", "everything", "fa" }, { "AutoFarmAll" }, "Auto Farm Everything")
-				toggleCommand("farmop", { "afeop", "op" }, { "AutoFarmOP" }, "Auto Farm Everything OP")
+								toggleCommand("farm", { "afe", "everything", "fa", "farmop", "op" }, { "AutoFarmOP" }, "Auto Farm Everything")
 				toggleCommand("sea", { "autosea", "opensea" }, { "AutoSea" }, "Auto Open Sea")
 				toggleCommand("autosell", { "as" }, { "AutoSell" }, "Auto Sell")
 				toggleCommand("equipbest", { "best" }, { "AutoEquipBest" }, "Auto Equip Best")
@@ -34985,8 +34951,7 @@ local BootOk, BootError = xpcall(function()
 		if Library.SetQuickBar then
 			pcall(function()
 				Library:SetQuickBar({
-					{ Toggle = "AutoFarmAll", Icon = "zap", Label = "Farm All" },
-					{ Toggle = "AutoFarmOP", Icon = "flame", Label = "Farm OP", Default = false },
+					{ Toggle = "AutoFarmOP", Icon = "zap", Label = "Farm Everything", Default = false },
 				{ Toggle = "AutoSea", Icon = "waves-horizontal", Label = "Sea" },
 					{ Toggle = "AutoSell", Icon = "banknote", Label = "Sell" },
 					{ Toggle = "AutoEquipBest", Icon = "star", Label = "Best" },
@@ -35028,18 +34993,11 @@ local BootOk, BootError = xpcall(function()
 						Description = "Pick everything you want running. Tap again to unpick.",
 						Multi = true,
 						Required = true,
-						Default = { "farmall" },
+						Default = { "farmop" },
 						Choices = {
 							{
-								Id = "farmall",
-								Title = "Auto Farm Everything",
-								Description = "Recommended. Switches on every safe farm toggle with your own filters. Nothing is sold or spent for you",
-								Icon = "zap",
-								Color = "#ffd166",
-							},
-							{
 								Id = "farmop",
-								Title = "Auto Farm Everything OP",
+								Title = "Auto Farm Everything",
 								Description = "Full automatic: the planner sells, spends and trains for max profit. Can sell your animals",
 								Icon = "flame",
 								Color = "#ff5d8f",
@@ -35091,7 +35049,7 @@ local BootOk, BootError = xpcall(function()
 					{
 						Id = "move",
 						Title = "How should Corvus move at sea?",
-						Description = "You can change this later in the Player tab.",
+						Description = "You can change this later in the Sea tab.",
 						Default = "Teleport",
 						SingleColumn = true,
 						ChoiceHeight = 54,
@@ -35119,7 +35077,7 @@ local BootOk, BootError = xpcall(function()
 							},
 						},
 						Visible = function(state)
-							return type(state.tasks) == "table" and state.tasks.sea == true and state.tasks.farmall ~= true and state.tasks.farmop ~= true
+							return type(state.tasks) == "table" and state.tasks.sea == true and state.tasks.farmop ~= true
 						end,
 					},
 					{
@@ -35153,7 +35111,7 @@ local BootOk, BootError = xpcall(function()
 							},
 						},
 						Visible = function(state)
-							return type(state.tasks) == "table" and state.tasks.sea == true and state.tasks.farmall ~= true and state.tasks.farmop ~= true
+							return type(state.tasks) == "table" and state.tasks.sea == true and state.tasks.farmop ~= true
 						end,
 					},
 				},
@@ -35164,15 +35122,7 @@ local BootOk, BootError = xpcall(function()
 							Toggles.AutoFarmOP:SetValue(true)
 						end)
 						markSetupDone()
-						notify("Quick setup done", "Confirm Auto Farm Everything OP on the card. Change anything in the tabs any time", 5)
-						return
-					end
-					if picked.farmall then
-						pcall(function()
-							Toggles.AutoFarmAll:SetValue(true)
-						end)
-						markSetupDone()
-						notify("Quick setup done", "Auto Farm Everything is on. Change anything in the tabs any time", 5)
+						notify("Quick setup done", "Confirm Auto Farm Everything on the card. Change anything in the tabs any time", 5)
 						return
 					end
 					local groups = {
@@ -35341,6 +35291,7 @@ local BootOk, BootError = xpcall(function()
 				"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
 				string.rep("-", 70),
 			}
+		Game.AllAuto = AllAutoToggles
 			return table.concat(lines, "\n")
 		end
 		Log.header = Debug.header
@@ -35826,15 +35777,6 @@ local BootOk, BootError = xpcall(function()
 			end)
 		end)
 	end
-	-- Farm All was on last time (any server, any config): turn it back on so an AFK account keeps farming
-	task.delay(3, function()
-		pcall(function()
-			if Library:GetSetting("OSFA_FarmAll") == true and Toggles.AutoFarmAll and not Toggles.AutoFarmAll.Value then
-				log("FARM ALL restored after a rejoin")
-				Toggles.AutoFarmAll:SetValue(true)
-			end
-		end)
-	end)
 	-- Auto Farm Everything OP was on last time: back on without asking again (it was confirmed once)
 	task.delay(3.5, function()
 		pcall(function()
@@ -35853,7 +35795,7 @@ local BootOk, BootError = xpcall(function()
 		pcall(function()
 			if not Library:GetSetting("OSFA_FarmSplitToast") then
 				Library:SetSetting("OSFA_FarmSplitToast", true)
-				notify("Auto Farm Everything", "Auto Farm Everything is now on Main. Normal = your toggles, OP = full automatic.", 9)
+				notify("Auto Farm Everything", "Auto Farm Everything is now one full automatic toggle on Main. Pick what it must never sell or spend in Exclude.", 9)
 			end
 		end)
 	end)
@@ -36133,6 +36075,34 @@ local BootOk, BootError = xpcall(function()
 			if shown(Tabs.Main) or shown(Tabs.Sea) then
 				group(function()
 					Labels.Status:SetText(Status)
+				end)
+				group(function()
+					if not on("AutoFarmOP") then
+						Labels.UpNext:SetText("Switch on Auto Farm Everything to see the plan")
+						return
+					end
+					local plan = Game.lastPlan
+					local lines = {}
+					if plan then
+						local target = plan.target
+						if target then
+							local wait = math.max(target.cost - cash(), 0) / math.max(plan.income, 1e-9)
+							table.insert(lines, if wait < 5 then "Buy " .. target.name .. " now" else "Buy " .. target.name .. " in ~" .. clockText(wait))
+						end
+						if plan.trainNow and plan.train then
+							table.insert(lines, "Train " .. math.max(math.ceil(plan.train.tp / 60), 1) .. " min for the next zone")
+						end
+					end
+					local eggIn = nextEggReady()
+					if eggIn then
+						table.insert(lines, if eggIn <= 0 then "Hatch the ready eggs" else "Hatch the next egg in " .. clockText(eggIn))
+					end
+					local sellAt = math.min(tonumber(Options.SellAt and Options.SellAt.Value) or 150, inventoryLimit())
+					local held = inventoryCount()
+					if held > 0 then
+						table.insert(lines, if held >= sellAt then "Sell " .. held .. " items now" else "Sell at " .. math.floor(sellAt) .. " items (" .. math.floor(held) .. " now)")
+					end
+					Labels.UpNext:SetText(if #lines > 0 then table.concat(lines, "\n") else "Collecting data...")
 				end)
 				group(function()
 					local window = openDuration(reach) + waveTime() + chargeValue()
