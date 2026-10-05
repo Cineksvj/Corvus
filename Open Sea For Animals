@@ -29282,6 +29282,96 @@ local BootOk, BootError = xpcall(function()
 		-- Training is a server state (TrainingService.StartTraining), the sea is only remotes. If the server keeps the
 		-- training on while Blatant opens waves, power grows all the time and the sea never pauses. Tried once per
 		-- server: kept only if power rises AND waves keep paying, otherwise stopped and the normal schedule runs.
+		-- Profit engine v2: live rates measured from every Blatant wave (the planner turns them into income per second)
+		--   b: log value growth per plate near the reach edge (best item of plate p vs plate p-1)
+		--   carry: value of the next item a wave offers / value of the items Carry already takes
+		--   e: luck elasticity, best catch ~ luck^e (same reach, two luck levels: potion, server luck, events, new staff)
+		--   waveGap / takenV: seconds between waves and value taken per wave (fallback when no sale was measured yet)
+		local Rates = { t0 = os.clock(), bN = 0, eN = 0, buckets = {}, waves = 0, trainShare = 0.3 }
+		Game.rates = Rates
+		function Rates.ewma(old, new, alpha)
+			if old == nil then
+				return new
+			end
+			return old + (new - old) * alpha
+		end
+		function Rates.observe(list, k, reach)
+			local now = os.clock()
+			if Rates.lastWave then
+				local gap = now - Rates.lastWave
+				if gap > 0 and gap < 30 then
+					Rates.waveGap = Rates.ewma(Rates.waveGap, gap, 0.05)
+				end
+			end
+			Rates.lastWave = now
+			Rates.waves += 1
+			local values, top, hi = {}, {}, 0
+			for _, item in ipairs(list) do
+				local v = tonumber(item.info.value) or 0
+				if v > 0 and not item.info.special then
+					table.insert(values, v)
+					local p = item.plate
+					if p and not item.boss then
+						if not top[p] or v > top[p] then
+							top[p] = v
+						end
+						hi = math.max(hi, p)
+					end
+				end
+			end
+			for p = hi, math.max(hi - 3, 2), -1 do
+				if top[p] and top[p - 1] then
+					Rates.b = Rates.ewma(Rates.b, math.log(top[p] / top[p - 1]), 0.01)
+					Rates.bN += 1
+				end
+			end
+			if #values == 0 then
+				return
+			end
+			table.sort(values, function(a, b)
+				return a > b
+			end)
+			k = math.max(k, 1)
+			local sum = 0
+			for i = 1, math.min(k, #values) do
+				sum += values[i]
+			end
+			Rates.takenV = Rates.ewma(Rates.takenV, sum, 0.05)
+			Rates.carry = Rates.ewma(Rates.carry, (values[k + 1] or 0) / sum, 0.02)
+			local luck = Rates.luckNow
+			if not luck or luck <= 0 then
+				return
+			end
+			if Rates.bucketReach ~= reach then
+				table.clear(Rates.buckets)
+				Rates.bucketReach = reach
+			end
+			local key = math.floor(math.log(luck, 2) * 2 + 0.5)
+			local bucket = Rates.buckets[key]
+			if not bucket then
+				bucket = { n = 0, luck = luck }
+				Rates.buckets[key] = bucket
+			end
+			bucket.n += 1
+			bucket.m = Rates.ewma(bucket.m, math.log(values[1]), if bucket.n < 20 then 1 / bucket.n else 0.05)
+			if Rates.waves % 50 == 0 then
+				local lo, up
+				for _, other in pairs(Rates.buckets) do
+					if other.n >= 20 then
+						if not lo or other.luck < lo.luck then
+							lo = other
+						end
+						if not up or other.luck > up.luck then
+							up = other
+						end
+					end
+				end
+				if lo and up and up.luck > lo.luck * 1.3 then
+					Rates.e = Rates.ewma(Rates.e, (up.m - lo.m) / math.log(up.luck / lo.luck), 0.2)
+					Rates.eN += 1
+				end
+			end
+		end
 		local TS = { state = nil, restarts = 0 }
 		Game.trainSea = TS
 		local function trainAlongside(I)
@@ -29372,7 +29462,7 @@ local BootOk, BootError = xpcall(function()
 				if info then
 					total += 1
 					if matches(info, "Catch", minValue) then
-						table.insert(list, { id = spawn.entity.id, info = info, boss = spawn.isBossItem })
+						table.insert(list, { id = spawn.entity.id, info = info, boss = spawn.isBossItem, plate = tonumber(spawn.wavePart) })
 					end
 				end
 			end
@@ -29402,6 +29492,7 @@ local BootOk, BootError = xpcall(function()
 				Sea.gainAt = os.clock()
 			end
 			Sea.preview = { matching = #list, total = total, at = os.clock() }
+			pcall(Game.rates.observe, list, maxPickup(), waveReach())
 			if anyIndex and capacity > 1 and #list > 1 then
 				-- six copies of one missing animal unlock the index entry once: the copies after the first count without it
 				local chosen, seen, pool = {}, {}, list
@@ -30918,6 +31009,29 @@ local BootOk, BootError = xpcall(function()
 			call("TrainingService", "EquipTrainTool", best)
 			return true
 		end
+		-- What a rebirth takes away is server side (not in the dump): the first rebirth is measured and saved
+		-- (cash, power, Carry/Base levels), the planner adds it to the rebirth cost from then on
+		local RebirthReset = nil
+		local function rebirthReset()
+			if RebirthReset == nil then
+				local ok, saved = pcall(Library.GetSetting, Library, "OSFA_RebirthReset")
+				RebirthReset = if ok and type(saved) == "table" then saved else {}
+			end
+			return RebirthReset
+		end
+		local function rebuyCost()
+			local total = 0
+			if type(Game.UpgradeConfig) ~= "table" or type(Game.UpgradeConfig.GetPrice) ~= "function" then
+				return 0
+			end
+			for _, id in ipairs({ "Carry", "PlotUpgrade" }) do
+				for level = 1, math.min(upgradeLevel(id), 300) do
+					local ok, price = pcall(Game.UpgradeConfig.GetPrice, id, level)
+					total += if ok then tonumber(price) or 0 else 0
+				end
+			end
+			return total
+		end
 		local RebirthNext = 0
 		function rebirthTick()
 			if os.clock() < RebirthNext or isWaveActive() or #carriedModels() > 0 then
@@ -30928,6 +31042,7 @@ local BootOk, BootError = xpcall(function()
 				return false
 			end
 			local before = rebirths()
+			local snap = { cash = cash(), power = power(), carry = upgradeLevel("Carry"), base = upgradeLevel("PlotUpgrade"), placed = (placedStats()) }
 			RebirthNext = os.clock() + 5
 			setStatus("Rebirthing")
 			call("RebirthService", "Rebirth")
@@ -30946,6 +31061,18 @@ local BootOk, BootError = xpcall(function()
 				)
 				emit("rebirth", rebirths())
 				notify("Rebirth", "Rebirth " .. rebirths() .. " done", 4)
+				task.delay(3, function()
+					local after = { cash = cash(), power = power(), carry = upgradeLevel("Carry"), base = upgradeLevel("PlotUpgrade"), placed = (placedStats()) }
+					local reset = {
+						cash = after.cash < (snap.cash - cost) * 0.5,
+						power = after.power < snap.power * 0.5,
+						upgrades = after.carry < snap.carry or after.base < snap.base,
+						animals = after.placed < snap.placed,
+					}
+					RebirthReset = reset
+					pcall(Library.SetSetting, Library, "OSFA_RebirthReset", reset)
+					log("REBIRTH reset cash", formatNumber(snap.cash), "->", formatNumber(after.cash), "power", formatNumber(snap.power), "->", formatNumber(after.power), "carry", snap.carry, "->", after.carry, "base", snap.base, "->", after.base, "animals", snap.placed, "->", after.placed)
+				end)
 				return true
 			end
 			RebirthNext = os.clock() + 30
@@ -31000,6 +31127,10 @@ local BootOk, BootError = xpcall(function()
 			if waitFor(isTraining, 4) then
 				setStatus("Training started")
 				log("TRAIN started at", brief(stand.Position), "power", power())
+				if Game.rates.askedAt then
+					Game.rates.switch = Game.rates.ewma(Game.rates.switch, os.clock() - Game.rates.askedAt, 0.3)
+					Game.rates.askedAt = nil
+				end
 				return true
 			end
 			TrainFailUntil = os.clock() + 10
@@ -31027,26 +31158,6 @@ local BootOk, BootError = xpcall(function()
 			end)
 		end)
 		local Schedule = { phase = "sea", since = os.clock() }
-		-- game events change what a minute is worth: x2 Train Power doubles power per second (train sooner), a luck
-		-- event or server luck makes every wave better (stay at sea longer before training)
-		local function eventLike(text)
-			local folder = ReplicatedStorage:FindFirstChild("ActiveEvents")
-			for _, child in ipairs(folder and folder:GetChildren() or {}) do
-				if string.find(child.Name, text, 1, true) then
-					return true
-				end
-			end
-			return false
-		end
-		local function seaBeforeTrain()
-			if eventLike("TRAIN") then
-				return 90, "x2 train event"
-			end
-			if eventLike("LUCK") or (tonumber(ReplicatedStorage:GetAttribute("ServerLuckMultiplier")) or 1) > 1 then
-				return 600, "luck event"
-			end
-			return 300, nil
-		end
 		function trainTurn()
 			if not on("AutoTrain") then
 				return false
@@ -31064,25 +31175,21 @@ local BootOk, BootError = xpcall(function()
 				return false
 			end
 			if on("AutoFarmAll") then
+				-- profit engine v2: train only while the next plate bought with sea time (gain/$ of Train) beats the best
+				-- money purchase and pays back inside the horizon (Game.plan, PLAN log)
 				local now = os.clock()
+				local plan = Game.plan()
+				local want = plan ~= nil and plan.trainNow == true
 				if Schedule.phase == "sea" then
-					local seaTime = now - Schedule.since
-					local dry = isBlatant() and seaTime >= 120 and now - math.max(Sea.gainAt or 0, Schedule.since) >= 90
-					local seaNeeded, why = seaBeforeTrain()
-					if why ~= Schedule.why then
-						Schedule.why = why
-						log("SCHEDULE sea time before training", seaNeeded .. "s", why or "normal")
-					end
-					if (seaTime >= seaNeeded or dry) and not isWaveActive() then
+					if want and not isWaveActive() then
 						Schedule.phase, Schedule.since, Schedule.reach = "train", now, waveReach()
-						log("SCHEDULE train until reach", Schedule.reach + 1, "power", power())
+						Game.rates.askedAt = now
+						local t = plan.train
+						log(string.format("SCHEDULE train to reach %d: %ds for +%.0f%% sea income, gain/$ %.3g > best buy %.3g", waveReach() + 1, math.floor(t.tp), (t.mult - 1) * 100, t.ratio, plan.target and plan.target.ratio or 0))
 					end
-				else
-					local trained = now - Schedule.since
-					if (waveReach() > (Schedule.reach or 0) and trained >= 45) or trained >= 480 then
-						Schedule.phase, Schedule.since = "sea", now
-						log("SCHEDULE sea, reach", waveReach(), "after", math.floor(trained) .. "s of training")
-					end
+				elseif not want then
+					log("SCHEDULE sea, reach", waveReach(), "after", math.floor(now - Schedule.since) .. "s of training")
+					Schedule.phase, Schedule.since = "sea", now
 				end
 				return Schedule.phase == "train"
 			end
@@ -31482,15 +31589,87 @@ local BootOk, BootError = xpcall(function()
 			local _, total = placedStats()
 			return total * (tonumber(modifier("CashMulti")) or 1)
 		end
-		-- Spending planner for Farm All. Every purchase gets a payback time = price / extra cash per second:
-		--   Carry: one more item every wave, so sell income / carry
-		--   Upgrade Base: one more slot (a pet about as good as the weakest) and +0.05 cash multiplier
-		--   Rebirth: plot income * (next multiplier / current - 1)
-		--   Staff: luck, income * (sqrt(new luck / luck) - 1) (rarer spawns, diminishing)
-		--   Dumbbell: faster power, income * 0.3 * (1 - gain now / new gain) (power only moves the reach)
-		-- The fastest payback is the target: it is bought as soon as affordable and its price is saved up; anything
-		-- else is only bought with cash above that saving, or when its payback is within 25% of the target.
+		-- Profit engine v2 (CLAUDE.md.txt 8.00): every money and time option on one scale, gain/$ = extra income per
+		-- second / cost. Time is priced at the sea income it gives up. Live rates (Game.rates) beat priors.
+		--   sea income S = measured sales per second (Sold, 15 min), base S0 = S / luck boost^e
+		--   Carry: S0 * (next item value / items taken)          Upgrade Base: base * 0.05 * index + slot (plot full)
+		--   Rebirth: base * (next - cur multiplier) * other multipliers * index, cost + what a rebirth was seen to reset
+		--   Staff: S0 * ((new luck / luck)^e - 1)                Dumbbell: S0 * (avg over the horizon of e^(b * plates))
+		--   Train (time): +1 plate = S0 * (e^b - 1) for (power to next plate / power per second + walk) s of sea income
+		-- Buy in order of gain/$; save for the best one, cheaper ones only when they pay back before it is saved up or
+		-- from cash above it; nothing whose payback is longer than the rest of the 24 h horizon (rebirth is progress).
 		local PlanCache = nil
+		local PlanLog = { key = nil, at = -1e9, ratesAt = -1e9 }
+		local function sumValues(t)
+			local s = 0
+			for _, v in pairs(type(t) == "table" and t or {}) do
+				s += tonumber(v) or 0
+			end
+			return s
+		end
+		local function eventMulti(field)
+			local best = 1
+			local cfgs = Game.EventConfig
+			local folder = ReplicatedStorage:FindFirstChild("ActiveEvents")
+			for _, child in ipairs(folder and folder:GetChildren() or {}) do
+				local cfg = type(cfgs) == "table" and (cfgs[child.Name] or (type(cfgs.EVENTS) == "table" and cfgs.EVENTS[child.Name]))
+				if type(cfg) == "table" and tonumber(cfg[field]) then
+					best = math.max(best, tonumber(cfg[field]))
+				end
+			end
+			return best
+		end
+		local function reachOf(p)
+			if type(Game.PowerWaveConfig) == "table" and type(Game.PowerWaveConfig.GetReach) == "function" then
+				local ok, r = pcall(Game.PowerWaveConfig.GetReach, p)
+				if ok and tonumber(r) then
+					return tonumber(r)
+				end
+			end
+			return nil
+		end
+		-- inverse of PowerWaveConfig.GetReach: reach = a.reach + floor(frac * (b.reach - a.reach))
+		local function powerFor(target)
+			local list = type(Game.PowerWaveConfig) == "table" and Game.PowerWaveConfig.ReachBrackets
+			if type(list) ~= "table" then
+				return nil
+			end
+			for i = 1, #list - 1 do
+				local a, b = list[i], list[i + 1]
+				if b.reach < a.reach then
+					break
+				end
+				if target <= a.reach then
+					return a.minPower
+				end
+				if target <= b.reach and b.reach > a.reach then
+					return a.minPower + (target - a.reach) / (b.reach - a.reach) * (b.minPower - a.minPower) + 1
+				end
+			end
+			return nil
+		end
+		-- TrainGain / TrainCooldown from the game modifiers (the client TrainGain modifier reads 0, so from config)
+		local function formulaPowerRate(data)
+			local owned = type(data.OwnedTrainTools) == "table" and data.OwnedTrainTools or {}
+			local tool = TrainTools[data.EquippedTrainTool]
+			local gain = if type(tool) == "table" then toolGain(tool, owned) else 1
+			local bosses = 0
+			for _ in pairs(type(data.CompletedBosses) == "table" and data.CompletedBosses or {}) do
+				bosses += 1
+			end
+			local potion = if activePotionTypes().Train then 2 else 1
+			return gain * potion * (1 + 0.1 * bosses) * eventMulti("trainMulti") / math.max(0.1, 0.8 / eventMulti("trainSpeedMulti"))
+		end
+		local function luckBoost()
+			local boost = math.max(tonumber(ReplicatedStorage:GetAttribute("ServerLuckMultiplier")) or 1, 1) * eventMulti("luckMultiplier")
+			if activePotionTypes().Luck then
+				boost *= 2
+			end
+			return boost
+		end
+		local function ratioText(r)
+			return string.format("%.3g", r)
+		end
 		function Game.plan()
 			if PlanCache and os.clock() - PlanCache.at < 5 then
 				return PlanCache
@@ -31499,75 +31678,188 @@ local BootOk, BootError = xpcall(function()
 			if not data then
 				return nil
 			end
+			local R = Game.rates
+			local now = os.clock()
+			local together = Game.trainSea ~= nil and Game.trainSea.state == "works"
+			-- live power per second (only while the server trains)
+			local p = power()
+			local training = together or isTraining()
+			if R.powerAt and training and R.power and p > R.power and now > R.powerAt then
+				R.powerRate = R.ewma(R.powerRate, (p - R.power) / (now - R.powerAt), 0.25)
+			end
+			R.power, R.powerAt = p, now
+			R.trainShare = R.ewma(R.trainShare, if training and not together then 1 else 0, 0.005)
+			local owned = type(data.OwnedPickaxes) == "table" and data.OwnedPickaxes or {}
+			local bestKey = bestOwnedStaff()
+			local bestCfg = bestKey and staffOf(bestKey)
+			local staffLuck = math.max(bestCfg and effectiveLuck(bestCfg, owned) or 1, 1)
+			local boost = luckBoost()
+			R.luckNow = staffLuck * boost
+			local b = if R.bN >= 30 and R.b then math.clamp(R.b, 0.01, 1.5) else 0.14
+			local e = if R.eN >= 3 and R.e then math.clamp(R.e, 0, 1.5) else 0.5
+			local rate = if R.powerRate and R.powerRate > 0 then R.powerRate else formulaPowerRate(data)
 			local multi = tonumber(modifier("CashMulti")) or 1
 			local placedAmount, base, worst = placedStats()
 			local plot = base * multi
-			local sellRate = (Metrics.current("Sold") or 0) / 3600
-			local income = plot + sellRate
-			local list = {}
-			local function add(key, cost, gain, name)
+			local seaShare = if together then 1 else math.max(1 - (R.trainShare or 0), 0.05)
+			local mNow = Metrics.now()
+			local window = math.min(900, mNow - (Metrics.sessionStart or mNow))
+			local catch = if window >= 60 then (Metrics.rate("Sold", mNow, window) or 0) / 3600 else 0
+			if catch <= 0 and R.takenV and R.waveGap and R.waveGap > 0 then
+				catch = R.takenV * 30 / R.waveGap * seaShare
+			end
+			local catchBase = catch / boost ^ e
+			local H = math.max(86400 - (now - R.t0) % 86400, 600)
+			local income = plot + catch
+			local list, byKey = {}, {}
+			local function add(key, cost, gain, name, progress)
 				if cost and cost > 0 and gain and gain > 0 then
-					table.insert(list, { key = key, cost = cost, gain = gain, payback = cost / gain, name = name or key })
+					local item = { key = key, cost = cost, gain = gain, ratio = gain / cost, payback = cost / gain, name = name or key }
+					if progress or item.payback <= H then
+						table.insert(list, item)
+						byKey[key] = item
+					end
 				end
 			end
-			add("Carry", nextUpgradePrice("Carry"), sellRate / math.max(maxPickup(), 1), "Carry")
-			-- a new slot only pays when the plot is full (a free slot already waits for an animal)
+			local k = math.max(maxPickup(), 1)
+			add("Carry", nextUpgradePrice("Carry"), catchBase * (R.carry or 1 / k), "Carry")
+			local q = 1 + 0.1 * sumValues(modifier("CompletedEggs"))
 			local slotGain = if placedAmount >= maxAnimals() then worst * multi else 0
-			add("PlotUpgrade", nextUpgradePrice("PlotUpgrade"), slotGain + plot * 0.05 / math.max(multi, 1), "Upgrade Base")
-			local nextR, curR = Rebirths[rebirths() + 1], Rebirths[rebirths()]
-			if type(nextR) == "table" then
-				local curM = type(curR) == "table" and tonumber(curR.CashMulti) or 1
-				add("Rebirth", nextRebirthCost(), plot * ((tonumber(nextR.CashMulti) or 1) / curM - 1), "Rebirth")
+			add("PlotUpgrade", nextUpgradePrice("PlotUpgrade"), slotGain + base * 0.05 * q, "Upgrade Base")
+			if not isBlatant() and (Options.SeaMove and Options.SeaMove.Value) ~= "Teleport" then
+				add("MovementSpeed", nextUpgradePrice("MovementSpeed"), catchBase * 0.5 / (16 + upgradeLevel("MovementSpeed")), "Speed")
 			end
-			local owned = type(data.OwnedPickaxes) == "table" and data.OwnedPickaxes or {}
-			-- compare staff to staff: the luck modifier also holds potions and server luck, which every staff gets
-			local bestKey = bestOwnedStaff()
-			local bestCfg = bestKey and staffOf(bestKey)
-			local luck = math.max(bestCfg and effectiveLuck(bestCfg, owned) or tonumber(currentLuck()) or 1, 1)
+			local nextR, curR = Rebirths[rebirths() + 1], Rebirths[rebirths()]
+			local rebirthCost = nextRebirthCost()
+			if type(nextR) == "table" and rebirthCost then
+				local curM = type(curR) == "table" and tonumber(curR.CashMulti) or 1
+				local other = math.max((multi / q - 0.05 * upgradeLevel("PlotUpgrade")) / curM, 1)
+				local gain = base * ((tonumber(nextR.CashMulti) or curM) - curM) * other * q
+				local reset = rebirthReset()
+				local c = rebirthCost
+				if reset.cash then
+					c = math.max(c, cash())
+				end
+				if reset.upgrades then
+					c += rebuyCost()
+				end
+				if reset.power then
+					c += catch * math.min(p / math.max(rate, 1e-9), H)
+				end
+				add("Rebirth", c, gain, "Rebirth", true)
+			end
 			for key, cfg in pairs(Staffs) do
 				local cost = type(cfg) == "table" and tonumber(cfg.cost)
-				if cost and not owned[key] and not cfg.passRequired and not cfg.hideIfNotOwned and not cfg.isSpecial and (tonumber(cfg.luck) or 0) > luck then
-					add("Staff:" .. key, cost, income * (math.sqrt(cfg.luck / luck) - 1), tostring(cfg.name or key))
+				if cost and not owned[key] and not cfg.passRequired and not cfg.hideIfNotOwned and not cfg.isSpecial and (tonumber(cfg.luck) or 0) > staffLuck then
+					add("Staff:" .. key, cost, catchBase * ((cfg.luck / staffLuck) ^ e - 1), tostring(cfg.name or key))
 				end
+			end
+			local reach = waveReach()
+			local share = if together then 1 else R.trainShare or 0.3
+			local function path(r)
+				local sum = 0
+				for i = 1, 8 do
+					local later = reachOf(p + r * share * H * (i - 0.5) / 8) or reach
+					sum += math.exp(math.min(b * math.max(later - reach, 0), 30)) - 1
+				end
+				return sum / 8
 			end
 			local tools = type(data.OwnedTrainTools) == "table" and data.OwnedTrainTools or {}
 			local current = TrainTools[data.EquippedTrainTool]
-			local gainNow = math.max(type(current) == "table" and tonumber(current.gainPerTrain) or 1, 1)
+			local gainNow = math.max(if type(current) == "table" then toolGain(current, tools) else 1, 1)
+			local pathNow = nil
 			for id, cfg in pairs(TrainTools) do
 				local cost = type(cfg) == "table" and tonumber(cfg.cost)
 				if cost and not tools[id] and not cfg.isSpecial and not cfg.hideIfNotOwned and not cfg.passRequired and (tonumber(cfg.rebirthRequired) or 0) <= rebirths() and (tonumber(cfg.gainPerTrain) or 0) > gainNow then
-					add("Dumbbell:" .. id, cost, income * 0.3 * (1 - gainNow / cfg.gainPerTrain), tostring(cfg.name or id))
+					pathNow = pathNow or path(rate)
+					add("Dumbbell:" .. id, cost, catchBase * (path(rate * cfg.gainPerTrain / gainNow) - pathNow), tostring(cfg.name or id))
 				end
 			end
-			table.sort(list, function(a, b)
-				return a.payback < b.payback
+			table.sort(list, function(x, y)
+				return x.ratio > y.ratio
 			end)
-			local plan = { at = os.clock(), list = list, target = list[1], ok = {} }
-			for _, item in ipairs(list) do
-				if item.payback <= list[1].payback * 1.25 then
-					plan.ok[item.key] = true
+			-- time option: sea time spent on the next plate
+			local train = nil
+			local need = powerFor(reach + 1)
+			if not together and need and rate > 0 and catch > 0 then
+				local walk = if Schedule.phase == "train" then 0 else R.switch or 5
+				local tp = math.max(need - p, 0) / rate + walk
+				local mult = math.exp(b)
+				local cost = tp * catch / seaShare
+				local gain = catchBase * (mult - 1)
+				if cost > 0 and gain > 0 then
+					train = { key = "Train", name = "Train to reach " .. (reach + 1), cost = cost, gain = gain, ratio = gain / cost, payback = cost / gain, tp = tp, mult = mult }
 				end
 			end
-			if plan.target and (not PlanCache or not PlanCache.target or PlanCache.target.key ~= plan.target.key) then
-				log("PLAN target", plan.target.name, "$" .. formatNumber(plan.target.cost), string.format("payback %ds", math.floor(plan.target.payback)), "income $" .. formatNumber(income) .. "/s")
+			local target = list[1]
+			local plan = { at = now, list = list, byKey = byKey, target = target, train = train, income = income, H = H }
+			plan.trainNow = train ~= nil and train.payback + train.tp <= H and train.ratio > math.max(target and target.ratio or 0, 1 / H)
+			local all = table.clone(list)
+			if train then
+				table.insert(all, train)
+				table.sort(all, function(x, y)
+					return x.ratio > y.ratio
+				end)
+			end
+			local best = all[1]
+			plan.best = best
+			if best and (PlanLog.key ~= best.key or now - PlanLog.at >= 60) then
+				PlanLog.key, PlanLog.at = best.key, now
+				local alt = {}
+				for i = 2, 3 do
+					if all[i] then
+						table.insert(alt, all[i].name .. " " .. ratioText(all[i].ratio))
+					end
+				end
+				local eta = if best.key == "Train" then best.tp else math.max(best.cost - cash(), 0) / math.max(income, 1e-9)
+				log(string.format("PLAN best=%s gain/$=%s eta=%ds alt=%s", best.name, ratioText(best.ratio), math.floor(math.min(eta, 1e9)), if #alt > 0 then table.concat(alt, ", ") else "none"))
+			end
+			if now - PlanLog.ratesAt >= 60 then
+				PlanLog.ratesAt = now
+				log(string.format(
+					"RATES sea $%s/s plot $%s/s power %s/s (%s) reach %d plate x%.3f (%s) luck^%.2f (%s) boost x%.1f carry %.3f trainShare %.2f H %.1fh",
+					formatNumber(catch), formatNumber(plot), formatNumber(rate), if R.powerRate then "measured" else "formula", reach,
+					math.exp(b), if R.bN >= 30 then "measured" else "prior", e, if R.eN >= 3 then "measured" else "prior", boost,
+					R.carry or 1 / k, R.trainShare or 0, H / 3600
+				))
 			end
 			PlanCache = plan
 			Game.lastPlan = plan
 			return plan
 		end
+		local function saveEta(plan)
+			local target = plan.target
+			return math.max(target.cost - cash(), 0) / math.max(plan.income, 1e-9)
+		end
 		function Game.spendOk(key, cost)
 			local plan = Game.plan()
-			if not plan or not plan.target or plan.ok[key] then
+			if not plan then
 				return true
 			end
-			return cash() - cost >= plan.target.cost
+			local item = plan.byKey[key]
+			if not item then
+				return false
+			end
+			local target = plan.target
+			if not target or target.key == key or cash() - cost >= target.cost then
+				return true
+			end
+			return item.payback <= saveEta(plan)
 		end
 		function Game.budget(key)
 			local plan = Game.plan()
-			if not plan or not plan.target or plan.ok[key] then
+			if not plan then
 				return cash()
 			end
-			return math.max(cash() - plan.target.cost, 0)
+			local item = plan.byKey[key]
+			if not item then
+				return 0
+			end
+			local target = plan.target
+			if not target or target.key == key or item.payback <= saveEta(plan) then
+				return cash()
+			end
+			return math.max(cash() - target.cost, 0)
 		end
 		function currentLuck()
 			local ok, luck = pcall(function()
