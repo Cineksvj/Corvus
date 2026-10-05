@@ -27140,6 +27140,70 @@ pcall(function()
 Library:Notify({ Title = Title, Description = Text, Time = Time or 3 })
 end)
 end
+local Log = { lines = {}, start = os.clock(), flushedAt = os.clock() - 25, once = {}, file = "Corvus_SFTR_" .. LocalPlayer.Name .. "_log.txt" }
+local function log(...)
+local parts = table.pack(...)
+for i = 1, parts.n do
+parts[i] = tostring(parts[i])
+end
+local stamp = ""
+pcall(function()
+stamp = os.date("%H:%M:%S")
+end)
+local line = string.format("[%s +%7.1fs] %s", stamp, os.clock() - Log.start, table.concat(parts, " ", 1, parts.n))
+if #line > 420 then
+line = string.sub(line, 1, 420) .. "..."
+end
+local lines = Log.lines
+lines[#lines + 1] = line
+local count = #lines
+if count > 1800 then
+table.move(lines, 301, count, 1)
+for i = count, count - 299, -1 do
+lines[i] = nil
+end
+end
+end
+local function logEvery(key, seconds, ...)
+local now = os.clock()
+if (Log.once[key] or -1e9) + seconds <= now then
+Log.once[key] = now
+log(...)
+end
+end
+function Log.flush(force)
+if type(writefile) ~= "function" then
+return
+end
+if not force and os.clock() - Log.flushedAt < 30 then
+return
+end
+Log.flushedAt = os.clock()
+local head = ""
+if Log.header then
+local ok, text = pcall(Log.header)
+if ok and type(text) == "string" then
+head = text .. "\n"
+end
+end
+pcall(writefile, Log.file, head .. table.concat(Log.lines, "\n"))
+end
+local Plan = { target = nil, surplus = 0, surplusAt = -1e9 }
+local Sched = {
+f = 0.5,
+period = 420,
+cycleStart = os.clock(),
+failUntil = 0,
+mountFails = 0,
+updatedAt = -1e9,
+trainTime = 0,
+trainSpeed = 0,
+trainMoney = 0,
+otherTime = 0,
+otherMoney = 0,
+info = "not computed yet",
+training = nil,
+}
 local Shared = ReplicatedStorage:WaitForChild("Shared", 20)
 local NetFolder = Shared and Shared:WaitForChild("Packages", 10)
 NetFolder = NetFolder and NetFolder:WaitForChild("Network", 10)
@@ -27210,6 +27274,12 @@ end
 local AreaData = safeRequire("Shared.Data.AreaData")
 local TrailData = safeRequire("Shared.Data.TrailData")
 local Balance = safeRequire("LBTHClient.Services.ClientBalanceService")
+local SpeedData = safeRequire("Shared.Data.SpeedData")
+local SlotPrices = nil
+do
+local slotData = safeRequire("Shared.Data.SlotUpgradesData")
+SlotPrices = type(slotData) == "table" and type(slotData.Prices) == "table" and slotData.Prices or nil
+end
 local Areas = {}
 do
 local list = AreaData and AreaData.Areas
@@ -27886,6 +27956,7 @@ if Nav.building then
 return
 end
 Nav.building = true
+local builtFrom = os.clock()
 Nav.streamedAt = -1e9
 Nav.streamArena(nil)
 local newFlags, newGround = buffer.create(COUNT), buffer.create(COUNT)
@@ -27981,8 +28052,10 @@ end
 flags, groundQ = newFlags, newGround
 stamp, gScore, cameFrom = buffer.create(COUNT * 4), buffer.create(COUNT * 4), buffer.create(COUNT * 4)
 Nav.ready = true
-computeField()
+local fieldOk = computeField()
 Nav.building = false
+Nav.walls = walls
+log("NAV mapped", string.format("%.1fs", os.clock() - builtFrom), "grid", NX .. "x" .. NZ, "walls", walls, "home field", tostring(fieldOk))
 end
 
 local function nearestWalkable(i, j, radius, strict)
@@ -28623,6 +28696,9 @@ waited += task.wait(0.2) or 0.2
 end
 end
 local ok = walkTo(target, options)
+if not ok and alive() then
+logEvery("travel", 15, "TRAVEL failed to", string.format("%.0f, %.0f", target.X, target.Z), "status", Status)
+end
 if options.toTreadmill and ok then
 local hum = humanoid()
 if hum and not onTreadmill() then
@@ -28969,10 +29045,16 @@ area = AreaData.LEGACY_IDS[area]
 end
 return area, rarity or nameRarity
 end
+local PromptCache = setmetatable({}, { __mode = "k" })
 local function stealPrompt(crate)
+local cached = PromptCache[crate]
+if cached and cached.Parent and cached:IsDescendantOf(crate) then
+return if cached.Enabled then cached else nil
+end
 for _, d in ipairs(crate:GetDescendants()) do
-if d:IsA("ProximityPrompt") and d.Enabled and (d.ActionText == "Steal" or d.ActionText == "") then
-return d
+if d:IsA("ProximityPrompt") and (d.ActionText == "Steal" or d.ActionText == "") then
+PromptCache[crate] = d
+return if d.Enabled then d else nil
 end
 end
 return nil
@@ -29011,7 +29093,12 @@ end
 local best, bestScore
 local priority = Options.StealPriority and Options.StealPriority.Value or "Best Rarity"
 for _, crate in ipairs(folder:GetChildren()) do
-if crate:GetAttribute("IsCrate") ~= false and crate:IsA("Model") and (FailedCrates[crate.Name] or 0) < os.clock() then
+local failedUntil = FailedCrates[crate.Name]
+if failedUntil and failedUntil < os.clock() then
+FailedCrates[crate.Name] = nil
+failedUntil = nil
+end
+if failedUntil == nil and crate:GetAttribute("IsCrate") ~= false and crate:IsA("Model") then
 local area, rarity = crateInfo(crate)
 if area and rarity and zoneAllowed(area) and selected(Options.StealCrateRarities, rarity) then
 local prompt = stealPrompt(crate)
@@ -29032,6 +29119,14 @@ end
 end
 end
 return best
+end
+local SoonPick = { at = -1e9, value = nil }
+local function pickCrateSoon()
+if os.clock() - SoonPick.at > 0.6 then
+SoonPick.at = os.clock()
+SoonPick.value = pickCrate()
+end
+return SoonPick.value
 end
 local function bankedCrates()
 return #toolsWith("CrateUid")
@@ -29102,6 +29197,14 @@ if LastStealRarity then
 Session.rarities[LastStealRarity] = (Session.rarities[LastStealRarity] or 0) + 1
 end
 Track.stolen(LastStealRarity, LastStealArea, StealStartedAt and os.clock() - StealStartedAt)
+log(
+"STEAL ok",
+LastStealRarity,
+LastStealArea,
+StealStartedAt and string.format("trip %.0fs", os.clock() - StealStartedAt) or "",
+"total",
+Session.stolen
+)
 emit("stolen", LastStealRarity, LastStealArea)
 end
 local function returnToSafety()
@@ -29130,6 +29233,7 @@ ZoneBackoff[LastStealArea] = os.clock() + 120
 end
 ReturnFails = 0
 setStatus("Dropped the crate, it could not be brought home")
+log("STEAL dropped crate, could not reach the safe zone", LastStealRarity, LastStealArea)
 end
 elseif bankedCrates() > before or LocalPlayer:GetAttribute("InSafeZone") == true then
 ReturnFails = 0
@@ -29141,6 +29245,7 @@ if LastStealArea then
 ZoneBackoff[LastStealArea] = os.clock() + 90
 end
 setStatus("The guard took the crate back")
+log("STEAL guard took the crate back", LastStealRarity, LastStealArea)
 end
 end
 local function stealOnce()
@@ -29191,6 +29296,7 @@ if not travel(spot, { keepGoing = stillWanted, arrive = 2 }) and stillWanted() t
 local root = rootPart()
 if not (root and (root.Position - position).Magnitude <= reach) then
 FailedCrates[target.crate.Name] = os.clock() + 20
+log("STEAL could not reach", target.rarity, target.area, "status", Status)
 return true
 end
 end
@@ -29222,6 +29328,7 @@ Refusals += 1
 if Refusals >= 3 then
 Refusals = 0
 setStatus("The server lost track of you, running to the safe zone to resync")
+log("STEAL server refused 3 times, resync at the safe zone")
 travel(safeSpot(), { arrive = 4 })
 FailedCrates[target.crate.Name] = os.clock() + 20
 return true
@@ -29236,6 +29343,7 @@ end
 returnToSafety()
 else
 FailedCrates[target.crate.Name] = os.clock() + 20
+log("STEAL failed", target.rarity, target.area, PromptIssue or "the server refused it")
 setStatus("Could not steal: " .. (PromptIssue or "the server refused it") .. ". Trying another crate")
 end
 return true
@@ -29317,6 +29425,7 @@ local spot = findSpot(floor)
 if not spot then
 PlotFullUntil = os.clock() + 20
 setStatus("Plot is full")
+log("PLACE plot is full")
 break
 end
 pcall(hum.EquipTool, hum, tool)
@@ -29337,6 +29446,7 @@ break
 end
 end
 pcall(hum.UnequipTools, hum)
+log("PLACE tried", #crates, "crate(s), placed in total", Session.placed)
 return true
 end
 local OpenedUid = {}
@@ -29456,11 +29566,13 @@ return LastSellResult ~= nil
 end, 4)
 local result = LastSellResult
 if type(result) == "table" and result.Ok then
+log("SELL", kind, "ok $" .. formatNumber(tonumber(result.Total) or 0))
 Session.earned += tonumber(result.Total) or 0
 Track.sold(tonumber(result.Total) or 0)
 emit("sold", tonumber(result.Total) or 0, result.Text)
 return true, result
 end
+log("SELL", kind, "failed", type(result) == "table" and tostring(result.Text) or "no answer")
 return false, result
 end
 local LastSell = 0
@@ -29494,6 +29606,15 @@ table.insert(crateList, tool)
 end
 end
 local crates = #crateList
+do
+local top = 0
+for _, tool in ipairs(toolsWith("ItemUid")) do
+top = math.max(top, tonumber(tool:GetAttribute("ItemIncome")) or 0)
+end
+if top > 0 then
+Plan.surplus, Plan.surplusAt = top, os.clock()
+end
+end
 local quote = sellQuote()
 local allCount = quote and tonumber(quote.AllCount)
 if mode == "All" then
@@ -29695,15 +29816,17 @@ fire("TRAIL_STATE")
 return
 end
 local cash = money()
-for _, trail in ipairs(Trails) do
-if not TrailState.Owned[trail.Id] then
-if (trail.Cost or math.huge) <= cash then
-fire("TRAIL_BUY", trail.Id)
+local pick
+for _, candidate in ipairs(Plan.candidates()) do
+if candidate.kind == "trail" then
+pick = candidate
+end
+end
+if pick and pick.cost <= cash and Plan.allow("trail", pick.cost) then
+log("BUY trail", pick.name, "for $" .. formatNumber(pick.cost))
+fire("TRAIL_BUY", pick.id)
 task.wait(0.5)
 fire("TRAIL_STATE")
-end
-break
-end
 end
 end
 local stormActive, collectOrbs, Storm, thunderSpot, thunderReady, chargeCrate
@@ -29951,6 +30074,7 @@ setStatus("Thunder Machine: not enough storm points yet")
 return true
 end
 setStatus("Charging " .. tostring(best.Tier) .. " crate with " .. formatNumber(spend) .. " storm points")
+log("THUNDER charge", best.Tier, "with", spend, "points")
 local result = invokeWithTimeout(Remotes.rf_THUNDER_MACHINE, 10, "mutate", best.Uid, spend)
 if type(result) == "table" and result.ok then
 Session.charged = (Session.charged or 0) + 1
@@ -30047,7 +30171,7 @@ end
 local cash = money()
 local job
 for _, candidate in ipairs(fuseCandidates()) do
-if candidate.fee <= cash then
+if candidate.fee <= cash and (not Plan.smart() or candidate.fee * 4 <= cash) then
 job = candidate
 break
 end
@@ -30064,6 +30188,7 @@ for _, tool in ipairs(job.tools) do
 table.insert(uids, tool:GetAttribute("ItemUid"))
 end
 local before = #toolsWith("ItemUid")
+log("FUSE", job.name, "fee $" .. formatNumber(job.fee))
 fire("FUSE_ITEMS", uids)
 if waitFor(function()
 return #toolsWith("ItemUid") < before
@@ -30080,6 +30205,272 @@ FuseNext = os.clock() + 30
 setStatus("The Fuse Machine did not take " .. job.name)
 end
 return true
+end
+end
+do
+function Plan.on(name)
+local toggle = Toggles[name]
+return toggle ~= nil and toggle.Value == true
+end
+function Plan.smart()
+return Plan.on("SmartSpend")
+end
+function Plan.mult()
+local best = 1
+for _, trail in ipairs(Trails) do
+if TrailState.Owned[trail.Id] and (trail.Multiplier or 0) > best then
+best = trail.Multiplier
+end
+end
+return best
+end
+function Plan.treadmill()
+local tiers = SpeedData and SpeedData.TreadmillTiers
+if type(tiers) ~= "table" or #tiers == 0 then
+return nil, nil
+end
+local level = math.clamp(math.floor(tonumber(LocalPlayer:GetAttribute("TreadmillLevel")) or 1), 1, #tiers)
+return tiers[level], tiers[level + 1]
+end
+function Plan.speedRate()
+local current = Plan.treadmill()
+return (current and tonumber(current.GainPerSecond) or 5) * Plan.mult()
+end
+function Plan.candidates()
+local list = {}
+local current, nextTier = Plan.treadmill()
+if current and nextTier and tonumber(nextTier.Cost) then
+table.insert(list, {
+kind = "treadmill",
+name = nextTier.Name or "next treadmill",
+cost = nextTier.Cost,
+rel = (tonumber(nextTier.GainPerSecond) or 0) / math.max(tonumber(current.GainPerSecond) or 1, 1) - 1,
+})
+end
+if TrailState.known then
+local mult = Plan.mult()
+for _, trail in ipairs(Trails) do
+if not TrailState.Owned[trail.Id] and (trail.Multiplier or 0) > mult then
+table.insert(list, {
+kind = "trail",
+name = trail.Name or trail.Id,
+id = trail.Id,
+cost = trail.Cost or math.huge,
+rel = trail.Multiplier / mult - 1,
+})
+break
+end
+end
+end
+return list
+end
+function Plan.refresh()
+local best, bestScore
+for _, candidate in ipairs(Plan.candidates()) do
+local score = candidate.rel / math.max(candidate.cost, 1)
+if not bestScore or score > bestScore then
+best, bestScore = candidate, score
+end
+end
+local old = Plan.target
+Plan.target = best
+if best and (not old or old.kind ~= best.kind or old.name ~= best.name) then
+log("PLAN speed target", best.kind, best.name, "cost $" .. formatNumber(best.cost), "speed gain +" .. math.floor(best.rel * 100) .. "%")
+end
+end
+function Plan.allow(kind, cost)
+if not Plan.smart() then
+return true
+end
+local target = Plan.target
+if not target or target.kind == kind then
+return true
+end
+if money() >= target.cost + cost or cost * 8 <= target.cost then
+return true
+end
+return false
+end
+function Plan.treadmillOk()
+local _, nextTier = Plan.treadmill()
+if not nextTier then
+return SpeedData == nil
+end
+return Plan.allow("treadmill", tonumber(nextTier.Cost) or 0)
+end
+function Plan.bestSurplus()
+local top = 0
+for _, tool in ipairs(toolsWith("ItemUid")) do
+top = math.max(top, tonumber(tool:GetAttribute("ItemIncome")) or 0)
+end
+if top <= 0 and os.clock() - Plan.surplusAt < 1200 then
+top = Plan.surplus or 0
+end
+return top
+end
+function Plan.slotOk()
+if type(SlotPrices) ~= "table" then
+return true
+end
+local price = SlotPrices[(tonumber(LocalPlayer:GetAttribute("AddedSlots")) or 0) + 1]
+if not price then
+return false
+end
+local cash = money()
+if cash < price then
+return false
+end
+if not Plan.smart() then
+return true
+end
+local income = Plan.bestSurplus()
+if income <= 0 then
+return price * 10 <= cash
+end
+if price / income <= 10800 then
+return true
+end
+local target = Plan.target
+return cash >= price + (target and target.cost or 0)
+end
+Plan.farmNames = {
+"AutoSteal",
+"AutoSell",
+"AutoPlace",
+"AutoOpen",
+"AutoEquipBest",
+"AutoBuySlot",
+"AutoUpgradePlot",
+"AutoUpgradeTreadmill",
+"AutoTreadmill",
+"AutoIndex",
+"AutoTrails",
+"AutoOrbs",
+"AutoThunder",
+"SmartZones",
+"SmartSpend",
+"SmartSchedule",
+}
+Plan.farmSet = {}
+function Plan.farmAll(value)
+if value then
+for _, name in ipairs(Plan.farmNames) do
+local toggle = Toggles[name]
+if toggle and not toggle.Value then
+Plan.farmSet[name] = true
+toggle:SetValue(true)
+end
+end
+pcall(function()
+local zones, rarities = {}, {}
+for _, label in ipairs(ZoneLabels) do
+zones[label] = true
+end
+for _, name in ipairs(CrateRarities.list) do
+rarities[name] = true
+end
+Options.StealZones:SetValue(zones)
+Options.StealCrateRarities:SetValue(rarities)
+Options.StealPriority:SetValue("Best Rarity")
+Options.SellMode:SetValue("All")
+end)
+local turned = {}
+for name in pairs(Plan.farmSet) do
+table.insert(turned, name)
+end
+table.sort(turned)
+log("FARM ALL on, switched on:", if #turned > 0 then table.concat(turned, ",") else "nothing new, all were on already")
+else
+for name in pairs(Plan.farmSet) do
+local toggle = Toggles[name]
+if toggle and toggle.Value then
+toggle:SetValue(false)
+end
+end
+Plan.farmSet = {}
+log("FARM ALL off")
+end
+end
+function Sched.sample(moneyGain, speedGain, step)
+if step <= 0 or step > 5 then
+return
+end
+if onTreadmill() then
+Sched.trainTime = Sched.trainTime * 0.9995 + step
+Sched.trainSpeed = Sched.trainSpeed * 0.9995 + speedGain
+Sched.trainMoney = Sched.trainMoney * 0.9995 + moneyGain
+else
+Sched.otherTime = Sched.otherTime * 0.9995 + step
+Sched.otherMoney = Sched.otherMoney * 0.9995 + moneyGain
+end
+end
+function Sched.update()
+local now = os.clock()
+if now - Sched.updatedAt < 5 then
+return
+end
+Sched.updatedAt = now
+Plan.refresh()
+local level = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
+local nextZone
+for _, area in ipairs(Areas) do
+if (area.RecommendedSpeed or 0) > level then
+nextZone = area
+break
+end
+end
+local rate = if Sched.trainTime >= 20 and Sched.trainSpeed > 0 then Sched.trainSpeed / Sched.trainTime else Plan.speedRate()
+rate = math.max(rate, 0.01)
+local need = if nextZone then (nextZone.RecommendedSpeed - level) else 0
+local moneySteal = if Sched.otherTime >= 30 then Sched.otherMoney / Sched.otherTime else nil
+local moneyTrain = if Sched.trainTime >= 30 then Sched.trainMoney / Sched.trainTime else 0
+local deficit = 0
+local target = Plan.target
+if target then
+deficit = math.max(target.cost - money(), 0)
+end
+local f, why
+if need <= 0 then
+f, why = 0.15, "no higher zone to unlock"
+elseif target and deficit <= 0 then
+f, why = 0.85, "next speed upgrade is already affordable"
+elseif not moneySteal or moneySteal <= 0 then
+f, why = 0.5, "no money rate measured yet"
+else
+local denominator = deficit * rate + need * (moneySteal - math.min(moneyTrain, moneySteal))
+f = need * moneySteal / math.max(denominator, 1e-9)
+why = "both goals finish together"
+end
+Sched.f = math.clamp(f, 0.15, 0.85)
+Sched.info = string.format(
+"train share %.0f%% (%s), speed %s/s, next zone %s needs %s more, money while stealing $%s/s, upgrade deficit $%s",
+Sched.f * 100,
+why,
+formatNumber(rate),
+nextZone and nextZone.Id or "none",
+formatNumber(need),
+formatNumber(moneySteal or 0),
+formatNumber(deficit)
+)
+logEvery("sched", 120, "SCHED", Sched.info)
+end
+function Sched.trainNow()
+if not (Plan.on("SmartSchedule") and Plan.on("AutoTreadmill") and Plan.on("AutoSteal")) then
+return false
+end
+local train
+if adminTreadmill() then
+train = true
+elseif os.clock() < Sched.failUntil then
+train = false
+else
+train = (os.clock() - Sched.cycleStart) % Sched.period < Sched.f * Sched.period
+end
+if train ~= Sched.training then
+Sched.training = train
+log("SCHED switch to", if train then "TRAINING on the treadmill" else "STEALING", string.format("(train share %.0f%%)", Sched.f * 100))
+end
+return train
 end
 end
 local nextStormIn, claimOffline, equipBestBat, FreeGiftNext, freeGiftClaimed, claimFreeGift, setIdleRejoinBlocked, setAntiKnockback
@@ -30123,6 +30514,7 @@ local BatOrder = {
 "GoldTycoon",
 "Astronaut",
 "DemonKing",
+"Angel",
 }
 local IndexBats = { Owned = nil, Equipped = nil }
 onNet("INDEX_STATE", function(state)
@@ -30287,6 +30679,15 @@ end)
 end
 local StatusBox, StatusLabel, StormLabel
 do
+local FarmBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "rocket")
+FarmBox:AddToggle("FarmAll", {
+Text = "Auto Farm Everything",
+Default = false,
+Tooltip = "One switch for the whole farm: steal in every zone you can escape, place, open, sell, upgrades, trails, orbs and treadmill. It splits your time between stealing and training by calculation.",
+Callback = function(value)
+task.spawn(Plan.farmAll, value)
+end,
+})
 local StealBox = Tabs.Main:AddLeftGroupbox("Steal", "hand")
 StealBox:AddToggle("AutoSteal", {
 Text = "Auto Steal",
@@ -30399,6 +30800,11 @@ PlotBox:AddToggle("AutoOpen", { Text = "Auto Open", Default = false, Tooltip = "
 PlotBox:AddToggle("AutoEquipBest", { Text = "Auto Equip Best", Default = false, Tooltip = "Keeps your best items on the plot" })
 PlotBox:AddToggle("AutoBuySlot", { Text = "Auto Buy +1 Equip", Default = false, Tooltip = "Buys extra item slots with cash" })
 PlotBox:AddToggle("AutoUpgradePlot", { Text = "Auto Upgrade Plot", Default = false })
+PlotBox:AddToggle("SmartSpend", {
+Text = "Smart Spending",
+Default = true,
+Tooltip = "Buys the upgrade with the best payback first: slots by the income of your spare items, trails and treadmill tiers by speed gain per dollar. Cheap buys never starve the better one.",
+})
 PlotBox:AddButton({
 Text = "Go To Plot",
 Func = function()
@@ -30415,6 +30821,11 @@ Default = false,
 Tooltip = "Trains on your treadmill whenever nothing else needs doing",
 })
 TreadBox:AddToggle("AutoUpgradeTreadmill", { Text = "Auto Upgrade Treadmill", Default = false })
+TreadBox:AddToggle("SmartSchedule", {
+Text = "Balance Steal and Train",
+Default = true,
+Tooltip = "With Auto Steal and Auto Treadmill on, switches between stealing and training so the next zone unlock and the next speed upgrade arrive at the same time. An active Admin Treadmill event always gets the training time.",
+})
 TreadBox:AddToggle("UseAdminTreadmill", {
 Text = "Use Admin Treadmill In Events",
 Default = true,
@@ -31086,6 +31497,7 @@ end,
 end
 local FarmToggles = { "AutoSteal", "AutoPlace", "AutoOpen", "AutoEquipBest", "AutoIndex" }
 local AllAutoToggles = {
+"FarmAll",
 "AutoSteal",
 "AutoSell",
 "AutoPlace",
@@ -31116,6 +31528,7 @@ toggleCommand("farm", { "autofarm" }, FarmToggles, "The full farm (steal, place,
 toggleCommand("orbs", { "storm" }, { "AutoOrbs" }, "Auto Collect Storm Orbs")
 toggleCommand("thunder", { "charge" }, { "AutoThunder" }, "Auto Charge Crates")
 toggleCommand("fuse", { "autofuse" }, { "AutoFuse" }, "Auto Fuse")
+toggleCommand("farmall", { "everything", "afk" }, { "FarmAll" }, "Auto Farm Everything")
 Library:AddCommand({
 Name = "freegift",
 Aliases = { "gift" },
@@ -31241,6 +31654,8 @@ end
 if Library.OnUnload then
 Library:OnUnload(function()
 INSTANCE.stop = true
+log("STOP hub unloaded")
+Log.flush(true)
 saveStats(true)
 Metrics.save()
 end)
@@ -31258,6 +31673,7 @@ end
 if Library.SetQuickBar then
 pcall(function()
 Library:SetQuickBar({
+{ Toggle = "FarmAll", Icon = "rocket", Label = "Farm All" },
 { Toggle = "AutoSteal", Icon = "hand", Label = "Steal" },
 { Toggle = "AutoSell", Icon = "banknote", Label = "Sell" },
 { Toggle = "AutoPlace", Icon = "house", Label = "Place" },
@@ -31814,6 +32230,100 @@ local function on(name)
 local t = Toggles[name]
 return t ~= nil and t.Value == true
 end
+Log.header = function()
+local out = {}
+local function add(text)
+out[#out + 1] = text
+end
+local elapsed = math.floor(os.clock() - Session.started)
+local executor = "?"
+pcall(function()
+executor = table.concat({ identifyexecutor() }, " ")
+end)
+local stamp = ""
+pcall(function()
+stamp = os.date("%Y-%m-%d %H:%M:%S")
+end)
+add("Corvus Steal From The Rich log | " .. LocalPlayer.Name .. " | executor " .. executor)
+add(string.format("written %s | hub running %dh %02dm | place %s", stamp, elapsed // 3600, (elapsed % 3600) // 60, tostring(game.PlaceId)))
+add("status: " .. tostring(Status))
+local enabled = {}
+for _, name in ipairs(AllAutoToggles) do
+if on(name) then
+table.insert(enabled, name)
+end
+end
+add("running toggles: " .. (if #enabled > 0 then table.concat(enabled, ", ") else "none"))
+add(
+string.format(
+"money $%s | income $%s/s | speed level %s | treadmill level %s | best trail x%s | added slots %s | carrying %s | on treadmill %s",
+formatNumber(money()),
+formatNumber(LocalPlayer:GetAttribute("IncomePerSecond") or 0),
+formatNumber(LocalPlayer:GetAttribute("SpeedLevel") or 0),
+tostring(LocalPlayer:GetAttribute("TreadmillLevel")),
+tostring(Plan.mult()),
+tostring(LocalPlayer:GetAttribute("AddedSlots")),
+tostring(carrying()),
+tostring(onTreadmill())
+)
+)
+add(
+string.format(
+"session: stolen %d | placed %d | opened %d | sold %d for $%s | bought %d | orbs %d | made $%s",
+Session.stolen,
+Session.placed,
+Session.opened,
+Session.sold,
+formatNumber(Session.earned),
+Session.bought,
+Session.orbs,
+formatNumber(Session.made or 0)
+)
+)
+add(
+"nav: ready "
+.. tostring(Nav.ready)
+.. " | home field "
+.. tostring(Nav.fieldReady)
+.. " | walls "
+.. tostring(Nav.walls)
+.. " | zone backoffs "
+.. (function()
+local count = 0
+for _, untilAt in pairs(ZoneBackoff) do
+if untilAt > os.clock() then
+count += 1
+end
+end
+return count
+end)()
+)
+add("speed target: " .. (if Plan.target then string.format("%s %s for $%s (+%d%% speed gain)", Plan.target.kind, Plan.target.name, formatNumber(Plan.target.cost), math.floor(Plan.target.rel * 100)) else "none"))
+add("schedule: " .. Sched.info .. " | now " .. (if Sched.training then "training" else "stealing"))
+add("storm: " .. (if stormActive() then "ON" else "off") .. " | storm points " .. formatNumber(tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0))
+add(string.rep("-", 70))
+return table.concat(out, "\n")
+end
+do
+local missing = {}
+for _, name in ipairs({ "re_PLACE_AT", "re_PLOT_UPGRADE", "re_TREADMILL_UPGRADE", "re_SELL_DO", "rf_SELL_QUOTE", "rf_ITEM_LOADOUT", "rf_CRATE_TIMERS", "rf_THUNDER_MACHINE" }) do
+if not Remotes[name] then
+table.insert(missing, name)
+end
+end
+log(
+"START hub loaded | areas",
+#Areas,
+"| SpeedData",
+SpeedData ~= nil,
+"| slot prices",
+SlotPrices ~= nil,
+"| net folder",
+NetFolder ~= nil,
+"| missing remotes:",
+if #missing > 0 then table.concat(missing, ",") else "none"
+)
+end
 local CratesWaitingSince = nil
 task.spawn(function()
 while alive() do
@@ -31844,7 +32354,7 @@ local batchDone = banked >= 3
 or not on("AutoSteal")
 or os.clock() - CratesWaitingSince > 60
 or (stormActive() and on("AutoOrbs"))
-or pickCrate() == nil
+or pickCrateSoon() == nil
 if batchDone and placeCrates() then
 return
 end
@@ -31883,7 +32393,7 @@ if sellNow(false) then
 return
 end
 end
-if on("AutoSteal") then
+if on("AutoSteal") and not Sched.trainNow() then
 if stealOnce() then
 return
 end
@@ -31893,7 +32403,16 @@ end
 end
 if on("AutoTreadmill") then
 if not onTreadmill() then
-mountTreadmill()
+if mountTreadmill() then
+Sched.mountFails = 0
+else
+Sched.mountFails += 1
+if Sched.mountFails >= 3 then
+Sched.mountFails = 0
+Sched.failUntil = os.clock() + 300
+log("TREADMILL could not get on it 3 times, steal only for 5 minutes. Status:", Status)
+end
+end
 else
 local riding, wanted = ridingTreadmill(), myTreadmill()
 if riding and wanted and riding ~= wanted and leaveTreadmill() then
@@ -31914,6 +32433,7 @@ end
 end)
 if not ok then
 setStatus("Error: " .. tostring(err))
+logEvery("loop:" .. string.sub(tostring(err), 1, 60), 20, "ERROR main loop:", err)
 end
 task.wait(0.25)
 end
@@ -31931,6 +32451,7 @@ local answer = upgradeAnswered(sent)
 if answer == nil and snapshot() ~= before then
 answer = true
 end
+log("BUY", key, if answer == true then "ok" elseif answer == false then "refused" else "no answer", LastGameMessage.text)
 if answer == true then
 Session.bought += 1
 last[key] = os.clock() + 1
@@ -31943,6 +32464,7 @@ while alive() do
 pcall(function()
 local now = os.clock()
 local floor = myFloor()
+Sched.update()
 if on("AutoIndex") and now - last.index > 10 then
 last.index = now
 fire("INDEX_CLAIM_ALL")
@@ -31981,7 +32503,7 @@ last.best = now
 task.spawn(placeBest)
 end
 if floor and now > last.upgrade then
-if on("AutoBuySlot") and now > last.slot and Remotes.re_PLOT_UPGRADE then
+if on("AutoBuySlot") and now > last.slot and Remotes.re_PLOT_UPGRADE and Plan.slotOk() then
 tryUpgrade("slot", function()
 return tostring(LocalPlayer:GetAttribute("AddedSlots")) .. "/" .. tostring(LocalPlayer:GetAttribute("UnlockedPlotSlots"))
 end, Remotes.re_PLOT_UPGRADE, floor, true)
@@ -32000,6 +32522,7 @@ on("AutoUpgradeTreadmill")
 and now > last.tread
 and Remotes.re_TREADMILL_UPGRADE
 and canAfford(signOf(floor, "TreadmillSignBoard"))
+and Plan.treadmillOk()
 then
 tryUpgrade("tread", function()
 return tostring(LocalPlayer:GetAttribute("TreadmillLevel"))
@@ -32058,17 +32581,22 @@ end)
 pcall(function()
 local clock = os.clock()
 local now = money()
+local moneyGain, speedGain = 0, 0
 if Analytics.lastMoney and now > Analytics.lastMoney then
-Track.money(now - Analytics.lastMoney)
+moneyGain = now - Analytics.lastMoney
+Track.money(moneyGain)
 end
 Analytics.lastMoney = now
 local speed = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
 if Analytics.lastSpeed and speed > Analytics.lastSpeed then
-Track.speed(speed - Analytics.lastSpeed)
+speedGain = speed - Analytics.lastSpeed
+Track.speed(speedGain)
 end
 Analytics.lastSpeed = speed
 local step = clock - (Analytics.lastTick or clock)
 Analytics.lastTick = clock
+Sched.sample(moneyGain, speedGain, step)
+Log.flush()
 for _, name in ipairs(AllAutoToggles) do
 if on(name) then
 Saved.seconds += step
@@ -32078,6 +32606,7 @@ end
 local storming = stormActive()
 if storming and Analytics.storming == false then
 Track.event("Storm", "Storm started", "Orbs are out for 5 minutes", "cloud-lightning", "#7dd3fc")
+log("STORM started, orb collecting is", if on("AutoOrbs") then "on" else "off")
 end
 Analytics.storming = storming
 Metrics.sample()
