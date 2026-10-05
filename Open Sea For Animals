@@ -30111,6 +30111,7 @@ local BootOk, BootError = xpcall(function()
 					if type(item) == "table" and (item.type == nil or item.type == "Brainrot") and Brainrots[item.id] then
 						local base = describe("Brainrot", item.id, mutation, "baby").value
 						local chance = (tonumber(item.chance) or 0) / total
+						gain += chance * Game.indexGain(item.id, mutation)
 						for _, z in pairs(sizeTable()) do
 							local p = chance * (tonumber(z.chance) or 0) / sizeTotal
 							local v = base * (tonumber(z.cashMulti) or 1)
@@ -30135,6 +30136,61 @@ local BootOk, BootError = xpcall(function()
 			local z = sizeTable()[size or "baby"]
 			return math.max((cfg and tonumber(cfg.hatchTime) or 60) * (z and tonumber(z.timeToHatchMulti) or 1), 1)
 		end
+		-- Index: every egg whose animals you own in one mutation adds +10% of the base cash multiplier for good
+		-- (CashMulti = m * (1 + 0.1 * completed)). In base $/s that is plotBase * 0.1 / (1 + 0.1 * completed). A missing
+		-- animal gets that value split over the animals its egg still misses.
+		local IndexCache = { at = -1e9, value = 0 }
+		function Game.completionValue()
+			if os.clock() - IndexCache.at < 10 then
+				return IndexCache.value
+			end
+			local _, base = placedStats()
+			local done = 0
+			local completed = modifier("CompletedEggs")
+			for _, v in pairs(type(completed) == "table" and completed or {}) do
+				done += tonumber(v) or 0
+			end
+			IndexCache.at, IndexCache.value, IndexCache.done = os.clock(), base * 0.1 / (1 + 0.1 * done), done
+			return IndexCache.value
+		end
+		function Game.indexGain(brainrotType, mutation)
+			mutation = mutation or "NORMAL"
+			local data = Data()
+			local unlocked = data and data.UnlockedBrainrots
+			if type(unlocked) ~= "table" then
+				return 0
+			end
+			local have = unlocked[brainrotType]
+			if type(have) == "table" and have[mutation] then
+				return 0
+			end
+			local cfg = Game.EggsConfig
+			local total = 0
+			for _, egg in pairs(Eggs) do
+				local ok, inIndex = false, false
+				if type(cfg) == "table" and type(cfg.IsInMutationIndex) == "function" then
+					ok, inIndex = pcall(cfg.IsInMutationIndex, egg, mutation)
+				end
+				if ok and inIndex == true and type(egg.items) == "table" then
+					local missing, contains = 0, false
+					for _, item in ipairs(egg.items) do
+						if type(item) == "table" and item.type == "Brainrot" and Brainrots[item.id] then
+							local h = unlocked[item.id]
+							if not (type(h) == "table" and h[mutation]) then
+								missing += 1
+							end
+							if item.id == brainrotType then
+								contains = true
+							end
+						end
+					end
+					if contains and missing > 0 then
+						total += Game.completionValue() / missing
+					end
+				end
+			end
+			return total
+		end
 		function Game.itemGain(info, floor)
 			if info.kind == "Egg" then
 				return (Game.eggGain(info.type, info.mutation, floor))
@@ -30142,7 +30198,7 @@ local BootOk, BootError = xpcall(function()
 			if info.special then
 				return 0
 			end
-			return math.max(info.value - floor, 0)
+			return math.max(info.value - floor, 0) + Game.indexGain(info.type, info.mutation)
 		end
 		function equipBest(force)
 			local amount, _, worst = placedStats()
@@ -30405,6 +30461,10 @@ local BootOk, BootError = xpcall(function()
 			return type(tier) == "table" and type(tier.Cost) == "table" and tonumber(tier.Cost.Cash) or nil
 		end
 		function spendable()
+			if on("AutoFarmAll") then
+				-- the planner decides (Game.plan)
+				return cash()
+			end
 			local reserve = 0
 			if on("SaveForRebirth") and on("AutoRebirth") then
 				reserve = nextRebirthCost() or 0
@@ -30444,7 +30504,7 @@ local BootOk, BootError = xpcall(function()
 				local move = Options.SeaMove and Options.SeaMove.Value
 				local useless = id == "MovementSpeed" and (move == "Blatant" or move == "Teleport")
 				if not useless and allows(Options.UpgradeFilter, label) and (UpgradeBackoff[id] or 0) <= os.clock() then
-					local amount = maxBuyable(id, if id == "Carry" then cash() else spendable())
+					local amount = maxBuyable(id, if on("AutoFarmAll") then Game.budget(id) elseif id == "Carry" then cash() else spendable())
 					if amount > 0 then
 						local level = upgradeLevel(id)
 						setStatus("Buying " .. label .. " x" .. amount)
@@ -30530,6 +30590,9 @@ local BootOk, BootError = xpcall(function()
 				return (tonumber(Staffs[a].luck) or 0) > (tonumber(Staffs[b].luck) or 0)
 			end)
 			for i, key in ipairs(list) do
+				if on("AutoFarmAll") and not Game.spendOk("Staff:" .. key, Staffs[key].cost) then
+					continue
+				end
 				if i > 3 or cash() < Staffs[key].cost then
 					break
 				end
@@ -30611,6 +30674,9 @@ local BootOk, BootError = xpcall(function()
 				return (tonumber(TrainTools[a].gainPerTrain) or 0) > (tonumber(TrainTools[b].gainPerTrain) or 0)
 			end)
 			for i, id in ipairs(list) do
+				if on("AutoFarmAll") and not Game.spendOk("Dumbbell:" .. id, TrainTools[id].cost) then
+					continue
+				end
 				if i > 3 or cash() < TrainTools[id].cost then
 					break
 				end
@@ -30664,7 +30730,7 @@ local BootOk, BootError = xpcall(function()
 				return false
 			end
 			local cost = nextRebirthCost()
-			if not cost or cash() < cost then
+			if not cost or cash() < cost or (on("AutoFarmAll") and not Game.spendOk("Rebirth", cost)) then
 				return false
 			end
 			local before = rebirths()
@@ -31191,6 +31257,87 @@ local BootOk, BootError = xpcall(function()
 		function plotIncome()
 			local _, total = placedStats()
 			return total * (tonumber(modifier("CashMulti")) or 1)
+		end
+		-- Spending planner for Farm All. Every purchase gets a payback time = price / extra cash per second:
+		--   Carry: one more item every wave, so sell income / carry
+		--   Upgrade Base: one more slot (a pet about as good as the weakest) and +0.05 cash multiplier
+		--   Rebirth: plot income * (next multiplier / current - 1)
+		--   Staff: luck, income * (sqrt(new luck / luck) - 1) (rarer spawns, diminishing)
+		--   Dumbbell: faster power, income * 0.3 * (1 - gain now / new gain) (power only moves the reach)
+		-- The fastest payback is the target: it is bought as soon as affordable and its price is saved up; anything
+		-- else is only bought with cash above that saving, or when its payback is within 25% of the target.
+		local PlanCache = nil
+		function Game.plan()
+			if PlanCache and os.clock() - PlanCache.at < 5 then
+				return PlanCache
+			end
+			local data = Data()
+			if not data then
+				return nil
+			end
+			local multi = tonumber(modifier("CashMulti")) or 1
+			local _, base, worst = placedStats()
+			local plot = base * multi
+			local sellRate = (Metrics.current("Sold") or 0) / 3600
+			local income = plot + sellRate
+			local list = {}
+			local function add(key, cost, gain, name)
+				if cost and cost > 0 and gain and gain > 0 then
+					table.insert(list, { key = key, cost = cost, gain = gain, payback = cost / gain, name = name or key })
+				end
+			end
+			add("Carry", nextUpgradePrice("Carry"), sellRate / math.max(maxPickup(), 1), "Carry")
+			add("PlotUpgrade", nextUpgradePrice("PlotUpgrade"), worst * multi + plot * 0.05 / math.max(multi, 1), "Upgrade Base")
+			local nextR, curR = Rebirths[rebirths() + 1], Rebirths[rebirths()]
+			if type(nextR) == "table" then
+				local curM = type(curR) == "table" and tonumber(curR.CashMulti) or 1
+				add("Rebirth", nextRebirthCost(), plot * ((tonumber(nextR.CashMulti) or 1) / curM - 1), "Rebirth")
+			end
+			local owned = type(data.OwnedPickaxes) == "table" and data.OwnedPickaxes or {}
+			local luck = math.max(tonumber(currentLuck()) or 1, 1)
+			for key, cfg in pairs(Staffs) do
+				local cost = type(cfg) == "table" and tonumber(cfg.cost)
+				if cost and not owned[key] and not cfg.passRequired and not cfg.hideIfNotOwned and not cfg.isSpecial and (tonumber(cfg.luck) or 0) > luck then
+					add("Staff:" .. key, cost, income * (math.sqrt(cfg.luck / luck) - 1), tostring(cfg.name or key))
+				end
+			end
+			local tools = type(data.OwnedTrainTools) == "table" and data.OwnedTrainTools or {}
+			local current = TrainTools[data.EquippedTrainTool]
+			local gainNow = math.max(type(current) == "table" and tonumber(current.gainPerTrain) or 1, 1)
+			for id, cfg in pairs(TrainTools) do
+				local cost = type(cfg) == "table" and tonumber(cfg.cost)
+				if cost and not tools[id] and not cfg.isSpecial and not cfg.hideIfNotOwned and not cfg.passRequired and (tonumber(cfg.rebirthRequired) or 0) <= rebirths() and (tonumber(cfg.gainPerTrain) or 0) > gainNow then
+					add("Dumbbell:" .. id, cost, income * 0.3 * (1 - gainNow / cfg.gainPerTrain), tostring(cfg.name or id))
+				end
+			end
+			table.sort(list, function(a, b)
+				return a.payback < b.payback
+			end)
+			local plan = { at = os.clock(), list = list, target = list[1], ok = {} }
+			for _, item in ipairs(list) do
+				if item.payback <= list[1].payback * 1.25 then
+					plan.ok[item.key] = true
+				end
+			end
+			if plan.target and (not PlanCache or not PlanCache.target or PlanCache.target.key ~= plan.target.key) then
+				log("PLAN target", plan.target.name, "$" .. formatNumber(plan.target.cost), string.format("payback %ds", math.floor(plan.target.payback)), "income $" .. formatNumber(income) .. "/s")
+			end
+			PlanCache = plan
+			return plan
+		end
+		function Game.spendOk(key, cost)
+			local plan = Game.plan()
+			if not plan or not plan.target or plan.ok[key] then
+				return true
+			end
+			return cash() - cost >= plan.target.cost
+		end
+		function Game.budget(key)
+			local plan = Game.plan()
+			if not plan or not plan.target or plan.ok[key] then
+				return cash()
+			end
+			return math.max(cash() - plan.target.cost, 0)
 		end
 		function currentLuck()
 			local ok, luck = pcall(function()
@@ -33764,7 +33911,11 @@ local BootOk, BootError = xpcall(function()
 							)
 						)
 					end
-					Labels.Upgrades:SetText(table.concat(upgradeLines, "\n"))
+					local plan = on("AutoFarmAll") and Game.plan and Game.plan()
+				if plan and plan.target then
+					table.insert(upgradeLines, string.format('<font color="#60d696">Saving for %s ($%s), pays back in %s</font>', plan.target.name, formatNumber(plan.target.cost), clockText(plan.target.payback)))
+				end
+				Labels.Upgrades:SetText(table.concat(upgradeLines, "\n"))
 				end)
 				group(function()
 					local staffKey = data and data.EquippedPickaxe
