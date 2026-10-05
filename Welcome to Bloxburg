@@ -30740,11 +30740,32 @@ do
 		end
 		return false
 	end
+	-- The game refuses jobs below JobData MinHeight (default 0.9 of the age height scale): "You are too young".
+	function N.tooYoung(name)
+		local jh = N.jobHandler()
+		local result = isolated(function()
+			local age = jh.Shared.AppearanceService:GetCurrentAgeData(LocalPlayer)
+			local job = jh.Shared.JobData:GetJob(name)
+			return age ~= nil and age.HeightScale < ((job and job.MinHeight) or 0.9)
+		end)
+		return result == true
+	end
 	-- Clock in: the game's own "go to work" (server teleport to the job) and start shift.
 	function N.ensureShift(name)
 		if N.currentJob() == name then
 			return true
 		end
+		if N.tooYoung(name) then
+			setStatus("Your character is too young for jobs: change your age at a wardrobe or dresser")
+			if not N.Job.youngWarned then
+				N.Job.youngWarned = true
+				notify("Corvus", "Jobs need an older character. Use a wardrobe or dresser to change your age, then Auto Work continues.", 8)
+				log("SHIFT blocked: character too young")
+			end
+			task.wait(3)
+			return false
+		end
+		N.Job.youngWarned = false
 		if os.clock() - N.Job.lastShiftTry < 8 then
 			return false
 		end
@@ -30755,7 +30776,7 @@ do
 			task.wait(1)
 		end
 		setStatus("Going to work: " .. name)
-		callJob(20, "GoToWork", name)
+		callJob(45, "GoToWork", name)
 		task.wait(1.5)
 		local started = callJob(15, "StartWorking", name)
 		if waitFor(function()
@@ -30790,7 +30811,7 @@ end
 -- color it wants are the hat it wears (PrimaryHat): the style is the asset with that name (or the same mesh) in
 -- GameObjects.JobAssets.StylezHairAssets.Styles, the color is the Colors value with the hat's BrickColor. The game
 -- sends UseWorkstation when you click a style button and JobCompleted {Workstation, Order = {style, color}} on Done.
-N.Hair = { stations = {}, last = "" }
+N.Hair = { stations = {}, last = "", skip = setmetatable({}, { __mode = "k" }) }
 do
 	local function assets()
 		local folder = ReplicatedStorage:FindFirstChild("GameObjects")
@@ -30813,8 +30834,109 @@ do
 		end)
 		return part, if ok then id else nil
 	end
+	-- Everything the order icon in the customer's chat bubble shows: names, attributes, images and colors.
+	local function bubbleOrder(customer)
+		local head = customer:FindFirstChild("Head")
+		local bubble = head and head:FindFirstChild("ChatBubble")
+		local body = bubble and bubble:FindFirstChild("Body")
+		local frame = body and body:FindFirstChild("IconFrame")
+		if not frame then
+			return nil
+		end
+		local info = { words = {}, images = {}, colors = {}, text = {} }
+		local function add(instance)
+			table.insert(info.words, instance.Name)
+			for key, value in pairs(instance:GetAttributes()) do
+				table.insert(info.words, tostring(value))
+				table.insert(info.text, key .. "=" .. tostring(value))
+			end
+			if instance:IsA("ImageLabel") or instance:IsA("ImageButton") then
+				table.insert(info.images, instance.Image)
+				table.insert(info.colors, instance.ImageColor3)
+				table.insert(info.text, instance.Name .. ".Image=" .. instance.Image .. " color=" .. tostring(instance.ImageColor3))
+			end
+			if instance:IsA("GuiObject") and instance.BackgroundTransparency < 1 then
+				table.insert(info.colors, instance.BackgroundColor3)
+				table.insert(info.text, instance.Name .. ".Bg=" .. tostring(instance.BackgroundColor3))
+			end
+			if instance:IsA("TextLabel") then
+				table.insert(info.words, instance.Text)
+			end
+		end
+		for _, child in ipairs(frame:GetChildren()) do
+			if child:IsA("GuiObject") and child.Name ~= "Plus" and child.Name ~= "Icon" then
+				add(child)
+				for _, d2 in ipairs(child:GetDescendants()) do
+					add(d2)
+				end
+			end
+		end
+		return if #info.text > 0 or #info.words > 0 then info else nil
+	end
+	N.bubbleOrder = bubbleOrder
 	-- Returns the style and color names the customer wants, or nil.
 	function N.hairOrder(customer)
+		local folder = assets()
+		local order = bubbleOrder(customer)
+		if folder and order then
+			local styles = folder:FindFirstChild("Styles")
+			local colors = folder:FindFirstChild("Colors")
+			local style, color
+			local wordSet = {}
+			for _, w in ipairs(order.words) do
+				wordSet[w] = true
+			end
+			for _, child in ipairs(styles and styles:GetChildren() or {}) do
+				if wordSet[child.Name] then
+					style = child.Name
+				end
+				-- the style icon may show the hat's own image
+				for _, image in ipairs(order.images) do
+					for _, d2 in ipairs(child:GetDescendants()) do
+						local ok, id = pcall(function()
+							return d2.TextureId or d2.Texture or d2.Image
+						end)
+						if ok and id and id ~= "" and id == image then
+							style = child.Name
+						end
+					end
+					local okAttr, thumb = pcall(child.GetAttribute, child, "Image")
+					if okAttr and thumb and tostring(thumb) == image then
+						style = child.Name
+					end
+				end
+			end
+			local bestDiff = 0.06
+			for _, child in ipairs(colors and colors:GetChildren() or {}) do
+				if wordSet[child.Name] then
+					color = child.Name
+					break
+				end
+				local ok, brick = pcall(function()
+					return child.Value.Color
+				end)
+				if ok and brick then
+					for _, c in ipairs(order.colors) do
+						local diff = math.abs(c.R - brick.R) + math.abs(c.G - brick.G) + math.abs(c.B - brick.B)
+						if diff < bestDiff then
+							bestDiff, color = diff, child.Name
+						end
+					end
+				end
+			end
+			if style and color then
+				return style, color
+			end
+			if not N.Hair.dumped then
+				N.Hair.dumped = true
+				log("HAIR order bubble", table.concat(order.text, " | "), "words", table.concat(order.words, ","), "style", tostring(style), "color", tostring(color))
+			end
+			return nil
+		end
+		return N.hairOrderFromHat(customer)
+	end
+	-- Old guess (the customer's own hat): kept as a fallback only.
+	function N.hairOrderFromHat(customer)
 		local folder = assets()
 		local hat = customer and customer:FindFirstChild("PrimaryHat")
 		if not (folder and hat) then
@@ -30853,7 +30975,10 @@ do
 			end
 		end
 		if not (style and color) then
-			log("HAIR could not read the order", hat.Name, tostring(meshId), tostring(part.BrickColor), "style", tostring(style), "color", tostring(color))
+			if os.clock() - (N.Hair.hatLogAt or -1e9) > 60 then
+				N.Hair.hatLogAt = os.clock()
+				log("HAIR could not read the order", hat.Name, tostring(meshId), tostring(part.BrickColor), "style", tostring(style), "color", tostring(color))
+			end
 			return nil
 		end
 		return style, color
@@ -30908,9 +31033,21 @@ do
 		table.sort(list, function(a, b)
 			return a.dist < b.dist
 		end)
-		local item = list[1]
+		local item
+		for _, entry in ipairs(list) do
+			if (N.Hair.skip[entry.customer] or 0) <= os.clock() then
+				item = entry
+				break
+			end
+		end
+		if not item then
+			setStatus("Hairdresser: cannot read the orders yet, waiting")
+			task.wait(1)
+			return
+		end
 		local style, color = N.hairOrder(item.customer)
 		if not style then
+			N.Hair.skip[item.customer] = os.clock() + 20
 			task.wait(0.5)
 			return
 		end
@@ -31206,9 +31343,15 @@ do
 		end
 		return words
 	end
-	function N.iceOrder(order)
+	function N.iceOrder(order, customer)
 		local scoops, topping = {}, nil
-		for _, word in ipairs(orderWords(order)) do
+		local words = orderWords(order)
+		-- the order icon in the customer's chat bubble (same as the hairdresser)
+		local bubble = customer and N.bubbleOrder and N.bubbleOrder(customer)
+		for _, w in ipairs(bubble and bubble.words or {}) do
+			table.insert(words, w)
+		end
+		for _, word in ipairs(words) do
 			if Flavors[word] and #scoops < 2 then
 				table.insert(scoops, word)
 			elseif Toppings[word] then
@@ -31252,11 +31395,12 @@ do
 			task.wait(0.3)
 			return
 		end
-		local scoops, topping = N.iceOrder(order)
+		local scoops, topping = N.iceOrder(order, customer)
 		if #scoops == 0 then
 			N.Ice.unread += 1
 			if N.Ice.unread % 10 == 1 then
-				log("ICE could not read the order", "value", order.Value, "words", table.concat(orderWords(order), ","))
+				local bubble = N.bubbleOrder and N.bubbleOrder(customer)
+				log("ICE could not read the order", "value", order.Value, "words", table.concat(orderWords(order), ","), "bubble", bubble and table.concat(bubble.text, " | ") or "none")
 			end
 			task.wait(1)
 			return
