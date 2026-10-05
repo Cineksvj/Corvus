@@ -28216,6 +28216,10 @@ local BootOk, BootError = xpcall(function()
 			local t = Toggles[name]
 			return t ~= nil and t.Value == true
 		end
+		-- Farm Mode: Normal keeps every choice of the player, OP lets the planner override them (only while Farm All is on)
+		function Game.opMode()
+			return on("AutoFarmAll") and Options.FarmMode ~= nil and Options.FarmMode.Value == "OP"
+		end
 		function count(t)
 			local n = 0
 			if type(t) == "table" then
@@ -28573,7 +28577,7 @@ local BootOk, BootError = xpcall(function()
 			end
 			if prefix == "Catch" and info.kind ~= "Egg" then
 				local pick = Options.CatchAnimals and Options.CatchAnimals.Value
-				if type(pick) == "table" and next(pick) ~= nil and pick[info.name] ~= true and not Game.isEventAnimal(info.type) then
+				if type(pick) == "table" and next(pick) ~= nil and pick[info.name] ~= true and not (on("EventRush") and Game.isEventAnimal(info.type)) then
 					return false
 				end
 			end
@@ -30008,7 +30012,7 @@ local BootOk, BootError = xpcall(function()
 		local TS = { state = nil, restarts = 0 }
 		Game.trainSea = TS
 		local function trainAlongside(I)
-			if not (on("AutoFarmAll") and on("AutoTrain")) or TS.state == "no" then
+			if not (on("AutoFarmAll") and on("AutoTrain")) or TS.state == "no" or (not Game.opMode() and (Options.TrainMode and Options.TrainMode.Value) ~= "Alternate with the sea") then
 				return
 			end
 			local now = os.clock()
@@ -30134,9 +30138,16 @@ local BootOk, BootError = xpcall(function()
 					end
 				end
 			end
+			local pr = not Game.opMode() and Options.SeaPriority and Options.SeaPriority.Value or "Best Value"
 			table.sort(list, function(a, b)
 				if a.ev ~= b.ev then
 					return a.ev == true
+				end
+				if pr == "Rarest" and a.info.rank ~= b.info.rank then
+					return a.info.rank > b.info.rank
+				end
+				if pr == "Nearest" and (a.plate or 0) ~= (b.plate or 0) then
+					return (a.plate or 0) < (b.plate or 0)
 				end
 				if a.gain ~= b.gain then
 					return a.gain > b.gain
@@ -30152,7 +30163,7 @@ local BootOk, BootError = xpcall(function()
 			end
 			Sea.preview = { matching = #list, total = total, at = os.clock() }
 			pcall(Game.rates.observe, list, maxPickup(), waveReach())
-			if anyIndex and capacity > 1 and #list > 1 then
+			if anyIndex and pr == "Best Value" and capacity > 1 and #list > 1 then
 				-- six copies of one missing animal unlock the index entry once: the copies after the first count without it
 				local chosen, seen, pool = {}, {}, list
 				for _ = 1, math.min(capacity, #pool) do
@@ -31174,7 +31185,7 @@ local BootOk, BootError = xpcall(function()
 			or selected(Options.LockSizes, SizeNames[info.size] or info.size)
 		end
 		function lockProtected()
-			if on("AutoFarmAll") then
+			if Game.opMode() then
 				return 0
 			end
 			local data = Data()
@@ -31228,7 +31239,9 @@ local BootOk, BootError = xpcall(function()
 				for key, entry in pairs(data and data.Inventory or {}) do
 					local info = entryInfo(entry)
 					local locked = info ~= nil and entry.innerEntity.locked == true
-					if info and not info.special and (not locked or isProtected(info)) and not (Game.event ~= nil and Game.event.wanted(info)) then
+					local cap = parseAmount(Options.SellBelow and Options.SellBelow.Value)
+					local mine = info ~= nil and not Game.opMode() and (isProtected(info) or (cap ~= nil and info.value >= cap))
+					if info and not info.special and (not locked or isProtected(info)) and not mine and not (Game.event ~= nil and Game.event.wanted(info)) then
 						table.insert(smart, { key = key, info = info, kind = entry.itemType, locked = locked })
 					end
 				end
@@ -31405,9 +31418,12 @@ local BootOk, BootError = xpcall(function()
 			return type(tier) == "table" and type(tier.Cost) == "table" and tonumber(tier.Cost.Cash) or nil
 		end
 		function spendable()
-			if on("AutoFarmAll") then
+			if Game.opMode() then
 				-- the planner decides (Game.plan)
 				return cash()
+			elseif on("AutoFarmAll") then
+				-- Normal: the planner chooses, but never beyond the player's Spend Up To
+				return cash() * spendFraction()
 			end
 			local reserve = 0
 			if on("SaveForRebirth") and on("AutoRebirth") then
@@ -31448,7 +31464,7 @@ local BootOk, BootError = xpcall(function()
 				local move = Options.SeaMove and Options.SeaMove.Value
 				local useless = id == "MovementSpeed" and (move == "Blatant" or move == "Teleport")
 				if not useless and allows(Options.UpgradeFilter, label) and (UpgradeBackoff[id] or 0) <= os.clock() then
-					local amount = maxBuyable(id, if on("AutoFarmAll") then Game.budget(id) elseif id == "Carry" then cash() else spendable())
+					local amount = maxBuyable(id, if Game.opMode() then Game.budget(id) elseif on("AutoFarmAll") then math.min(Game.budget(id), spendable()) elseif id == "Carry" then cash() else spendable())
 					if amount > 0 then
 						local level = upgradeLevel(id)
 						setStatus("Buying " .. label .. " x" .. amount)
@@ -31848,8 +31864,9 @@ local BootOk, BootError = xpcall(function()
 			for _, key in ipairs(list) do
 				if on("AutoFarmAll") then
 					-- a staff with no more luck (and no longer sea when you walk) is wasted cash
-					local betterLuck = effectiveLuck(Staffs[key], owned) > ownedLuck
-					local betterTime = not isBlatant() and (tonumber(Staffs[key].time) or 0) > ownedTime
+					local byTime = not Game.opMode() and (Options.StaffPick and Options.StaffPick.Value) == "Longest Time"
+					local betterLuck = not byTime and effectiveLuck(Staffs[key], owned) > ownedLuck
+					local betterTime = (byTime or not isBlatant()) and (tonumber(Staffs[key].time) or 0) > ownedTime
 					if not (betterLuck or betterTime) or not Game.spendOk("Staff:" .. key, Staffs[key].cost) then
 						continue
 					end
@@ -32170,7 +32187,8 @@ local BootOk, BootError = xpcall(function()
 				end
 				return false
 			end
-			if on("AutoFarmAll") then
+			local planned = Game.opMode() or (on("AutoFarmAll") and tonumber(Options.SeaMinutes and Options.SeaMinutes.Value) == 10 and tonumber(Options.TrainMinutes and Options.TrainMinutes.Value) == 5)
+			if planned then
 				-- profit engine v2: train only while the next plate bought with sea time (gain/$ of Train) beats the best
 				-- money purchase and pays back inside the horizon (Game.plan, PLAN log)
 				local now = os.clock()
@@ -33124,29 +33142,33 @@ local BootOk, BootError = xpcall(function()
 							toggle:SetValue(true)
 						end
 					end
-					for name, value2 in pairs({ SeaMove = "Blatant", SeaCharge = "Perfect (+5s)", SellMode = "Smart", SellAt = 190, TrainMode = "Alternate with the sea", SeaMinutes = 10, TrainMinutes = 3, UpgradeSpend = 100 }) do
+					local op = Options.FarmMode ~= nil and Options.FarmMode.Value == "OP"
+					log("MODE", if op then "OP" else "Normal")
+					-- Normal: only settings still on their default are tuned, a value the player changed stays
+					for name, pair in pairs({ SeaMove = { "Blatant", "Blatant" }, SeaCharge = { "Perfect (+5s)", "Perfect (+5s)" }, SellMode = { "Smart", "Smart" }, SellAt = { 150, 190 }, TrainMode = { "Alternate with the sea", "Alternate with the sea" }, SeaMinutes = { 10, 10 }, TrainMinutes = { 5, 3 }, UpgradeSpend = { 100, 100 } }) do
 						local option = Options[name]
-						if option then
-							pcall(option.SetValue, option, value2)
+						if option and (op or (option.Value == pair[1] and name ~= "TrainMinutes")) then
+							pcall(option.SetValue, option, pair[2])
 						end
 					end
-					if Toggles.AutoLock then
+					if op and Toggles.AutoLock then
 						Toggles.AutoLock:SetValue(false)
 					end
 					local all = {}
 					for _, rarity in ipairs(RarityList) do
 						all[rarity] = true
 					end
-					for _, pair in ipairs({
+					-- only OP overrides the catch, egg and priority picks; Normal leaves every filter as the player set it
+					for _, pair in ipairs(if op then {
 						{ "CatchRarities", all }, { "EggRarities", all }, { "CatchKinds", { Animals = true, Eggs = true } },
 						{ "CatchMinValue", "" }, { "CatchAnimals", {} }, { "EggOrder", "Smart" }, { "SeaPriority", "Best Value" },
-					}) do
+					} else {}) do
 						local option = Options[pair[1]]
 						if option then
 							pcall(option.SetValue, option, pair[2])
 						end
 					end
-					for _, name in ipairs({ "CatchMutations", "CatchSizes" }) do
+					for _, name in ipairs(if op then { "CatchMutations", "CatchSizes" } else {}) do
 						local option = Options[name]
 						if option and type(option.Values) == "table" then
 							local pick = {}
@@ -33186,6 +33208,19 @@ local BootOk, BootError = xpcall(function()
 				Tooltip = "The fastest farm: Blatant sea, smart selling, eggs, best animals, Carry first, rebirths, training, potions and every reward. Turning it off stops what it started.",
 				Callback = function(value)
 					task.spawn(farmAll, value)
+				end,
+			})
+			local FarmModeLast = nil
+			SeaBox:AddDropdown("FarmMode", {
+				Text = "Farm Mode",
+				Values = { "Normal", "OP" },
+				Default = "Normal",
+				Tooltip = "Normal = automate everything within your own filters and picks. OP = the planner overrides every choice for max profit.",
+				Callback = function(value)
+					if value ~= FarmModeLast then
+						FarmModeLast = value
+						log("MODE", tostring(value))
+					end
 				end,
 			})
 			SeaBox:AddToggle("AutoSea", {
@@ -34659,6 +34694,7 @@ local BootOk, BootError = xpcall(function()
 					local picked = type(values.tasks) == "table" and values.tasks or {}
 					if picked.farmall then
 						pcall(function()
+							Options.FarmMode:SetValue("Normal")
 							Toggles.AutoFarmAll:SetValue(true)
 						end)
 						markSetupDone()
