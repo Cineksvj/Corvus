@@ -30301,6 +30301,10 @@ local BootOk, BootError = xpcall(function()
 			local reserve = 0
 			if on("SaveForRebirth") and on("AutoRebirth") then
 				reserve = nextRebirthCost() or 0
+				local perHour = Metrics.current("Money")
+				if on("AutoFarmAll") and reserve > 0 and perHour and cash() + perHour / 4 < reserve then
+					reserve = 0
+				end
 			end
 			return math.max(cash() - reserve, 0) * spendFraction()
 		end
@@ -30668,6 +30672,22 @@ local BootOk, BootError = xpcall(function()
 			end
 			if (Options.TrainMode and Options.TrainMode.Value) ~= "Alternate with the sea" then
 				return false
+			end
+			if on("AutoFarmAll") then
+				local now = os.clock()
+				if Schedule.phase == "sea" then
+					if now - Schedule.since >= 300 and not isWaveActive() then
+						Schedule.phase, Schedule.since, Schedule.reach = "train", now, waveReach()
+						log("SCHEDULE train until reach", Schedule.reach + 1, "power", power())
+					end
+				else
+					local trained = now - Schedule.since
+					if (waveReach() > (Schedule.reach or 0) and trained >= 45) or trained >= 480 then
+						Schedule.phase, Schedule.since = "sea", now
+						log("SCHEDULE sea, reach", waveReach(), "after", math.floor(trained) .. "s of training")
+					end
+				end
+				return Schedule.phase == "train"
 			end
 			local minutes = if Schedule.phase == "sea"
 			then tonumber(Options.SeaMinutes and Options.SeaMinutes.Value)
@@ -31181,6 +31201,13 @@ local BootOk, BootError = xpcall(function()
 						end
 					end
 					log("FARM ALL on, turned on", #FarmAllTurned, "toggles")
+				pcall(function()
+					Library:SetSetting("OSFA_FarmAll", true)
+				end)
+				local data = Data()
+				if data and data.TutorialFinished ~= true then
+					pcall(skipTutorial)
+				end
 				elseif FarmAllTurned.active then
 					-- only a real switch off stops the farm (a config load with Farm All off must not touch your toggles)
 					FarmAllTurned.active = nil
@@ -31192,6 +31219,9 @@ local BootOk, BootError = xpcall(function()
 					end
 					table.clear(FarmAllTurned)
 					log("FARM ALL off")
+				pcall(function()
+					Library:SetSetting("OSFA_FarmAll", false)
+				end)
 				end
 			end
 			SeaBox:AddToggle("AutoFarmAll", {
@@ -33254,6 +33284,15 @@ local BootOk, BootError = xpcall(function()
 			SaveManager:LoadAutoloadConfig()
 		end)
 	end
+	-- Farm All was on last time (any server, any config): turn it back on so an AFK account keeps farming
+	task.delay(3, function()
+		pcall(function()
+			if Library:GetSetting("OSFA_FarmAll") == true and Toggles.AutoFarmAll and not Toggles.AutoFarmAll.Value then
+				log("FARM ALL restored after a rejoin")
+				Toggles.AutoFarmAll:SetValue(true)
+			end
+		end)
+	end)
 	-- one time: configs saved before Blatant existed still say Teleport, the instant catch is much faster
 	pcall(function()
 		if not Library:GetSetting("OSFA_BlatantDefault") then
