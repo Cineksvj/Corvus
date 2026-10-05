@@ -30496,7 +30496,7 @@ do
 		return found
 	end
 	-- Only the job actions a worker sends. Never purchases, trading, admin or anything for other players.
-	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true }
+	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true, TakeOil = true, TakeWheel = true, TakePainter = true, FixBike = true }
 	local AllowedJobInvoke = { CleanSchoolJanitorObject = true }
 	function N.jobFire(packet)
 		local jh = N.jobHandler()
@@ -31579,6 +31579,158 @@ do
 		log("BAKER", wanted, if answered then order.Value else "no answer")
 	end
 end
+
+-- Mike's Motors Mechanic: MechanicWorkstations (Occupied = customer with Order and Vehicle; Vehicle.MotorcycleType).
+-- Fixes are FixBike {Workstation} with the right tool held: Oil Can (TakeOil {Object = Interior.OilCans child}),
+-- wheels (TakeWheel {Object = Interior.TireRacks child}, FixBike {Front = true} then FixBike for the back), paint
+-- (TakePainter {Object = Interior.PaintingEquipment child}). Done = JobCompleted {Workstation} while Order is "".
+-- The wanted paint color is not in the client code: the hub paints only when the vehicle names a color, and logs the
+-- vehicle and order data of the first customer so the next version can learn it.
+N.Mechanic = { logged = false, last = "" }
+do
+	local function shopInterior()
+		local env = workspace:FindFirstChild("Environment")
+		local node = env and env:FindFirstChild("Locations")
+		node = node and node:FindFirstChild("City")
+		node = node and node:FindFirstChild("MikesMotors")
+		return node and node:FindFirstChild("Interior")
+	end
+	local function heldTool()
+		local jh = N.jobHandler()
+		return isolated(function()
+			return jh.Shared.EquipmentService:GetEquipped(LocalPlayer)
+		end)
+	end
+	local function posOf(instance)
+		if not instance then
+			return nil
+		end
+		if instance:IsA("BasePart") then
+			return instance.Position
+		end
+		local ok, pivot = pcall(instance.GetPivot, instance)
+		return if ok then pivot.Position else nil
+	end
+	local function dump(instance)
+		local parts = {}
+		for key, value in pairs(instance:GetAttributes()) do
+			table.insert(parts, key .. "=" .. tostring(value))
+		end
+		for _, child in ipairs(instance:GetChildren()) do
+			local ok, value = pcall(function()
+				return child.Value
+			end)
+			if ok and value ~= nil then
+				table.insert(parts, child.Name .. "=" .. tostring(value))
+			end
+		end
+		return table.concat(parts, " ")
+	end
+	local function take(folder, pick, packetType)
+		local item = pick(folder)
+		if not item then
+			return false
+		end
+		N.walkTo(posOf(item), 4, 12)
+		task.wait(N.actionDelay())
+		N.jobFire({ Type = packetType, Object = item })
+		return waitFor(function()
+			return heldTool() ~= nil
+		end, 2)
+	end
+	function N.mechanicStep()
+		if not N.ensureShift("MikesMechanic") then
+			return
+		end
+		local interior = shopInterior()
+		local stations = interior and interior:FindFirstChild("MechanicWorkstations")
+		if not stations then
+			setStatus("Mechanic: waiting for Mike's Motors to load")
+			task.wait(1)
+			return
+		end
+		local ws, customer
+		for _, station in ipairs(stations:GetChildren()) do
+			local occ = station:FindFirstChild("Occupied")
+			local inUse = station:FindFirstChild("InUse")
+			local c = occ and occ.Value
+			local order = c and c:FindFirstChild("Order")
+			if order and order.Value == "" and not (inUse and inUse.Value and inUse.Value ~= LocalPlayer) then
+				ws, customer = station, c
+				break
+			end
+		end
+		if not ws then
+			setStatus(string.format("Mechanic: waiting for customers (%d fixed)", Session.done))
+			task.wait(0.3)
+			return
+		end
+		local vehicle = customer:FindFirstChild("Vehicle")
+		local order = customer:FindFirstChild("Order")
+		if not vehicle then
+			task.wait(0.5)
+			return
+		end
+		if not N.Mechanic.logged then
+			N.Mechanic.logged = true
+			log("MECHANIC vehicle", dump(vehicle), "| order", dump(order), "| customer", dump(customer))
+		end
+		local kind = vehicle:FindFirstChild("MotorcycleType")
+		kind = kind and kind.Value
+		local spot = posOf(vehicle)
+		setStatus("Mechanic: fixing a " .. tostring(kind or "bike"))
+		-- oil
+		if take(interior:FindFirstChild("OilCans"), function(f)
+			return f and f:GetChildren()[1]
+		end, "TakeOil") then
+			N.walkTo(spot, 4, 12)
+			task.wait(N.actionDelay())
+			N.jobFire({ Type = "FixBike", Workstation = ws })
+			task.wait(0.5)
+		end
+		-- wheels of the bike's own type (the rack whose wheels match MotorcycleType)
+		for _, front in ipairs({ true, false }) do
+			local got = take(interior:FindFirstChild("TireRacks"), function(f)
+				for _, rack in ipairs(f and f:GetChildren() or {}) do
+					if kind and string.find(rack.Name, kind, 1, true) then
+						return rack
+					end
+				end
+				return f and f:GetChildren()[1]
+			end, "TakeWheel")
+			if got then
+				N.walkTo(spot, 4, 12)
+				task.wait(N.actionDelay())
+				N.jobFire(if front then { Type = "FixBike", Front = true, Workstation = ws } else { Type = "FixBike", Workstation = ws })
+				task.wait(1.1)
+			end
+		end
+		-- paint only when the vehicle says which color it wants
+		local wanted = vehicle:GetAttribute("Color") or vehicle:GetAttribute("WantedColor") or vehicle:GetAttribute("PaintColor")
+		local painting = interior:FindFirstChild("PaintingEquipment")
+		if wanted and painting and take(painting, function(f)
+			return f:FindFirstChild(tostring(wanted))
+		end, "TakePainter") then
+			N.walkTo(spot, 4, 12)
+			task.wait(N.actionDelay())
+			N.jobFire({ Type = "FixBike", Workstation = ws })
+			task.wait(3.2)
+		end
+		task.wait(N.actionDelay())
+		N.jobFire({ Type = "JobCompleted", Workstation = ws })
+		local answered = waitFor(function()
+			return order.Parent == nil or order.Value == "true" or order.Value == "false"
+		end, 3)
+		Session.done += 1
+		if answered and order.Value == "true" then
+			Session.correct += 1
+		elseif answered and order.Value == "false" then
+			Session.wrong += 1
+			logProblem("Mechanic job judged wrong: " .. dump(vehicle))
+		end
+		log("MECHANIC", tostring(kind), if answered then order.Value else "no answer")
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -31635,7 +31787,7 @@ do
 	})
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream", "Supermarket Cashier", "Pizza Baker" },
+		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream", "Supermarket Cashier", "Pizza Baker", "Mechanic" },
 		Default = "Hairdresser",
 		Tooltip = "The Pay box shows what every job really paid you per hour",
 	})
@@ -32340,7 +32492,7 @@ do
 	if not N.jobHandler() then
 		logProblem("The game's JobHandler was not found, job farms cannot start")
 	end
-	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep }
+	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep }
 	local wasWorking = false
 	loop("main loop", function()
 		if N.manualRunning() then
