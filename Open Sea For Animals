@@ -29330,12 +29330,23 @@ local BootOk, BootError = xpcall(function()
 					end
 				end
 			end
+			local floor = Game.plotFloor and Game.plotFloor() or 0
+			for _, item in ipairs(list) do
+				item.gain = Game.itemGain and Game.itemGain(item.info, floor) or 0
+			end
 			table.sort(list, function(a, b)
+				if a.gain ~= b.gain then
+					return a.gain > b.gain
+				end
 				if a.info.value ~= b.info.value then
 					return a.info.value > b.info.value
 				end
 				return a.info.rank > b.info.rank
 			end)
+			if list[1] and list[1].gain > 0 then
+				-- the sea still gives upgrades at this reach (the training schedule watches this)
+				Sea.gainAt = os.clock()
+			end
 			Sea.preview = { matching = #list, total = total, at = os.clock() }
 			local ids, infos = {}, {}
 			for i = 1, math.min(capacity, #list) do
@@ -29829,7 +29840,16 @@ local BootOk, BootError = xpcall(function()
 					table.insert(list, { tool = tool, info = info })
 				end
 			end
+			if order == "Smart" then
+				local floor = Game.plotFloor()
+				for _, entry in ipairs(list) do
+					entry.rate = Game.eggGain(entry.info.type, entry.info.mutation, floor) / Game.hatchSeconds(entry.info.type, entry.info.size)
+				end
+			end
 			table.sort(list, function(a, b)
+				if order == "Smart" and a.rate ~= b.rate then
+					return a.rate > b.rate
+				end
 				if order == "Fastest Hatch" and a.info.hatch ~= b.info.hatch then
 					return a.info.hatch < b.info.hatch
 				elseif order == "Rarest" and a.info.tier ~= b.info.tier then
@@ -30044,6 +30064,86 @@ local BootOk, BootError = xpcall(function()
 			end
 			return amount, total, if worst == math.huge then 0 else worst
 		end
+		-- Upgrade math. Plot income only grows when a new animal beats the weakest one on the plot (or fills a free
+		-- slot). So an item is worth its expected gain over that floor:
+		--   animal: max(0, value - floor)
+		--   egg: sum over its animals and hatch sizes of chance * max(0, value - floor) (EggsConfig chances, egg
+		--   mutation kept, size rolled at hatch with SizeConfig chances)
+		-- Eggs go on the plot by gain per second of hatching, the sea takes the biggest gain first, Smart Sell keeps
+		-- the eggs with the biggest gain.
+		local GainCache, GainCacheSize = {}, 0
+		local DefaultSizes = {
+			baby = { chance = 86, cashMulti = 1, timeToHatchMulti = 1 },
+			big = { chance = 12, cashMulti = 1.25, timeToHatchMulti = 1.5 },
+			huge = { chance = 2, cashMulti = 1.5, timeToHatchMulti = 2 },
+		}
+		local function sizeTable()
+			local sizes = type(Game.SizeConfig) == "table" and Game.SizeConfig.SIZES
+			return if type(sizes) == "table" then sizes else DefaultSizes
+		end
+		function Game.plotFloor()
+			local amount, _, worst = placedStats()
+			if amount < maxAnimals() then
+				return 0
+			end
+			return worst
+		end
+		function Game.eggGain(eggType, mutation, floor)
+			local key = tostring(eggType) .. "|" .. tostring(mutation) .. "|" .. tostring(math.floor(floor))
+			local hit = GainCache[key]
+			if hit and os.clock() - hit.at < 30 then
+				return hit.gain, hit.chance
+			end
+			local cfg = Eggs[eggType]
+			local items = type(cfg) == "table" and type(cfg.items) == "table" and cfg.items or {}
+			local total, sizeTotal = 0, 0
+			for _, item in ipairs(items) do
+				if type(item) == "table" and (item.type == nil or item.type == "Brainrot") and Brainrots[item.id] then
+					total += tonumber(item.chance) or 0
+				end
+			end
+			for _, z in pairs(sizeTable()) do
+				sizeTotal += tonumber(z.chance) or 0
+			end
+			local gain, better = 0, 0
+			if total > 0 and sizeTotal > 0 then
+				for _, item in ipairs(items) do
+					if type(item) == "table" and (item.type == nil or item.type == "Brainrot") and Brainrots[item.id] then
+						local base = describe("Brainrot", item.id, mutation, "baby").value
+						local chance = (tonumber(item.chance) or 0) / total
+						for _, z in pairs(sizeTable()) do
+							local p = chance * (tonumber(z.chance) or 0) / sizeTotal
+							local v = base * (tonumber(z.cashMulti) or 1)
+							if v > floor then
+								gain += p * (v - floor)
+								better += p
+							end
+						end
+					end
+				end
+			end
+			if GainCacheSize > 600 then
+				table.clear(GainCache)
+				GainCacheSize = 0
+			end
+			GainCache[key] = { at = os.clock(), gain = gain, chance = better }
+			GainCacheSize += 1
+			return gain, better
+		end
+		function Game.hatchSeconds(eggType, size)
+			local cfg = Eggs[eggType]
+			local z = sizeTable()[size or "baby"]
+			return math.max((cfg and tonumber(cfg.hatchTime) or 60) * (z and tonumber(z.timeToHatchMulti) or 1), 1)
+		end
+		function Game.itemGain(info, floor)
+			if info.kind == "Egg" then
+				return (Game.eggGain(info.type, info.mutation, floor))
+			end
+			if info.special then
+				return 0
+			end
+			return math.max(info.value - floor, 0)
+		end
 		function equipBest(force)
 			local amount, _, worst = placedStats()
 			local best = bestInventoryBrainrot()
@@ -30135,7 +30235,14 @@ local BootOk, BootError = xpcall(function()
 						table.insert(smart, { key = key, info = info, kind = entry.itemType, locked = locked })
 					end
 				end
+				local floor = Game.plotFloor()
+				for _, item in ipairs(smart) do
+					item.score = if item.kind == "Egg" then Game.eggGain(item.info.type, item.info.mutation, floor) else 0
+				end
 				table.sort(smart, function(a, b)
+					if a.score ~= b.score then
+						return a.score > b.score
+					end
 					return a.info.value > b.info.value
 				end)
 				local keepEggs = if on("AutoPlaceEggs") then eggCap() * 2 else 0
@@ -30676,7 +30783,9 @@ local BootOk, BootError = xpcall(function()
 			if on("AutoFarmAll") then
 				local now = os.clock()
 				if Schedule.phase == "sea" then
-					if now - Schedule.since >= 300 and not isWaveActive() then
+					local seaTime = now - Schedule.since
+					local dry = seaTime >= 120 and now - math.max(Sea.gainAt or 0, Schedule.since) >= 90
+					if (seaTime >= 300 or dry) and not isWaveActive() then
 						Schedule.phase, Schedule.since, Schedule.reach = "train", now, waveReach()
 						log("SCHEDULE train until reach", Schedule.reach + 1, "power", power())
 					end
@@ -31183,7 +31292,7 @@ local BootOk, BootError = xpcall(function()
 					end
 					for _, pair in ipairs({
 						{ "CatchRarities", all }, { "EggRarities", all }, { "CatchKinds", { Animals = true, Eggs = true } },
-						{ "CatchMinValue", "" }, { "EggOrder", "Best Value" }, { "SeaPriority", "Best Value" },
+						{ "CatchMinValue", "" }, { "EggOrder", "Smart" }, { "SeaPriority", "Best Value" },
 					}) do
 						local option = Options[pair[1]]
 						if option then
@@ -31438,7 +31547,7 @@ local BootOk, BootError = xpcall(function()
 			)
 			EggBox:AddDropdown(
 				"EggOrder",
-				{ Text = "Place First", Values = { "Best Value", "Rarest", "Fastest Hatch" }, Default = "Best Value" }
+				{ Text = "Place First", Values = { "Smart", "Best Value", "Rarest", "Fastest Hatch" }, Default = "Smart", Tooltip = "Smart places the eggs most likely to beat your weakest plot animal, per second of hatching" }
 			)
 			EggBox:AddDropdown(
 				"EggRarities",
