@@ -29463,8 +29463,13 @@ local BootOk, BootError = xpcall(function()
 			Track.wave()
 			local minValue = parseAmount(Options.CatchMinValue and Options.CatchMinValue.Value) or 0
 			local list, total = {}, 0
+			local blocks = {}
 			for _, spawn in pairs(wave.spawns) do
-				local info = spawnInfo(spawn)
+				local blockKey, blockCfg = Game.lucky.of(spawn)
+				if blockKey then
+					table.insert(blocks, { id = spawn.entity.id, key = blockKey, cfg = blockCfg })
+				end
+				local info = if blockKey then nil else spawnInfo(spawn)
 				if info then
 					total += 1
 					if matches(info, "Catch", minValue) then
@@ -29522,7 +29527,11 @@ local BootOk, BootError = xpcall(function()
 				list = chosen
 			end
 			local ids, infos = {}, {}
-			for i = 1, math.min(capacity, #list) do
+			for _, id in ipairs(Game.lucky.take(blocks, capacity)) do
+				table.insert(ids, id)
+			end
+			local blockCount = #ids
+			for i = 1, math.min(capacity - blockCount, #list) do
 				table.insert(ids, list[i].id)
 				table.insert(infos, list[i].info)
 			end
@@ -29532,11 +29541,20 @@ local BootOk, BootError = xpcall(function()
 				endWave()
 				return true
 			end
-			setStatus(string.format("Blatant: taking %s (%s, $%s/s)", infoTitle(infos[1]), infos[1].rarity, formatNumber(infos[1].value)))
+			if infos[1] then
+				setStatus(string.format("Blatant: taking %s (%s, $%s/s)", infoTitle(infos[1]), infos[1].rarity, formatNumber(infos[1].value)))
+			else
+				setStatus("Blatant: taking lucky blocks")
+			end
 			call("WaveService", "Finished", ids)
 			local got = waitFor(function()
-				return inventoryCount() >= before + #ids
+				return inventoryCount() >= before + #infos
 			end, 1.5)
+			if #infos == 0 then
+				task.wait(0.3)
+				Game.lucky.shot(blockCount)
+				return true
+			end
 			if not got and inventoryCount() <= before then
 				I.refused += 1
 				log("INSTANT refused", #ids, "item(s), inventory", before, "->", inventoryCount(), "refused", I.refused)
@@ -30711,6 +30729,9 @@ local BootOk, BootError = xpcall(function()
 			if os.clock() < SellQuietUntil then
 				return false
 			end
+			if Game.cashBoost and Game.cashBoost() and inventoryCount() > 0 then
+				return true
+			end
 			local limit = math.min(tonumber(Options.SellAt and Options.SellAt.Value) or 150, inventoryLimit())
 			if inventoryCount() >= limit then
 				return true
@@ -30787,6 +30808,313 @@ local BootOk, BootError = xpcall(function()
 				end
 			end
 			return false
+		end
+	end
+	do
+		-- Lucky blocks (admin events), weather schedule, luck hop and the free ad reward (2026-10-05).
+		-- Everything hangs on Game.*, so the earlier code (Blatant wave, Smart Sell, planner) reaches it at run time.
+		local function cfgOf(name)
+			local ok, value = pcall(function()
+				return require(ReplicatedStorage.Configs[name])
+			end)
+			return if ok and type(value) == "table" then value else nil
+		end
+		Game.LuckyBlockConfig = cfgOf("LuckyBlockConfig")
+		-- first active event of an EventConfig type (cashEvent, adminEvent, ...) and its remaining seconds
+		function Game.activeEvent(kind)
+			local folder = ReplicatedStorage:FindFirstChild("ActiveEvents")
+			local cfgs = Game.EventConfig
+			for _, child in ipairs(folder and folder:GetChildren() or {}) do
+				local cfg = type(cfgs) == "table" and cfgs[child.Name]
+				if type(cfg) == "table" and cfg.type == kind then
+					local ok, left = pcall(function()
+						return child.Value
+					end)
+					return child.Name, (if ok then tonumber(left) else nil)
+				end
+			end
+			return nil, nil
+		end
+
+		-- 1. Lucky blocks: they are wave items (Pickable with LuckyBlockType, Tool in the backpack). Admin event blocks are
+		-- taken by the Blatant wave first; opening is tried with the block Tool (equip + Activate). The client has no
+		-- remote for opening, so 3 failures in a row back the feature off for 10 minutes.
+		local Lucky = { found = 0, taken = 0, opened = 0, fails = 0, backoffUntil = 0, unknownLogged = 0 }
+		Game.lucky = Lucky
+		function Lucky.of(spawn)
+			local blocks = type(Game.LuckyBlockConfig) == "table" and Game.LuckyBlockConfig.LUCKY_BLOCKS
+			local e = type(spawn) == "table" and spawn.entity
+			if type(blocks) ~= "table" or type(e) ~= "table" or e.id == nil then
+				return nil
+			end
+			for _, v in pairs(e) do
+				if type(v) == "string" and type(blocks[v]) == "table" then
+					return v, blocks[v]
+				end
+			end
+			if e.eggType == nil and e.brainrotType == nil and Lucky.unknownLogged < 3 then
+				Lucky.unknownLogged += 1
+				log("LUCKY unknown wave entity", e)
+			end
+			return nil
+		end
+		function Lucky.take(blocks, capacity)
+			local ids = {}
+			if #blocks == 0 then
+				return ids
+			end
+			Lucky.found += #blocks
+			if not on("AutoLucky") or os.clock() < Lucky.backoffUntil then
+				return ids
+			end
+			local names = {}
+			for _, block in ipairs(blocks) do
+				if #ids < capacity and block.cfg.type == "Admin" then
+					table.insert(ids, block.id)
+					table.insert(names, block.key)
+				end
+			end
+			if #ids > 0 then
+				Lucky.taken += #ids
+				log("LUCKY take", table.concat(names, ","), "event", Game.activeEvent("adminEvent") or "none", "of", #blocks, "blocks in the wave")
+			end
+			return ids
+		end
+		function Lucky.shot(count)
+			log("LUCKY taken=" .. count, "inventory", inventoryCount())
+		end
+		local function luckyInventory()
+			local data = Data()
+			local n = 0
+			for _, entry in pairs(data and type(data.Inventory) == "table" and data.Inventory or {}) do
+				if type(entry) == "table" and entry.itemType == "LuckyBlock" then
+					n += 1
+				end
+			end
+			return n
+		end
+		function Lucky.open()
+			if os.clock() < Lucky.backoffUntil or isWaveActive() then
+				return false
+			end
+			local owned = luckyInventory()
+			local tools = {}
+			for _, container in ipairs({ LocalPlayer:FindFirstChild("Backpack"), character() }) do
+				for _, tool in ipairs(container and container:GetChildren() or {}) do
+					if tool:IsA("Tool") and tool:GetAttribute("LuckyBlockType") then
+						table.insert(tools, tool)
+					end
+				end
+			end
+			if #tools == 0 and owned == 0 then
+				return false
+			end
+			local tool = tools[1]
+			local name = if tool then tostring(tool:GetAttribute("LuckyBlockType")) else "inventory"
+			local ok = false
+			if tool then
+				local hum = humanoid()
+				pcall(function()
+					if hum then
+						hum:EquipTool(tool)
+					end
+				end)
+				task.wait(0.3)
+				local cfg = Game.LuckyBlockConfig.LUCKY_BLOCKS[name]
+				local hits = math.clamp(tonumber(cfg and cfg.hp) or 20, 5, 60)
+				for _ = 1, hits do
+					if not tool.Parent or luckyInventory() < owned then
+						break
+					end
+					pcall(function()
+						tool:Activate()
+					end)
+					task.wait(0.08)
+				end
+				ok = tool.Parent == nil or luckyInventory() < owned
+				pcall(function()
+					if hum then
+						hum:UnequipTools()
+					end
+				end)
+			end
+			log(string.format("LUCKY found=%d open=%s ok=%s", Lucky.found, name, tostring(ok)))
+			if ok then
+				Lucky.opened += 1
+				Lucky.fails = 0
+				Session.claimed += 1
+				Track.event("Lucky", "Opened " .. name, nil, "gift", "#ffd166")
+			else
+				Lucky.fails += 1
+				if Lucky.fails >= 3 then
+					Lucky.fails = 0
+					Lucky.backoffUntil = os.clock() + 600
+					log("LUCKY unsupported, back off 10 min")
+				end
+			end
+			return ok
+		end
+
+		-- 2. Weather: ActiveWeathers children (gold, diamond, radioactive, rainbow) change the mutation odds
+		-- (MutationConfig.chances[weather]); mult = expected cashMulti of an animal with the weather / without it.
+		local Weather = { name = nil, mult = 1, avg = 1, untilAt = 0, key = "?" }
+		Game.weatherState = Weather
+		local function expectedCash(chanceKey)
+			local cfg = Game.MutationConfig
+			if type(cfg) ~= "table" then
+				return nil
+			end
+			local total, sum = 0, 0
+			for _, m in pairs(cfg) do
+				local chance = type(m) == "table" and type(m.chances) == "table" and tonumber(m.chances[chanceKey])
+				if chance then
+					total += chance
+					sum += chance * (tonumber(m.cashMulti) or 1)
+				end
+			end
+			return if total > 0 then sum / total else nil
+		end
+		function Weather.update()
+			local folder = ReplicatedStorage:FindFirstChild("ActiveWeathers")
+			local base = expectedCash("base") or 1
+			local name, mult, left = nil, 1, 0
+			for _, child in ipairs(folder and folder:GetChildren() or {}) do
+				local expected = expectedCash(child.Name)
+				local m = if expected then expected / base else 1
+				if name == nil or m > mult then
+					local ok, value = pcall(function()
+						return child.Value
+					end)
+					name, mult, left = child.Name, m, (if ok then tonumber(value) or 0 else 0)
+				end
+			end
+			Weather.name, Weather.mult, Weather.untilAt = name, mult, os.clock() + left
+			if (name or "none") ~= Weather.key then
+				Weather.key = name or "none"
+				log(string.format("WEATHER %s mult=%.3f until=%ds", Weather.key, mult, math.floor(left)))
+			end
+		end
+		task.spawn(function()
+			while alive() do
+				pcall(Weather.update)
+				task.wait(5)
+			end
+		end)
+		-- x2 Cash event (EventConfig cashEvent): Smart Sell sells everything in the window (sellDue)
+		local CashState = nil
+		function Game.cashBoost()
+			local name, left = Game.activeEvent("cashEvent")
+			if name ~= CashState then
+				CashState = name
+				log("CASHBOOST", name or "ended", "left", left or 0)
+			end
+			return name ~= nil
+		end
+
+		-- 3. Luck hop: no server luck for N minutes (or 20 s while a hop chain is running) -> another public server
+		local Hop = { since = nil, lastAt = -1e9, logged = nil, gaveUp = false }
+		Game.hop = Hop
+		local function hopSaved()
+			local ok, saved = pcall(Library.GetSetting, Library, "OSFA_LuckHop")
+			return if ok and type(saved) == "table" then saved else {}
+		end
+		local function hopSave(value)
+			pcall(Library.SetSetting, Library, "OSFA_LuckHop", value)
+		end
+		function Game.hopTick()
+			if game.PrivateServerId ~= "" or game.PrivateServerOwnerId ~= 0 then
+				return false
+			end
+			local luck = tonumber(ReplicatedStorage:GetAttribute("ServerLuckMultiplier")) or 1
+			if luck > 1 and ReplicatedStorage:GetAttribute("ServerLuckPaused") ~= true then
+				if Hop.logged ~= game.JobId then
+					Hop.logged = game.JobId
+					log(string.format("HOP reason=luck found=%.3g", luck))
+					hopSave({ at = 0, tries = 0, tried = {} })
+				end
+				Hop.since, Hop.gaveUp = nil, false
+				return false
+			end
+			if Hop.gaveUp then
+				return false
+			end
+			local saved = hopSaved()
+			local chain = type(saved.at) == "number" and saved.at > 0 and os.time() - saved.at < 300
+			local tries = tonumber(saved.tries) or 0
+			if type(saved.at) == "number" and saved.at > 0 and os.time() - saved.at > 1800 then
+				tries = 0
+			end
+			Hop.since = Hop.since or os.clock()
+			local wait = if chain then 20 else (tonumber(Options.LuckHopMinutes and Options.LuckHopMinutes.Value) or 2) * 60
+			if os.clock() - Hop.since < wait or os.clock() - Hop.lastAt < 60 or isWaveActive() or #carriedModels() > 0 then
+				return false
+			end
+			if tries >= 25 then
+				Hop.gaveUp = true
+				log("HOP reason=luck gave up after", tries, "servers without luck")
+				return false
+			end
+			Hop.lastAt = os.clock()
+			local ok, body = pcall(function()
+				return game:HttpGet(string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", game.PlaceId))
+			end)
+			local decoded = nil
+			if ok and type(body) == "string" then
+				local okJson, value = pcall(HttpService.JSONDecode, HttpService, body)
+				decoded = if okJson and type(value) == "table" then value else nil
+			end
+			local tried = type(saved.tried) == "table" and saved.tried or {}
+			local candidates = {}
+			for _, server in ipairs(decoded and type(decoded.data) == "table" and decoded.data or {}) do
+				if type(server) == "table" and server.id ~= game.JobId and not table.find(tried, server.id)
+					and tonumber(server.playing) and tonumber(server.maxPlayers) and server.playing < server.maxPlayers then
+					table.insert(candidates, server.id)
+				end
+			end
+			if #candidates == 0 then
+				log("HOP reason=luck no other public server found", if decoded then "list empty" else "list not readable")
+				return false
+			end
+			local pick = candidates[math.random(1, math.min(#candidates, 30))]
+			table.insert(tried, game.JobId)
+			table.insert(tried, pick)
+			while #tried > 40 do
+				table.remove(tried, 1)
+			end
+			hopSave({ at = os.time(), tries = tries + 1, tried = tried })
+			log(string.format("HOP reason=luck leaving, server luck x%.3g, try %d", luck, tries + 1))
+			notify("Luck Hop", "No server luck here, trying another server", 4)
+			pcall(function()
+				game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, pick, LocalPlayer)
+			end)
+			return true
+		end
+
+		-- 4. Free video ad reward (VideoAdService.CanAd / PlayAd): a failing call is logged once and the job stops
+		local Ad = { stopped = false }
+		function Game.adTick()
+			if Ad.stopped then
+				return false
+			end
+			local ok, can = call("VideoAdService", "CanAd")
+			if not ok then
+				Ad.stopped = true
+				log("AD error CanAd failed, the free ad job stops")
+				return false
+			end
+			if can ~= true then
+				return false
+			end
+			local okPlay, result = call("VideoAdService", "PlayAd")
+			if not okPlay then
+				Ad.stopped = true
+				log("AD error PlayAd failed, the free ad job stops")
+				return false
+			end
+			log("AD reward=" .. brief(result))
+			Session.claimed += 1
+			Track.event("Ad", "Free ad reward", nil, "gift", "#ffd166")
+			return true
 		end
 	end
 	local buyStaffTick, equipStaffTick, buyDumbbellTick, equipDumbbellTick, rebirthTick, trainTick, trainTurn, playtimeTick, nextPlaytimeGift, dailyTick, freeShopTick, foreverTick, limitedTick
@@ -31700,6 +32028,12 @@ local BootOk, BootError = xpcall(function()
 			local bestCfg = bestKey and staffOf(bestKey)
 			local staffLuck = math.max(bestCfg and effectiveLuck(bestCfg, owned) or 1, 1)
 			local boost = luckBoost()
+			local W = Game.weatherState
+			local wmNow = if W then math.max(W.mult or 1, 1) else 1
+			if W then
+				W.avg = R.ewma(W.avg, wmNow, 0.0055)
+			end
+			local wmAvg = if W then math.max(W.avg or 1, 1) else 1
 			R.luckNow = staffLuck * boost
 			local b = if R.bN >= 30 and R.b then math.clamp(R.b, 0.01, 1.5) else 0.14
 			local e = if R.eN >= 3 and R.e then math.clamp(R.e, 0, 1.5) else 0.5
@@ -31714,7 +32048,7 @@ local BootOk, BootError = xpcall(function()
 			if catch <= 0 and R.takenV and R.waveGap and R.waveGap > 0 then
 				catch = R.takenV * 30 / R.waveGap * seaShare
 			end
-			local catchBase = catch / boost ^ e
+			local catchBase = catch / (boost ^ e * wmAvg)
 			local H = 86400 -- rolling 24 h: the farm never ends, so the horizon never shrinks
 			local income = plot + catch
 			local list, byKey = {}, {}
@@ -31791,7 +32125,7 @@ local BootOk, BootError = xpcall(function()
 				local walk = if Schedule.phase == "train" then 0 else R.switch or 5
 				local tp = math.max(need - p, 0) / rate + walk
 				local mult = math.exp(b)
-				local cost = tp * catch / seaShare
+				local cost = tp * catch * (wmNow / wmAvg) / seaShare
 				local gain = catchBase * (mult - 1)
 				if cost > 0 and gain > 0 then
 					train = { key = "Train", name = "Train to reach " .. (reach + 1), cost = cost, gain = gain, ratio = gain / cost, payback = cost / gain, tp = tp, mult = mult }
@@ -31940,7 +32274,7 @@ local BootOk, BootError = xpcall(function()
 				"AutoSea", "AutoSell", "AutoEquipBest", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff",
 				"AutoEquipStaff", "AutoBuyDumbbell", "AutoEquipDumbbell", "AutoTrain", "AutoBonus", "AutoRebirth",
 				"AutoPotions", "SmartPotions", "AutoOffline", "SkipEmpty", "EquipBeforeSell", "SaveForRebirth",
-				"AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoCodes", "AutoStars",
+				"AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoCodes", "AutoStars", "AutoLucky",
 			}
 			local FarmAllMain = { "AutoSea", "AutoSell", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff", "AutoBuyDumbbell", "AutoTrain", "AutoRebirth", "AutoPotions" }
 			local FarmAllTurned = {}
@@ -32456,6 +32790,13 @@ local BootOk, BootError = xpcall(function()
 			FreeBox:AddToggle(
 				"AutoGroup",
 				{ Text = "Auto Claim Group Reward", Default = true, Tooltip = "Only when you are in the game's group" }
+			)
+			FreeBox:AddToggle("AutoLucky", { Text = "Auto Lucky Blocks", Default = true, Tooltip = "Takes the lucky blocks of admin events from the sea and opens them" })
+			FreeBox:AddToggle("AutoAd", { Text = "Auto Free Ad Reward", Default = true, Tooltip = "Asks the game for the free video reward when it is available" })
+			FreeBox:AddToggle("LuckHop", { Text = "Luck Hop", Default = false, Tooltip = "Hops public servers until one has server luck above x1 (not on private servers)" })
+			FreeBox:AddSlider(
+				"LuckHopMinutes",
+				{ Text = "Hop After No Luck For", Default = 2, Min = 1, Max = 15, Rounding = 0, Suffix = " min", HideMax = true }
 			)
 			Labels.Rewards = FreeBox:AddLabel({ Text = "-", DoesWrap = true })
 			FreeBox:AddButton({
@@ -34345,6 +34686,15 @@ local BootOk, BootError = xpcall(function()
 			{ "AutoLimited", "limited", 60, limitedTick },
 			{ "AutoSeasonPass", "season", 15, seasonTick },
 			{ "AutoCodes", "codes", 20, codesTick },
+			{ "AutoLucky", "lucky", 8, function()
+				Game.lucky.open()
+			end },
+			{ "AutoAd", "ad", 300, function()
+				Game.adTick()
+			end },
+			{ "LuckHop", "luckhop", 5, function()
+				Game.hopTick()
+			end },
 			{ "AutoPotions", "potions", 10, potionTick },
 			{ "AutoSpin", "spin", 5, function()
 				-- the game's lucky wheel: 25 LuminousCoins a spin (10M cash 55%, demonic/angelic animals, Luminous Trident)
