@@ -27279,6 +27279,7 @@ end
                     "CorvusConfigList",
                     "CorvusShareCode",
                     "CorvusAutoSave",
+                    "FarmAll",
                 })
                 SaveManager:SetFolder(Folder)
                 if Info.SubFolder then
@@ -32221,6 +32222,10 @@ do
 			local hooked = wrapField(t, "setInput", function(original)
 				D.localRides[t] = original
 				return function(frame, ...)
+					if type(frame) == "table" then
+						-- the frame the game built from the keys (logged next to ours in DRIVE diag)
+						D.gameFrame = { throttle = tonumber(frame.throttle) or 0, steer = tonumber(frame.steer) or 0 }
+					end
 					if injecting("localride") then
 						D.calls.localride = (D.calls.localride or 0) + 1
 						frame = override(if type(frame) == "table" then frame else fullFrame())
@@ -32344,6 +32349,12 @@ do
 		D.flip, D.flips = 1, 0
 		D.steerOk = false
 		D.calls = {}
+		D.selfTest = nil
+		if N.driveMethod() == "keys" and D.unfocused then
+			-- VirtualInputManager key events are dropped while the Roblox window is unfocused (known limitation)
+			log("DRIVE method keys skipped: the window is unfocused, key presses do not reach the game")
+			D.method = D.method % #N.DriveMethods + 1
+		end
 		if N.driveMethod() == "localride" then
 			D.gcScanned = false
 			N.hookReplay()
@@ -32462,14 +32473,211 @@ do
 		end
 		return N.flat(goal.target - part.Position).Magnitude
 	end
+	-- The game's own ride state. VoltlineClientRide (dump 68659-68906) sets LocalRide.active = { model, rig, go, token } and
+	-- steps the rig only after the server's GO; PhysicalScooterRig.step (134761-134775) gives drive only when
+	-- authority.powerEnabled and not locked and rideAllowed, the rider is on (mountedCharacter) and boarding is over.
+	-- Owner log 2026-10-05: the game called our wrapped setInput 118 times in 5 s (our frame reached LocalRide) and the
+	-- rig got it (rig calls 130), yet speed stayed 0 -> the input methods were not the problem; this reads the gates.
+	function N.activeRide()
+		for t in pairs(D.localRides) do
+			local ride = rawget(t, "active")
+			if type(ride) == "table" then
+				return ride
+			end
+		end
+		local lr = N.mod("VoltlineShared.Ride.LocalRide")
+		local ride = type(lr) == "table" and lr.active or nil
+		return if type(ride) == "table" then ride else nil
+	end
+	function N.rideState(model)
+		local s = { localRide = false }
+		local ride = N.activeRide()
+		if not ride then
+			return s
+		end
+		s.localRide = true
+		s.go = ride.go == true
+		s.ours = model == nil or ride.model == nil or ride.model == model
+		local rig = type(ride.rig) == "table" and ride.rig or nil
+		if rig then
+			pcall(function()
+				local auth = rig.authority
+				if type(auth) == "table" then
+					s.power = auth.powerEnabled == true
+					s.locked = auth.locked == true
+					s.allowed = auth.rideAllowed == true
+					s.mode = auth.mode
+				end
+				s.boarding = rig.boardingSession ~= nil
+				s.rider = rig.mountedCharacter ~= nil
+				s.demand = tonumber(rig.driveThrottle)
+				if type(rig.input) == "table" then
+					s.rigThrottle = tonumber(rig.input.throttle)
+					s.rigSteer = tonumber(rig.input.steer)
+				end
+				if type(rig.telemetry) == "table" then
+					s.telSpeed = tonumber(rig.telemetry.speedMps)
+				end
+				if rig.chassis then
+					s.anchored = rig.chassis.Anchored == true
+				end
+			end)
+		end
+		return s
+	end
+	-- Why the motor gives no drive, from the ride state (nil = nothing blocks it or the ride is server-run).
+	function N.rideBlock(s)
+		if not s.localRide then
+			return nil
+		end
+		if s.ours == false then
+			return "the game's ride is another scooter"
+		elseif not s.go then
+			return "ride not granted by the server (no GO)"
+		elseif s.boarding then
+			return "still getting on"
+		elseif s.rider == false then
+			return "rider not on the scooter"
+		elseif s.power == false then
+			return "power off in the ride authority"
+		elseif s.locked then
+			return "scooter locked"
+		elseif s.allowed == false then
+			return "ride not allowed (service required)"
+		elseif s.anchored then
+			return "scooter anchored"
+		end
+		return nil
+	end
+	-- Our throttle reached the rig's input (the proof an input method works, independent of speed).
+	function N.inputReached(s)
+		if s.rigThrottle == nil then
+			return nil
+		end
+		local want = if D.input.brake > 0.05 then 0 else D.input.throttle
+		return math.abs(s.rigThrottle - want) < 0.15
+	end
+	-- A block that lasts: step off and back on (the game's own fix for a ride that never got GO / stuck boarding);
+	-- ride not allowed -> service (serviceStep reads N.Service.forced).
+	function N.handleBlock(reason, model, dt)
+		if D.blockReason ~= reason then
+			D.blockReason = reason
+			D.blockFor = 0
+			D.blockLogAt = nil
+		end
+		D.blockFor = (D.blockFor or 0) + dt
+		if os.clock() - (D.blockLogAt or -1e9) > 10 then
+			D.blockLogAt = os.clock()
+			log("DRIVE blocked", reason, string.format("for %.0fs", D.blockFor))
+		end
+		if string.find(reason, "service", 1, true) then
+			if not N.Service.forced then
+				local st = N.state()
+				local maint = st.maint
+				N.Service.forced = true
+				logProblem("Scooter needs a service before it can be ridden (" .. tostring(type(maint) == "table" and maint.rideReason or "?") .. ")")
+			end
+			return
+		end
+		if D.blockFor > 6 and os.clock() - (D.remountAt or -1e9) > 20 then
+			D.remountAt = os.clock()
+			D.blockFor = 0
+			log("DRIVE remount", reason)
+			N.fireEvent("RequestDismount")
+		end
+	end
+	-- Every 2 s while driving: our frame, the game's last frame, what the rig got, and every gate.
+	function N.driveDiag(dt, s, speed, model, part)
+		D.diagAt = (D.diagAt or 0) - dt
+		if D.diagAt > 0 then
+			return
+		end
+		D.diagAt = 2
+		local g = D.gameFrame or {}
+		local up = 1
+		pcall(function()
+			up = part.CFrame.UpVector.Y
+		end)
+		local function f(v)
+			return if v == nil then "-" else string.format("%.2f", v)
+		end
+		log(
+			"DRIVE diag",
+			string.format("ours thr=%s st=%s game thr=%s st=%s rig thr=%s st=%s demand=%s", f(D.input.throttle), f(D.input.steer), f(g.throttle), f(g.steer), f(s.rigThrottle), f(s.rigSteer), f(s.demand)),
+			string.format("seated=%s local=%s go=%s power=%s allowed=%s locked=%s boarding=%s rider=%s anchored=%s", tostring(N.seated(model)), tostring(s.localRide), tostring(s.go), tostring(s.power), tostring(s.allowed), tostring(s.locked), tostring(s.boarding), tostring(s.rider), tostring(s.anchored)),
+			string.format("phase=%s mode=%s speed=%.1f tel=%s up=%.2f method=%s", tostring(model:GetAttribute("PowerPhase")), tostring(s.mode), speed, f(s.telSpeed), up, N.driveMethod())
+		)
+	end
+	-- Seated: the game's MountedScooter value points at this model and the rider is not falling.
+	function N.seated(model)
+		local mounted = N.mounted()
+		return mounted ~= nil and (model == nil or mounted == model) and not N.isFalling()
+	end
+	-- Self-test at the start of each ride (5 s): does the rig get our throttle, does the speed rise? Logs
+	-- `DRIVE selftest ok|failed`; a method whose input never reaches the rig is dropped right away.
+	function N.selfTestStep(dt, s, speed, blocked)
+		local st = D.selfTest
+		if not st then
+			st = { t = 0, maxSpeed = 0, reached = 0, asked = 0 }
+			D.selfTest = st
+		end
+		if st.done then
+			return
+		end
+		st.t += dt
+		st.maxSpeed = math.max(st.maxSpeed, speed)
+		if D.input.throttle > 0.3 then
+			st.asked += dt
+			if N.inputReached(s) then
+				st.reached += dt
+			end
+		end
+		if st.t < 5 then
+			return
+		end
+		st.done = true
+		local fmt = string.format("method=%s input reached %.1f of %.1f s, max speed %.1f m/s", N.driveMethod(), st.reached, st.asked, st.maxSpeed)
+		if st.maxSpeed >= 1 then
+			log("DRIVE selftest ok", fmt)
+			D.proven[N.driveMethod()] = true
+		elseif blocked then
+			log("DRIVE selftest failed", fmt, "blocked:", blocked)
+		elseif s.localRide and s.rigThrottle ~= nil and st.asked > 2 and st.reached < 0.5 then
+			log("DRIVE selftest failed", fmt, "our input does not reach the rig")
+			N.nextMethod("selftest: input does not reach the rig")
+		else
+			log("DRIVE selftest failed", fmt, if N.inputReached(s) then "input reaches the rig, the scooter does not move (stuck or a gate)" else "")
+		end
+	end
 	-- Speed watchdog: full throttle asked but the scooter stays under 3 m/s for 10 s -> the method does not reach the
 	-- game, try the next one. A method that once went over 5 m/s is kept (then it is a stuck scooter, not the method).
-	function N.driveWatch(dt, out, speed, model, reached)
+	-- When the rig's own input shows our throttle, the method works: a slow scooter is then stuck, not a method fault.
+	function N.driveWatch(dt, out, speed, model, reached, s)
 		local method = N.driveMethod()
 		D.methodFor += dt
 		if speed > 2.5 and out.throttle > 0.2 then
 			-- the method moved the scooter: later slow phases are a stuck scooter (stuck recovery), not the method
 			D.proven[method] = true
+		end
+		s = s or { localRide = false }
+		local blocked = N.rideBlock(s)
+		if not blocked and out.throttle >= 0.6 and N.inputReached(s) == true and s.demand ~= nil and s.demand < 0.05 and speed < 1 then
+			-- our throttle is in the rig but RideDriveResponse gives 0: a gate we cannot read; switching methods cannot help
+			blocked = "motor gives no drive (rig demand 0)"
+		end
+		if blocked then
+			D.slowFor = 0
+			N.handleBlock(blocked, model, dt)
+		else
+			D.blockFor = 0
+		end
+		local working = not blocked and out.throttle >= 0.6 and N.inputReached(s) == true and (s.demand or 0) > 0.3
+		if working then
+			-- our throttle is in the rig and the motor gives drive: never a method fault
+			if not D.reachLogged then
+				D.reachLogged = true
+				log("DRIVE input reaches the rig", method, string.format("rig thr=%.2f demand=%.2f", s.rigThrottle or 0, s.demand or 0))
+			end
 		end
 		if not reached and D.methodFor > 3 then
 			N.nextMethod("cannot reach the game input")
@@ -32483,7 +32691,9 @@ do
 		local powered = phase == nil or phase == "READY"
 		-- full throttle and still slow (any target speed: a sharp heading error caps the target at 3 m/s, the old check
 		-- needed >= 5 and never counted)
-		if powered and not N.isFalling() and out.throttle >= 0.6 and speed < 3 then
+		if blocked or working then
+			D.slowFor = 0
+		elseif powered and not N.isFalling() and out.throttle >= 0.6 and speed < 3 then
 			D.slowFor += dt
 		elseif speed >= 3 then
 			D.slowFor = 0
@@ -32571,14 +32781,27 @@ do
 			Session.stuck = (Session.stuck or 0) + 1
 			log("STUCK cycle", S.cycles, string.format("err=%ddeg speed=%.1f", math.floor(math.deg(out.err or 0) + 0.5), speed))
 			local model = N.mounted()
+			-- RIGHT_SCOOTER / BRING_SCOOTER while mounted are refused (owner log: DISMOUNT_BEFORE_RECOVERY / _RECALL); the
+			-- game's own mounted action is DISMOUNT_STUCK (tilted under 0.8 and slower than 1 m/s, dump 29648-29651).
+			local part = model and N.partOf(model)
+			local up = 1
+			pcall(function()
+				up = part.CFrame.UpVector.Y
+			end)
 			if S.cycles == 2 then
-				N.command("RideRecoveryRequest", { action = "RIGHT_SCOOTER", scooterId = N.scooterId(model) })
+				if model and up < 0.8 then
+					log("STUCK tilted", string.format("up=%.2f", up), "DISMOUNT_STUCK")
+					N.command("RideRecoveryRequest", { action = "DISMOUNT_STUCK", scooterId = N.scooterId(model) })
+				elseif not model then
+					N.command("RideRecoveryRequest", { action = "RIGHT_SCOOTER", scooterId = N.selectedId() })
+				end
 			elseif S.cycles == 3 and D.goal then
 				log("STUCK replanning from here")
 				N.setGoal(D.goal.target, { label = D.goal.label, stopRadius = D.goal.stopRadius, replan = true })
 			elseif S.cycles >= 4 then
-				log("STUCK summoning the scooter")
-				N.command("RideRecoveryRequest", { action = "BRING_SCOOTER", scooterId = N.scooterId(model) })
+				-- step off: the mount flow then picks the scooter up (RIGHT_SCOOTER) and gets back on
+				log("STUCK stepping off to reset the scooter")
+				N.fireEvent("RequestDismount")
 				S.cycles = 0
 			end
 		end
@@ -32625,6 +32848,12 @@ do
 		if not part then
 			return
 		end
+		if not D.active or D.rideModel ~= model or D.rideSince ~= N.Rider.mountedSince then
+			-- a new ride (start, or back on after a fall/remount): self-test again
+			D.selfTest = nil
+			D.rideModel = model
+			D.rideSince = N.Rider.mountedSince
+		end
 		D.active = true
 		local pos = part.Position
 		local fwd, look = N.forwardOf(model, part)
@@ -32649,7 +32878,9 @@ do
 		D.vmax = out.vmax
 		D.err = out.err
 		N.calibrateHeading(look, N.flat(part.AssemblyLinearVelocity), speed, D.input.throttle)
-		local recovery = N.stuckStep(dt, speed, out, out.throttle > 0.3)
+		local rs = N.rideState(model)
+		N.driveDiag(dt, rs, speed, model, part)
+		local recovery = N.rideBlock(rs) == nil and N.stuckStep(dt, speed, out, out.throttle > 0.3) or nil
 		if recovery then
 			N.setInput(recovery.throttle, recovery.brake, recovery.steer, recovery.walkBack)
 			N.applyInput(dt)
@@ -32657,7 +32888,8 @@ do
 		end
 		N.setInput(out.throttle, out.brake, out.steer)
 		local reached = N.applyInput(dt)
-		N.driveWatch(dt, out, speed, model, reached)
+		N.selfTestStep(dt, rs, speed, N.rideBlock(rs))
+		N.driveWatch(dt, out, speed, model, reached, rs)
 		N.steerCheck(dt, look, speed, out.steer)
 		if out.throttle > 0.3 then
 			D.commandedFor += dt
@@ -32688,7 +32920,15 @@ do
 	-- Window focus: the game drops all input while the Roblox window is unfocused (AFK on a second screen).
 	-- The game's own WindowFocused handler turns input back on; the hub fires it after a focus loss while driving.
 	pcall(function()
+		Library:GiveSignal(UIS.WindowFocused:Connect(function()
+			D.unfocused = false
+		end))
 		Library:GiveSignal(UIS.WindowFocusReleased:Connect(function()
+			D.unfocused = true
+			if D.active and N.driveMethod() == "keys" and not D.keysFocusLogged then
+				D.keysFocusLogged = true
+				log("FOCUS keys method: VirtualInputManager keys are dropped while unfocused (known limitation)")
+			end
 			if D.active and on("KeepDrivingUnfocused") and type(firesignal) == "function" then
 				task.delay(0.2, function()
 					pcall(firesignal, UIS.WindowFocused)
@@ -33209,6 +33449,9 @@ do
 		R.falling = false
 		local mounted = N.mounted()
 		if mounted then
+			if R.mountTries > 0 then
+				log("MOUNT ok after", R.mountTries, "tries")
+			end
 			R.mountTries = 0
 			R.bringCount = 0
 			R.mountedSince = R.mountedSince or os.clock()
@@ -33235,7 +33478,33 @@ do
 			N.bring(id)
 			return false
 		end
-		if dist > 5 then
+		-- a scooter on its side cannot be mounted: the game asks "Pick up your scooter" = RIGHT_SCOOTER while on foot
+		-- (dump 29623-29634, UpVector.Y < 0.94). Owner log 2026-10-05: after a fall RequestMount was spammed forever.
+		local up = 1
+		pcall(function()
+			up = part.CFrame.UpVector.Y
+		end)
+		local recovery = model:GetAttribute("RideRecoveryState")
+		if up < 0.94 or recovery == "LIFTING" then
+			if dist > 6 then
+				setStatus("Walking to the scooter")
+				pcall(function()
+					N.humanoid():MoveTo(part.Position)
+				end)
+				return false
+			end
+			setStatus("Picking up the scooter")
+			if recovery ~= "LIFTING" and os.clock() - (R.rightAt or -1e9) > 3 then
+				R.rightAt = os.clock()
+				log("MOUNT scooter on its side", string.format("up=%.2f", up), "RIGHT_SCOOTER")
+				N.command("RideRecoveryRequest", { action = "RIGHT_SCOOTER", scooterId = id })
+			end
+			return false
+		end
+		-- the game mounts the nearest own scooter within 5.2 studs of the PrimaryPart (3D) with MountPrompt enabled
+		-- (Bootstrap 23150-23178)
+		local reach = (part.Position - root.Position).Magnitude
+		if reach > 4.6 then
 			setStatus("Walking to the scooter")
 			pcall(function()
 				N.humanoid():MoveTo(part.Position)
@@ -33245,11 +33514,26 @@ do
 		if os.clock() - R.mountAt < 2 then
 			return false
 		end
+		local prompt = part:FindFirstChild("MountPrompt") or model:FindFirstChild("MountPrompt", true)
+		local enabled = true
+		pcall(function()
+			enabled = prompt == nil or prompt.Enabled ~= false
+		end)
 		R.mountAt = os.clock()
 		R.mountTries += 1
 		setStatus("Getting on the scooter")
-		if R.mountTries % 3 == 0 then
-			local prompt = model:FindFirstChild("MountPrompt", true)
+		log("MOUNT try", R.mountTries, string.format("dist=%.1f up=%.2f prompt=%s", reach, up, if prompt == nil then "none" elseif enabled then "on" else "off"), "transition", tostring(model:GetAttribute("RideTransition")), "recovery", tostring(recovery))
+		pcall(function()
+			LocalPlayer:SetAttribute("VoltlineMountRequestedAt", workspace:GetServerTimeNow())
+		end)
+		if R.mountTries % 4 == 0 then
+			-- repeated refusals: let the game set the scooter back on its stand, then summon it if that did not help
+			if R.mountTries % 8 == 0 then
+				N.command("RideRecoveryRequest", { action = "BRING_SCOOTER", scooterId = id })
+			else
+				N.command("RideRecoveryRequest", { action = "RIGHT_SCOOTER", scooterId = id })
+			end
+		elseif R.mountTries % 3 == 0 and prompt then
 			N.firePrompt(prompt)
 		else
 			N.fireEvent("RequestMount", id)
@@ -33639,7 +33923,20 @@ do
 		local maint = st.maint
 		local wear = N.wearOf(maint)
 		local service, due = N.serviceNeeded(wear, LocalPlayer:GetAttribute("VoltlineTireWarning"))
-		if not service or os.clock() - (N.Service.at[service] or -1e9) < 600 then
+		-- the game says the scooter cannot be ridden (MaintenanceSnapshot.rideAllowed false, "Service required") or the
+		-- driver saw rideAllowed false in the ride authority: repair the worst part even under the usual limits
+		local forced = N.Service.forced or (type(maint) == "table" and maint.rideAllowed == false)
+		if forced and not service then
+			local worst, worstValue = nil, -1
+			for part, value in pairs(wear) do
+				if value > worstValue then
+					worst, worstValue = part, value
+				end
+			end
+			service = if worst == "damage" then "DAMAGE_REPAIR" elseif worst then ServiceFor[worst] or "FULL_SERVICE" else "FULL_SERVICE"
+			due = { worst or "all" }
+		end
+		if not service or os.clock() - (N.Service.at[service] or -1e9) < (if forced then 60 else 600) then
 			return false
 		end
 		local price = N.ServicePrice[service] or 0
@@ -33688,6 +33985,7 @@ do
 			end, 4)
 		end
 		N.Service.at[service] = os.clock()
+		N.Service.forced = nil
 		if pc and type(pc.RequestService) == "function" then
 			isolated(pc.RequestService, service, id, useCover)
 		else
