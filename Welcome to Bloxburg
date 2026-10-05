@@ -30496,7 +30496,7 @@ do
 		return found
 	end
 	-- Only the job actions a worker sends. Never purchases, trading, admin or anything for other players.
-	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true, TakeOil = true, TakeWheel = true, TakePainter = true, FixBike = true, DeliverPizza = true, ExitWorkstation = true }
+	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true, TakeOil = true, TakeWheel = true, TakePainter = true, FixBike = true, DeliverPizza = true, ExitWorkstation = true, UseFishingRod = true, UseHatchet = true }
 	local AllowedJobInvoke = { CleanSchoolJanitorObject = true, TakePizzaBox = true, MineBlock = true, TeacherJob_TaskComplete = true, TeacherJob_GetHallPass = true, TeacherJob_StartLectureStudent = true, TeacherJob_UseBoard = true, RequestCashierRole = true, ConfirmOrderCashier = true }
 	-- Build mode on YOUR OWN plot only, paid with your own money (the normal build packets the game's build menu sends).
 	local AllowedBuild = { EnterBuild = true, PlaceObject = true, PlaceWall = true, PlaceFloor = true, PlacePath = true }
@@ -30534,7 +30534,7 @@ do
 		local ok, err = pcall(function()
 			jh.net:FireServer(packet)
 		end)
-		if packet.Type ~= "UseWorkstation" or not ok then
+		if (packet.Type ~= "UseWorkstation" and packet.Type ~= "UseFishingRod" and packet.Type ~= "UseHatchet") or not ok then
 			log("JOB", packet.Type, argsText({ packet.Workstation, packet.Order }, 1, 2), if ok then "" else "failed: " .. tostring(err))
 		end
 		return ok
@@ -33400,9 +33400,11 @@ N.JobKeys = {
 	["BloxBurgers Cashier"] = "BloxBurgersEmployee",
 	Teacher = "HighSchoolTeacher",
 	["Taxi (beta)"] = "TaxiJob",
+	["Fisherman (beta)"] = "HutFisherman",
+	["Woodcutter (beta)"] = "LumberWoodcutter",
 }
 do
-	local Explore = { "Hairdresser", "BloxBurgers Cashier", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery" }
+	local Explore = { "Hairdresser", "BloxBurgers Cashier", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Fisherman (beta)", "Woodcutter (beta)" }
 	local function rate(name)
 		local entry = N.Pay.jobs[N.JobKeys[name]]
 		if entry and entry.seconds >= 300 then
@@ -33442,6 +33444,279 @@ do
 		end
 		N.Best.current, N.Best.since = pick, now
 		return pick
+	end
+end
+-- Tool jobs: Hut Fisherman and Lumber Woodcutter. The server gives the Fishing Rod / Hatchet when the shift starts
+-- (RequiredEquipment) and the job ends if you swap the item. Both are plain hotbar actions of the game:
+--   UseFishingRod {State = true, Pos = water point}  (cast), then {State = false, Time = seconds since the cast} (pull)
+--   UseHatchet {Tree = tree model}  (swing at a tree within ~6 studs)
+-- Nothing here was tested in game: every cast, pull and swing logs what happened (FISH / WOOD lines).
+N.Fish = { last = "", casts = 0, got = 0, gotAt = 0, timeouts = 0, tries = 0, goodTime = nil, noWater = 0 }
+N.Wood = { down = setmetatable({}, { __mode = "k" }), skip = setmetatable({}, { __mode = "k" }), hooked = false, home = nil, homeShift = -1, swings = 0 }
+N.Unhooks = {}
+do
+	local function hookEvent(name, fn)
+		local jh = N.jobHandler()
+		local ok, unhook = pcall(function()
+			return jh.net:HookEvent(name, fn)
+		end)
+		if not ok then
+			log("HOOK failed", name, tostring(unhook))
+			return
+		end
+		if type(unhook) == "function" then
+			table.insert(N.Unhooks, unhook)
+		end
+	end
+	local function face(pos)
+		local root = N.root()
+		if not root then
+			return
+		end
+		local flat = Vector3.new(pos.X, root.Position.Y, pos.Z)
+		if (flat - root.Position).Magnitude < 0.1 then
+			return
+		end
+		pcall(function()
+			root.CFrame = CFrame.lookAt(root.Position, flat)
+		end)
+	end
+	local function afterAction()
+		local mode = optionText("JobSpeed", "Fast")
+		if mode == "Blatant" then
+			return 0.3
+		elseif mode == "Legit" then
+			return 2 + math.random() * 0.8
+		end
+		return 1.2 + math.random() * 0.4
+	end
+
+	-- Fisherman -------------------------------------------------------------------------------------------------
+	local FishHooked = false
+	local PullTimes = { 3, 5, 7, 9, 11, 13 }
+	local function rodPos()
+		local jh = N.jobHandler()
+		local rod = isolated(function()
+			return jh.Shared.EquipmentService:GetEquipped(LocalPlayer)
+		end)
+		local pos = typeof(rod) == "Instance" and rod:FindFirstChild("Pos")
+		local ok, value = pcall(function()
+			return pos.Value
+		end)
+		return if ok then value else nil
+	end
+	-- A water point about 12 studs in front of you (the game casts there), turning until one is found.
+	local function waterSpot()
+		local root = N.root()
+		if not root then
+			return nil
+		end
+		local base = root.CFrame
+		for _, deg in ipairs({ 0, 25, -25, 50, -50, 80, -80, 110, -110, 140, -140, 180 }) do
+			local rot = base * CFrame.Angles(0, math.rad(deg), 0)
+			for _, dist in ipairs({ 12, 8, 16 }) do
+				local origin = (rot * CFrame.new(0, 0, -dist)).Position
+				local hit = workspace:Raycast(origin, Vector3.new(0, -20, 0))
+				if hit and hit.Instance == workspace.Terrain and hit.Material == Enum.Material.Water then
+					return hit.Position, rot.LookVector
+				end
+			end
+		end
+		return nil
+	end
+	function N.fishStep()
+		if not N.ensureShift("HutFisherman") then
+			return
+		end
+		if not FishHooked then
+			FishHooked = true
+			hookEvent("GotFish", function()
+				N.Fish.gotAt = os.clock()
+			end)
+		end
+		if N.heldName() ~= "Fishing Rod" then
+			setStatus("Fisherman: waiting for the fishing rod")
+			if not N.Fish.rodWarned then
+				N.Fish.rodWarned = true
+				log("FISH not holding the rod, holding", N.heldName())
+			end
+			task.wait(1)
+			return
+		end
+		local pos, look = waterSpot()
+		local root = N.root()
+		if not (pos and root) then
+			N.Fish.noWater += 1
+			if N.Fish.noWater <= 3 then
+				log("FISH no water near", brief(root and root.Position))
+			end
+			setStatus("Fisherman: looking for water")
+			if root then
+				local angle = math.random() * math.pi * 2
+				N.walkTo(root.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * (8 + math.random() * 10), 2, 6)
+			end
+			task.wait(0.5)
+			return
+		end
+		pcall(function()
+			root.CFrame = CFrame.lookAt(root.Position, root.Position + Vector3.new(look.X, 0, look.Z))
+		end)
+		local F = N.Fish
+		F.casts += 1
+		setStatus(string.format("Fisherman: fishing (%d fish)", F.got))
+		local castAt = os.clock()
+		N.jobFire({ Type = "UseFishingRod", State = true, Pos = pos })
+		task.wait(1.6)
+		local base = rodPos()
+		-- pull when the bobber moves (the server moves the rod's Pos on a bite); without that signal use a rotating timer
+		local limit = if F.goodTime then F.goodTime else (if F.timeouts >= 2 then PullTimes[(F.tries % #PullTimes) + 1] else 14)
+		local reason = "timer"
+		while alive() and os.clock() - castAt < limit do
+			local now = rodPos()
+			if base and now and (now - base).Magnitude > 0.2 and os.clock() - castAt > 2 then
+				reason = "bobber moved"
+				break
+			end
+			if not on("AutoJob") or N.currentJob() ~= "HutFisherman" then
+				return
+			end
+			task.wait(0.1)
+		end
+		if reason == "timer" then
+			F.tries += 1
+		end
+		local pullAt = os.clock()
+		N.jobFire({ Type = "UseFishingRod", State = false, Time = pullAt - castAt })
+		local got = false
+		local waited = os.clock()
+		while os.clock() - waited < 2.5 do
+			if F.gotAt >= pullAt - 0.05 then
+				got = true
+				break
+			end
+			task.wait(0.1)
+		end
+		if got then
+			F.got += 1
+			F.timeouts = 0
+			Session.done += 1
+			Session.correct += 1
+			if reason == "timer" then
+				F.goodTime = pullAt - castAt
+			end
+		else
+			Session.wrong += 1
+			if reason == "timer" then
+				F.timeouts += 1
+				F.goodTime = nil
+			end
+		end
+		F.last = string.format("cast %d: %s after %.1fs, fish %s", F.casts, reason, pullAt - castAt, tostring(got))
+		if F.casts <= 12 or F.casts % 25 == 0 then
+			log("FISH", F.last)
+		end
+		task.wait(afterAction())
+	end
+
+	-- Woodcutter ------------------------------------------------------------------------------------------------
+	local function trees()
+		local node = workspace:FindFirstChild("Environment")
+		for _, name in ipairs({ "Foliage", "Trees" }) do
+			node = node and node:FindFirstChild(name)
+		end
+		return node
+	end
+	local function inArea(pos)
+		local env = workspace:FindFirstChild("Environment")
+		local node = env
+		for _, name in ipairs({ "Locations", "Mountains", "LumberMill", "LumberCollision" }) do
+			node = node and node:FindFirstChild(name)
+		end
+		if node and node:IsA("BasePart") then
+			local local_ = node.CFrame:PointToObjectSpace(pos)
+			local half = node.Size / 2
+			return math.abs(local_.X) <= half.X + 10 and math.abs(local_.Z) <= half.Z + 10
+		end
+		return true
+	end
+	function N.woodStep()
+		if not N.ensureShift("LumberWoodcutter") then
+			return
+		end
+		local W = N.Wood
+		if not W.hooked then
+			W.hooked = true
+			hookEvent("TreeFalling", function(data)
+				if data and data.Tree then
+					W.down[data.Tree] = true
+					if data.Owner == LocalPlayer then
+						Session.done += 1
+						Session.correct += 1
+					end
+				end
+			end)
+			hookEvent("TreeRespawning", function(data)
+				if data and data.Tree then
+					W.down[data.Tree] = nil
+				end
+			end)
+		end
+		if N.heldName() ~= "Hatchet" then
+			setStatus("Woodcutter: waiting for the hatchet")
+			if not W.hatchetWarned then
+				W.hatchetWarned = true
+				log("WOOD not holding the hatchet, holding", N.heldName())
+			end
+			task.wait(1)
+			return
+		end
+		local folder, root = trees(), N.root()
+		if not (folder and root) then
+			setStatus("Woodcutter: waiting for the trees to load")
+			task.wait(1)
+			return
+		end
+		if W.homeShift ~= Session.shifts then
+			W.homeShift, W.home = Session.shifts, root.Position
+		end
+		local now = os.clock()
+		local best, bestDist, bestPos
+		for _, tree in ipairs(folder:GetChildren()) do
+			if not W.down[tree] and (W.skip[tree] or 0) <= now and tree:FindFirstChild("Leaves") then
+				local body = tree:FindFirstChild("Body") or tree:FindFirstChild("CollisionPart")
+				if body and body:IsA("BasePart") and (body.Position - W.home).Magnitude <= 160 and inArea(body.Position) then
+					local d = (body.Position - root.Position).Magnitude
+					if not bestDist or d < bestDist then
+						best, bestDist, bestPos = tree, d, body.Position
+					end
+				end
+			end
+		end
+		if not best then
+			setStatus("Woodcutter: no tree to cut, waiting for them to grow back")
+			task.wait(1.5)
+			return
+		end
+		setStatus(string.format("Woodcutter: cutting (%d trees)", Session.done))
+		local away = Vector3.new(root.Position.X - bestPos.X, 0, root.Position.Z - bestPos.Z)
+		local stand = if away.Magnitude > 0.1 then bestPos + away.Unit * 3.5 else bestPos + Vector3.new(3.5, 0, 0)
+		N.walkTo(Vector3.new(stand.X, root.Position.Y, stand.Z), 1.5, 25)
+		face(bestPos)
+		for swing = 1, 10 do
+			if not alive() or not on("AutoJob") or N.currentJob() ~= "LumberWoodcutter" or W.down[best] then
+				break
+			end
+			N.jobFire({ Type = "UseHatchet", Tree = best })
+			W.swings += 1
+			if W.swings <= 6 or W.swings % 50 == 0 then
+				log("WOOD swing", W.swings, "tree", best.Name, "dist", math.floor(bestDist))
+			end
+			task.wait(math.max(N.actionDelay(), if optionText("JobSpeed", "Fast") == "Blatant" then 0.45 else 1.0))
+		end
+		if not W.down[best] then
+			W.skip[best] = os.clock() + 90
+			log("WOOD tree did not fall, skipped", best.Name)
+		end
 	end
 end
 local Window, Tabs, Labels
@@ -33484,7 +33759,8 @@ do
 			})
 		end)
 	end
-	Tabs.Jobs = N.addTab("Jobs", "briefcase", "Job farms: work shifts on their own")
+	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+	Tabs.Jobs = N.addTab("Jobs", "briefcase", "Job farms: pick a job, speed and see the pay")
 	Tabs.Build = N.addTab("Build", "hammer", "Copy a plot's house onto your own plot")
 	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and pay")
 	if Window.AddMiscTab then
@@ -33493,15 +33769,54 @@ do
 		end)
 	end
 	Labels = {}
+	do
+		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
+		N.FarmBestOn = { "AutoJob" }
+		N.FarmBestOff = N.FarmBestOn
+		QuickBox:AddToggle("AutoFarmBest", {
+			Text = "Auto Farm Everything",
+			Default = false,
+			Tooltip = "One switch: Auto Work on Best Pay (auto). It tries every job, then keeps working the one that really paid you the most per hour. Turning it off clocks you out and gives your own job pick back",
+			Callback = function(value)
+				task.defer(function()
+					if value then
+						local pick = Options.JobPick
+						if pick and pick.Value ~= "Best Pay (auto)" then
+							N.FarmPrevPick = pick.Value
+							pcall(function()
+								pick:SetValue("Best Pay (auto)")
+							end)
+						end
+					elseif N.FarmPrevPick and Options.JobPick then
+						local prev = N.FarmPrevPick
+						N.FarmPrevPick = nil
+						pcall(function()
+							Options.JobPick:SetValue(prev)
+						end)
+					end
+					for _, name in ipairs(N.FarmBestOn) do
+						local toggle = Toggles[name]
+						if toggle and toggle.Value ~= value then
+							toggle:SetValue(value)
+						end
+					end
+				end)
+			end,
+		})
+		QuickBox:AddLabel({
+			Text = '<font transparency="0.35">One switch for the whole farm. The Jobs tab still lets you pick one job and a speed yourself.</font>',
+			DoesWrap = true,
+		})
+		QuickBox:AddToggle("AutoJob", {
+			Text = "Auto Work",
+			Default = false,
+			Tooltip = "Goes to work, starts the shift and does the job for you, all day. The job and speed come from the Jobs tab",
+		})
+	end
 	local JobBox = Tabs.Jobs:AddLeftGroupbox("Job Farm", "briefcase")
-	JobBox:AddToggle("AutoJob", {
-		Text = "Auto Work",
-		Default = false,
-		Tooltip = "Goes to work, starts the shift and does the job for you, all day",
-	})
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Best Pay (auto)", "Hairdresser", "BloxBurgers Cashier", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Taxi (beta)" },
+		Values = { "Best Pay (auto)", "Hairdresser", "BloxBurgers Cashier", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Fisherman (beta)", "Woodcutter (beta)", "Taxi (beta)" },
 		Default = "Hairdresser",
 		Tooltip = "Best Pay (auto) tries each job a few minutes, then keeps working the one that really paid you the most per hour",
 	})
@@ -33521,9 +33836,15 @@ do
 			task.spawn(N.endShift)
 		end,
 	})
-	local StatusBox = Tabs.Jobs:AddRightGroupbox("Status", "activity")
+	local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 	Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 	Labels.Job = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+	StatusBox:AddButton({
+		Text = "Stop Everything",
+		Func = function()
+			N.stopAll()
+		end,
+	})
 	local PayBox = Tabs.Jobs:AddRightGroupbox("Pay Per Job", "coins")
 	Labels.Pay = PayBox:AddLabel({ Text = "-", DoesWrap = true })
 
@@ -33686,6 +34007,7 @@ do
 	Log.header = Debug.header
 end
 N.AllAutoToggles = {
+	"AutoFarmBest",
 	"AutoJob",
 }
 do
@@ -34022,7 +34344,7 @@ do
 	end
 	if Library.AddCommand then
 		pcall(function()
-			toggleCommand("work", { "job", "farm" }, { "AutoJob" }, "Auto Work")
+			toggleCommand("farmall", { "farmbest", "all", "farm", "work", "job" }, { "AutoFarmBest" }, "Auto Farm Everything")
 			Library:AddCommand({
 				Name = "stop",
 				Aliases = { "alloff" },
@@ -34059,6 +34381,9 @@ do
 					N.Taxi.hook()
 				end
 			end)
+			for _, unhook in ipairs(N.Unhooks) do
+				pcall(unhook)
+			end
 			log("UNLOAD")
 			flushLog(true)
 		end)
@@ -34071,6 +34396,7 @@ do
 	if Library.SetQuickBar then
 		pcall(function()
 			Library:SetQuickBar({
+				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm All" },
 				{ Toggle = "AutoJob", Icon = "briefcase", Label = "Work" },
 			})
 		end)
@@ -34104,9 +34430,10 @@ do
 					Description = "Pick everything you want running. Tap again to unpick.",
 					Multi = true,
 					Required = true,
-					Default = { "work" },
+					Default = { "farm" },
 					Choices = {
-						{ Id = "work", Title = "Work", Description = "Goes to work and does the job for you", Icon = "briefcase", Color = "#60d696" },
+						{ Id = "farm", Title = "Auto Farm Everything", Description = "One switch: works every job for a few minutes, then keeps the one that pays you the most", Icon = "sparkles", Color = "#60d696" },
+						{ Id = "work", Title = "Work one job", Description = "Goes to work and does the job you pick in the Jobs tab", Icon = "briefcase", Color = "#fab428" },
 					},
 				},
 			},
@@ -34114,9 +34441,10 @@ do
 				local chosen = type(values.tasks) == "table" and values.tasks or {}
 				local groups = { work = { "AutoJob" } }
 				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] then "on" else "off" })
+					setToggles(names, { if chosen[id] and not chosen.farm then "on" else "off" })
 				end
 				N.markSetupDone()
+				setToggles({ "AutoFarmBest" }, { if chosen.farm then "on" else "off" })
 				notify("Quick setup done", "Change anything in the tabs any time", 5)
 			end,
 			Skipped = function()
@@ -34209,6 +34537,7 @@ if Window.AddInfoTab then
 	}
 	for _, tab in ipairs({
 		Tabs.Info,
+		Tabs.Main,
 		Tabs.Jobs,
 		Tabs.Stats,
 		Tabs.Misc,
@@ -34269,7 +34598,7 @@ do
 	if not N.jobHandler() then
 		logProblem("The game's JobHandler was not found, job farms cannot start")
 	end
-	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep, ["Pizza Delivery"] = N.deliveryStep, Miner = N.minerStep, ["BloxBurgers Cashier"] = N.bbCashierStep, Teacher = N.teacherStep, ["Taxi (beta)"] = N.taxiStep }
+	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep, ["Pizza Delivery"] = N.deliveryStep, Miner = N.minerStep, ["BloxBurgers Cashier"] = N.bbCashierStep, Teacher = N.teacherStep, ["Taxi (beta)"] = N.taxiStep, ["Fisherman (beta)"] = N.fishStep, ["Woodcutter (beta)"] = N.woodStep }
 	local wasWorking, lastPick = false, nil
 	local function leaveJob()
 		N.taxiRelease()
@@ -34386,10 +34715,14 @@ do
 		while alive() do
 			local started = os.clock()
 			group(UIQueue.flush)
-			if shown(Tabs.Jobs) then
+			if shown(Tabs.Main) then
 				group(function()
 					Labels.Status:SetText(Status)
 					Labels.Job:SetText(N.InfoText.jobText or "-")
+				end)
+			end
+			if shown(Tabs.Jobs) then
+				group(function()
 					Labels.Pay:SetText(N.InfoText.pay or "-")
 				end)
 			end
@@ -34444,12 +34777,12 @@ do
 		end
 	end)
 	pcall(function()
-		Tabs.Jobs:Show()
+		Tabs.Main:Show()
 	end)
 	notify("Corvus", if Library.IsMobile then "Loaded and ready. The round Corvus button opens and closes the hub." else "Loaded. Press RightControl to hide or show the menu.", 5)
 	if Library.ShowWizard and not N.setupDone() then
 		task.delay(1.5, function()
-			if on("AutoJob") then
+			if on("AutoJob") or on("AutoFarmBest") then
 				N.markSetupDone()
 				return
 			end
