@@ -31778,7 +31778,8 @@ do
 			end
 		end
 	end))
-	-- Only the game's own player actions. No trading, staff/admin, fusing (uses up units) or Robux remotes.
+	-- Only the game's own player actions. No trading, staff/admin or Robux remotes. Fusing only through Auto Fuse
+	-- (junk from the sell plan, profit checked; FusingService dump v652 line 26836).
 	-- Paths are under ReplicatedStorage.Network: "<Service>/RE|RF/<Name>", root remotes are "RE/<Name>".
 	local Allowed = {
 		["RollService/RE/SetAutoRoll"] = true,
@@ -31804,6 +31805,10 @@ do
 		["GradeService/RE/Roll"] = true,
 		["Towers/RE/EquipBestTowerTeam"] = true,
 		["Towers/RE/SetAutoTower"] = true,
+		["RebirthService/RE/AddStat"] = true,
+		["RebirthService/RE/UseResetToken"] = true,
+		["GamepassService/RE/Use"] = true,
+		["FusingService/RE/Fuse"] = true,
 	}
 	local AllowedInvoke = {
 		["RollService/RF/RollDice"] = true,
@@ -31978,6 +31983,10 @@ do
 	N.G.Group = N.tableOr(safeRequire("Framework.Features.Rewards.GroupRewardConfig"))
 	N.G.Mutations = N.tableOr(safeRequire("Framework.Features.Inventory.Kinds.Unit.Mutations"))
 	N.G.Monetization = N.tableOr(safeRequire("Framework.Features.Monetization.MonetizationConfig"))
+	-- v652: Rebirth Stats points and the fuse odds (both plain config/maths modules, safe to require).
+	N.G.RebirthStats = N.tableOr(safeRequire("Framework.Features.Rebirth.RebirthStatsConfig"))
+	N.G.FuseUtil = N.tableOr(safeRequire("Framework.Features.Fusing.FusingUtil"))
+	N.G.FuseConfig = N.tableOr(safeRequire("Framework.Features.Fusing.FusingConfig"))
 end
 local formatNumber, allows, selected, on, optionNumber, optionText, Status, setStatus, picked
 do
@@ -32322,12 +32331,17 @@ N.R = {
 	playTower = "Towers/RF/PlayTower",
 	floor = "Towers/RF/CompleteTowerFloor",
 	cancelTower = "Towers/RF/CancelTower",
+	addStat = "RebirthService/RE/AddStat",
+	resetStats = "RebirthService/RE/UseResetToken",
+	gamepassItem = "GamepassService/RE/Use",
+	fuse = "FusingService/RE/Fuse",
 }
 do
 	local R = N.R
 	-- Rolling: the server only allows one roll per "Roll Duration" (2.5 s base, less with Roll Speed). The game's
 	-- own auto roll waits for the whole animation on top of that; Corvus asks again the moment the server allows it.
 	N.Roll = { autoOffAt = -1e9, nextAt = 0, fullSince = nil, margin = 0.04, clean = 0, rejectStreak = 0, lastAt = -1e9, lastCount = 0 }
+	N.Fuse = { lockUntil = -1e9, at = -1e9, result = nil, done = 0, lastWhy = "" }
 	function N.rollDuration()
 		return math.max(N.buff("Roll Duration", 2.5) or 2.5, 0.2)
 	end
@@ -32399,6 +32413,10 @@ do
 		if N.inventoryFull() then
 			Roll.fullSince = Roll.fullSince or os.clock()
 			setStatus(string.format("Unit storage is full (%d/%d)%s", N.UnitCache.count, N.storage(), if on("AutoSell") then ", selling" else ", turn on Auto Sell"))
+			-- Rolling is paused anyway: the moment for fusing (each fuse locks rolls server-wide for 3 s).
+			if on("AutoFuse") then
+				N.fuseStep()
+			end
 			if on("AutoSell") then
 				N.sellStep(true)
 			end
@@ -32407,7 +32425,8 @@ do
 		end
 		Roll.fullSince = nil
 		N.spinStep()
-		local wait = Roll.nextAt - os.clock()
+		-- Our own fuse locks RollDice server-wide for 3 s (FusingService.Fusing): wait it out instead of being refused.
+		local wait = math.max(Roll.nextAt, N.Fuse.lockUntil) - os.clock()
 		if wait > 0 then
 			task.wait(wait)
 			if not on("AutoRoll") or N.manualRunning() then
@@ -32439,7 +32458,8 @@ do
 			-- off when it keeps refusing so no calls are wasted.
 			Roll.clean = 0
 			Roll.rejectStreak += 1
-			if Roll.rejectStreak == 1 then
+			-- A refusal right after our own fuse is the server-wide fuse lock, not ping: the timing margin stays.
+			if Roll.rejectStreak == 1 and started > N.Fuse.lockUntil + 0.2 then
 				Roll.margin = math.min(Roll.margin + 0.03, 0.3)
 			end
 			Roll.nextAt = os.clock() + math.min(0.1 * 2 ^ (Roll.rejectStreak - 1), 3)
@@ -32606,6 +32626,17 @@ do
 	function N.levelGain(info)
 		return info.income / (1 + 0.25 * (info.level - 1)) * 0.25 * (N.buff("Money Multiplier", 1) or 1)
 	end
+	-- Levels are partly refundable: a unit sells for income(attrs) x 40 x Sell Multiplier (SellUtil, dump v652 line
+	-- 41874), levels included, while the level price ignores trait and grade. So each level adds 10 x the level-1
+	-- income x trait x grade x Sell Multiplier of resale value. The cash is still tied up in the unit until it is sold,
+	-- so the net price never drops below 10 % of the price.
+	function N.levelRefund(info)
+		local sell = N.buff("Sell Multiplier", 1)
+		if type(sell) ~= "number" or sell <= 0 then
+			return 0
+		end
+		return info.income / (1 + 0.25 * (info.level - 1)) * 0.25 * 40 * sell
+	end
 	function N.levelOptions(strategyOverride)
 		local list = {}
 		for _, info in ipairs(N.units()) do
@@ -32613,7 +32644,9 @@ do
 				local price = N.levelPrice(info)
 				local gain = N.levelGain(info)
 				if price > 0 and gain > 0 then
-					table.insert(list, { info = info, price = price, gain = gain, payback = price / gain })
+					local refund = N.levelRefund(info)
+					local net = math.max(price - refund, price * 0.1)
+					table.insert(list, { info = info, price = price, gain = gain, refund = refund, net = net, free = refund >= price, payback = net / gain })
 				end
 			end
 		end
@@ -32637,6 +32670,13 @@ do
 		local first = options[1]
 		if not first then
 			return nil
+		end
+		-- A level whose resale value covers its price only moves cash into the unit: no budget cap for it.
+		local money = N.money()
+		for _, option in ipairs(options) do
+			if option.free and option.price <= money then
+				return option.info, option
+			end
 		end
 		-- Fastest payback waits for the best option instead of buying a worse one that happens to be affordable,
 		-- unless the best one takes over 10x longer to pay back than the affordable one is worth waiting for.
@@ -34091,13 +34131,14 @@ do
 		local ctx = N.spendContext()
 		Sp.ctx = ctx
 		local owned = N.field("Upgrades", {}) or {}
-		local function add(kind, name, price, gain, buy, done, progress)
+		local function add(kind, name, price, gain, buy, done, progress, net)
 			if price and price > 0 and gain and gain > 0 and (Sp.failed[name] or 0) <= now then
-				local payback = price / gain
+				-- net: the price minus what stays in the unit as resale value (slot levels), else the price.
+				local payback = (net or price) / gain
 				-- Rolling 24 h horizon: what cannot pay back within it is skipped, unless it is progress that counts on
 				-- its own (rebirth).
 				if payback <= ctx.left or progress then
-					local option = { kind = kind, name = name, price = price, gain = gain, payback = payback, ratio = gain / price, buy = buy, done = done }
+					local option = { kind = kind, name = name, price = price, gain = gain, payback = payback, ratio = gain / (net or price), buy = buy, done = done }
 					table.insert(list, option)
 					return option
 				end
@@ -34117,7 +34158,7 @@ do
 				local item = N.inventory()[key]
 				local attrs = type(item) == "table" and item.attributes
 				return (tonumber(type(attrs) == "table" and attrs.level) or 1) > before
-			end)
+			end, nil, option.net)
 		end
 		if allows(Options.SpendOn, "Dice") then
 			for _, dice in ipairs(N.diceList()) do
@@ -34242,9 +34283,15 @@ do
 				table.insert(alts, string.format("%s %s", option.label or option.name, short(option.ratio)))
 			end
 		end
+		-- Friend Boost (BuffService updateFriendBoosts, dump v652 line 25271): +10 % money per Roblox friend in the
+		-- server, already inside the measured income. The hub has no server hop, so it is only logged here.
+		local friend = 0
+		pcall(function()
+			friend = tonumber(LocalPlayer:GetAttribute("FriendBoost")) or 0
+		end)
 		log(
 			string.format(
-				"PLAN best=%s gain/$=%s eta=%ds alt=%s | buy=%s drops/s=%s blocked=%d%% income=%s/s rho=%s left=%.1fh",
+				"PLAN best=%s gain/$=%s eta=%ds alt=%s | buy=%s drops/s=%s blocked=%d%% income=%s/s rho=%s left=%.1fh friend=+%d%%",
 				name,
 				if target then short(target.ratio) else "0",
 				math.floor(wait or 0),
@@ -34254,7 +34301,8 @@ do
 				math.floor(ctx.blocked * 100 + 0.5),
 				formatNumber(ctx.cashRate),
 				short(ctx.rho),
-				ctx.left / 3600
+				ctx.left / 3600,
+				math.floor(friend * 100 + 0.5)
 			)
 		)
 	end
@@ -34412,6 +34460,318 @@ do
 		Sp.ticketLast = "Bought " .. best.name .. " with tickets"
 		log("TICKETS bought", best.name, "price", best.price, "gain/s", best.gain)
 		return true
+	end
+	-- Rebirth Stats (v652, RebirthService line 38591): one point per rebirth, AddStat(stat) costs nothing (server
+	-- debounce 0.1 s). Each point is a multiplier 1 + perPoint x points (BuffService RebirthStats, line 25016). Money
+	-- and Luck are put on the same $/s scale (Money: the whole plot income, Luck: the exact roll odds over 24 h);
+	-- Damage/Health only help towers, Trait/Grade Luck are half as strong and only touch rerolls: never picked.
+	N.RStat = { nextAt = 0, refusedAt = nil, resetTried = false, probeLog = "", total = 0 }
+	function N.rstatPerPoint(name)
+		for _, stat in ipairs(N.tableOr(N.G.RebirthStats.Stats)) do
+			if type(stat) == "table" and stat.name == name then
+				return tonumber(stat.perPoint) or 0.1
+			end
+		end
+		return 0.1
+	end
+	function N.rstatState()
+		local stats = N.field("RebirthStats", nil)
+		stats = if type(stats) == "table" then stats else {}
+		local spent = 0
+		for _, value in pairs(stats) do
+			spent += tonumber(value) or 0
+		end
+		return math.max(N.rebirth() - spent, 0), stats, spent
+	end
+	function N.rstatPick(ctx, stats)
+		local best, bestGain, bestMult = nil, -1, 1
+		for _, name in ipairs({ "Money", "Luck" }) do
+			local per = N.rstatPerPoint(name)
+			local have = tonumber(stats[name]) or 0
+			local ratio = (1 + per * (have + 1)) / (1 + per * have)
+			local gain = if name == "Money" then N.changeGain(ctx, { moneyRatio = ratio }) else N.changeGain(ctx, { luck = ctx.luck * ratio })
+			-- Ties go to Money (certain cash now, luck pays only through future drops).
+			if gain > bestGain + 1e-9 then
+				best, bestGain, bestMult = name, gain, 1 + per * (have + 1)
+			end
+		end
+		return best, bestGain, bestMult
+	end
+	function N.rstatStep()
+		if not (on("AutoRebirthStats") or on("SmartSpend")) then
+			return false
+		end
+		local R = N.RStat
+		local now = os.clock()
+		if now < R.nextAt then
+			return false
+		end
+		R.nextAt = now + 5
+		N.Data.at = -1e9
+		local free, stats, spent = N.rstatState()
+		local probe = string.format("RSTAT have=%d spent=%d free=%d", N.rebirth(), spent, free)
+		if probe ~= R.probeLog then
+			R.probeLog = probe
+			log(probe)
+		end
+		-- A Reset Token the player already owns is free: used once when points sit in stats that earn no cash
+		-- (Trait/Grade Luck, or Damage/Health while Auto Tower is off). Never bought (it costs 50 tickets).
+		if not R.resetTried and N.amount("Reset Token") > 0 then
+			local idle = 0
+			for name, value in pairs(stats) do
+				local fights = (name == "Damage" or name == "Health") and on("AutoTower")
+				if name ~= "Money" and name ~= "Luck" and not fights then
+					idle += tonumber(value) or 0
+				end
+			end
+			if idle >= 1 then
+				R.resetTried = true
+				fire(N.R.resetStats)
+				log("RSTAT reset token used, points back:", spent, "idle:", idle)
+				waitFor(function()
+					N.Data.at = -1e9
+					return select(3, N.rstatState()) == 0
+				end, 3)
+				free, stats, spent = N.rstatState()
+			end
+		end
+		if free < 1 or R.refusedAt == N.rebirth() then
+			return false
+		end
+		N.measureRates()
+		local ctx = N.spendContext()
+		local added = {}
+		local order = {}
+		while free >= 1 and alive() and (on("AutoRebirthStats") or on("SmartSpend")) do
+			local name, gain, mult = N.rstatPick(ctx, stats)
+			if not name then
+				break
+			end
+			local before = tonumber(stats[name]) or 0
+			local ok = false
+			for _ = 1, 3 do
+				fire(N.R.addStat, name)
+				ok = waitFor(function()
+					N.Data.at = -1e9
+					local _, now2 = N.rstatState()
+					return (tonumber(now2[name]) or 0) > before
+				end, 1)
+				if ok then
+					break
+				end
+				task.wait(0.15)
+			end
+			if not ok then
+				-- Three tries without the field moving: stop until the next rebirth.
+				R.refusedAt = N.rebirth()
+				log("RSTAT refused", name, "free", free)
+				break
+			end
+			if not added[name] then
+				added[name] = { n = 0 }
+				table.insert(order, name)
+			end
+			added[name].n += 1
+			R.total += 1
+			added[name].mult = mult
+			added[name].gain = (added[name].gain or 0) + gain
+			free, stats = N.rstatState()
+			task.wait(0.15)
+		end
+		for _, name in ipairs(order) do
+			local a = added[name]
+			log(string.format("RSTAT +%d %s mult=%.2f gain/s=%s", a.n, name, a.mult, formatNumber(a.gain)))
+		end
+		return #order > 0
+	end
+	function N.rstatText()
+		local free, stats = N.rstatState()
+		local parts = {}
+		for _, name in ipairs({ "Money", "Luck", "Damage", "Health", "Trait Luck", "Grade Luck" }) do
+			local value = tonumber(stats[name]) or 0
+			if value > 0 then
+				table.insert(parts, string.format("%s %d (x%.2f)", name, value, 1 + N.rstatPerPoint(name) * value))
+			end
+		end
+		return string.format("Rebirth points free: <b>%d</b>%s", free, if #parts > 0 then "\n" .. table.concat(parts, ", ") else "")
+	end
+	-- Gamepass items (v652, GamepassService line 30373): a pass that came as an item (gift/trade) is redeemed once.
+	-- The server refuses passes you already own without taking the item, so those are skipped.
+	N.GamepassItems = { tried = {} }
+	function N.gamepassItemStep()
+		for key, item in pairs(N.inventory()) do
+			if type(item) == "table" and (tonumber(item.amount) or 0) > 0 and not N.GamepassItems.tried[key] then
+				local cfg = N.entry(item.name)
+				if cfg and cfg.kind == "Gamepass" then
+					N.GamepassItems.tried[key] = true
+					local pass = tostring(cfg.gamepass or item.name)
+					if N.ownsPass(pass) then
+						log("GAMEPASS already owned", pass)
+					else
+						fire(N.R.gamepassItem, key)
+						log("GAMEPASS used", pass)
+						task.wait(0.5)
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+	-- Fusing (FusingService line 26836): 3 units with 1-in-X chances summing to S give one unit of chance about
+	-- 2/3 x S (FusingUtil.BuildPools odds, 0.1 % up to 20x), for S x 10000 x (S/1e12)^0.2 cash. Every Fuse locks
+	-- RollDice for the whole server for 3 s, so it only runs while rolling is paused (storage full) or off.
+	-- Only units from the sell plan (amount 1, not locked, not limited) and only when the expected value of the
+	-- result beats their sale price + the fuse cost + 3 s of sales.
+	function N.fuseValue(outcome, ctx, cache)
+		local key = tostring(outcome.name) .. "|" .. tostring(outcome.mutation)
+		local hit = cache[key]
+		if hit then
+			return hit
+		end
+		local cfg = N.entry(outcome.name)
+		local income = tonumber(cfg and N.call(cfg.income, { mutation = outcome.mutation, level = 1 })) or 0
+		-- Resale value, plus one hour of the extra income when it beats the weakest unit on the plot.
+		local value = income * 40 * ctx.sell + math.max(income - ctx.weakest, 0) * ctx.mult * 3600
+		cache[key] = value
+		return value
+	end
+	function N.fuseEV(sum, ctx, cache)
+		local ok, pools = pcall(N.G.FuseUtil.BuildPools, sum)
+		if not ok or type(pools) ~= "table" or #pools == 0 then
+			return nil
+		end
+		local ev = 0
+		for _, pool in ipairs(pools) do
+			local entries = type(pool) == "table" and pool.entries
+			if type(entries) == "table" and #entries > 0 then
+				local total = 0
+				for _, outcome in ipairs(entries) do
+					total += N.fuseValue(outcome, ctx, cache)
+				end
+				ev += (tonumber(pool.weight) or 0) * total / #entries
+			end
+		end
+		return ev
+	end
+	function N.fuseCost(sum)
+		local ok, cost = pcall(N.G.FuseConfig.GetCost, sum)
+		return if ok and type(cost) == "number" then cost else sum * 10000 * (sum / 1e12) ^ 0.2
+	end
+	function N.fuseCandidates()
+		local list = {}
+		local inv = N.inventory()
+		for _, info in ipairs(N.sellPlan(0)) do
+			local item = inv[info.key]
+			local cfg = N.entry(info.name)
+			if type(item) == "table" and tonumber(item.amount) == 1 and not info.locked and cfg and cfg.chance and not cfg.limited then
+				local chance = tonumber(N.call(cfg.chance, info.attrs)) or 0
+				if chance > 0 then
+					table.insert(list, { info = info, chance = chance, sale = info.income * 40 })
+				end
+			end
+		end
+		table.sort(list, function(a, b)
+			if a.chance ~= b.chance then
+				return a.chance > b.chance
+			end
+			return tostring(a.info.key) < tostring(b.info.key)
+		end)
+		return list
+	end
+	-- Best profitable triple (or nil): consecutive by chance, rarest first.
+	function N.fusePick()
+		local list = N.fuseCandidates()
+		if #list < 3 then
+			return nil, "fewer than 3 junk units"
+		end
+		local weakest = math.huge
+		for _, info in ipairs(N.units()) do
+			if info.slot and info.income < weakest then
+				weakest = info.income
+			end
+		end
+		local sell = N.buff("Sell Multiplier", 1)
+		local ctx = {
+			sell = if type(sell) == "number" and sell > 0 then sell else 0,
+			weakest = if weakest < math.huge then weakest else 0,
+			mult = N.buff("Money Multiplier", 1) or 1,
+		}
+		local lost = 3 * math.max(tonumber(Sp.rates.sold) or 0, 0)
+		local cache = {}
+		local money = N.money()
+		local why = "no triple pays"
+		for i = 1, math.min(#list - 2, 12) do
+			local a, b, c = list[i], list[i + 1], list[i + 2]
+			local sum = a.chance + b.chance + c.chance
+			local ev = N.fuseEV(sum, ctx, cache)
+			local cost = N.fuseCost(sum)
+			local sale = (a.sale + b.sale + c.sale) * ctx.sell
+			if ev and cost <= money then
+				local profit = ev - cost - sale - lost
+				if profit > 0 then
+					return { units = { a.info, b.info, c.info }, sum = sum, ev = ev, cost = cost, sale = sale, profit = profit }
+				end
+				if i == 1 then
+					why = string.format("rarest triple 1/%s: ev $%s < cost $%s + sale $%s", formatNumber(sum), formatNumber(ev), formatNumber(cost), formatNumber(sale + lost))
+				end
+			end
+		end
+		return nil, why
+	end
+	N.onRemote("FusingService/RE/Result", function(unit, err, key)
+		N.Fuse.result = { unit = unit, err = err, key = key, at = os.clock() }
+	end)
+	function N.fuseStep()
+		local F = N.Fuse
+		if not on("AutoFuse") or os.clock() - F.at < 10 then
+			return false
+		end
+		F.at = os.clock()
+		local fused = 0
+		for _ = 1, 3 do
+			local pick, why = N.fusePick()
+			if not pick then
+				if os.clock() - (F.whyAt or -1e9) > 300 then
+					F.whyAt = os.clock()
+					log("FUSE skip", why)
+				end
+				break
+			end
+			F.result = nil
+			local fireAt = os.clock()
+			fire(N.R.fuse, pick.units[1].key, pick.units[2].key, pick.units[3].key)
+			F.lockUntil = fireAt + 3.05
+			waitFor(function()
+				return F.result ~= nil
+			end, 2.5)
+			local result = F.result
+			N.UnitCache.at = -1e9
+			N.Data.at = -1e9
+			if not result or result.err then
+				log("FUSE refused", if result then tostring(result.err) else "no answer")
+				break
+			end
+			fused += 1
+			F.done += 1
+			local unit = type(result.unit) == "table" and result.unit or {}
+			local attrs = type(unit.attributes) == "table" and unit.attributes or {}
+			log(string.format(
+				"FUSE %s + %s + %s (1/%s) cost $%s ev $%s sale $%s -> %s%s",
+				N.unitText(pick.units[1]),
+				N.unitText(pick.units[2]),
+				N.unitText(pick.units[3]),
+				formatNumber(pick.sum),
+				formatNumber(pick.cost),
+				formatNumber(pick.ev),
+				formatNumber(pick.sale),
+				if attrs.mutation then tostring(attrs.mutation) .. " " else "",
+				tostring(unit.name or "?")
+			))
+			-- The next fuse needs the server-wide lock to be over.
+			task.wait(math.max(F.lockUntil - os.clock(), 0))
+		end
+		return fused > 0
 	end
 	function N.spendText()
 		local rows = {}
@@ -34813,6 +35173,11 @@ do
 			AllowNull = true,
 			Tooltip = "Never sold, not even when the storage is full. Too many of them can stop rolling, the Status line then says so",
 		})
+		SellBox:AddToggle("AutoFuse", {
+			Text = "Auto Fuse Junk",
+			Default = false,
+			Tooltip = "Fuses 3 units from the sell list into one rarer unit when the expected result is worth more than their sale price plus the fuse cost. Each fuse pauses rolling for 3 s, so it only fuses while the storage is full or Auto Roll is off. Never touches the plot, team, locked or kept units",
+		})
 		SellBox:AddDropdown("GameAutoSell", {
 			Text = "Game Auto Sell",
 			Values = N.GameSellNames,
@@ -34984,7 +35349,7 @@ do
 		SpendBox:AddToggle("SmartSpend", {
 			Text = "Smart Spending",
 			Default = false,
-			Tooltip = "Puts slot levels, dice, every upgrade, rebirths and ticket gamepasses on one scale: extra cash per second for each $ spent, with luck and roll speed valued from the game's exact roll odds over the next 24 hours. Buys the best first and saves for it. Replaces Auto Level, Auto Buy Dice, Auto Upgrade, Auto Rebirth and the gamepass order while on",
+			Tooltip = "Puts slot levels, dice, every upgrade, rebirths and ticket gamepasses on one scale: extra cash per second for each $ spent, with luck and roll speed valued from the game's exact roll odds over the next 24 hours. Buys the best first and saves for it. Also spends free rebirth points. Replaces Auto Level, Auto Buy Dice, Auto Upgrade, Auto Rebirth and the gamepass order while on",
 		})
 		SpendBox:AddDropdown("SpendOn", {
 			Text = "May Spend On",
@@ -35018,6 +35383,11 @@ do
 			Text = "Auto Rebirth",
 			Default = false,
 			Tooltip = "Rebirths as soon as you can afford it. You keep your units, dice and upgrades, only cash resets",
+		})
+		RebirthBox:AddToggle("AutoRebirthStats", {
+			Text = "Auto Rebirth Points",
+			Default = false,
+			Tooltip = "Spends every free rebirth point (one per rebirth) on Money or Luck, whichever adds more cash per second. At start and after every rebirth. Smart Spending does this too. A Reset Token you already own is used once if points sit in stats that earn nothing",
 		})
 		Labels.Rebirth = RebirthBox:AddLabel({ Text = "-", DoesWrap = true })
 		local GearBox = Tabs.Upgrades:AddRightGroupbox("Gear", "shirt")
@@ -35161,7 +35531,7 @@ do
 		QuestBox:AddDropdown("SpareTickets", { Text = "Spare Tickets On", Values = { "Lucky Spin", "Gems", "Trait Reroll" }, Default = "Lucky Spin", Tooltip = "Lucky Spin costs 10 tickets, 10 Gems or 10 Trait Rerolls cost 1 ticket" })
 		Labels.Quests = QuestBox:AddLabel({ Text = "-", DoesWrap = true })
 		local BoostBox = Tabs.Items:AddLeftGroupbox("Boosts", "zap")
-		BoostBox:AddToggle("AutoBoosts", { Text = "Auto Use Boosts", Default = false, Tooltip = "Keeps one boost running per picked kind, the strongest one you own" })
+		BoostBox:AddToggle("AutoBoosts", { Text = "Auto Use Boosts", Default = false, Tooltip = "Keeps one boost running per picked kind, the strongest one you own. Also redeems gamepass items (gifted or traded) you do not own yet" })
 		BoostBox:AddDropdown("BoostOrder", { Text = "Use Order", Values = { "Strongest first", "Weakest first" }, Default = "Strongest first", Tooltip = "Weakest first saves your strong boosts for later" })
 		-- Every luck and income kind by default: the tower drops (Dragon, Cursed, Pirate, Leaf, Slayer) are their own
 		-- kinds and run next to the plain ones (owner log 2026-10-05: tower boosts were piling up unused).
@@ -35197,7 +35567,8 @@ do
 	-- saved (SaveManager ignore), clicks on it are logged under the real name, Stop Everything and configs only touch
 	-- the real toggle and the mirror follows within 0.1 s (N.syncMirrors in the draw thread).
 	N.Mirrors = {}
-	N.QuickStart = { "AutoRoll", "SmartSpend", "AutoSell", "AutoTower", "AutoCollect", "AutoEquipBest" }
+	-- At most 6 (quality bar): Auto Equip Best stays in the Plot tab.
+	N.QuickStart = { "AutoRoll", "SmartSpend", "AutoRebirthStats", "AutoSell", "AutoTower", "AutoCollect" }
 	function N.mirrorToggle(idx, box, opts)
 		local original = Toggles[idx]
 		if not original then
@@ -35237,6 +35608,7 @@ do
 		local texts = {
 			AutoRoll = { Text = "Auto Roll (Fast)" },
 			SmartSpend = { Text = "Smart Spending", Tooltip = "Spends cash and tickets on what pays back fastest (slot levels, dice, upgrades, rebirth, ticket gamepasses). Same switch as in Upgrades" },
+			AutoRebirthStats = { Text = "Auto Rebirth Points", Tooltip = "Spends free rebirth points on Money or Luck by profit. Same switch as in Upgrades" },
 			AutoSell = { Text = "Auto Sell Weak Units" },
 			AutoTower = { Text = "Auto Tower" },
 			AutoCollect = { Text = "Auto Collect Plot Cash" },
@@ -35438,6 +35810,8 @@ N.AllAutoToggles = {
 	"AutoBuyDice",
 	"AutoUpgrade",
 	"AutoRebirth",
+	"AutoRebirthStats",
+	"AutoFuse",
 	"AutoTower",
 	"AutoBoosts",
 	"AutoTrait",
@@ -35638,6 +36012,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 			end
 		end
 		N.Events.rebirth = function(level)
+			-- The new rebirth point is spent on the next chores round.
+			N.RStat.nextAt = 0
 			if hookOn() and on("WebhookRebirths") then
 				queueEmbed({
 					title = "\u{2726}  Rebirth " .. tostring(level),
@@ -35972,7 +36348,7 @@ do
 					roll = { "AutoRoll", "AutoEquipDice" },
 					plot = { "AutoCollect", "AutoEquipBest", "AutoLevel" },
 					sell = { "AutoSell" },
-					upgrades = { "SmartSpend", "AutoBuyDice", "AutoUpgrade", "AutoRebirth", "AutoGear" },
+					upgrades = { "SmartSpend", "AutoBuyDice", "AutoUpgrade", "AutoRebirth", "AutoRebirthStats", "AutoGear" },
 					towers = { "AutoTower", "TowerEquipTeam" },
 					rewards = { "AutoDaily", "AutoOffline", "AutoGroup", "AutoCodes", "AutoQuests", "AutoTicketPasses" },
 				}
@@ -36231,7 +36607,12 @@ do
 			N.shopStep()
 		end
 		N.levelStep()
+		N.rstatStep()
 		N.spendStep()
+		-- With Auto Roll off a fuse costs no rolls; with it on, fusing waits for the storage-full pause (rollStep).
+		if on("AutoFuse") and not on("AutoRoll") and choreDue("fuse", 10) then
+			N.fuseStep()
+		end
 		if choreDue("rewards", 3) then
 			N.rewardStep()
 		end
@@ -36239,6 +36620,9 @@ do
 			N.weatherTick()
 		end
 		if choreDue("boosts", 5) then
+			if on("AutoBoosts") then
+				N.gamepassItemStep()
+			end
 			N.boostStep()
 		end
 		if choreDue("gear", 10) then
@@ -36363,6 +36747,7 @@ do
 							formatNumber(nextRebirth.moneyMultiplier)
 						)
 						else "Max rebirth reached"
+					I.rebirth ..= "\n" .. N.rstatText()
 					I.shop = if #N.Shop.log > 0 then table.concat(N.Shop.log, "\n") else '<font transparency="0.4">Nothing bought yet</font>'
 					local T = N.Tower
 					local towerLines = {}
