@@ -28517,11 +28517,76 @@ end
 local function isFavorite(tool)
 return tool:GetAttribute("Favorite") == true
 end
+Plan.bootAt = os.clock()
+function Plan.opHas(key)
+if not Plan.op() then
+return false
+end
+local option = Options.OPExclude
+return option ~= nil and type(option.Value) == "table" and option.Value[key] == true
+end
+function Plan.opKeepTier(tier, crate, what)
+if tier == nil or tier == "" or not Plan.op() then
+return false
+end
+local name = tostring(tier)
+name = string.upper(string.sub(name, 1, 1)) .. string.lower(string.sub(name, 2))
+local label = (if crate then "Crate: " else "Item: ") .. name
+if Plan.opHas(label) then
+logEvery("opx:" .. label .. tostring(what), 300, "OP exclude", tostring(what or label), "(" .. label .. ")")
+return true
+end
+return false
+end
+function Plan.opReserve()
+return if Plan.opHas("Money reserve (keep 25%)") then 0.25 else 0
+end
+function Plan.spendable()
+return money() * (1 - Plan.opReserve())
+end
+function Plan.opAfford(cost)
+cost = tonumber(cost)
+if not cost or cost <= 0 or Plan.opReserve() == 0 then
+return true
+end
+if cost <= Plan.spendable() then
+return true
+end
+logEvery("opx:reserve", 300, "OP exclude", "money reserve", "(holding back $" .. formatNumber(cost) .. ")")
+return false
+end
+function Plan.opExcludeLabels()
+local labels, defaults = {}, {}
+local function add(label, default)
+table.insert(labels, label)
+if default then
+table.insert(defaults, label)
+end
+end
+for _, name in ipairs({ "Cosmic", "Secret", "Eternal", "Divine" }) do
+if RarityRank[name] then
+add("Item: " .. name, true)
+end
+end
+local from = CrateRarities.rank["Godly"] or 6
+for index, name in ipairs(CrateRarities.list) do
+if index >= from then
+add("Crate: " .. name, name == "Secret" or name == "Divine" or name == "Cosmic")
+end
+end
+add("Thunder points", true)
+add("Blessing points", true)
+add("Money reserve (keep 25%)", false)
+return labels, defaults
+end
 local function wantsProtect(tool)
+local tier = tierOf(tool)
+if tier ~= nil and Plan.opKeepTier(tier, false, tool:GetAttribute("ItemName") or tool.Name) then
+return true
+end
 if not (Toggles.ProtectItems and Toggles.ProtectItems.Value) then
 return false
 end
-local tier = tierOf(tool)
 return tier ~= nil and selected(Options.ProtectRarities, tier)
 end
 local FavoriteAsked = setmetatable({}, { __mode = "k" })
@@ -30661,6 +30726,8 @@ local crateList = {}
 for _, tool in ipairs(toolsWith("CrateUid")) do
 if isFavorite(tool) then
 kept += 1
+elseif Plan.opKeepTier(tool:GetAttribute("CrateTier"), true, tool:GetAttribute("CrateName") or tool.Name) then
+pending += 1
 else
 table.insert(crateList, tool)
 end
@@ -30875,7 +30942,7 @@ if not TrailState.known then
 fire("TRAIL_STATE")
 return
 end
-local cash = money()
+local cash = Plan.spendable()
 local pick
 if Plan.smart() and Plan.ready then
 for _, option in ipairs(Plan.list) do
@@ -31102,6 +31169,7 @@ end
 function thunderReady()
 local config = stormConfig()
 return Remotes.rf_THUNDER_MACHINE ~= nil
+and not Plan.opHas("Thunder points")
 and (os.clock() >= ThunderNext or (Admin.mutationLuck() > 1 and ThunderNext - os.clock() <= 45))
 and (tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0) >= chargeTarget(config)
 end
@@ -31242,6 +31310,10 @@ return ok and position or nil
 end
 function Bless.ready()
 if os.clock() < Bless.next then
+return false
+end
+if Plan.opHas("Blessing points") then
+logEvery("opx:bless", 600, "OP exclude", "Blessing points", "(not spending)")
 return false
 end
 return ReplicatedStorage:FindFirstChild("rf_ARCHANGEL_BLESSING") ~= nil
@@ -31409,9 +31481,12 @@ local name = tool:GetAttribute("ItemName") or tool.Name
 local tier = tool:GetAttribute("ItemTier")
 local tierName = type(tier) == "number" and RarityList[tier] or tier
 if
+not Plan.opKeepTier(tierName, false, name)
+and (
 not tierName
 or selected(Options.FuseTiers, tierName)
 or selected(Options.FuseTiers, (tostring(tierName):sub(1, 1) .. tostring(tierName):sub(2):lower()))
+)
 then
 groups[name] = groups[name] or {}
 table.insert(groups[name], tool)
@@ -31449,7 +31524,7 @@ function fuseOnce()
 if os.clock() < FuseNext then
 return false
 end
-local cash = money()
+local cash = Plan.spendable()
 local job, jobRatio
 for _, candidate in ipairs(fuseCandidates()) do
 if candidate.fee <= cash then
@@ -32212,11 +32287,15 @@ end
 end
 return nil
 end
-function Plan.allow(kind, _cost, id)
+function Plan.allow(kind, cost, id)
+local found = Plan.find(kind, id)
+if not Plan.opAfford(found and found.cost or cost) then
+return false
+end
 if not (Plan.smart() and Plan.ready) then
 return true
 end
-local option = Plan.find(kind, id)
+local option = found
 if not option then
 return true
 end
@@ -32863,6 +32942,7 @@ end,
 end)
 end
 Tabs.Main = addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+Tabs.AutoOP = addTab("Auto OP", "zap", "Full automatic mode and what it must never touch")
 Tabs.Storm = addTab("Storm", "cloud-lightning", "Storm orbs, Thunder Machine and Archangel Blessing")
 Tabs.Plot = addTab("Plot", "layout-grid", "Place and open crates, best items on the plot")
 Tabs.Upgrades = addTab("Upgrades", "trending-up", "Smart Spending, trails and the treadmill")
@@ -32878,28 +32958,8 @@ end)
 end
 local StatusBox, StatusLabel, StormLabel, BlessLabel
 do
-local FarmBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "rocket")
-FarmBox:AddToggle("FarmAll", {
-Text = "Auto Farm Everything",
-Default = false,
-Tooltip = "Normal mode: switches on exactly the toggles picked below, with your own zones, rarities, priority and sell mode. It never sells, fuses or spends points or money unless you picked that toggle yourself.",
-Callback = function(value)
-task.spawn(Plan.farmAll, value)
-end,
-})
-FarmBox:AddDropdown("FarmSet", {
-Text = "Farm Everything includes",
-Values = Plan.farmLabels(),
-Default = Plan.farmDefaults(),
-Multi = true,
-AllowNull = true,
-Searchable = true,
-Tooltip = "The toggles Auto Farm Everything switches on. The default is the safe set: nothing that sells, fuses or spends points or money.",
-Callback = function()
-task.spawn(Plan.farmApply)
-end,
-})
-FarmBox:AddToggle("AutoFarmOP", {
+local OPBox = Tabs.AutoOP:AddLeftGroupbox("Auto Farm Everything OP", "zap")
+OPBox:AddToggle("AutoFarmOP", {
 Text = "Auto Farm Everything OP",
 Default = false,
 Tooltip = "The planner sells, fuses, spends points and money for max profit and can sell or fuse your crates. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
@@ -32908,6 +32968,17 @@ if value and not Plan.opApproved then
 Plan.opSilent = true
 Toggles.AutoFarmOP:SetValue(false)
 Plan.opSilent = false
+if os.clock() - Plan.bootAt < 10 then
+if Toggles.RememberOP and Toggles.RememberOP.Value then
+Plan.opApproved = true
+log("OP restored", "(Remember Auto OP is on)")
+Toggles.AutoFarmOP:SetValue(true)
+else
+Plan.opPending = true
+log("OP not restored", "(Remember Auto OP is off)")
+end
+return
+end
 if Plan.uiReady and Library.ShowConfirmPrompt then
 Library:ShowConfirmPrompt({
 Title = "Enable Auto Farm Everything OP?",
@@ -32931,9 +33002,64 @@ Plan.opApproved = false
 task.spawn(Plan.farmOP, value)
 end,
 })
+OPBox:AddLabel({
+Text = '<font transparency="0.35">OP is full automatic: it sells, fuses and spends by profit math. Full automatic. Uses the game remotes faster than a normal player: the game anticheat MAY BAN this account. Use at your own risk, preferably on an alt. Items and points you list under Exclude from OP are never touched.</font>',
+DoesWrap = true,
+})
+local SafeBox = Tabs.AutoOP:AddRightGroupbox("OP Safety", "shield")
+SafeBox:AddToggle("RememberOP", {
+Text = "Remember Auto OP",
+Default = false,
+Tooltip = "Warning: when on, saved configs switch OP back on at the next start without asking. Full automatic. The game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt. Off (default): OP always starts off.",
+Callback = function(value)
+if value and Plan.opPending and os.clock() - Plan.bootAt < 10 then
+Plan.opPending = false
+Plan.opApproved = true
+log("OP restored", "(Remember Auto OP is on)")
+Toggles.AutoFarmOP:SetValue(true)
+end
+end,
+})
+local exLabels, exDefaults = Plan.opExcludeLabels()
+SafeBox:AddDropdown("OPExclude", {
+Text = "Exclude from OP",
+Values = exLabels,
+Default = exDefaults,
+Multi = true,
+AllowNull = true,
+Searchable = true,
+Tooltip = "OP never sells or fuses these items and crates, never spends Thunder or Blessing points when listed, and keeps a money reserve when listed. Event crates are the Cosmic ones.",
+})
+end
+do
+local FarmBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "rocket")
+FarmBox:AddToggle("FarmAll", {
+Text = "Auto Farm Everything",
+Default = false,
+Tooltip = "Normal mode: switches on exactly the toggles picked below, with your own zones, rarities, priority and sell mode. It never sells, fuses or spends points or money unless you picked that toggle yourself.",
+Callback = function(value)
+task.spawn(Plan.farmAll, value)
+end,
+})
+FarmBox:AddDropdown("FarmSet", {
+Text = "Farm Everything includes",
+Values = Plan.farmLabels(),
+Default = Plan.farmDefaults(),
+Multi = true,
+AllowNull = true,
+Searchable = true,
+Tooltip = "The toggles Auto Farm Everything switches on. The default is the safe set: nothing that sells, fuses or spends points or money.",
+Callback = function()
+task.spawn(Plan.farmApply)
+end,
+})
+FarmBox:AddLabel({
+Text = '<font transparency="0.35">Full automatic mode (sell, fuse, spend) lives in the Auto OP tab.</font>',
+DoesWrap = true,
+})
 log("MODE", "Normal", "(start)")
 FarmBox:AddLabel({
-Text = '<font transparency="0.35">Normal = your own toggles, OP = full automatic. Everything below still works if you want to fine tune it.</font>',
+Text = '<font transparency="0.35">Normal = your own toggles. Everything below still works if you want to fine tune it.</font>',
 DoesWrap = true,
 })
 FarmBox:AddToggle("AutoSteal", {
@@ -35357,7 +35483,7 @@ if on("AutoOpen") and Remotes.rf_CRATE_TIMERS and now - last.open > 3 then
 last.open = now
 task.spawn(openCratesRemote)
 end
-if on("ProtectItems") and now - last.protect > 5 then
+if (on("ProtectItems") or Plan.op()) and now - last.protect > 5 then
 last.protect = now
 protectTick()
 end
