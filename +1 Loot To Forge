@@ -32025,6 +32025,14 @@ do
 			Session.kills += 1
 			F.target = nil
 		end
+		-- note the clear time before the pack check, or a full pack would hide it from the planner forever
+		if F.seen[F.stage] and F.fightStart and not F.clearedAt then
+			F.clearedAt = os.clock()
+			if N.planNoteClear then
+				N.planNoteClear(F.clearedAt - F.fightStart)
+			end
+			F.fightStart = nil
+		end
 		if packNow >= packMax then
 			N.bank("pack full")
 			return
@@ -32045,9 +32053,6 @@ do
 			-- The ores drop once the server answers, give them a moment before moving on.
 			if not F.clearedAt then
 				F.clearedAt = os.clock()
-				if F.fightStart and N.planNoteClear then
-					N.planNoteClear(F.clearedAt - F.fightStart)
-				end
 				F.fightStart = nil
 			end
 			if pickHere and os.clock() - F.clearedAt < 2.5 then
