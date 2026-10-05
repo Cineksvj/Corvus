@@ -31676,47 +31676,11 @@ do
 		end
 		return list
 	end
-	-- A toggle counts as on when the player switched it on, or when Auto Farm Everything (full automatic) runs and the
-	-- toggle is one of its jobs (N.FullSet). Full automatic never changes the player's own toggles.
-	N.FullSet = {}
-	-- Mode "My filters" (Main): no planner. The jobs picked in the Run dropdown run, nothing else is started for the player.
-	-- Fuse, delete and rebirth never run in this mode, not even from their own toggles.
-	N.RunMap = {
-		AutoThrow = "Auto Throw",
-		AutoTrain = "Auto Train",
-		AutoEquipBest = "Equip Best",
-		AutoOpenEggs = "Hatch owned eggs",
-		AutoDaily = "Daily reward",
-		AutoGifts = "Timed gifts",
-		AutoOffline = "Offline skill",
-		AutoGroupReward = "Group reward",
-		AutoIndex = "Pet index",
-		AutoCodes = "Redeem codes",
-		AutoFriend = "Auto Friend",
-	}
-	N.RunOrder = { "AutoThrow", "AutoTrain", "AutoEquipBest", "AutoOpenEggs", "AutoDaily", "AutoGifts", "AutoOffline", "AutoGroupReward", "AutoIndex", "AutoCodes", "AutoFriend" }
-	N.NeverInFilters = { AutoFuse = true, AutoDeletePets = true, AutoRebirth = true }
-	function N.farmOn()
-		return Toggles.AutoFarmAll ~= nil and Toggles.AutoFarmAll.Value == true
-	end
-	function N.myFilters()
-		return N.farmOn() and Options.FarmMode ~= nil and Options.FarmMode.Value == "My filters"
-	end
+	-- Every feature is its own toggle (owner decision 2026-10-05: no Auto Farm Everything master toggle). A job runs only
+	-- when the player switched its toggle on.
 	function on(name)
 		local t = Toggles[name]
-		if t ~= nil and t.Value == true then
-			if N.NeverInFilters[name] and N.myFilters() then
-				return false
-			end
-			return true
-		end
-		if Toggles.AutoFarmAll ~= nil and Toggles.AutoFarmAll.Value == true then
-			if Options.FarmMode ~= nil and Options.FarmMode.Value == "My filters" then
-				return N.RunMap[name] ~= nil and selected(Options.FarmRun, N.RunMap[name])
-			end
-			return N.FullSet[name] == true
-		end
-		return false
+		return t ~= nil and t.Value == true
 	end
 	function optionNumber(name, default)
 		local option = Options[name]
@@ -31727,40 +31691,27 @@ do
 		local value = option and option.Value
 		return if type(value) == "string" and value ~= "" then value else default
 	end
-	-- Auto Farm Everything = full automatic (confirmed by the player): the planner runs every job of this game, spending
-	-- included, independent of the manual toggles. Off = only the toggles the player switched on run.
 	function N.farmMode()
-		return if not N.farmOn() then "Manual" elseif N.myFilters() then "My filters" else "Full auto"
+		return (if optionText("ThrowSpeed", "Legit (game pace)") == "Max (Blatant)" then "Max" else "Legit") .. ", " .. (if optionText("MoveMode", "Walk (Safe)") == "Teleport (Fast)" then "Teleport" else "Walk")
 	end
+	-- Kept for the shared pet code: there is no full automatic mode any more, so nothing takes over the player's filters.
 	function N.opActive()
-		return N.farmOn() and not N.myFilters()
+		return false
 	end
-	N.fullActive = N.opActive
-	-- "Exclude" (Main tab): resources Corvus never sells, deletes, fuses or uses, in full automatic and in manual mode.
-	-- Keys like "Pets: Legendary", "Golden pets", "Egg: Dragon", "Potion: Luck".
 	N.OPSkipped = { count = 0, last = "" }
-	function N.opExcluded(key)
-		local yes = selected(Options.ExcludeOP, key)
-		if yes then
-			N.OPSkipped.count += 1
-			N.OPSkipped.last = key
-		end
-		return yes
+	function N.opExcluded(_key)
+		return false
 	end
 	-- Max throw rate: no pause between throws beyond the game's own cooldown (the Throw button comes back after it), with
-	-- a back-off when the server refuses a throw. Manual play keeps Safe (the pace of the game's own Auto Wins pass) unless
-	-- the player picks Max; full automatic always throws at the rate the server accepts (the audit found no anticheat).
+	-- a back-off when the server refuses a throw. Default Legit (the pace of the game's own Auto Wins pass).
 	function N.blatant()
-		return N.opActive() or optionText("ThrowSpeed", "Legit (game pace)") == "Max (Blatant)"
+		return optionText("ThrowSpeed", "Legit (game pace)") == "Max (Blatant)"
 	end
 	-- Movement: Walk (Safe, default) walks like a player; Teleport (opt-in) moves the character instantly.
 	function N.safeMove()
 		return optionText("MoveMode", "Walk (Safe)") ~= "Teleport (Fast)"
 	end
 	function N.pickText(name, default)
-		if N.opActive() then
-			return default
-		end
 		return optionText(name, default)
 	end
 	Status = "Idle"
@@ -31963,9 +31914,51 @@ do
 			char:PivotTo(cf)
 		end))
 	end
-	-- Goes to a spot the way the player would: Walk (Safe) uses Humanoid:MoveTo (again every 2 s, a jump when stuck)
-	-- and gives up after the timeout; Teleport (Fast) pivots there. Returns true when the character is there.
-	N.Walk = { fails = 0 }
+	-- Goes to a spot the way the player would: Walk (Safe) follows a PathfindingService path (around decks, rails and
+	-- water edges), then Humanoid:MoveTo for the last studs (again every 2 s, a jump when stuck), and gives up after the
+	-- timeout; Teleport (Fast) pivots there (the spot already carries the height above the part), checks the landing and
+	-- pivots once more when the character slid off. Returns true when the character is there.
+	N.Walk = { fails = 0, path = "" }
+	local function followPath(hum, target, near, flat, deadline)
+		local ok, waypoints = pcall(function()
+			local path = game:GetService("PathfindingService"):CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 6 })
+			path:ComputeAsync(N.root().Position, target)
+			if path.Status ~= Enum.PathStatus.Success then
+				N.Walk.path = tostring(path.Status)
+				return nil
+			end
+			return path:GetWaypoints()
+		end)
+		if not ok or type(waypoints) ~= "table" or #waypoints == 0 then
+			N.Walk.path = if ok then N.Walk.path else "unavailable"
+			return false
+		end
+		N.Walk.path = "ok " .. #waypoints
+		for i = 2, #waypoints do
+			local wp = waypoints[i]
+			if os.clock() > deadline or not alive() then
+				return false
+			end
+			pcall(function()
+				if wp.Action == Enum.PathWaypointAction.Jump then
+					hum.Jump = true
+				end
+				hum:MoveTo(wp.Position)
+			end)
+			local started = os.clock()
+			while os.clock() - started < 3 and os.clock() <= deadline do
+				local p = N.root() and N.root().Position
+				if not p or Vector3.new(p.X - wp.Position.X, 0, p.Z - wp.Position.Z).Magnitude <= 2.5 then
+					break
+				end
+				if flat() <= near then
+					return true
+				end
+				task.wait(0.1)
+			end
+		end
+		return flat() <= near
+	end
 	function N.goTo(cf, near, timeout)
 		near = near or 4
 		local target = cf.Position
@@ -31981,15 +31974,27 @@ do
 			return true
 		end
 		if not N.safeMove() then
-			N.tp(cf)
-			return true
+			for _ = 1, 2 do
+				N.tp(cf)
+				task.wait(0.15)
+				if flat() <= near then
+					return true
+				end
+			end
+			logProblem(string.format("Teleport did not land on the spot (%.0f studs off after 2 tries)", flat()))
+			return false
 		end
 		local hum = N.humanoid()
 		if not hum then
 			return false
 		end
-		local started, lastDist, lastAt, sentAt = os.clock(), flat(), os.clock(), -1e9
 		timeout = timeout or 25
+		local started = os.clock()
+		if followPath(hum, target, near, flat, started + timeout * 0.7) then
+			N.Walk.fails = 0
+			return true
+		end
+		local lastDist, lastAt, sentAt = flat(), os.clock(), -1e9
 		while os.clock() - started < timeout and alive() do
 			if os.clock() - sentAt >= 2 then
 				sentAt = os.clock()
@@ -32013,7 +32018,7 @@ do
 			task.wait(0.1)
 		end
 		N.Walk.fails += 1
-		logProblem(string.format("Walk did not reach the spot (%.0f studs left). Movement Teleport (Fast) skips walking", flat()))
+		logProblem(string.format("Walk did not reach the spot (%.0f studs left, path %s). Movement Teleport (Fast) skips walking", flat(), N.Walk.path))
 		return false
 	end
 	-- Streaming: parts far away may not exist on the client yet.
@@ -32457,8 +32462,22 @@ function N.throwStep()
 	return true
 end
 -- Training ------------------------------------------------------------------------------------------------------
--- Standing on a training stand starts Practice on the server (no remote); the game then trains by itself.
-N.Train = { zone = nil, failed = {}, startedAt = -1e9, last = "" }
+-- Standing on a training stand starts Practice on the server (no remote, Practice.Radius 8); the game then trains by
+-- itself. A zone opens with Rebirths + BonusRebirths >= Practice.ZoneRequiredRebirths of this world (the game's
+-- WorldPresentation.updateTrainingUnlocks), pass zones (TrainingPasses) need OwnedTrainingZones. The zone's own
+-- "UnlockStatus" label (UNLOCKED / LOCKED) is the game's verdict and wins over the hub's math.
+N.Train = { zone = nil, failed = {}, startedAt = -1e9, last = "", verifyAt = nil, verifySkill = 0, verifyRebirths = 0 }
+function N.effRebirths()
+	local s = N.state()
+	return N.rebirths() + (tonumber(s.BonusRebirths) or 0)
+end
+local function zoneLabel(model)
+	local label = model and model:FindFirstChild("UnlockStatus", true)
+	if label and label:IsA("TextLabel") then
+		return string.upper(tostring(label.Text))
+	end
+	return nil
+end
 function N.zones()
 	local cfg = N.worldCfg()
 	local practice = cfg and cfg.Practice or N.G.Balance.Practice or {}
@@ -32499,8 +32518,21 @@ function N.zones()
 	end)
 	return list
 end
+-- Why the player cannot use a zone (nil = can use it).
+function N.zoneLock(zone)
+	if not zone.owned then
+		return "needs the training pass"
+	end
+	if N.effRebirths() < zone.need then
+		return string.format("needs %d rebirths (have %d)", zone.need, N.effRebirths())
+	end
+	if zoneLabel(zone.model) == "LOCKED" then
+		return "the game shows it LOCKED"
+	end
+	return nil
+end
 function N.zoneOpen(zone)
-	return zone.owned and N.rebirths() >= zone.need and (N.Train.failed[zone.name] or 0) <= os.clock()
+	return N.zoneLock(zone) == nil and (N.Train.failed[zone.name] or 0) <= os.clock()
 end
 function N.bestZone()
 	local pick = N.pickText("TrainZone", "Best open")
@@ -32515,20 +32547,36 @@ function N.bestZone()
 	end
 	return best
 end
-function N.zoneStand(zone)
+function N.zoneStandPart(zone)
 	local model = zone.model
 	local stand = model:FindFirstChild("TrainingStand")
 	if not stand then
 		local deck = model:FindFirstChild("ThrowingDeck")
 		stand = deck and deck:FindFirstChild("DeckFrame")
 	end
-	if stand and stand:IsA("BasePart") then
+	return if stand and stand:IsA("BasePart") then stand else nil
+end
+function N.zoneStand(zone)
+	local stand = N.zoneStandPart(zone)
+	if stand then
 		return stand.CFrame + Vector3.new(0, stand.Size.Y / 2 + 3, 0)
 	end
 	local ok, pivot = pcall(function()
-		return model:GetPivot()
+		return zone.model:GetPivot()
 	end)
 	return if ok then pivot + Vector3.new(0, 3, 0) else nil
+end
+-- Practice.Radius of this world (8 in the dump): the server starts Practice inside it.
+local function practiceRadius()
+	local cfg = N.worldCfg()
+	local practice = cfg and cfg.Practice or N.G.Balance.Practice or {}
+	return tonumber(practice.Radius) or 8
+end
+local function rest(zone, seconds, reason)
+	N.Train.failed[zone.name] = os.clock() + seconds
+	N.Train.zone = nil
+	N.Train.verifyAt = nil
+	logProblem("Training did not start at " .. zone.name .. ": " .. reason)
 end
 function N.trainStep()
 	local zone = N.bestZone()
@@ -32542,6 +32590,28 @@ function N.trainStep()
 		if N.Train.zone == zone.name or os.clock() - N.Train.startedAt < 3 then
 			N.Train.zone = N.Train.zone or zone.name
 			N.Train.bonus = N.Train.bonus or zone.bonus
+			-- Started is not enough: the skill has to rise within 5 s (a rebirth in between re-arms the check).
+			local T = N.Train
+			if T.verifyAt and N.rebirths() ~= T.verifyRebirths then
+				T.verifyAt, T.verifySkill, T.verifyRebirths = os.clock() + 5, N.skill(), N.rebirths()
+			end
+			if T.verifyAt and os.clock() >= T.verifyAt then
+				local gained = N.skill() - T.verifySkill
+				T.verifyAt = nil
+				if gained > 0 then
+					log("TRAIN verified", T.zone, "skill +" .. brief(gained), "in 5s")
+				else
+					send("StopPractice", nil)
+					local named
+					for _, z in ipairs(N.zones()) do
+						if z.name == T.zone then
+							named = z
+						end
+					end
+					rest(named or zone, 120, "Practice on but the skill did not rise in 5 s")
+					return false
+				end
+			end
 			setStatus("Training at " .. N.Train.zone)
 			task.wait(0.5)
 			return true
@@ -32573,11 +32643,24 @@ function N.trainStep()
 		N.Train.startedAt = os.clock()
 		N.Train.bonus = zone.bonus
 		N.Train.last = zone.name .. " (+" .. formatNumber(zone.bonus) .. ")"
+		N.Train.verifyAt, N.Train.verifySkill, N.Train.verifyRebirths = os.clock() + 5, N.skill(), N.rebirths()
 		log("TRAIN start", zone.name, "bonus", zone.bonus)
 		return true
 	end
-	N.Train.failed[zone.name] = os.clock() + 600
-	logProblem("Training did not start at " .. zone.name)
+	-- Name the reason: locked (game label / rebirths / pass), too far from the stand, or busy.
+	local lock = N.zoneLock(zone)
+	if lock then
+		rest(zone, 600, lock)
+		return false
+	end
+	local stand = N.zoneStandPart(zone)
+	local pos = N.root() and N.root().Position
+	local dist = if stand and pos then (stand.Position - pos).Magnitude else -1
+	if dist > practiceRadius() then
+		rest(zone, 60, string.format("stood %.0f studs from the stand (the game starts Practice within %d)", dist, practiceRadius()))
+	else
+		rest(zone, 300, string.format("on the stand (%.0f studs) but the game did not start Practice, activity %s", dist, tostring(N.activity())))
+	end
 	return false
 end
 -- Stones, trails ------------------------------------------------------------------------------------------------
@@ -33708,7 +33791,7 @@ end)
 -- (world Throw.Progression + DistanceMilestones, the game's Trajectory.Plan), the zone reached pays Wins (Zones[].Wins).
 -- Wins buy stones (x skill), trails (x wins) and eggs (pets, x skill). Rebirth multiplies skill and resets it.
 -- Skill is priced through the elasticity alpha = d ln(wins per throw) / d ln(skill) from the game's own tables.
-N.Plan = { at = -1e9, text = "", spendText = "", options = {}, f = 0.5, alpha = 1, mode = "throw", blockEnds = 0, logAt = -1e9, lastKey = "", spendKey = "", why = "", say = "", next = nil, decisionKey = "" }
+N.Plan = { at = -1e9, text = "", spendText = "", options = {}, f = 0.5, fBase = nil, goal = nil, chain = nil, rebirthSay = "", rebirthKey = "", rebirthLogAt = -1e9, alpha = 1, mode = "throw", blockEnds = 0, logAt = -1e9, lastKey = "", spendKey = "", why = "", say = "", next = nil, decisionKey = "" }
 -- Rates are stored per unit of the game's skill multiplier (see N.skillScale) so a rate measured before a rebirth or a
 -- new stone is still comparable with one measured after it. trainNorm is also per unit of (1 + zone bonus).
 N.Rate = { trainNorm = nil, throwNorm = nil, throwWins = nil, secPerThrow = nil, winsPerThrow = nil, trainSkill = nil, throwSkill = nil, acc = {}, last = nil, logAt = -1e9, foldAt = os.clock() }
@@ -33915,9 +33998,57 @@ do
 	-- spent throwing is f = T / ((T - s)(1 + alpha)) (T = training skill/s, s = skill/s while throwing, both at today's
 	-- stone and rebirth multiplier). Wins only come from throws, that is the f in front.
 	local UnlockTrainLimit = 1800
+	local function splitShare(T, s, alpha)
+		if s >= T then
+			return 1, "throws train faster", string.format("Throwing only: a throw gives more skill per second (%s) than training (%s), and Wins on top", formatNumber(s), formatNumber(T))
+		end
+		local f = math.clamp(T / ((T - s) * (1 + alpha)), 0.08, 1)
+		local pct = math.floor(f * 100 + 0.5)
+		if s <= 0 then
+			return f, "split", string.format("Throwing %d%% / training %d%%: throws give no skill, only Wins (%s/s); training gives %s skill/s", pct, 100 - pct, formatNumber(R.throwWins or 0), formatNumber(T))
+		end
+		return f,
+			"split",
+			string.format(
+				"Throwing %d%% / training %d%%: training gives %sx the skill of throwing (%s vs %s skill/s), Wins come only from throws (%s/s)",
+				pct,
+				100 - pct,
+				formatNumber(T / math.max(s, 1e-9)),
+				formatNumber(T),
+				formatNumber(s),
+				formatNumber(R.throwWins or 0)
+			)
+	end
+	-- Wins budget during the push to the next world: a better stone multiplies training too (skillScale), so throwing
+	-- first for the Wins it costs can open the next world sooner than training alone. Returns the best such stone.
+	-- tTrain = seconds of training to the unlock now, T / s = training / throwing skill per second.
+	function N.stoneFirst(tTrain, T, s, need)
+		if not on("AutoBuyStones") or not (R.throwWins and R.throwWins > 0) or not need then
+			return nil
+		end
+		local wins = N.wins()
+		local _, best = N.bestOwnedStone()
+		local owned = N.coll("OwnedStones")
+		local skill = N.skill()
+		local pick
+		for _, stone in ipairs(N.worldStones()) do
+			local mult, price = tonumber(stone.Multiplier) or 0, tonumber(stone.Price) or 0
+			if not owned[stone.Id] and mult > best and price > 0 and (N.Shop.refused[stone.Id] or 0) <= os.clock() then
+				local short = math.max(price - wins, 0)
+				local tThrow = short / R.throwWins
+				local left = math.max(need - skill - (s or 0) * tThrow, 0)
+				local t = tThrow + left / (T * mult / best)
+				if t < tTrain * 0.95 and (not pick or t < pick.t) then
+					pick = { stone = stone, t = t, tThrow = tThrow, short = short, k = mult / best }
+				end
+			end
+		end
+		return pick
+	end
 	function N.throwShare()
 		local alpha = N.alpha()
 		P.alpha = alpha
+		P.goal = nil
 		local T = N.trainRateNow()
 		local s = N.throwSkillNow()
 		local nextId = N.worldCfg() and N.worldCfg().NextWorldId
@@ -33936,34 +34067,33 @@ do
 			P.say = "Measuring how much skill and Wins throws give"
 			return 0.5
 		end
+		local f, why, say = splitShare(T, s, alpha)
+		-- The share the loop would use without the unlock push: Wins are valued with it (purchases pay back after the push).
+		P.fBase = f
 		-- The next world (better stones, eggs and zones) opens at the end of the map: when training gets there soon, only
-		-- train (throws there before the end pay little compared with the next world).
+		-- train, unless throwing first for a better stone gets there sooner (the stone multiplies training too).
 		local eta = N.unlockEta()
 		if eta and eta > 0 and eta <= UnlockTrainLimit and T > s then
+			local goal = N.stoneFirst(eta, T, s, N.mapEndSkill())
+			if goal then
+				P.goal = goal
+				P.why = "throw for stone"
+				P.say = string.format(
+					"Throwing first: %s more Wins buy the %s stone (x%s skill), then %s opens in ~%s instead of ~%s by training now",
+					formatNumber(goal.short),
+					tostring(goal.stone.Name or goal.stone.Id),
+					formatNumber(goal.k),
+					tostring(nextId),
+					N.longTime(goal.t),
+					N.longTime(eta)
+				)
+				return 1
+			end
 			P.why = "train to unlock"
 			P.say = string.format("Training only: %s opens at the end of the map, about %s of training away", tostring(nextId), N.longTime(eta))
 			return 0
 		end
-		if s >= T then
-			P.why = "throws train faster"
-			P.say = string.format("Throwing only: a throw gives more skill per second (%s) than training (%s), and Wins on top", formatNumber(s), formatNumber(T))
-			return 1
-		end
-		P.why = "split"
-		local f = math.clamp(T / ((T - s) * (1 + alpha)), 0.08, 1)
-		if s <= 0 then
-			P.say = string.format("Throwing %d%% / training %d%%: throws give no skill, only Wins (%s/s); training gives %s skill/s", math.floor(f * 100 + 0.5), 100 - math.floor(f * 100 + 0.5), formatNumber(R.throwWins or 0), formatNumber(T))
-			return f
-		end
-		P.say = string.format(
-			"Throwing %d%% / training %d%%: training gives %sx the skill of throwing (%s vs %s skill/s), Wins come only from throws (%s/s)",
-			math.floor(f * 100 + 0.5),
-			100 - math.floor(f * 100 + 0.5),
-			formatNumber(T / math.max(s, 1e-9)),
-			formatNumber(T),
-			formatNumber(s),
-			formatNumber(R.throwWins or 0)
-		)
+		P.why, P.say = why, say
 		return f
 	end
 	function N.nextWorldLocked()
@@ -33972,13 +34102,18 @@ do
 		return nextId ~= nil and N.G.Worlds.ById and N.G.Worlds.ById[nextId] ~= nil and not N.worldUnlocked(nextId)
 	end
 	-- Wins per second the whole loop makes (measured, else the model).
-	function N.winsIncome()
-		local f = P.f
+	function N.winsIncome(f)
+		f = f or P.f
 		if R.throwWins and R.throwWins > 0 then
 			return R.throwWins * f
 		end
 		local per = N.baseWins(N.skill()) * N.trailMult()
 		return per / (R.secPerThrow or 6) * f
+	end
+	-- Wins per second a purchase is valued with: the share the loop throws outside a short unlock push (a push trains
+	-- only for minutes, the purchase pays for the rest of the day).
+	function N.winsValueRate()
+		return N.winsIncome(math.max(P.f, P.fBase or 0, 0.08))
 	end
 	function N.skillIncome()
 		local f = P.f
@@ -34021,34 +34156,196 @@ do
 		end
 		return P.mode
 	end
-	-- Rebirth: worth it within 24 h when the skill the reset takes is less than the extra skill the new multiplier
-	-- (and any training zone it opens) brings over the horizon. Not while the next world is about to open: the reset
-	-- would push the unlock back.
+	-- Rebirth ------------------------------------------------------------------------------------------------------
+	-- The game (dump, Shared.Util.Progression + GameBalance): player Level comes from Skill through
+	-- GameBalance.Progression (LevelCosts, then FirstLevelCost + CostIncrease); Progression.GetRebirth gives the level a
+	-- rebirth needs (RequiredLevels 20..100, then + LevelIncreases tiers, max MaxRequiredLevel) and the multiplier
+	-- (SkillIncreases tiers + 1: x75 at 22 rebirths). A rebirth resets Skill. Training zones open at
+	-- Practice.ZoneRequiredRebirths (Rebirths + BonusRebirths). The next world opens when a throw reaches the end of the
+	-- map: Skill >= the last DistanceMilestone's skill (World2 -> World3: 400B, WorldsPage "Train and throw with 400B").
+	local function tierTotal(n, tiers)
+		local total = 0
+		for i, v in ipairs(tiers or {}) do
+			local nextTier = tiers[i + 1]
+			local upto = if nextTier then math.min(n, nextTier.FromRebirth - 1) else n
+			total += math.max(0, upto - v.FromRebirth + 1) * v.Increase
+		end
+		return total
+	end
+	local function reqFormula(n, cfg)
+		local idx = math.min(n + 1, tonumber(cfg.MaxRebirths) or math.huge)
+		local levels = cfg.RequiredLevels
+		local need = levels[idx] or (levels[#levels] + tierTotal(idx, cfg.LevelIncreases))
+		return math.min(need, tonumber(cfg.MaxRequiredLevel) or math.huge)
+	end
+	local LevelTotals = {}
+	-- Skill the player Level L needs (the game's Progression.Threshold for GameBalance.Progression), nil without config.
+	function N.playerSkillForLevel(L, prog)
+		prog = prog or N.G.Balance.Progression
+		if type(prog) ~= "table" then
+			return nil
+		end
+		local n = math.max(math.floor(tonumber(L) or 1) - 1, 0)
+		local q = tonumber(prog.QuadraticScale)
+		if q and q > 0 then
+			return q * n ^ 3 / 3
+		end
+		local first, inc = tonumber(prog.FirstLevelCost), tonumber(prog.CostIncrease) or 0
+		if not first then
+			return nil
+		end
+		local costs = prog.LevelCosts or {}
+		local totals = LevelTotals[prog]
+		if not totals then
+			totals = { 0 }
+			for i, c in ipairs(costs) do
+				totals[i + 1] = totals[i] + (tonumber(c) or 0)
+			end
+			LevelTotals[prog] = totals
+		end
+		local done = math.min(n, #costs)
+		local left = n - done
+		return totals[done + 1] + left * (first + done * inc) + inc * left * (left - 1) / 2
+	end
+	local function zoneFactorAt(n)
+		local best = 0
+		for _, zone in ipairs(N.zones()) do
+			if zone.owned and n >= zone.need then
+				best = math.max(best, zone.bonus)
+			end
+		end
+		return 1 + best
+	end
+	-- Future rebirths seen from now: steps[j] = { G = training speed after j rebirths / now, R = skill the (j+1)-th
+	-- rebirth needs, m = multiplier, level = required level }. Exact from the game's tables when they are loaded,
+	-- else one step from the State (NextRebirthMultiplier).
+	function N.rebirthSteps(K)
+		local s = N.state()
+		local r = N.rebirths()
+		local m = math.max(tonumber(s.RebirthMultiplier) or (r + 1), 1)
+		local m1 = tonumber(s.NextRebirthMultiplier) or (m + 1)
+		local cfg = N.G.Balance.Rebirth
+		local prog = N.G.Balance.Progression
+		local need0 = tonumber(s.NextRebirthLevel)
+		local exact = type(cfg) == "table" and type(cfg.SkillIncreases) == "table" and type(cfg.RequiredLevels) == "table" and #cfg.RequiredLevels > 0 and type(prog) == "table" and need0 ~= nil
+		-- Calibration: the skill the hub computes for today's level must match today's skill (else scale the curve).
+		local scale = 1
+		if exact then
+			local lvl, skill = N.level(), N.skill()
+			local th = N.playerSkillForLevel(lvl, prog)
+			if not th then
+				exact = false
+			elseif lvl > 1 and skill > 0 and th > 0 and (skill / th < 0.5 or skill / th > 2) then
+				scale = skill / th
+			end
+		end
+		local manual = N.pickText("TrainZone", "Best open") ~= "Best open"
+		local zone = N.bestZone()
+		local zNow = 1 + (zone and zone.bonus or 0)
+		local eff = N.effRebirths()
+		local zoneList = N.zones()
+		local steps = {}
+		local mult1 = if exact then tierTotal(r + 1, cfg.SkillIncreases) else 0
+		for j = 1, (if exact then K else 1) do
+			local mj = if j == 1 or not exact then m1 else m1 + tierTotal(r + j, cfg.SkillIncreases) - mult1
+			local zj = if manual then zNow else math.max(zoneFactorAt(eff + j, zoneList), zNow)
+			local step = { G = mj / m * zj / zNow, m = mj, zone = zj }
+			if exact then
+				step.level = need0 + reqFormula(r + j, cfg) - reqFormula(r, cfg)
+				step.R = (N.playerSkillForLevel(step.level, prog) or 0) * scale
+			end
+			steps[j] = step
+		end
+		return steps
+	end
+	-- Fastest way to the next world: k rebirths first (the first one now, each later one after re-reaching the skill
+	-- it needs at the faster rate), then training to the map end E. k = 0 = train on now. Returns k, seconds, seconds
+	-- for k = 0. Pure function (tests feed it the log numbers).
+	function N.unlockChain(S, E, T, steps)
+		local t0 = math.max(E - S, 0) / T
+		local bestK, bestT = 0, t0
+		local spent = 0
+		for k = 1, #steps do
+			local st = steps[k]
+			local tk = spent + E / (T * st.G)
+			if tk < bestT then
+				bestK, bestT = k, tk
+			end
+			if not st.R then
+				break
+			end
+			spent += st.R / (T * st.G)
+			if spent >= bestT then
+				break
+			end
+		end
+		return bestK, bestT, t0
+	end
+	-- Rebirth decision.
+	-- 1) Next world locked and reachable within 24 h: rebirth only when it opens the next world sooner than training on
+	--    (never while the unlock is closer than the time a rebirth needs to get back to the same skill). After the
+	--    unlock the bigger zones of the next world make every later rebirth cheaper.
+	-- 2) Otherwise: rebirth when the new multiplier (and any zone it opens) earns back the reset skill within 24 h.
 	function N.rebirthWorth()
 		local s = N.state()
 		local m = tonumber(s.RebirthMultiplier) or (N.rebirths() + 1)
 		local m2 = tonumber(s.NextRebirthMultiplier) or (N.rebirths() + 2)
-		local zoneNow, zoneNext = 0, 0
-		for _, zone in ipairs(N.zones()) do
-			if zone.owned then
-				if N.rebirths() >= zone.need then
-					zoneNow = math.max(zoneNow, zone.bonus)
+		local zone = N.bestZone()
+		local zoneNow = 1 + (zone and zone.bonus or 0)
+		local zoneNext = math.max(zoneFactorAt(N.effRebirths() + 1), zoneNow)
+		local f = P.f
+		local boost = m2 / math.max(m, 1) * ((1 - f) * zoneNext / zoneNow + f) - 1
+		local r = N.skillIncome()
+		local resets = N.Reb.resets ~= false
+		local lost = if resets then N.skill() else 0
+		local gain = H * r * boost
+		P.chain = nil
+		local T, E = N.trainRateNow(), N.mapEndSkill()
+		if resets and N.nextWorldLocked() and T and T > 0 and E then
+			local steps = N.rebirthSteps(60)
+			local S = N.skill()
+			local k, tk, t0 = N.unlockChain(S, E, T, steps)
+			local nextId = tostring(N.worldCfg().NextWorldId)
+			if tk <= H then
+				P.chain = { k = k, tk = tk, t0 = t0 }
+				local st = steps[math.max(k, 1)]
+				if k == 0 then
+					local t1 = E / (T * steps[1].G)
+					P.rebirthSay = string.format(
+						"No rebirth before %s: training opens it in ~%s; a rebirth now resets %s skill and the unlock would take ~%s (x%s -> x%s skill). Rebirths go on after the unlock",
+						nextId,
+						N.longTime(t0),
+						formatNumber(S),
+						N.longTime(t1),
+						formatNumber(m),
+						formatNumber(steps[1].m)
+					)
+					return false, gain, lost, nextId .. " unlock (~" .. N.longTime(t0) .. ")"
 				end
-				if N.rebirths() + 1 >= zone.need then
-					zoneNext = math.max(zoneNext, zone.bonus)
-				end
+				P.rebirthSay = string.format(
+					"Rebirth now: %s opens in ~%s after %d rebirth%s (x%s -> x%s skill%s) instead of ~%s by training on",
+					nextId,
+					N.longTime(tk),
+					k,
+					if k == 1 then "" else "s",
+					formatNumber(m),
+					formatNumber(st.m),
+					if st.zone > zoneNow then ", zone x" .. formatNumber(zoneNow) .. " -> x" .. formatNumber(st.zone) else "",
+					N.longTime(t0)
+				)
+				return true, gain, lost
 			end
 		end
-		local f = P.f
-		local boost = m2 / math.max(m, 1) * ((1 - f) * (1 + zoneNext) / (1 + zoneNow) + f) - 1
-		local r = N.skillIncome()
-		local lost = if N.Reb.resets == false then 0 else N.skill()
-		local gain = H * r * boost
-		local eta = N.unlockEta()
-		if eta and eta <= 600 and N.Reb.resets ~= false then
-			return false, gain, lost, "the next world opens first"
-		end
-		return gain > lost or r <= 0, gain, lost
+		local worth = gain > lost or r <= 0
+		P.rebirthSay = string.format(
+			"%s: x%s -> x%s skill brings %s skill in 24 h, the reset costs %s",
+			if worth then "Rebirth when ready" else "No rebirth yet",
+			formatNumber(m),
+			formatNumber(m2),
+			formatNumber(gain),
+			formatNumber(lost)
+		)
+		return worth, gain, lost
 	end
 	local function refresh()
 		local oldWhy = P.why
@@ -34066,11 +34363,20 @@ do
 			log("PLAN", P.text)
 			log("PLAN decision", P.say)
 		end
+		if on("AutoRebirth") then
+			local worth = N.rebirthWorth()
+			local rkey = tostring(worth) .. (if P.chain then "chain" .. P.chain.k else "24h")
+			if rkey ~= P.rebirthKey or os.clock() - P.rebirthLogAt > 300 then
+				P.rebirthKey = rkey
+				P.rebirthLogAt = os.clock()
+				log("PLAN decision", P.rebirthSay)
+			end
+		end
 	end
 	-- Spending ---------------------------------------------------------------------------------------------------
 	function N.spendOptions()
 		local list = {}
-		local W = math.max(N.winsIncome(), 1e-9)
+		local W = math.max(N.winsValueRate(), 1e-9)
 		local alpha = P.alpha
 		if on("AutoBuyStones") then
 			local _, best = N.bestOwnedStone()
@@ -34122,6 +34428,16 @@ do
 	end
 	function N.spendPick()
 		local list = N.spendOptions()
+		-- Throwing for a stone that opens the next world sooner: that stone first.
+		if P.goal then
+			for i, o in ipairs(list) do
+				if o.key == "stone:" .. tostring(P.goal.stone.Id) and i > 1 then
+					table.remove(list, i)
+					table.insert(list, 1, o)
+					break
+				end
+			end
+		end
 		local best = list[1]
 		if not best then
 			P.spendText = "nothing pays back within 24 h"
@@ -34215,8 +34531,12 @@ do
 		elseif mode == "throw" then
 			table.insert(lines, "Throw" .. (if left > 0 and P.f < 1 then " for ~" .. N.longTime(left) .. ", then train" else ""))
 		end
-		if P.say ~= "" and (on("AutoThrow") and on("AutoTrain")) then
+		if P.say ~= "" and on("AutoThrow") and on("AutoTrain") then
 			table.insert(lines, P.say)
+		elseif on("AutoThrow") and not on("AutoTrain") then
+			table.insert(lines, "Only Auto Throw is on: Wins and some skill, no training")
+		elseif on("AutoTrain") and not on("AutoThrow") then
+			table.insert(lines, "Only Auto Train is on: skill, no Wins (nothing to spend)")
 		end
 		local nx = P.next
 		if nx and nx.option then
@@ -34233,8 +34553,10 @@ do
 			local eta = N.unlockEta()
 			if eta == 0 then
 				table.insert(lines, "Unlock " .. nextId .. " with the next throw")
-			elseif eta then
+			elseif eta and P.why == "train to unlock" then
 				table.insert(lines, "Train until " .. nextId .. " unlock (~" .. N.longTime(eta) .. ")")
+			elseif eta then
+				table.insert(lines, nextId .. " needs " .. formatNumber(N.mapEndSkill() or 0) .. " skill (~" .. N.longTime(eta) .. " of training)")
 			else
 				table.insert(lines, "Reach the end of the map to unlock " .. nextId)
 			end
@@ -34244,8 +34566,10 @@ do
 			if need and N.level() < need then
 				table.insert(lines, string.format("Rebirth at level %d (now %d)", need, N.level()))
 			elseif need then
-				local worth, _, _, reason = N.rebirthWorth()
-				table.insert(lines, if worth then "Rebirth now" elseif reason then "Rebirth after " .. reason else "Rebirth when it pays back within 24 h")
+				N.rebirthWorth()
+				if P.rebirthSay ~= "" then
+					table.insert(lines, P.rebirthSay)
+				end
 			end
 		end
 		return lines
@@ -34307,7 +34631,7 @@ do
 			})
 		end)
 	end
-	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything, throwing, training and what Corvus does next")
+	Tabs.Main = N.addTab("Main", "house", "Throwing, training and what Corvus does next")
 	-- Throwing and training live on Main (packed tabs: the old Farm and Auto OP tabs were too small).
 	Tabs.Throw = Tabs.Main
 	Tabs.Train = Tabs.Main
@@ -34322,8 +34646,8 @@ do
 		end)
 	end
 	Labels = {}
-	-- Every job Auto Farm Everything runs. Full automatic switches none of these toggles: on() counts them as on while it
-	-- runs (N.FullSet), so the player's own manual picks stay as they were.
+	-- Every automation toggle of this hub (Stop Everything, Status "Running", the stuck check). Each feature is its own
+	-- toggle: there is no master toggle that runs them all (owner decision 2026-10-05).
 	N.FarmToggles = {
 		{ "AutoThrow", "Throw" },
 		{ "AutoTrain", "Train" },
@@ -34345,225 +34669,42 @@ do
 		{ "AutoDeletePets", "Delete junk pets" },
 		{ "AutoPotions", "Use potions" },
 	}
-	for _, row in ipairs(N.FarmToggles) do
-		N.FullSet[row[1]] = true
-	end
-	-- Full automatic needs a confirmation: a card with the ban warning (or a second click within 10 s without the card).
-	N.OP = { confirmed = false, ignore = false, armedUntil = 0, card = nil }
-	N.OPWarning = "Full automatic. Uses the game\'s remotes faster than a normal player: the game\'s anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
-	function N.confirmOP()
-		N.OP.confirmed = true
-		log("FARM confirmed")
-		if N.OP.card then
-			pcall(function()
-				N.OP.card:Destroy()
-			end)
-			N.OP.card = nil
+	-- Recommended Settings: the setup Corvus would pick for a new player (Safe mode: game pace and walking, planner
+	-- split, pet care that only removes pets weaker than the team). Starts nothing by itself.
+	function N.applyRecommended()
+		local values2 = {
+			ThrowSpeed = "Legit (game pace)",
+			MoveMode = "Walk (Safe)",
+			TimeSplit = "Auto (planner)",
+			TrainZone = "Best open",
+			RebirthMode = "Auto (planner)",
+			DeleteRarities = { Common = true, Uncommon = true },
+			KeepBestPets = 10,
+		}
+		for name, value in pairs(values2) do
+			local option = Options[name]
+			if option then
+				pcall(option.SetValue, option, value)
+			end
 		end
-		Toggles.AutoFarmAll:SetValue(true)
-	end
-	function N.cancelOP()
-		log("FARM cancelled")
-		if N.OP.card then
-			pcall(function()
-				N.OP.card:Destroy()
-			end)
-			N.OP.card = nil
+		for name, value in pairs({ SkipAnimations = true, FuseForIndex = true, DeleteOnlyWeaker = true, KeepVariants = true, DiscardOnHatch = true }) do
+			local toggle = Toggles[name]
+			if toggle then
+				pcall(toggle.SetValue, toggle, value)
+			end
 		end
-	end
-	function N.askOP()
-		-- The library modal (Library:ShowModal); without a UI the second click within 10 s confirms instead.
-		local gui = Library.ScreenGui
-		local ok = gui ~= nil
-			and Library.ShowModal ~= nil
-			and Library:ShowModal({
-					Icon = "sparkles",
-					Title = "Start Auto Farm Everything?",
-					Text = "The planner takes over everything: throws at the fastest rate the server accepts, trains, spends your Wins on stones, trails and eggs, uses potions, fuses and deletes spare pets and rebirths (resets your skill). Only the Exclude list is kept.",
-					Warning = N.OPWarning,
-					ConfirmText = "I understand, start",
-					CancelText = "Cancel",
-					OnConfirm = N.confirmOP,
-					OnCancel = N.cancelOP,
-				}) ~= nil
-		if not ok then
-			N.OP.armedUntil = os.clock() + 10
-			notify("Auto Farm Everything", N.OPWarning .. " Turn it on again within 10 s to confirm.", 10)
-		end
+		log("SETTINGS recommended applied")
+		notify("Corvus", "Recommended settings on: Safe mode (game pace, walking), planner time split, pet care that keeps your team. Switch on the toggles you want running", 6)
 	end
 	do
-		local FarmBox = Tabs.Main:AddLeftGroupbox("Auto Farm Everything", "sparkles")
-		-- Mode: Best value = the planner (spends, fuses, deletes, rebirths, asks to confirm). My filters = no planner, no
-		-- destructive step: only the jobs picked in Run. The master toggle is never saved in a config and never restored.
-		function N.needsConfirm()
-			return N.opActive() and not N.OP.confirmed
-		end
-		function N.syncFarmUI()
-			local run = Options.FarmRun
-			if run and run.SetVisible then
-				pcall(run.SetVisible, run, Options.FarmMode ~= nil and Options.FarmMode.Value == "My filters")
-			end
-		end
-		FarmBox:AddToggle("AutoFarmAll", {
-			Text = "Auto Farm Everything",
-			Default = false,
-			Tooltip = "Runs what Mode says. Best value: the planner does every job of this game for the most Wins and progress (throwing at the fastest accepted rate, training, buying, hatching, fusing, deleting spare pets, potions, rebirths) except what is in Exclude, and asks to confirm first. My filters: only the jobs you pick in Run, no buying, fusing, deleting or rebirth. Never saved in a config",
-			Callback = function(value)
-				if N.OP.ignore then
-					return
-				end
-				if value and N.myFilters() then
-					N.Plan.blockEnds = 0
-					log("FARM filters", "true")
-					return
-				end
-				if value and not N.OP.confirmed then
-					if os.clock() < N.OP.armedUntil then
-						N.OP.armedUntil = 0
-						N.OP.confirmed = true
-						log("FARM confirmed")
-					else
-						task.defer(function()
-							N.OP.ignore = true
-							Toggles.AutoFarmAll:SetValue(false)
-							N.OP.ignore = false
-							N.askOP()
-						end)
-						return
-					end
-				end
-				if not value then
-					N.OP.confirmed = false
-				end
-				-- A fresh plan: the next activity block starts now.
-				N.Plan.blockEnds = 0
-				log("FARM full", tostring(value))
-			end,
-		})
-		FarmBox:AddDropdown("FarmMode", {
-			Text = "Mode",
-			Values = { "Best value", "My filters" },
-			Default = "Best value",
-			Tooltip = "Best value: the planner picks the most profitable use of your time and Wins (buys, fuses, deletes, rebirths). My filters: no planner and nothing destructive, only the jobs picked in Run",
-			Callback = function(value)
-				N.syncFarmUI()
-				if value == "Best value" and Toggles.AutoFarmAll.Value and not N.OP.confirmed then
-					task.defer(function()
-						N.OP.ignore = true
-						Toggles.AutoFarmAll:SetValue(false)
-						N.OP.ignore = false
-						N.askOP()
-					end)
-				end
-				N.Plan.blockEnds = 0
-				log("FARM mode", tostring(value))
-			end,
-		})
-		do
-			local runValues, runDefaults = {}, {}
-			for _, key in ipairs(N.RunOrder) do
-				table.insert(runValues, N.RunMap[key])
-				table.insert(runDefaults, N.RunMap[key])
-			end
-			FarmBox:AddDropdown("FarmRun", {
-				Text = "Run",
-				Values = runValues,
-				Default = runDefaults,
-				Multi = true,
-				AllowNull = true,
-				Visible = false,
-				Tooltip = "My filters runs only these jobs: Auto Throw (at the Throw Speed you set), Auto Train, Equip Best, Hatch owned eggs, rewards, codes and Auto Friend. Nothing is bought, fused, deleted or used",
-			})
-			N.syncFarmUI()
-		end
-		local values, defaults = {}, {}
-		for _, rarity in ipairs(N.PetRarities) do
-			table.insert(values, "Pets: " .. rarity)
-		end
-		table.insert(values, "Golden pets")
-		table.insert(values, "Diamond pets")
-		for _, egg in ipairs(N.G.Balance.EggInventory or {}) do
-			if type(egg) == "table" and egg.Id then
-				table.insert(values, "Egg: " .. tostring(egg.Id))
-			end
-		end
-		for _, potion in ipairs({ "Skill", "Win", "Luck" }) do
-			table.insert(values, "Potion: " .. potion)
-		end
-		for _, key in ipairs({ "Pets: Legendary", "Pets: Mythical", "Pets: Divine", "Pets: Ascended", "Pets: Eternal", "Pets: Rainbow", "Pets: Special", "Pets: Exclusive", "Pets: Hacked Admin", "Diamond pets", "Egg: Special", "Egg: PirateSpecial", "Egg: Astronaut", "Egg: Chocolatier", "Egg: Dragon", "Egg: HackedAdmin" }) do
-			if table.find(values, key) then
-				table.insert(defaults, key)
-			end
-		end
-		FarmBox:AddDropdown("ExcludeOP", {
-			Text = "Exclude (never sell, delete, fuse or use)",
-			Values = values,
-			Default = defaults,
-			Multi = true,
-			AllowNull = true,
-			Tooltip = "Corvus never deletes or fuses pets of these rarities or variants, never opens these eggs and never drinks these potions",
-		})
-		FarmBox:AddLabel({
-			Text = '<font color="#ff6b4a"><b>Full automatic. Uses the game\'s remotes faster than a normal player: the game\'s anticheat MAY BAN this account. Use at your own risk, preferably on an alt.</b></font>',
-			DoesWrap = true,
-		})
-		-- Recommended Settings: the manual setup Corvus would pick for a new player (Safe mode: game pace and walking,
-		-- planner split, pet care that only removes pets weaker than the team). Never starts the full automatic.
-		function N.applyRecommended()
-			local values2 = {
-				ThrowSpeed = "Legit (game pace)",
-				MoveMode = "Walk (Safe)",
-				TimeSplit = "Auto (planner)",
-				TrainZone = "Best open",
-				RebirthMode = "Auto (planner)",
-				DeleteRarities = { Common = true, Uncommon = true },
-				KeepBestPets = 10,
-			}
-			for name, value in pairs(values2) do
-				local option = Options[name]
-				if option then
-					pcall(option.SetValue, option, value)
-				end
-			end
-			for name, value in pairs({ SkipAnimations = true, FuseForIndex = true, DeleteOnlyWeaker = true, KeepVariants = true, DiscardOnHatch = true }) do
-				local toggle = Toggles[name]
-				if toggle then
-					pcall(toggle.SetValue, toggle, value)
-				end
-			end
-			log("SETTINGS recommended applied")
-			notify("Corvus", "Recommended settings on: Safe mode for manual play (game pace, walking), planner split, pet care that keeps your team. Turn on Auto Farm Everything to let the planner do everything", 6)
-		end
-		FarmBox:AddButton({
-			Text = "Recommended Settings",
-			Tooltip = "Safe mode for manual play (game pace, walking), planner time split, pet care that only removes pets weaker than your team. Starts nothing by itself",
-			Func = function()
-				N.applyRecommended()
-			end,
-		})
-		FarmBox:AddButton({
-			Text = "Stop Everything",
-			Tooltip = "Turns Auto Farm Everything and every automation off",
-			Func = function()
-				N.stopAll()
-			end,
-		})
-		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
-		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
-		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		Labels.Plan = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		Labels.Lines = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-	end
-	do
-		-- Manual play: throwing and training (merged into Main, the old Farm tab had only two boxes).
-		local ThrowBox = Tabs.Main:AddLeftGroupbox("Throw And Train", "target")
+		-- Main: throwing and training first, then the Status box with "Up next" in plain words.
+		local ThrowBox = Tabs.Main:AddLeftGroupbox("Throw", "target")
 		ThrowBox:AddToggle("AutoThrow", { Text = "Auto Throw", Default = false, Tooltip = "Throws from the launch zone with the game's own Throw button" })
-		ThrowBox:AddToggle("AutoTrain", { Text = "Auto Train", Default = false, Tooltip = "Stands in the best open training zone. With Auto Throw on too, the planner splits the time" })
 		ThrowBox:AddDropdown("ThrowSpeed", {
 			Text = "Throw Speed",
 			Values = { "Legit (game pace)", "Max (Blatant)" },
 			Default = "Legit (game pace)",
-			Tooltip = "Manual play. Legit (Safe, default) waits like the game's own Auto Wins pass (about 2.4 s between throws). Max (Blatant, at your own risk) throws again the moment the game's 0.8 s cooldown ends. Best value mode of Auto Farm Everything always uses Max",
+			Tooltip = "Legit (Safe, default) waits like the game's own Auto Wins pass (about 2.4 s between throws). Max (Blatant, at your own risk) throws again the moment the game's 0.8 s cooldown ends",
 			Callback = function(value)
 				if value == "Max (Blatant)" then
 					notify("Blatant", "Max throw rate is faster than a normal player. Use it at your own risk", 6)
@@ -34574,24 +34715,12 @@ do
 			Text = "Movement",
 			Values = { "Walk (Safe)", "Teleport (Fast)" },
 			Default = "Walk (Safe)",
-			Tooltip = "Walk (Safe, default) walks to the launch zone, training stands, shops and eggs like a player. Teleport (Fast, at your own risk) moves you there instantly",
+			Tooltip = "Walk (Safe, default) walks (pathfinding) to the launch zone, training stands, shops and eggs like a player. Teleport (Fast, at your own risk) moves you there instantly",
 			Callback = function(value)
 				if value == "Teleport (Fast)" then
 					notify("Teleport", "Teleporting is not how a normal player moves. Use it at your own risk", 6)
 				end
 			end,
-		})
-		ThrowBox:AddDropdown("TimeSplit", {
-			Text = "Time Split",
-			Values = { "Auto (planner)", "Throw only", "Train only" },
-			Default = "Auto (planner)",
-			Tooltip = "With Auto Throw and Auto Train both on: Auto computes how much time to throw (Wins) and train (Skill, which makes throws longer)",
-		})
-		ThrowBox:AddDropdown("TrainZone", {
-			Text = "Training Zone",
-			Values = { "Best open", "TrainingZone", "TrainingZone_RareJade", "TrainingZone_EpicCrystal", "TrainingZone_LegendaryCelestial", "TrainingZone_Koi", "TrainingZone_Golden", "TrainingZone_Hacker" },
-			Default = "Best open",
-			Tooltip = "Best open = the biggest bonus you can use (rebirth zones, owned passes and the free Hacker event zone)",
 		})
 		ThrowBox:AddToggle("SkipAnimations", {
 			Text = "Skip Animations",
@@ -34599,7 +34728,40 @@ do
 			Tooltip = "Speeds up throw animation tracks and hides the secret throw overlay. The server still decides when a throw ends and when the next one may start, so this only hides the show",
 		})
 		Labels.Throw = ThrowBox:AddLabel({ Text = "-", DoesWrap = true })
-		Labels.Train = ThrowBox:AddLabel({ Text = "-", DoesWrap = true })
+		local TrainBox = Tabs.Main:AddLeftGroupbox("Train", "dumbbell")
+		TrainBox:AddToggle("AutoTrain", { Text = "Auto Train", Default = false, Tooltip = "Stands in the best training zone you qualify for. With Auto Throw on too, the planner splits the time" })
+		TrainBox:AddDropdown("TimeSplit", {
+			Text = "Time Split",
+			Values = { "Auto (planner)", "Throw only", "Train only" },
+			Default = "Auto (planner)",
+			Tooltip = "With Auto Throw and Auto Train both on: Auto computes how much time to throw (Wins) and train (Skill, which makes throws longer and unlocks the next world)",
+		})
+		TrainBox:AddDropdown("TrainZone", {
+			Text = "Training Zone",
+			Values = { "Best open", "TrainingZone", "TrainingZone_RareJade", "TrainingZone_EpicCrystal", "TrainingZone_LegendaryCelestial", "TrainingZone_Koi", "TrainingZone_Golden", "TrainingZone_Hacker" },
+			Default = "Best open",
+			Tooltip = "Best open = the biggest bonus you qualify for (rebirth zones, owned passes and the free Hacker event zone)",
+		})
+		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
+		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+		StatusBox:AddButton({
+			Text = "Recommended Settings",
+			Tooltip = "Safe mode (game pace, walking), planner time split, pet care that only removes pets weaker than your team. Starts nothing by itself",
+			Func = function()
+				N.applyRecommended()
+			end,
+		})
+		StatusBox:AddButton({
+			Text = "Stop Everything",
+			Tooltip = "Turns every automation off",
+			Func = function()
+				N.stopAll()
+			end,
+		})
+		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		Labels.Plan = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		Labels.Lines = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
 		local ShopBox = Tabs.Upgrades:AddLeftGroupbox("Smart Spending", "coins")
@@ -34967,7 +35129,7 @@ do
 	end
 	Log.header = Debug.header
 end
-N.AllAutoToggles = { "AutoFarmAll", "SpeedHack" }
+N.AllAutoToggles = { "SpeedHack" }
 for _, row in ipairs(N.FarmToggles) do
 	table.insert(N.AllAutoToggles, row[1])
 end
@@ -35435,7 +35597,6 @@ do
 			toggleCommand("rebirth", {}, { "AutoRebirth" }, "Auto Rebirth")
 			toggleCommand("stones", { "buy" }, { "AutoBuyStones" }, "Buy Stones")
 			toggleCommand("hatch", { "eggs" }, { "AutoHatch" }, "Auto Hatch")
-			toggleCommand("farmall", { "farmbest", "all", "farm" }, { "AutoFarmAll" }, "Auto Farm Everything")
 			Library:AddCommand({
 				Name = "stop",
 				Aliases = { "alloff" },
@@ -35486,7 +35647,6 @@ do
 	if Library.SetQuickBar then
 		pcall(function()
 			Library:SetQuickBar({
-				{ Toggle = "AutoFarmAll", Icon = "sparkles", Label = "Farm All" },
 				{ Toggle = "AutoThrow", Icon = "target", Label = "Throw" },
 				{ Toggle = "AutoTrain", Icon = "dumbbell", Label = "Train" },
 				{ Toggle = "AutoBuyStones", Icon = "coins", Label = "Stones" },
@@ -35526,7 +35686,6 @@ do
 					Required = true,
 					Default = { "throw", "train", "rewards" },
 					Choices = {
-						{ Id = "farm", Title = "Auto Farm Everything", Description = "Full automatic, ban risk: the game's anticheat MAY BAN this account. The planner throws, trains, buys, hatches, fuses, rebirths and claims everything. Asks to confirm", Icon = "sparkles", Color = "#ff6b6b" },
 						{ Id = "throw", Title = "Throw", Description = "Throws for Wins at the game's own pace (Safe)", Icon = "target", Color = "#fab428" },
 						{ Id = "train", Title = "Train", Description = "Trains Skill in the best open zone", Icon = "dumbbell", Color = "#3ccf91" },
 						{ Id = "spend", Title = "Smart Spending", Description = "Stones, trails and eggs by Wins gained per Win", Icon = "coins", Color = "#5fb8ff" },
@@ -35550,14 +35709,10 @@ do
 				if chosen.pets then
 					pcall(Options.DeleteRarities.SetValue, Options.DeleteRarities, { Common = true, Uncommon = true })
 				end
-				local farm = chosen.farm
 				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] and not farm then "on" else "off" })
+					setToggles(names, { if chosen[id] then "on" else "off" })
 				end
 				N.markSetupDone()
-				if chosen.farm and not on("AutoFarmAll") then
-					N.askOP()
-				end
 				notify("Quick setup done", "Change anything in the tabs any time", 5)
 			end,
 			Skipped = function()
@@ -35574,13 +35729,6 @@ if Window.AddSettingsTab then
 		Folder = "StoneSkipping",
 		MenuKeybind = "RightControl",
 	})
-	-- AutoFarmAll is never saved in a config or loaded from one (also not through share codes), and never restored.
-	pcall(function()
-		SaveManager:SetIgnoreIndexes({ "AutoFarmAll" })
-	end)
-	pcall(function()
-		SaveManager.Ignore.AutoFarmAll = true
-	end)
 	if ok and tab then
 		Tabs.Settings = tab
 	else
@@ -35781,18 +35929,18 @@ do
 			local asap = N.pickText("RebirthMode", "Auto (planner)") == "As soon as possible"
 			local worth, gain, lost, reason = N.rebirthWorth()
 			if asap or worth then
-				log("PLAN rebirth", "gain", brief(gain), "lost", brief(lost), "asap", tostring(asap))
+				log("PLAN rebirth", "gain", brief(gain), "lost", brief(lost), "asap", tostring(asap), "|", N.Plan.rebirthSay or "")
 				N.rebirth()
 				return
 			elseif choreDue("rebirthLog", 300) then
-				log("PLAN rebirth later", "gain", brief(gain), "lost", brief(lost), reason or "")
+				log("PLAN rebirth later", "gain", brief(gain), "lost", brief(lost), reason or "", "|", N.Plan.rebirthSay or "")
 			end
 		end
 		if act == "Idle" and idleChores() then
 			return
 		end
 		-- Training never passes through Idle: leave it now and then when the planner wants to buy something.
-		if act == "Practice" and (on("AutoBuyStones") or on("AutoBuyTrails") or on("AutoHatch")) and choreDue("trainSpend", if N.opActive() then 30 else 60) and N.spendPick() then
+		if act == "Practice" and (on("AutoBuyStones") or on("AutoBuyTrails") or on("AutoHatch")) and choreDue("trainSpend", 30) and N.spendPick() then
 			send("StopPractice", nil)
 			waitFor(function()
 				return N.activity() ~= "Practice"
@@ -35947,7 +36095,7 @@ do
 				)
 				local worth, gain, lost = N.rebirthWorth()
 				I.rebirth = string.format(
-					"Rebirth <b>%d</b>  \u{00B7}  level %d / %s\nx%s now, x%s next\n24 h gain %s skill vs reset %s (%s)%s",
+					"Rebirth <b>%d</b>  \u{00B7}  level %d / %s\nx%s now, x%s next\n24 h gain %s skill vs reset %s (%s)\n%s%s",
 					N.rebirths(),
 					N.level(),
 					tostring(s.NextRebirthLevel or "?"),
@@ -35956,6 +36104,7 @@ do
 					formatNumber(gain),
 					formatNumber(lost),
 					if worth then "worth it" else "wait",
+					N.Plan.rebirthSay or "",
 					if N.Reb.last ~= "" then "\n" .. N.Reb.last else ""
 				)
 				local nextId = N.worldCfg() and N.worldCfg().NextWorldId
@@ -36017,7 +36166,6 @@ do
 					end)()
 				)
 				I.codes = string.format("Known %d  \u{00B7}  worked %d, used %d, invalid %d\nLast: %s", #N.Codes.known, okCodes, usedCodes, badCodes, N.Codes.last)
-				I.exclude = string.format("Exclude: %d protected, %d actions skipped%s", #picked(Options.ExcludeOP), N.OPSkipped.count, if N.OPSkipped.last ~= "" then " (last: " .. N.OPSkipped.last .. ")" else "")
 				I.pets = string.format("%d pets, %d slots  \u{00B7}  power %s (weakest %s)%s", #N.coll("Pets"), N.petSlots(), formatNumber(total), formatNumber(weakest), if N.Fuse.last ~= "" then "\n" .. N.Fuse.last else "")
 			end)
 			if not ok then
@@ -36053,7 +36201,7 @@ do
 					group(function()
 						Labels.Status:SetText(Status)
 						Labels.Info:SetText(I.info or "-")
-						Labels.Lines:SetText((I.lines or "-") .. "\n" .. (I.exclude or ""))
+						Labels.Lines:SetText(I.lines or "-")
 						Labels.Plan:SetText(I.plan or "-")
 						Labels.Throw:SetText(I.throw or "-")
 						Labels.Train:SetText(I.train or "-")
@@ -36140,7 +36288,7 @@ do
 	end
 	if Library.ShowWizard and not N.setupDone() then
 		task.delay(1.5, function()
-			if on("AutoFarmAll") or on("AutoThrow") or on("AutoTrain") then
+			if on("AutoThrow") or on("AutoTrain") then
 				N.markSetupDone()
 				return
 			end
