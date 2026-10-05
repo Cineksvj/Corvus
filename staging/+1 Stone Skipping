@@ -31727,7 +31727,7 @@ do
 		return if type(value) == "string" and value ~= "" then value else default
 	end
 	function N.farmMode()
-		return (if optionText("ThrowSpeed", "Legit (game pace)") == "Max (Blatant)" then "Max" else "Legit") .. ", " .. (if optionText("MoveMode", "Walk (Safe)") == "Teleport (Fast)" then "Teleport" else "Walk")
+		return (if optionText("ThrowSpeed", "Max (Blatant)") == "Max (Blatant)" then "Max" else "Legit") .. ", " .. (if optionText("MoveMode", "Teleport (Fast)") == "Teleport (Fast)" then "Teleport" else "Walk")
 	end
 	-- Kept for the shared pet code: there is no full automatic mode any more, so nothing takes over the player's filters.
 	function N.opActive()
@@ -31738,13 +31738,13 @@ do
 		return false
 	end
 	-- Max throw rate: no pause between throws beyond the game's own cooldown (the Throw button comes back after it), with
-	-- a back-off when the server refuses a throw. Default Legit (the pace of the game's own Auto Wins pass).
+	-- a back-off when the server refuses a throw. Default Max.
 	function N.blatant()
-		return optionText("ThrowSpeed", "Legit (game pace)") == "Max (Blatant)"
+		return optionText("ThrowSpeed", "Max (Blatant)") == "Max (Blatant)"
 	end
-	-- Movement: Walk (Safe, default) walks like a player; Teleport (opt-in) moves the character instantly.
+	-- Movement: Walk walks like a player; Teleport (opt-in) moves the character instantly.
 	function N.safeMove()
-		return optionText("MoveMode", "Walk (Safe)") ~= "Teleport (Fast)"
+		return optionText("MoveMode", "Teleport (Fast)") ~= "Teleport (Fast)"
 	end
 	function N.pickText(name, default)
 		return optionText(name, default)
@@ -31951,7 +31951,7 @@ do
 	end
 	-- Goes to a spot the way the player would: Walk (Safe) follows a PathfindingService path (around decks, rails and
 	-- water edges), then Humanoid:MoveTo for the last studs (again every 2 s, a jump when stuck), and gives up after the
-	-- timeout; Teleport (Fast) pivots there (the spot already carries the height above the part), checks the landing and
+	-- timeout; Teleport (Fast, default) pivots there (the spot already carries the height above the part), checks the landing and
 	-- pivots once more when the character slid off. Returns true when the character is there.
 	N.Walk = { fails = 0, path = "" }
 	local function followPath(hum, target, near, flat, deadline)
@@ -34763,28 +34763,18 @@ do
 		local ThrowBox = Tabs.Main:AddLeftGroupbox("Throw", "target")
 		ThrowBox:AddToggle("AutoThrow", { Text = "Auto Throw", Default = false, Tooltip = "Throws from the launch zone with the game's own Throw button" })
 		ThrowBox:AddDropdown("ThrowSpeed", {
-			Text = "Throw Speed",
-			Values = { "Legit (game pace)", "Max (Blatant)" },
-			Default = "Legit (game pace)",
-			Tooltip = "Legit (Safe, default) waits like the game's own Auto Wins pass (about 2.4 s between throws). Max (Blatant, at your own risk) throws again the moment the game's 0.8 s cooldown ends",
-			Callback = function(value)
-				if value == "Max (Blatant)" then
-					notify("Blatant", "Max throw rate is faster than a normal player. Use it at your own risk", 6)
-				end
-			end,
-		})
-		ThrowBox:AddDropdown("MoveMode", {
-			Text = "Movement",
-			Values = { "Walk (Safe)", "Teleport (Fast)" },
-			Default = "Walk (Safe)",
-			Tooltip = "Walk (Safe, default) walks (pathfinding) to the launch zone, training stands, shops and eggs like a player. Teleport (Fast, at your own risk) moves you there instantly",
-			Callback = function(value)
-				if value == "Teleport (Fast)" then
-					notify("Teleport", "Teleporting is not how a normal player moves. Use it at your own risk", 6)
-				end
-			end,
-		})
-		ThrowBox:AddToggle("SkipAnimations", {
+				Text = "Throw Speed",
+				Values = { "Legit (game pace)", "Max (Blatant)" },
+				Default = "Max (Blatant)",
+				Tooltip = "Max throws again the moment the game's 0.8 s cooldown ends (default). Legit waits like the game's own Auto Wins pass (about 2.4 s between throws)",
+			})
+			ThrowBox:AddDropdown("MoveMode", {
+				Text = "Movement",
+				Values = { "Walk (Safe)", "Teleport (Fast)" },
+				Default = "Teleport (Fast)",
+				Tooltip = "Teleport moves you to the launch zone, training stands, shops and eggs instantly (default). Walk follows a pathfinding route like a player",
+			})
+			ThrowBox:AddToggle("SkipAnimations", {
 			Text = "Skip Animations",
 			Default = true,
 			Tooltip = "Speeds up throw animation tracks and hides the secret throw overlay. The server still decides when a throw ends and when the next one may start, so this only hides the show",
@@ -35751,7 +35741,7 @@ do
 					Required = true,
 					Default = { "throw", "train", "rewards" },
 					Choices = {
-						{ Id = "throw", Title = "Throw", Description = "Throws for Wins at the game's own pace (Safe)", Icon = "target", Color = "#fab428" },
+						{ Id = "throw", Title = "Throw", Description = "Throws for Wins at the max rate", Icon = "target", Color = "#fab428" },
 						{ Id = "train", Title = "Train", Description = "Trains Skill in the best open zone", Icon = "dumbbell", Color = "#3ccf91" },
 						{ Id = "spend", Title = "Smart Spending", Description = "Stones, trails and eggs by Wins gained per Win", Icon = "coins", Color = "#5fb8ff" },
 						{ Id = "rewards", Title = "Claim rewards", Description = "Daily, gifts, offline, group, index and inventory eggs", Icon = "gift", Color = "#ff5d8f" },
