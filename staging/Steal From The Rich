@@ -33465,6 +33465,13 @@ zones = {},
 orbs = 0,
 claimed = 0,
 bought = 0,
+rushPoints = 0,
+dodges = 0,
+dodgeOk = 0,
+grabTried = 0,
+grabWon = 0,
+clusters = 0,
+nights = 0,
 }
 local Events = {}
 local function emit(name, ...)
@@ -34113,6 +34120,129 @@ setStatus("Could not steal: " .. (PromptIssue or "the server refused it") .. ". 
 end
 return true
 end
+-- Night window (workspace ArenaNight, NightGrowthMult x30 on crate timers; Client.NightBadge). Measured, not assumed:
+-- value_rate = timer seconds lost per real second (rf_CRATE_TIMERS "list" Remaining, same uid 60 s apart).
+local Night = { on = workspace:GetAttribute("ArenaNight") == true, mult = 30, rate = nil, dayRate = nil, lastStart = nil, startedAt = nil, cycle = nil, len = nil, share = nil, count = 0 }
+function Night.wanted()
+return Plan.isOn("AutoPlace") or Plan.isOn("AutoOpen")
+end
+function Night.timers()
+local remote = Remotes.rf_CRATE_TIMERS
+local list = remote and invokeWithTimeout(remote, 5, "list")
+local out, total, n = {}, 0, 0
+if type(list) == "table" then
+for _, entry in ipairs(list) do
+if type(entry) == "table" and entry.Uid ~= nil and entry.Ready ~= true then
+local left = tonumber(entry.Remaining)
+if left then
+out[entry.Uid] = left
+total += left
+n += 1
+end
+end
+end
+end
+return out, total, n
+end
+function Night.measure(secs)
+local first, total, count = Night.timers()
+local started = os.clock()
+task.wait(secs)
+local second = Night.timers()
+local dt = math.max(os.clock() - started, 1)
+local sum, n = 0, 0
+for uid, left in pairs(first) do
+local now = second[uid]
+if now and left - now > 0 then
+sum += (left - now) / dt
+n += 1
+end
+end
+return (if n > 0 then sum / n else nil), n, total, count
+end
+function Night.confirmed()
+return Night.rate ~= nil and Night.rate >= 5
+end
+function Night.prep()
+if not Night.confirmed() then
+return false
+end
+if Night.on then
+return true
+end
+if not (Night.cycle and Night.lastStart) then
+return false
+end
+local left = Night.lastStart + Night.cycle - os.clock()
+return left <= 90 and left > -120
+end
+function Night.factor()
+if not (Night.confirmed() and Night.share) then
+return 1
+end
+return 1 + (math.min(Night.rate, Night.mult) - 1) * Night.share
+end
+function Night.crateRank(tool)
+local name = string.lower(tostring(tool:GetAttribute("CrateName") or tool.Name))
+if string.find(name, "admin", 1, true) or string.find(name, "tripple", 1, true) or string.find(name, "event", 1, true) then
+return 1000
+end
+local tier = string.lower(tostring(tool:GetAttribute("CrateTier") or ""))
+for rarity, rank in pairs(RarityRank) do
+if string.lower(rarity) == tier then
+return rank
+end
+end
+return 0
+end
+function Night.changed()
+local now = workspace:GetAttribute("ArenaNight") == true
+if now == Night.on then
+return
+end
+Night.on = now
+Night.mult = tonumber(workspace:GetAttribute("NightGrowthMult")) or 30
+local clock = os.clock()
+if now then
+Night.count += 1
+Session.nights += 1
+if Night.lastStart then
+Night.cycle = clock - Night.lastStart
+end
+Night.lastStart, Night.startedAt = clock, clock
+if not Night.wanted() then
+return
+end
+task.spawn(pcall, function()
+local rate, n, total, count = Night.measure(60)
+if rate then
+Night.rate = rate
+end
+log("NIGHT start", string.format("value_rate=%s", if rate then string.format("%.1f", rate) else "?"), "mult=" .. Night.mult, "crates=" .. tostring(count), "matched=" .. n, "remaining=" .. math.floor(total) .. "s", "cycle=" .. (if Night.cycle then math.floor(Night.cycle) .. "s" else "?"))
+end)
+else
+if Night.startedAt then
+Night.len = clock - Night.startedAt
+if Night.cycle and Night.cycle > Night.len then
+Night.share = Night.len / Night.cycle
+end
+end
+Night.startedAt = nil
+if not Night.wanted() then
+return
+end
+task.spawn(pcall, function()
+local rate, n = Night.measure(60)
+if rate then
+Night.dayRate = rate
+end
+log("NIGHT end", string.format("value_rate=%s day", if rate then string.format("%.2f", rate) else "?"), "night_rate=" .. (if Night.rate then string.format("%.1f", Night.rate) else "?"), "len=" .. (if Night.len then math.floor(Night.len) .. "s" else "?"), "share=" .. (if Night.share then string.format("%.3f", Night.share) else "?"), "matched=" .. n, "confirmed=" .. tostring(Night.confirmed()))
+end)
+end
+end
+workspace:GetAttributeChangedSignal("ArenaNight"):Connect(function()
+pcall(Night.changed)
+end)
 local PlotFullUntil = 0
 local function findSpot(floor)
 local occupied = {}
@@ -34177,7 +34307,13 @@ local hum = humanoid()
 if not (floor and hum and Remotes.re_PLACE_AT) then
 return false
 end
-setStatus("Placing crates on your plot")
+if Night.prep() then
+table.sort(crates, function(a, b)
+return Night.crateRank(a) > Night.crateRank(b)
+end)
+logEvery("nightfill", 30, "NIGHT fill plot longest first n=" .. #crates, "first=" .. tostring(crates[1]:GetAttribute("CrateTier") or crates[1].Name), "night=" .. tostring(Night.on))
+end
+setStatus(if Night.prep() then "Filling your plot before the night (crates grow x" .. Night.mult .. ")" else "Placing crates on your plot")
 if not goToPlot(floor) then
 setStatus("Could not reach your plot")
 return false
@@ -34819,22 +34955,44 @@ end
 local config = stormConfig()
 local radius = config.MAGNET_RADIUS or 16
 local now = os.clock()
-local best, bestScore
+if not Storm.rateAt or now - Storm.rateAt > 120 then
+Storm.rateAt, Storm.rateBase = now, Storm.points
+elseif now - Storm.rateAt >= 60 then
+Storm.lastRate = (Storm.points - Storm.rateBase) / ((now - Storm.rateAt) / 60)
+log("STORM rate", string.format("pts/min=%.1f", Storm.lastRate), "clusters=" .. Session.clusters)
+Storm.rateAt, Storm.rateBase = now, Storm.points
+end
+local ready = {}
 for _, orb in ipairs(orbs) do
 if (Storm.backAt[orb.index] or 0) <= now and (Storm.pendingUntil[orb.index] or 0) <= now then
-local d = (orb.pos - root.Position).Magnitude
-local score = orb.points / (d + 25)
-if not bestScore or score > bestScore then
-best, bestScore = orb, score
+table.insert(ready, orb)
 end
 end
-end
-if not best then
+if #ready == 0 then
 setStatus("Storm: every orb is taken, waiting for them to come back")
 return false
 end
+-- the game's StormOrbClient collects every ready orb within MAGNET_RADIUS, so score a stop by the whole cluster around it
+local speed = math.max(Plan.V.walk(tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0), 8)
+local best, bestScore, bestN, bestPts
+for _, c in ipairs(ready) do
+local pts, n = 0, 0
+for _, o in ipairs(ready) do
+local dx, dz = o.pos.X - c.pos.X, o.pos.Z - c.pos.Z
+if dx * dx + dz * dz <= 225 and math.abs(o.pos.Y - c.pos.Y) < 20 then
+pts += o.points
+n += 1
+end
+end
+local score = pts / ((c.pos - root.Position).Magnitude / speed + 0.3)
+if not bestScore or score > bestScore then
+best, bestScore, bestN, bestPts = c, score, n, pts
+end
+end
+Session.clusters += 1
+logEvery("orbcluster", 5, "ORB cluster n=" .. bestN, "pts=" .. bestPts, string.format("dist=%.0f", (best.pos - root.Position).Magnitude))
 setStatus(
-string.format("Collecting storm orbs (%s points)", formatNumber(tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0))
+string.format("Collecting storm orbs (%d nearby, %s points)", bestN, formatNumber(tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0))
 )
 travel(best.pos, {
 arrive = 5,
@@ -34846,7 +35004,8 @@ root = rootPart()
 if root and stormActive() and (Storm.backAt[best.index] or 0) <= os.clock() then
 local offset = best.pos - root.Position
 if Vector3.new(offset.X, 0, offset.Z).Magnitude <= radius and math.abs(offset.Y) < 20 then
-task.wait(0.15)
+-- give the game's magnet a moment for the whole cluster, fire only the stop orb if it is still there
+task.wait(0.3)
 if (Storm.backAt[best.index] or 0) <= os.clock() then
 fire("STORM_COLLECT", best.index)
 end
@@ -35632,6 +35791,9 @@ local crateSpeed = Admin.get("CrateSpeed")
 if crateSpeed > 1 and wait > 0 then
 local fast = math.min(Admin.left("CrateSpeed"), wait / crateSpeed)
 wait = fast + math.max(wait - fast * crateSpeed, 0)
+end
+if wait > 0 then
+wait = wait / Night.factor()
 end
 local left = math.max(Plan.horizon() - wait, 0)
 local sell = income * SellSeconds * (if wait <= Admin.left("Money") then Admin.get("Money") else 1)
@@ -36794,7 +36956,7 @@ local AdminBox = Tabs.Rewards:AddLeftGroupbox("Admin Events", "crown")
 AdminBox:AddToggle("AutoEventGame", {
 Text = "Auto Event Minigame",
 Default = false,
-Tooltip = "When an admin runs the MisterTrippleT minigame: hits him with the bat, carries his Secret Crate (Admin Throne, billions per second) to the safe zone, then picks up the admin crates and brings them to your plot.",
+Tooltip = "When an admin runs the MisterTrippleT minigame: hits him with the bat, waits next to him from 90% and grabs his crate (Admin Throne) the moment it drops. Crate Rush: banks exactly 26 points (best reward) then goes back to farming. Walks out of every slam warning.",
 })
 AdminBox:AddToggle("EventHop", {
 Text = "Event Hop",
@@ -36934,7 +37096,7 @@ local OrbBox = Tabs.Storm:AddLeftGroupbox("Storm Orbs", "zap")
 OrbBox:AddToggle("AutoOrbs", {
 Text = "Auto Collect Storm Orbs",
 Default = false,
-Tooltip = "During the storm (every 20 minutes) runs through the orbs. Points charge crates at the Thunder Machine.",
+Tooltip = "During the storm (every 20 minutes) runs to the biggest orb clusters (the game picks up every orb within 16 studs). Points charge crates at the Thunder Machine.",
 })
 OrbBox:AddDropdown("OrbPriority", {
 Text = "During the storm",
@@ -37013,6 +37175,9 @@ StatRows.Sold = statRow(CrateBox, "banknote", "Items sold", 22)
 StatRows.Best = statRow(CrateBox, "star", "Best crate", 22, "FontColor")
 local ExtraBox = Tabs.Stats:AddRightGroupbox("Extras", "sparkles")
 StatRows.Orbs = statRow(ExtraBox, "zap", "Orbs collected", 22)
+StatRows.OrbRate = statRow(ExtraBox, "activity", "Orb points per minute", 22)
+StatRows.Event = statRow(ExtraBox, "crown", "Admin minigames", 22)
+StatRows.Night = statRow(ExtraBox, "moon", "Night windows", 22)
 StatRows.Claimed = statRow(ExtraBox, "gift", "Rewards claimed", 22)
 StatRows.Bought = statRow(ExtraBox, "shopping-cart", "Things bought", 22)
 local AllBox = Tabs.Stats:AddLeftGroupbox("All Time", "infinity")
@@ -38207,7 +38372,10 @@ end
 if stage ~= EventGame.stage then
 EventGame.stage = stage
 EventGame.stepFails = 0
-log("EVENTGAME stage", stage, "started, auto minigame", if on("AutoEventGame") then "on" else "off")
+EventGame.dodgeFails = 0
+EventGame.rushDone = false
+EventGame.crateSeenAt = nil
+log("EVENTGAME stage", stage, "started, auto minigame", if on("AutoEventGame") then "on" else "off", "points=" .. tostring(LocalPlayer:GetAttribute("MineGame2Points")))
 end
 return os.clock() >= EventGame.backoffUntil
 end
@@ -38270,7 +38438,17 @@ if not (prompt.Parent and prompt.Enabled) then
 eventLog("grab", false, "someone else took it first")
 return true
 end
+if EventGame.dodging then
+return true
+end
+if EventGame.grabbing then
+task.wait(0.1)
+return true
+end
+local me = rootPart()
+local dist = if me then (position - me.Position).Magnitude else 0
 local ok = triggerPrompt(prompt, carrying) or carrying()
+EventGame.grabLog(EventGame.crateSeenAt, dist, ok)
 eventStep("grab", ok, PromptIssue or "")
 return true
 end
@@ -38278,15 +38456,32 @@ local npc = workspace:FindFirstChild("MisterTrippleT")
 local npcRoot = npc and npc:FindFirstChild("HumanoidRootPart")
 if npcRoot and npc:GetAttribute("BatTarget") ~= false then
 local progress = tonumber(npc:GetAttribute("Progress")) or 0
-if progress >= 100 then
-setStatus("MisterTrippleT is down, waiting for his crate")
-task.wait(0.5)
+if progress >= 90 then
+-- stand next to the boss, on the side away from the spawn: the crate drops beside him and the first trigger wins
+local spot = EventGame.bossSpot(npcRoot)
+local here = rootPart()
+if here and (here.Position - spot).Magnitude > 3 then
+travel(spot, {
+keepGoing = function()
+return npc.Parent ~= nil
+end,
+arrive = 2,
+timeout = 6,
+})
+if EventGame.dodging then
 return true
+end
+end
+if progress >= 100 then
+setStatus("MisterTrippleT is down, waiting next to him for his crate")
+task.wait(0.1)
+return true
+end
 end
 setStatus(string.format("Hitting MisterTrippleT (%d%%)", progress))
 keepSlowModeOff()
 local me = rootPart()
-if me and (me.Position - npcRoot.Position).Magnitude > 7 then
+if progress < 90 and me and (me.Position - npcRoot.Position).Magnitude > 7 then
 travel(npcRoot.Position, {
 keepGoing = function()
 return npc.Parent ~= nil
@@ -38338,6 +38533,19 @@ return best, bestPrompt
 end
 function EventGame.mine2()
 local count = carryCount()
+local points = tonumber(LocalPlayer:GetAttribute("MineGame2Points")) or 0
+-- grantRewards: >= 26 points = AdminCrate6 (MrTrippleT Trophy), every point above is wasted
+local target = 26
+Session.rushPoints = math.max(Session.rushPoints, points)
+if EventGame.rushDone then
+return false
+end
+if points >= target and count == 0 then
+EventGame.rushDone = true
+log("EVENTGAME target reached points=" .. points .. " -> farming")
+return false
+end
+local need = math.max(target - points, 1)
 local floor = myFloor()
 local crate, prompt = adminCrate()
 local started = tonumber(workspace:GetAttribute("AdminAbuseStageStartedAt"))
@@ -38345,7 +38553,7 @@ local left = if started then started + 300 - workspace:GetServerTimeNow() else 3
 local me = rootPart()
 local level = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
 local back = if floor and me then (floor.Position - me.Position).Magnitude / Plan.V.walk(level) + 5 else 20
-if count > 0 and (count >= 5 or not crate or left < back + 15) then
+if count > 0 and (count >= 5 or count >= need or not crate or left < back + 15) then
 if not floor then
 eventStep("bank", false, "no plot found")
 return true
@@ -38357,6 +38565,9 @@ return carryCount() > 0
 end,
 arrive = 4,
 })
+if EventGame.dodging then
+return true
+end
 waitFor(function()
 return carryCount() == 0
 end, 4)
@@ -38377,7 +38588,7 @@ end,
 arrive = 2.5,
 timeout = 40,
 })
-if not (prompt.Parent and prompt.Enabled) then
+if EventGame.dodging or not (prompt.Parent and prompt.Enabled) then
 return true
 end
 local before = carryCount()
@@ -38394,6 +38605,119 @@ end
 task.wait(0.5)
 return true
 end
+function EventGame.bossSpot(npcRoot)
+local away = npcRoot.Position - EventSpawn
+away = Vector3.new(away.X, 0, away.Z)
+local dir = if away.Magnitude > 0.5 then away.Unit else Vector3.new(1, 0, 0)
+return npcRoot.Position + dir * 8
+end
+function EventGame.grabLog(seen, dist, won)
+local ms = if seen then math.floor((os.clock() - seen) * 1000) else -1
+if type(won) == "boolean" then
+Session.grabTried += 1
+if won then
+Session.grabWon += 1
+end
+end
+log("EVENTGAME grab", "latency=" .. ms, string.format("dist=%.1f", dist or -1), "won=" .. tostring(won))
+end
+-- MineGameWarn(pos, radius, secs): the slam tumbles everyone inside radius after secs, a tumble drops every carried crate
+function EventGame.dodge(pos, radius, secs)
+if not (on("AutoEventGame") and EventGame.stage) or EventGame.dodging then
+return
+end
+local me = rootPart()
+pos = typeof(pos) == "Vector3" and pos or nil
+if not (me and pos) then
+return
+end
+radius = math.abs(tonumber(radius) or 26)
+secs = math.abs(tonumber(secs) or 1.5)
+if secs <= 0 then
+secs = 1.5
+end
+local flat = Vector3.new(me.Position.X - pos.X, 0, me.Position.Z - pos.Z)
+local dist = flat.Magnitude
+if dist > radius + 4 then
+return
+end
+if (EventGame.dodgeFails or 0) >= 2 then
+logEvery("dodgeoff", 60, "EVENTGAME dodge off: failed twice this stage")
+return
+end
+local dir = if dist > 0.5 then flat.Unit else Vector3.new(1, 0, 0)
+local out = Vector3.new(pos.X, me.Position.Y, pos.Z) + dir * (radius + 6)
+local started = os.clock()
+EventGame.dodging = true
+runManual(function()
+setStatus("Dodging the slam")
+travel(out, {
+arrive = 2,
+timeout = math.max(secs - 0.2, 0.5),
+keepGoing = function()
+return os.clock() - started < secs + 0.3
+end,
+})
+local rest = secs + 0.3 - (os.clock() - started)
+if rest > 0 then
+task.wait(rest)
+end
+end)
+local char = character()
+local ok = not (char and char:GetAttribute("Tumbling") == true)
+EventGame.dodging = false
+Session.dodges += 1
+if ok then
+Session.dodgeOk += 1
+else
+EventGame.dodgeFails = (EventGame.dodgeFails or 0) + 1
+end
+log("EVENTGAME dodge", string.format("r=%.0f dist=%.1f", radius, dist), "ok=" .. tostring(ok), "stage=" .. tostring(EventGame.stage))
+end
+task.spawn(pcall, function()
+local module = ReplicatedStorage:WaitForChild("Network", 30)
+local network = module and require(module)
+local packet = type(network) == "table" and network:GetPacket("MineGameWarn")
+if packet then
+packet.OnClientEvent:Connect(function(pos, radius, secs)
+task.spawn(pcall, EventGame.dodge, pos, radius, secs)
+end)
+end
+end)
+workspace.ChildAdded:Connect(function(child)
+if child.Name ~= "MisterTrippleTCrate" then
+return
+end
+local seen = os.clock()
+EventGame.crateSeenAt = seen
+if not (on("AutoEventGame") and EventGame.stage == "MineGame1") or carrying() then
+return
+end
+task.spawn(pcall, function()
+local prompt
+while child.Parent and os.clock() - seen < 10 do
+prompt = eventPrompt(child, "Steal")
+if prompt then
+break
+end
+task.wait()
+end
+if not prompt or carrying() then
+return
+end
+local me = rootPart()
+local position = promptPosition(prompt) or child:GetPivot().Position
+local dist = if me then (position - me.Position).Magnitude else math.huge
+if dist > 15 then
+EventGame.grabLog(seen, dist, "walking")
+return
+end
+EventGame.grabbing = true
+local ok = triggerPrompt(prompt, carrying) or carrying()
+EventGame.grabbing = false
+EventGame.grabLog(seen, dist, ok)
+end)
+end)
 function EventGame.once()
 local stage = Admin.stage()
 if stage == "MineGame1" then
@@ -38674,6 +38998,7 @@ local batchDone = banked >= 3
 or not on("AutoSteal")
 or os.clock() - CratesWaitingSince > 60
 or (stormActive() and on("AutoOrbs"))
+or Night.prep()
 or pickCrateSoon() == nil
 if batchDone and placeCrates() then
 return
@@ -38984,6 +39309,9 @@ StatRows.Opened.set(formatNumber(Session.opened))
 StatRows.Sold.set(formatNumber(Session.sold))
 StatRows.Best.set(best and (best .. " x" .. Session.rarities[best]) or "-")
 StatRows.Orbs.set(formatNumber(Session.orbs) .. " (+" .. formatNumber(Storm.points) .. " pts)")
+StatRows.OrbRate.set(if Storm.lastRate then string.format("%.1f (stops %d)", Storm.lastRate, Session.clusters) else "measured during the storm")
+StatRows.Event.set(string.format("Rush best %d pts | throne %d/%d | dodges %d/%d", Session.rushPoints, Session.grabWon, Session.grabTried, Session.dodgeOk, Session.dodges))
+StatRows.Night.set(string.format("%d seen | %s", Session.nights, if Night.rate then string.format("crates x%.1f%s", Night.rate, if Night.share then string.format(", %.0f%% of time", Night.share * 100) else "") else "rate not measured yet"))
 local stormText
 if stormActive() then
 local ends = tonumber(workspace:GetAttribute("StormEndsAt"))
