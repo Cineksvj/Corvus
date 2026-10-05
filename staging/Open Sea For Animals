@@ -4342,302 +4342,581 @@ local BootOk, BootError = xpcall(function()
 			return false
 		end
 
-		function Library:ShowDiscordPrompt()
-			if Library.DiscordPrompt and Library.DiscordPrompt.Parent then
-				return
+	-- Corvus modal: the one themed pop-up every hub uses (confirmations, the Discord card). A dimmed backdrop over the hub
+	-- window, a card in the window's colours and corner radius, lucide icon + title, muted body text, an optional warning
+	-- band (accent tinted, never raw orange), accent primary button + ghost secondary, close x, Esc / Enter, 150 ms fade
+	-- and scale. Opts: Icon, Title, Text, Warning, WarningIcon, Content(Holder), ConfirmText, CancelText (false = none),
+	-- CancelStyle ("button" | "link"), OnConfirm(), OnCancel(reason), OnClose(accepted, reason), Timeout (s, false = never),
+	-- Width (max px), Toast (true = corner card without a backdrop), Replace (close the open one first).
+	-- Returns { Root, Card, Close(accepted, reason) } or nil when nothing could be shown (no UI yet, or one is already open).
+	local function GetWarningColor(): Color3
+		return Library.Scheme.WarningColor or Library.Scheme.AccentColor
+	end
+
+	function Library:ShowModal(Opts)
+		Opts = Opts or {}
+		local Toast = Opts.Toast == true
+		local Slot = if Toast then "ActiveToast" else "ActiveModal"
+		local Open = Library[Slot]
+		if Open and Open.Root and Open.Root.Parent then
+			if Opts.Replace then
+				Open.Close(false, "replaced")
+			else
+				return nil
 			end
-			local Root = New("Frame", {
+		end
+		local Window = Library.Window
+		local Host = if Toast then Library.ScreenGui else ((Window and Window.MainFrame) or Library.ScreenGui)
+		if not Host then
+			return nil
+		end
+		local Width = tonumber(Opts.Width) or (if Toast then 320 else 420)
+		local Radius = UDim.new(0, Library.CornerRadius)
+		local Modal = {}
+
+		local Root
+		if Toast then
+			Root = New("Frame", {
 				AnchorPoint = Vector2.new(1, 1),
+				AutomaticSize = Enum.AutomaticSize.Y,
 				BackgroundTransparency = 1,
-				Position = UDim2.new(1, 340, 1, -12),
-				Size = UDim2.fromOffset(300, 206),
+				Position = UDim2.new(1, Width + 40, 1, -12),
+				Size = UDim2.new(0.9, 0, 0, 0),
 				ZIndex = 60,
-				Parent = Library.ScreenGui,
+				Parent = Host,
 			})
-			Library.DiscordPrompt = Root
-			table.insert(
-				Library.Scales,
-				New("UIScale", {
-					Parent = Root,
-				})
-			)
-			local Box = New("Frame", {
-				BackgroundColor3 = "MainColor",
+			table.insert(Library.Scales, New("UIScale", { Parent = Root }))
+			New("UISizeConstraint", { MaxSize = Vector2.new(Width, math.huge), Parent = Root })
+		else
+			Root = New("TextButton", {
+				AutoButtonColor = false,
+				BackgroundColor3 = "DarkColor",
 				BackgroundTransparency = 1,
 				Size = UDim2.fromScale(1, 1),
-				ZIndex = 60,
-				Parent = Root,
+				Text = "",
+				ZIndex = 9000,
+				Parent = Host,
 			})
-			table.insert(
-				Library.Corners,
-				New("UICorner", {
-					CornerRadius = UDim.new(0, Library.CornerRadius),
-					Parent = Box,
-				})
-			)
-			local Outline, Shadow = Library:AddOutline(Box)
-			Outline.Transparency = 1
-			Shadow.Transparency = 1
-			local Content = New("CanvasGroup", {
-				BackgroundTransparency = 1,
-				GroupTransparency = 1,
-				Size = UDim2.fromScale(1, 1),
-				ZIndex = 61,
-				Parent = Root,
-			})
-			table.insert(
-				Library.Corners,
-				New("UICorner", {
-					CornerRadius = UDim.new(0, Library.CornerRadius),
-					Parent = Content,
-				})
-			)
+		end
 
-			local Banner = New("Frame", {
-				BackgroundColor3 = "AccentColor",
-				Size = UDim2.new(1, 0, 0, 56),
-				ZIndex = 62,
-				Parent = Content,
-			})
-			New("UIGradient", {
-				Color = function()
-					local Accent = Library.Scheme.AccentColor
-					return ColorSequence.new(Accent, ShadeColor(Accent, 0.55))
-				end,
-				Rotation = 20,
-				Parent = Banner,
-			})
+		local Card = New("CanvasGroup", {
+			AnchorPoint = if Toast then Vector2.new(0, 0) else Vector2.new(0.5, 0.5),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundColor3 = "BackgroundColor",
+			GroupTransparency = 1,
+			Position = if Toast then UDim2.fromScale(0, 0) else UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.new(if Toast then 1 else 0.9, 0, 0, 0),
+			ZIndex = if Toast then 61 else 9001,
+			Parent = Root,
+		})
+		if not Toast then
+			New("UISizeConstraint", { MaxSize = Vector2.new(Width, math.huge), Parent = Card })
+		end
+		table.insert(Library.Corners, New("UICorner", { CornerRadius = Radius, Parent = Card }))
+		Library:AddOutline(Card)
+		local Scale = New("UIScale", { Scale = 0.92, Parent = Card })
+		New("UIPadding", {
+			PaddingBottom = UDim.new(0, 14),
+			PaddingLeft = UDim.new(0, 14),
+			PaddingRight = UDim.new(0, 14),
+			PaddingTop = UDim.new(0, 12),
+			Parent = Card,
+		})
+		New("UIListLayout", {
+			Padding = UDim.new(0, 10),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Parent = Card,
+		})
+		local Z = Card.ZIndex + 1
 
-			local Ring = New("Frame", {
-				BackgroundColor3 = "MainColor",
-				Position = UDim2.fromOffset(12, 32),
-				Size = UDim2.fromOffset(48, 48),
-				ZIndex = 63,
-				Parent = Content,
+		-- header: icon + title + close
+		local Header = New("Frame", {
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			LayoutOrder = 1,
+			Size = UDim2.new(1, 0, 0, 22),
+			ZIndex = Z,
+			Parent = Card,
+		})
+		local IconData = Library:GetCustomIcon(Opts.Icon or "circle-help")
+		local TitleX = 0
+		if IconData then
+			local Icon = New("ImageLabel", {
+				AnchorPoint = Vector2.new(0, 0.5),
+				ImageColor3 = if IconData.Custom then "WhiteColor" else "AccentColor",
+				Position = UDim2.new(0, 0, 0.5, 0),
+				Size = UDim2.fromOffset(18, 18),
+				ZIndex = Z,
+				Parent = Header,
 			})
-			New("UICorner", {
-				CornerRadius = UDim.new(1, 0),
-				Parent = Ring,
-			})
-			local Avatar = New("ImageLabel", {
-				AnchorPoint = Vector2.new(0.5, 0.5),
-				BackgroundColor3 = "AccentColor",
-				Position = UDim2.fromScale(0.5, 0.5),
-				ScaleType = Enum.ScaleType.Crop,
-				Size = UDim2.new(1, -8, 1, -8),
-				ZIndex = 64,
-				Parent = Ring,
-			})
-			New("UICorner", {
-				CornerRadius = UDim.new(1, 0),
-				Parent = Avatar,
-			})
-			pcall(function()
-				Library:ApplyDiscordIcon(Avatar)
-			end)
+			Library:ApplyLucideIcon(Icon, IconData)
+			TitleX = 26
+		end
+		local Title = New("TextLabel", {
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			FontFace = GetBoldFont,
+			Position = UDim2.fromOffset(TitleX, 0),
+			Size = UDim2.new(1, -TitleX - 28, 0, 22),
+			Text = tostring(Opts.Title or "Are you sure?"),
+			TextColor3 = "FontColor",
+			TextSize = 15,
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Center,
+			ZIndex = Z,
+			Parent = Header,
+		})
+		local CloseButton = New("TextButton", {
+			AnchorPoint = Vector2.new(1, 0),
+			BackgroundColor3 = "MainColor",
+			BackgroundTransparency = 1,
+			Position = UDim2.new(1, 2, 0, -1),
+			Size = UDim2.fromOffset(24, 24),
+			Text = "\u{00D7}",
+			TextColor3 = "FontColor",
+			TextSize = 18,
+			TextTransparency = 0.5,
+			ZIndex = Z,
+			Parent = Header,
+		})
+		table.insert(Library.Corners, New("UICorner", { CornerRadius = Radius, Parent = CloseButton }))
 
-			local NameLabel = New("TextLabel", {
+		-- body
+		local Body
+		if Opts.Text and Opts.Text ~= "" then
+			Body = New("TextLabel", {
+				AutomaticSize = Enum.AutomaticSize.Y,
 				BackgroundTransparency = 1,
-				FontFace = GetBoldFont,
-				Position = UDim2.fromOffset(70, 58),
-				Size = UDim2.new(1, -82, 0, 18),
-				Text = "Corvus",
-				TextColor3 = "FontColor",
-				TextSize = 14,
-				TextTruncate = Enum.TextTruncate.AtEnd,
-				TextXAlignment = Enum.TextXAlignment.Left,
-				ZIndex = 63,
-				Parent = Content,
-			})
-			local StatsLabel = New("TextLabel", {
-				BackgroundTransparency = 1,
-				Position = UDim2.fromOffset(70, 76),
-				Size = UDim2.new(1, -82, 0, 14),
-				Text = "Corvus community",
-				TextColor3 = "FontColor",
-				TextSize = 12,
-				TextTransparency = 0.3,
-				TextTruncate = Enum.TextTruncate.AtEnd,
-				TextXAlignment = Enum.TextXAlignment.Left,
-				ZIndex = 63,
-				Parent = Content,
-			})
-			New("TextLabel", {
-				BackgroundTransparency = 1,
-				FontFace = GetBoldFont,
-				Position = UDim2.fromOffset(12, 96),
-				Size = UDim2.new(1, -24, 0, 18),
-				Text = "Join the Corvus Discord",
-				TextColor3 = "FontColor",
-				TextSize = 16,
-				TextTruncate = Enum.TextTruncate.AtEnd,
-				TextXAlignment = Enum.TextXAlignment.Left,
-				ZIndex = 63,
-				Parent = Content,
-			})
-			New("TextLabel", {
-				BackgroundTransparency = 1,
-				Position = UDim2.fromOffset(12, 116),
-				Size = UDim2.new(1, -24, 0, 16),
-				Text = "Updates, codes and support",
+				LayoutOrder = 2,
+				Size = UDim2.new(1, 0, 0, 0),
+				Text = tostring(Opts.Text),
 				TextColor3 = "FontColor",
 				TextSize = 13,
-				TextTransparency = 0.45,
-				TextTruncate = Enum.TextTruncate.AtEnd,
+				TextTransparency = 0.25,
+				TextWrapped = true,
 				TextXAlignment = Enum.TextXAlignment.Left,
-				ZIndex = 63,
-				Parent = Content,
+				TextYAlignment = Enum.TextYAlignment.Top,
+				ZIndex = Z,
+				Parent = Card,
 			})
+		end
 
-			local Join = New("TextButton", {
-				AutoButtonColor = false,
-				BackgroundColor3 = "AccentColor",
-				FontFace = GetBoldFont,
-				Position = UDim2.fromOffset(12, 138),
-				Size = UDim2.new(1, -24, 0, 32),
-				Text = "Join Discord",
-				TextColor3 = "BackgroundColor",
-				TextSize = 14,
-				ZIndex = 63,
-				Parent = Content,
-			})
-			table.insert(
-				Library.Corners,
-				New("UICorner", {
-					CornerRadius = UDim.new(0, Library.CornerRadius),
-					Parent = Join,
-				})
-			)
-			local Link = New("TextButton", {
-				AutoButtonColor = false,
+		-- custom rows (the Discord card puts its banner here)
+		if typeof(Opts.Content) == "function" then
+			local Holder = New("Frame", {
+				AutomaticSize = Enum.AutomaticSize.Y,
 				BackgroundTransparency = 1,
-				Position = UDim2.fromOffset(12, 176),
-				Size = UDim2.new(1, -24, 0, 20),
-				Text = "I'm already in, don't ask again",
+				LayoutOrder = 3,
+				Size = UDim2.new(1, 0, 0, 0),
+				ZIndex = Z,
+				Parent = Card,
+			})
+			pcall(Opts.Content, Holder, Modal)
+		end
+
+		-- warning band
+		if Opts.Warning and Opts.Warning ~= "" then
+			local Band = New("Frame", {
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundColor3 = GetWarningColor,
+				BackgroundTransparency = 0.86,
+				LayoutOrder = 4,
+				Size = UDim2.new(1, 0, 0, 0),
+				ZIndex = Z,
+				Parent = Card,
+			})
+			table.insert(Library.Corners, New("UICorner", { CornerRadius = Radius, Parent = Band }))
+			New("UIStroke", { Color = GetWarningColor, Transparency = 0.6, Thickness = 1, Parent = Band })
+			New("UIPadding", {
+				PaddingBottom = UDim.new(0, 8),
+				PaddingLeft = UDim.new(0, 10),
+				PaddingRight = UDim.new(0, 10),
+				PaddingTop = UDim.new(0, 8),
+				Parent = Band,
+			})
+			local WarnIcon = Library:GetCustomIcon(Opts.WarningIcon or "triangle-alert")
+			local TextX = 0
+			if WarnIcon then
+				local Icon = New("ImageLabel", {
+					ImageColor3 = GetWarningColor,
+					Position = UDim2.fromOffset(0, 1),
+					Size = UDim2.fromOffset(16, 16),
+					ZIndex = Z,
+					Parent = Band,
+				})
+				Library:ApplyLucideIcon(Icon, WarnIcon)
+				TextX = 24
+			end
+			New("TextLabel", {
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				FontFace = GetMediumFont,
+				Position = UDim2.fromOffset(TextX, 0),
+				Size = UDim2.new(1, -TextX, 0, 0),
+				Text = tostring(Opts.Warning),
 				TextColor3 = "FontColor",
 				TextSize = 12,
-				TextTransparency = 0.45,
-				ZIndex = 63,
-				Parent = Content,
+				TextWrapped = true,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextYAlignment = Enum.TextYAlignment.Top,
+				ZIndex = Z,
+				Parent = Band,
 			})
-			local CloseButton = New("TextButton", {
-				AnchorPoint = Vector2.new(1, 0),
-				AutoButtonColor = false,
-				BackgroundColor3 = Color3.new(0, 0, 0),
-				BackgroundTransparency = 0.6,
-				Position = UDim2.new(1, -8, 0, 8),
-				Size = UDim2.fromOffset(22, 22),
-				Text = "\u{00D7}",
-				TextColor3 = Color3.new(1, 1, 1),
-				TextSize = 18,
-				ZIndex = 64,
-				Parent = Content,
-			})
-			New("UICorner", {
-				CornerRadius = UDim.new(1, 0),
-				Parent = CloseButton,
-			})
+		end
 
-			local Closed = false
-			local State = Library.CommunityState
-			local function Paint()
-				if Closed then
-					return
-				end
-				if State.Name then
-					NameLabel.Text = State.Name
-				end
-				if State.Online or State.Members then
-					StatsLabel.Text = string.format(
-						'<font color="#60d696">\u{25CF}</font> %s online <font transparency="0.4">\u{00B7}</font> %s members',
-						FormatThousands(State.Online or 0),
-						FormatThousands(State.Members or 0)
-					)
-				end
+		-- buttons: primary (accent) + secondary (ghost button or a text link under it)
+		local HasCancel = Opts.CancelText ~= false
+		local LinkStyle = HasCancel and Opts.CancelStyle == "link"
+		local Buttons = New("Frame", {
+			BackgroundTransparency = 1,
+			LayoutOrder = 5,
+			Size = UDim2.new(1, 0, 0, if LinkStyle then 58 else 34),
+			ZIndex = Z,
+			Parent = Card,
+		})
+		local Primary = New("TextButton", {
+			BackgroundColor3 = "AccentColor",
+			FontFace = GetBoldFont,
+			Position = if (HasCancel and not LinkStyle) then UDim2.new(0.5, 4, 0, 0) else UDim2.fromOffset(0, 0),
+			Size = if (HasCancel and not LinkStyle) then UDim2.new(0.5, -4, 0, 34) else UDim2.new(1, 0, 0, 34),
+			Text = tostring(Opts.ConfirmText or "Confirm"),
+			TextColor3 = "BackgroundColor",
+			TextSize = 14,
+			TextWrapped = true,
+			ZIndex = Z,
+			Parent = Buttons,
+		})
+		table.insert(Library.Corners, New("UICorner", { CornerRadius = Radius, Parent = Primary }))
+		local Secondary
+		if HasCancel then
+			if LinkStyle then
+				Secondary = New("TextButton", {
+					BackgroundTransparency = 1,
+					Position = UDim2.fromOffset(0, 38),
+					Size = UDim2.new(1, 0, 0, 20),
+					Text = tostring(Opts.CancelText or "Cancel"),
+					TextColor3 = "FontColor",
+					TextSize = 12,
+					TextTransparency = 0.45,
+					ZIndex = Z,
+					Parent = Buttons,
+				})
+			else
+				Secondary = New("TextButton", {
+					BackgroundColor3 = "MainColor",
+					BackgroundTransparency = 1,
+					FontFace = GetMediumFont,
+					Size = UDim2.new(0.5, -4, 0, 34),
+					Text = tostring(Opts.CancelText or "Cancel"),
+					TextColor3 = "FontColor",
+					TextSize = 14,
+					TextTransparency = 0.15,
+					TextWrapped = true,
+					ZIndex = Z,
+					Parent = Buttons,
+				})
+				table.insert(Library.Corners, New("UICorner", { CornerRadius = Radius, Parent = Secondary }))
+				New("UIStroke", { Color = "OutlineColor", Thickness = 1, Parent = Secondary })
 			end
-			local function Close()
-				if Closed then
+		end
+
+		-- hover and press states
+		local function Tween(Object, Props)
+			pcall(function()
+				TweenService:Create(Object, Library.TweenInfo, Props):Play()
+			end)
+		end
+		Primary.MouseEnter:Connect(function()
+			Tween(Primary, { BackgroundColor3 = Library:GetLighterColor(Library.Scheme.AccentColor) })
+		end)
+		Primary.MouseLeave:Connect(function()
+			Tween(Primary, { BackgroundColor3 = Library.Scheme.AccentColor })
+		end)
+		Primary.MouseButton1Down:Connect(function()
+			Tween(Primary, { BackgroundColor3 = ShadeColor(Library.Scheme.AccentColor, 0.82) })
+		end)
+		Primary.MouseButton1Up:Connect(function()
+			Tween(Primary, { BackgroundColor3 = Library:GetLighterColor(Library.Scheme.AccentColor) })
+		end)
+		if Secondary then
+			if LinkStyle then
+				Secondary.MouseEnter:Connect(function()
+					Tween(Secondary, { TextTransparency = 0.1 })
+				end)
+				Secondary.MouseLeave:Connect(function()
+					Tween(Secondary, { TextTransparency = 0.45 })
+				end)
+			else
+				Secondary.MouseEnter:Connect(function()
+					Tween(Secondary, { BackgroundTransparency = 0, TextTransparency = 0 })
+				end)
+				Secondary.MouseLeave:Connect(function()
+					Tween(Secondary, { BackgroundTransparency = 1, TextTransparency = 0.15 })
+				end)
+				Secondary.MouseButton1Down:Connect(function()
+					Tween(Secondary, { BackgroundTransparency = 0.4 })
+				end)
+			end
+		end
+		CloseButton.MouseEnter:Connect(function()
+			Tween(CloseButton, { BackgroundTransparency = 0, TextTransparency = 0.1 })
+		end)
+		CloseButton.MouseLeave:Connect(function()
+			Tween(CloseButton, { BackgroundTransparency = 1, TextTransparency = 0.5 })
+		end)
+
+		-- close, callbacks, keyboard
+		local Closed = false
+		local KeyConnection
+		local function Close(Accepted, Reason)
+			if Closed then
+				return
+			end
+			Closed = true
+			if Library[Slot] == Modal then
+				Library[Slot] = nil
+			end
+			if KeyConnection then
+				pcall(function()
+					KeyConnection:Disconnect()
+				end)
+			end
+			local Info = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			pcall(function()
+				TweenService:Create(Card, Info, { GroupTransparency = 1 }):Play()
+				TweenService:Create(Scale, Info, { Scale = 0.95 }):Play()
+				if Toast then
+					TweenService:Create(Root, Info, { Position = UDim2.new(1, Width + 40, 1, -12) }):Play()
+				else
+					TweenService:Create(Root, Info, { BackgroundTransparency = 1 }):Play()
+				end
+			end)
+			task.delay(0.15, function()
+				if Root.Parent then
+					Root:Destroy()
+				end
+			end)
+			local Handler = if Accepted then Opts.OnConfirm else Opts.OnCancel
+			if Handler then
+				task.spawn(function()
+					local Ok, Err = pcall(Handler, Reason)
+					if not Ok then
+						warn("[Corvus] modal callback: " .. tostring(Err))
+					end
+				end)
+			end
+			if Opts.OnClose then
+				task.spawn(pcall, Opts.OnClose, Accepted == true, Reason)
+			end
+		end
+		Modal.Root = Root
+		Modal.Card = Card
+		Modal.Close = Close
+		Modal.Primary = Primary
+		Modal.Secondary = Secondary
+		Modal.Title = Title
+		Modal.Body = Body
+		Library[Slot] = Modal
+
+		Primary.MouseButton1Click:Connect(function()
+			Close(true, "button")
+		end)
+		if Secondary then
+			Secondary.MouseButton1Click:Connect(function()
+				Close(false, "cancel")
+			end)
+		end
+		CloseButton.MouseButton1Click:Connect(function()
+			Close(false, "close")
+		end)
+		if not Toast and Opts.OutsideClickDismiss then
+			Root.MouseButton1Click:Connect(function()
+				Close(false, "outside")
+			end)
+		end
+		pcall(function()
+			KeyConnection = UserInputService.InputBegan:Connect(function(Input, Processed)
+				if Input.UserInputType ~= Enum.UserInputType.Keyboard then
 					return
 				end
-				Closed = true
+				if Input.KeyCode == Enum.KeyCode.Escape then
+					Close(false, "close")
+				elseif not Processed and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
+					Close(true, "key")
+				end
+			end)
+		end)
+		local Timeout = Opts.Timeout
+		if Timeout == nil then
+			Timeout = 90
+		end
+		if typeof(Timeout) == "number" and Timeout > 0 then
+			task.delay(Timeout, function()
+				Close(false, "timeout")
+			end)
+		end
+
+		-- fade + scale in (150 ms)
+		local FadeInfo = TweenInfo.new(0.15, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		pcall(function()
+			TweenService:Create(Card, FadeInfo, { GroupTransparency = 0 }):Play()
+			TweenService:Create(Scale, FadeInfo, { Scale = 1 }):Play()
+			if Toast then
+				TweenService:Create(Root, TweenInfo.new(0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { Position = UDim2.new(1, -12, 1, -12) }):Play()
+			else
+				TweenService:Create(Root, FadeInfo, { BackgroundTransparency = 0.45 }):Play()
+			end
+		end)
+		return Modal
+	end
+
+	-- Thin wrapper kept for the hubs: Title, Text, Warning, ConfirmText, CancelText, OnConfirm, OnCancel (+ any ShowModal option).
+	function Library:ShowConfirmPrompt(Opts)
+		Opts = Opts or {}
+		if Opts.Icon == nil then
+			Opts.Icon = "circle-help"
+		end
+		local Modal = Library:ShowModal(Opts)
+		Library.ConfirmPrompt = Modal and Modal.Root or nil
+		return Modal
+	end
+	Library.ShowConfirmCard = Library.ShowConfirmPrompt
+
+	function Library:ShowDiscordPrompt()
+		if Library.DiscordPrompt and Library.DiscordPrompt.Parent then
+			return
+		end
+		local State = Library.CommunityState
+		local NameLabel, StatsLabel
+		local function Paint()
+			if not (NameLabel and NameLabel.Parent) then
+				return
+			end
+			if State.Name then
+				NameLabel.Text = State.Name
+			end
+			if State.Online or State.Members then
+				StatsLabel.Text = string.format(
+					'<font color="#60d696">\u{25CF}</font> %s online <font transparency="0.4">\u{00B7}</font> %s members',
+					FormatThousands(State.Online or 0),
+					FormatThousands(State.Members or 0)
+				)
+			end
+		end
+		local Modal = Library:ShowModal({
+			Toast = true,
+			Width = 320,
+			Timeout = 45,
+			Icon = "message-circle",
+			Title = "Join the Corvus Discord",
+			Text = "Updates, codes and support",
+			ConfirmText = "Join Discord",
+			CancelText = "I'm already in, don't ask again",
+			CancelStyle = "link",
+			Content = function(Holder)
+				local Z = Holder.ZIndex + 1
+				Holder.Size = UDim2.new(1, 0, 0, 74)
+				Holder.AutomaticSize = Enum.AutomaticSize.None
+				local Banner = New("Frame", {
+					BackgroundColor3 = "AccentColor",
+					Size = UDim2.new(1, 0, 0, 40),
+					ZIndex = Z,
+					Parent = Holder,
+				})
+				table.insert(Library.Corners, New("UICorner", { CornerRadius = UDim.new(0, Library.CornerRadius), Parent = Banner }))
+				New("UIGradient", {
+					Color = function()
+						local Accent = Library.Scheme.AccentColor
+						return ColorSequence.new(Accent, ShadeColor(Accent, 0.55))
+					end,
+					Rotation = 20,
+					Parent = Banner,
+				})
+				local Ring = New("Frame", {
+					BackgroundColor3 = "BackgroundColor",
+					Position = UDim2.fromOffset(10, 18),
+					Size = UDim2.fromOffset(44, 44),
+					ZIndex = Z + 1,
+					Parent = Holder,
+				})
+				New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = Ring })
+				local Avatar = New("ImageLabel", {
+					AnchorPoint = Vector2.new(0.5, 0.5),
+					BackgroundColor3 = "AccentColor",
+					Position = UDim2.fromScale(0.5, 0.5),
+					ScaleType = Enum.ScaleType.Crop,
+					Size = UDim2.new(1, -6, 1, -6),
+					ZIndex = Z + 2,
+					Parent = Ring,
+				})
+				New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = Avatar })
+				pcall(function()
+					Library:ApplyDiscordIcon(Avatar)
+				end)
+				NameLabel = New("TextLabel", {
+					BackgroundTransparency = 1,
+					FontFace = GetBoldFont,
+					Position = UDim2.fromOffset(62, 44),
+					Size = UDim2.new(1, -62, 0, 16),
+					Text = "Corvus",
+					TextColor3 = "FontColor",
+					TextSize = 14,
+					TextTruncate = Enum.TextTruncate.AtEnd,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					ZIndex = Z,
+					Parent = Holder,
+				})
+				StatsLabel = New("TextLabel", {
+					BackgroundTransparency = 1,
+					Position = UDim2.fromOffset(62, 60),
+					Size = UDim2.new(1, -62, 0, 14),
+					Text = "Corvus community",
+					TextColor3 = "FontColor",
+					TextSize = 12,
+					TextTransparency = 0.3,
+					TextTruncate = Enum.TextTruncate.AtEnd,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					ZIndex = Z,
+					Parent = Holder,
+				})
+			end,
+			OnConfirm = function()
+				task.spawn(function()
+					pcall(function()
+						Library:OpenDiscordInvite()
+					end)
+				end)
+			end,
+			OnCancel = function(Reason)
+				if Reason == "cancel" then
+					pcall(function()
+						Library:SetSetting("DiscordAskAgain", false)
+					end)
+				end
+			end,
+			OnClose = function()
 				if State then
 					local Index = table.find(State.Listeners, Paint)
 					if Index then
 						table.remove(State.Listeners, Index)
 					end
 				end
-				local Info = TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-				pcall(function()
-					TweenService:Create(Root, Info, { Position = UDim2.new(1, 340, 1, -12) }):Play()
-					TweenService:Create(Content, Info, { GroupTransparency = 1 }):Play()
-					TweenService:Create(Box, Info, { BackgroundTransparency = 1 }):Play()
-					TweenService:Create(Outline, Info, { Transparency = 1 }):Play()
-					TweenService:Create(Shadow, Info, { Transparency = 1 }):Play()
-				end)
-				task.delay(0.3, function()
-					if Root.Parent then
-						Root:Destroy()
-					end
-				end)
-			end
-
-			local function Hover(Button, Property, Normal, Over)
-				Button.MouseEnter:Connect(function()
-					TweenService:Create(Button, Library.TweenInfo, { [Property] = Over() }):Play()
-				end)
-				Button.MouseLeave:Connect(function()
-					TweenService:Create(Button, Library.TweenInfo, { [Property] = Normal() }):Play()
-				end)
-			end
-			Hover(Join, "BackgroundColor3", function()
-				return Library.Scheme.AccentColor
-			end, function()
-				return Library:GetLighterColor(Library.Scheme.AccentColor)
-			end)
-			Hover(Link, "TextTransparency", function()
-				return 0.45
-			end, function()
-				return 0.1
-			end)
-			Hover(CloseButton, "BackgroundTransparency", function()
-				return 0.6
-			end, function()
-				return 0.3
-			end)
-
-			Join.MouseButton1Click:Connect(function()
-				Close()
-				task.spawn(function()
-					pcall(function()
-						Library:OpenDiscordInvite()
-					end)
-				end)
-			end)
-			Link.MouseButton1Click:Connect(function()
-				Close()
-				pcall(function()
-					Library:SetSetting("DiscordAskAgain", false)
-				end)
-			end)
-			CloseButton.MouseButton1Click:Connect(Close)
-
-			if State then
-				table.insert(State.Listeners, Paint)
-				Paint()
-				if Library.FetchCommunity then
-					local _, Code = ParseDiscordInvite(Library.DiscordInvite or "https://discord.gg/PdQvN2bDCu")
-					Library.FetchCommunity(Code)
-				end
-			end
-
-			local FadeInfo = TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
-			TweenService:Create(Root, FadeInfo, { Position = UDim2.new(1, -12, 1, -12) }):Play()
-			TweenService:Create(Content, FadeInfo, { GroupTransparency = 0 }):Play()
-			TweenService:Create(Box, FadeInfo, { BackgroundTransparency = 0 }):Play()
-			TweenService:Create(Outline, FadeInfo, { Transparency = 0 }):Play()
-			TweenService:Create(Shadow, FadeInfo, { Transparency = 0 }):Play()
-			task.delay(45, Close)
+			end,
+		})
+		if not Modal then
+			return
 		end
+		Library.DiscordPrompt = Modal.Root
+		if State then
+			table.insert(State.Listeners, Paint)
+			Paint()
+			if Library.FetchCommunity then
+				local _, Code = ParseDiscordInvite(Library.DiscordInvite or "https://discord.gg/PdQvN2bDCu")
+				Library.FetchCommunity(Code)
+			end
+		end
+	end
 
 		Library.CorvusThemes = {
 			["Corvus Night"] = {
@@ -33461,90 +33740,37 @@ local BootOk, BootError = xpcall(function()
 					end)
 				end
 			end
-			-- confirmation card for OP (same style as the Discord card)
+			-- confirmation card for OP: the library modal (Library:ShowModal)
 			local OPConfirmed, OPSkipCard = false, false
 			Game.opSkipCard = function(v)
 				OPSkipCard = v
 			end
-			local function showOPCard(onYes)
-				local gui = Library.ScreenGui
-				if not gui then
-					onYes()
-					return
+			local function showOPCard()
+				local shown = Library.ShowModal and Library:ShowModal({
+					Icon = "sparkles",
+					Title = "Enable Auto Farm Everything?",
+					Text = "Full automatic: the planner picks what to catch, sells, spends and trains for max profit. Can sell your animals. Use Exclude to keep what matters.",
+					Warning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
+					ConfirmText = "I understand, enable OP",
+					CancelText = "Cancel",
+					OnConfirm = function()
+						log("OP confirmed")
+						pcall(function()
+							Library:SetSetting("OSFA_OPConfirmed", true)
+						end)
+						OPConfirmed = true
+						if Toggles.AutoFarmOP then
+							Toggles.AutoFarmOP:SetValue(true)
+						end
+					end,
+					OnCancel = function()
+						log("OP cancelled")
+					end,
+				})
+				if not shown then
+					log("OP card not shown")
+					notify("Auto Farm Everything", "Could not open the confirmation, nothing was changed", 4)
 				end
-				if Library.OPCard and Library.OPCard.Parent then
-					return
-				end
-				local scheme = Library.Scheme or {}
-				local main = scheme.MainColor or Color3.fromRGB(25, 25, 35)
-				local accent = scheme.AccentColor or Color3.fromRGB(144, 133, 233)
-				local font = scheme.FontColor or Color3.new(1, 1, 1)
-				local back = scheme.BackgroundColor or Color3.fromRGB(15, 15, 22)
-				local card = Instance.new("Frame")
-				card.AnchorPoint = Vector2.new(0.5, 0.5)
-				card.Position = UDim2.fromScale(0.5, 0.5)
-				card.Size = UDim2.fromOffset(320, 278)
-				card.BackgroundColor3 = main
-				card.ZIndex = 80
-				card.Parent = gui
-				Library.OPCard = card
-				Instance.new("UICorner", card).CornerRadius = UDim.new(0, Library.CornerRadius or 6)
-				local stroke = Instance.new("UIStroke", card)
-				stroke.Color = accent
-				stroke.Thickness = 1.5
-				local function label(text, y, h, size, bold, trans)
-					local l = Instance.new("TextLabel")
-					l.BackgroundTransparency = 1
-					l.Position = UDim2.fromOffset(14, y)
-					l.Size = UDim2.new(1, -28, 0, h)
-					l.Text = text
-					l.TextColor3 = font
-					l.TextSize = size
-					l.Font = if bold then Enum.Font.GothamBold else Enum.Font.Gotham
-					l.TextTransparency = trans or 0
-					l.TextWrapped = true
-					l.TextXAlignment = Enum.TextXAlignment.Left
-					l.TextYAlignment = Enum.TextYAlignment.Top
-					l.ZIndex = 81
-					l.Parent = card
-					return l
-				end
-				label("Enable Auto Farm Everything?", 12, 22, 16, true)
-				label("Full automatic: the planner picks what to catch, sells, spends and trains for max profit. Can sell your animals. Use Exclude to keep what matters.", 40, 96, 13, false, 0.2)
-				label("Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.", 138, 82, 12, true).TextColor3 = Color3.fromRGB(255, 140, 60)
-				local function button(text, x, w, fill, textColor, action)
-					local b = Instance.new("TextButton")
-					b.AutoButtonColor = true
-					b.BackgroundColor3 = fill
-					b.Position = UDim2.fromOffset(x, 228)
-					b.Size = UDim2.fromOffset(w, 36)
-					b.Text = text
-					b.TextColor3 = textColor
-					b.TextSize = 13
-					b.TextWrapped = true
-					b.Font = Enum.Font.GothamBold
-					b.ZIndex = 82
-					b.Parent = card
-					Instance.new("UICorner", b).CornerRadius = UDim.new(0, Library.CornerRadius or 6)
-					b.MouseButton1Click:Connect(function()
-						card:Destroy()
-						Library.OPCard = nil
-						action()
-					end)
-				end
-				button("I understand, enable OP", 14, 140, accent, back, function()
-					log("OP confirmed")
-					pcall(function()
-						Library:SetSetting("OSFA_OPConfirmed", true)
-					end)
-					OPConfirmed = true
-					if Toggles.AutoFarmOP then
-						Toggles.AutoFarmOP:SetValue(true)
-					end
-				end)
-				button("Cancel", 166, 140, back, font, function()
-					log("OP cancelled")
-				end)
 			end
 			local OPBox = SeaBox
 			local OPExcludeBox = Tabs.Main:AddLeftGroupbox("Exclude", "shield-check")
