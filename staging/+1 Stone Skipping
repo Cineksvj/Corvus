@@ -4988,6 +4988,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             local Toggle = Library.Toggles[Entry.Target]
             if Toggle and not Toggle.Disabled then
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Entry.Target) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Entry.Target, Toggle.Value)
+                end
                 Library:Notify({ Title = tostring(Toggle.Text), Description = if Toggle.Value then "ON" else "OFF", Time = 1.5 })
             end
         elseif Entry.Kind == "Button" then
@@ -5698,6 +5701,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
 				Close(false, "outside")
 			end)
 		end
+		local ModalOpenedAt = os.clock()
 		pcall(function()
 			KeyConnection = UserInputService.InputBegan:Connect(function(Input, Processed)
 				if Input.UserInputType ~= Enum.UserInputType.Keyboard then
@@ -5705,7 +5709,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
 				end
 				if Input.KeyCode == Enum.KeyCode.Escape then
 					Close(false, "close")
-				elseif not Processed and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
+				elseif not Processed and not Opts.Warning and os.clock() - ModalOpenedAt > 0.8 and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
 					Close(true, "key")
 				end
 			end)
@@ -10753,6 +10757,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 end
     
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Idx) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+                end
             end))
     
             if typeof(Toggle.Tooltip) == "string" or typeof(Toggle.DisabledTooltip) == "string" then
@@ -11068,6 +11075,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 end
     
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Idx) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+                end
             end))
     
             table.insert(Toggle.Connections, Button.MouseButton1Down:Connect(function()
@@ -17636,6 +17646,28 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             return nil, false
         end
     
+        function Library:ResetHubOptions(Ignore: any): (boolean, any)
+        	local Ok, Json = pcall(HttpService.JSONEncode, HttpService, { v = 1, g = game.GameId, d = {} })
+        	if not Ok then
+        		return false, "Could not reset"
+        	end
+        	return Library:ImportShareCode("CORVUS-" .. Library.Base64Encode(Json), Ignore)
+        end
+
+        function Library:AskResetHubOptions(Ignore: any)
+        	return Library:ShowModal({
+        		Icon = "rotate-ccw",
+        		Title = "Reset all options to defaults?",
+        		Text = "Every toggle, dropdown, slider and input of this hub goes back to its default value. Saved configs are not deleted.",
+        		ConfirmText = "Reset",
+        		CancelText = "Cancel",
+        		OnConfirm = function()
+        			local Ok, Result = Library:ResetHubOptions(Ignore)
+        			Library:Notify({ Title = "Reset Hub Options", Description = if Ok then string.format("%d options reset", Result) else tostring(Result), Time = 4 })
+        		end,
+        	})
+        end
+
         function Library:ExportShareCode(Ignore: any): (string?, any)
             local Changed = {}
             local Count = 0
@@ -27401,7 +27433,6 @@ end
                     "CorvusConfigList",
                     "CorvusShareCode",
                     "CorvusAutoSave",
-                    "FarmAll",
                 })
                 SaveManager:SetFolder(Folder)
                 if Info.SubFolder then
@@ -27606,6 +27637,7 @@ end
                 if Info.AutoLoad ~= false then
                     task.defer(function()
                         pcall(SaveManager.LoadAutoloadConfig, SaveManager)
+                        if Library.OnAutoload then pcall(Library.OnAutoload) end
                     end)
                 end
             end
@@ -29976,6 +30008,9 @@ end
                         local Toggle = Library.Toggles[Item.Toggle]
                         if Toggle and not Toggle.Disabled then
                             Toggle:SetValue(not Toggle.Value)
+                            if typeof(Item.Toggle) == "string" and Library.OnUserToggle then
+                            	pcall(Library.OnUserToggle, Item.Toggle, Toggle.Value)
+                            end
                         end
                     end)
                     table.insert(DockButtons, Entry)
@@ -34669,34 +34704,64 @@ do
 		{ "AutoDeletePets", "Delete junk pets" },
 		{ "AutoPotions", "Use potions" },
 	}
-	-- Recommended Settings: the setup Corvus would pick for a new player (Safe mode: game pace and walking, planner
-	-- split, pet care that only removes pets weaker than the team). Starts nothing by itself.
-	function N.applyRecommended()
-		local values2 = {
-			ThrowSpeed = "Legit (game pace)",
-			MoveMode = "Walk (Safe)",
-			TimeSplit = "Auto (planner)",
-			TrainZone = "Best open",
-			RebirthMode = "Auto (planner)",
-			DeleteRarities = { Common = true, Uncommon = true },
-			KeepBestPets = 10,
-		}
-		for name, value in pairs(values2) do
-			local option = Options[name]
-			if option then
-				pcall(option.SetValue, option, value)
+	-- Reset Hub Options: every toggle, dropdown, slider and input back to the default it was registered with. Saved configs stay.
+	-- Key pickers, colors, the menu key and the config manager's own inputs are left alone.
+	function N.resetOptions()
+		local ignore = (SaveManager and SaveManager.Ignore) or {}
+		local function skip(name)
+			return ignore[name] == true or name == "MenuKeybind" or string.find(name, "^SaveManager") ~= nil or string.find(name, "^Corvus") ~= nil or string.find(name, "^ThemeManager") ~= nil
+		end
+		N.quiet = true
+		local changed = 0
+		for name, toggle in pairs(Toggles) do
+			local default = toggle.Default
+			if not skip(name) and type(default) == "boolean" and toggle.Value ~= default then
+				pcall(toggle.SetValue, toggle, default)
+				changed += 1
 			end
 		end
-		for name, value in pairs({ SkipAnimations = true, FuseForIndex = true, DeleteOnlyWeaker = true, KeepVariants = true, DiscardOnHatch = true }) do
-			local toggle = Toggles[name]
-			if toggle then
-				pcall(toggle.SetValue, toggle, value)
+		for name, option in pairs(Options) do
+			local kind = option.Type
+			local default = option.Default
+			if not skip(name) and default ~= nil and kind ~= "KeyPicker" and kind ~= "ColorPicker" then
+				if kind == "Dropdown" or type(default) == "table" then
+					local value = default
+					if option.Multi then
+						value = {}
+						for k, v in pairs(default) do
+							if type(k) == "number" then
+								value[v] = true
+							elseif v then
+								value[k] = true
+							end
+						end
+					elseif type(default) == "table" then
+						value = default[1]
+					end
+					pcall(option.SetValue, option, value)
+				else
+					pcall(option.SetValue, option, default)
+				end
+				changed += 1
 			end
 		end
-		log("SETTINGS recommended applied")
-		notify("Corvus", "Recommended settings on: Safe mode (game pace, walking), planner time split, pet care that keeps your team. Switch on the toggles you want running", 6)
+		N.quiet = false
+		N.Mode = nil
+		log("RESET options to defaults", "controls", changed)
+		notify("Corvus", "All hub options are back to their defaults. Saved configs are untouched", 5)
 	end
-	do
+	function N.askReset()
+		Library:ShowConfirmPrompt({
+			Title = "Reset Hub Options",
+			Text = "Reset all options to defaults?",
+			Warning = "Saved configs are not deleted",
+			ConfirmText = "Reset",
+			CancelText = "Cancel",
+			OnConfirm = function()
+				N.resetOptions()
+			end,
+		})
+	end	do
 		-- Main: throwing and training first, then the Status box with "Up next" in plain words.
 		local ThrowBox = Tabs.Main:AddLeftGroupbox("Throw", "target")
 		ThrowBox:AddToggle("AutoThrow", { Text = "Auto Throw", Default = false, Tooltip = "Throws from the launch zone with the game's own Throw button" })
@@ -34745,17 +34810,17 @@ do
 		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
 		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 		StatusBox:AddButton({
-			Text = "Recommended Settings",
-			Tooltip = "Safe mode (game pace, walking), planner time split, pet care that only removes pets weaker than your team. Starts nothing by itself",
-			Func = function()
-				N.applyRecommended()
-			end,
-		})
-		StatusBox:AddButton({
 			Text = "Stop Everything",
 			Tooltip = "Turns every automation off",
 			Func = function()
 				N.stopAll()
+			end,
+		})
+		StatusBox:AddButton({
+			Text = "Reset Hub Options",
+			Tooltip = "Puts every toggle, dropdown, slider and input back to its default. Saved configs are not deleted",
+			Func = function()
+				N.askReset()
 			end,
 		})
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
@@ -35151,12 +35216,15 @@ do
 		end
 	end
 	function N.stopAll()
+		N.quiet = true
 		for _, name in ipairs(N.AllAutoToggles) do
 			local toggle = Toggles[name]
 			if toggle and toggle.Value then
 				toggle:SetValue(false)
 			end
 		end
+		N.quiet = false
+		log("STOP everything")
 		N.Mode = nil
 		notify("Corvus", "Everything is off", 3)
 	end
@@ -35829,6 +35897,47 @@ pcall(function()
 		return string.format("wins %s  \u{00B7}  rebirth %d", formatNumber(N.wins()), N.rebirths())
 	end
 end)
+-- Autoload report and click log. The library applies the autoload config a moment after the Settings tab is built, so the
+-- report and the CLICK hooks wait for it; changes made by the hub itself (Stop Everything, Reset Hub Options) stay quiet.
+task.delay(3, function()
+	local function show(value)
+		if type(value) == "table" then
+			local keys = {}
+			for k, v in pairs(value) do
+				table.insert(keys, tostring(if type(k) == "number" then v else k))
+			end
+			table.sort(keys)
+			return "{" .. table.concat(keys, ",") .. "}"
+		end
+		return tostring(value)
+	end
+	local restored = {}
+	for name, toggle in pairs(Toggles) do
+		if toggle.Value == true and not toggle.Default then
+			table.insert(restored, name)
+		end
+	end
+	table.sort(restored)
+	log("AUTOLOAD toggles=" .. (if #restored > 0 then table.concat(restored, ",") else "-"))
+	local function hook(name, element)
+		local run = element.RunChanged
+		if type(run) ~= "function" or element.Type == "KeyPicker" or element.Type == "ColorPicker" then
+			return
+		end
+		element.RunChanged = function(self, ...)
+			if not N.quiet then
+				log("CLICK", name .. "=" .. show(element.Value))
+			end
+			return run(self, ...)
+		end
+	end
+	for name, toggle in pairs(Toggles) do
+		hook(name, toggle)
+	end
+	for name, option in pairs(Options) do
+		hook(name, option)
+	end
+end)
 do
 	local ErrorLogAt = {}
 	local function reportError(where, err)
@@ -35970,7 +36079,10 @@ do
 			task.wait(0.3)
 			return
 		end
-		N.planTick()
+		-- The planner only samples while an automation runs or the menu is open (it feeds Status and Up next).
+		if anyAutoOn() or Library.Toggled ~= false then
+			N.planTick()
+		end
 		if N.S.data then
 			N.rewardStep()
 			if on("AutoOpenEggs") and choreDue("invEggs", 8) then
