@@ -4634,11 +4634,12 @@ Options = Options or {}
 if Library.ConfirmPrompt and Library.ConfirmPrompt.Parent then
 Library.ConfirmPrompt:Destroy()
 end
+local Extra = if Options.Warning then 64 else 0
 local Root = New("Frame", {
 AnchorPoint = Vector2.new(1, 1),
 BackgroundTransparency = 1,
 Position = UDim2.new(1, 340, 1, -12),
-Size = UDim2.fromOffset(300, 200),
+Size = UDim2.fromOffset(300, 200 + Extra),
 ZIndex = 70,
 Parent = Library.ScreenGui,
 })
@@ -4721,13 +4722,29 @@ TextYAlignment = Enum.TextYAlignment.Top,
 ZIndex = 73,
 Parent = Content,
 })
+if Options.Warning then
+	New("TextLabel", {
+		BackgroundTransparency = 1,
+		FontFace = GetBoldFont,
+		Position = UDim2.fromOffset(14, 140),
+		Size = UDim2.new(1, -28, 0, 60),
+		Text = tostring(Options.Warning),
+		TextColor3 = Color3.fromRGB(255, 140, 60),
+		TextSize = 12,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		ZIndex = 73,
+		Parent = Content,
+	})
+end
 local Confirm = New("TextButton", {
 AutoButtonColor = false,
 BackgroundColor3 = "AccentColor",
 FontFace = GetBoldFont,
-Position = UDim2.fromOffset(12, 154),
+Position = UDim2.fromOffset(12, 154 + Extra),
 Size = UDim2.fromOffset(132, 32),
-Text = Options.ConfirmText or "Confirm",
+Text = Options.ConfirmText or "Confirm", TextWrapped = true,
 TextColor3 = "BackgroundColor",
 TextSize = 14,
 ZIndex = 73,
@@ -4745,7 +4762,7 @@ AutoButtonColor = false,
 BackgroundColor3 = Color3.new(0, 0, 0),
 BackgroundTransparency = 0.6,
 FontFace = GetBoldFont,
-Position = UDim2.fromOffset(156, 154),
+Position = UDim2.fromOffset(156, 154 + Extra),
 Size = UDim2.fromOffset(132, 32),
 Text = Options.CancelText or "Cancel",
 TextColor3 = "FontColor",
@@ -32885,7 +32902,7 @@ end,
 FarmBox:AddToggle("AutoFarmOP", {
 Text = "Auto Farm Everything OP",
 Default = false,
-Tooltip = "Full automatic: the planner sells, fuses, spends points and money for max profit. Can sell or fuse your crates.",
+Tooltip = "The planner sells, fuses, spends points and money for max profit and can sell or fuse your crates. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
 Callback = function(value)
 if value and not Plan.opApproved then
 Plan.opSilent = true
@@ -32895,7 +32912,8 @@ if Plan.uiReady and Library.ShowConfirmPrompt then
 Library:ShowConfirmPrompt({
 Title = "Enable Auto Farm Everything OP?",
 Text = "Full automatic: the planner sells, fuses, spends points and money for max profit. Can sell or fuse your crates.",
-ConfirmText = "Enable OP",
+ConfirmText = "I understand, enable OP",
+Warning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
 CancelText = "Cancel",
 OnConfirm = function()
 log("OP confirmed")
