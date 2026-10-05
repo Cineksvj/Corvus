@@ -31952,13 +31952,21 @@ do
 	N.onRemote("AnimalBankedRemote", function(...)
 		log("BANKED event", ...)
 	end)
+	-- Farm Everything uses Fast (0.36-0.4 s, just above the server's HitCooldown) unless the player picked Blatant
+	function N.hitSpeedPick()
+		local pick = optionText("HitSpeed", "Normal")
+		if on("AutoFarmBest") and pick ~= "Blatant (HIGH RISK OF BAN)" then
+			return "Fast"
+		end
+		return pick
+	end
 	function N.hitRange()
 		local base = N.swingGap()
 		local range = ({
 			Slow = { base + 0.15, base + 0.3 },
 			Fast = { 0.36, 0.4 },
 			["Blatant (HIGH RISK OF BAN)"] = { 0.1, 0.14 },
-		})[optionText("HitSpeed", "Normal")] or { base, base + 0.06 }
+		})[N.hitSpeedPick()] or { base, base + 0.06 }
 		return range[1], range[2]
 	end
 	function N.hitPace()
