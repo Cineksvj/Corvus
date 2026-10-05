@@ -31921,6 +31921,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	craftRarity = { Basic = true, Rare = true, Epic = true, Legendary = true, Mythical = true },
     	questPick = { Index = true, Daily = true, Group = true, Verify = true },
     	autoUfo = false,
+    	petStrike = false,
     	ufoTravel = false,
     	autoBuyWorlds = false,
     	autoSpawnUp = false,
@@ -32345,6 +32346,10 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	fishSince = os.time(),
     	ufoWon = 0,
     	ufoTop3 = 0,
+    	ufoPetFarm = -1,
+    	ufoPetWon = 0,
+    	ufoBeforeRate = -1,
+    	petStrikeKicked = 0,
     }
     
     pcall(function()
@@ -32364,6 +32369,12 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     end
     if (tonumber(Saved.luckStart) or -1) < 0 then
     	Saved.luckStart = tonumber(Saved.eggs) or 0
+    end
+    if (tonumber(Saved.ufoPetFarm) or -1) < 0 then
+    	local farm = tonumber(Saved.farmTime) or 0
+    	Saved.ufoPetFarm = farm
+    	Saved.ufoPetWon = tonumber(Saved.ufoWon) or 0
+    	Saved.ufoBeforeRate = if farm >= 1800 then (tonumber(Saved.ufoWon) or 0) / (farm / 3600) else -1
     end
     
     local Clock = 0
@@ -33735,6 +33746,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     		Saved.earnings = newEarnings()
     		Saved.farmTime = 0
     		Saved.broken = 0
+    		Saved.ufoPetFarm = 0
+    		Saved.ufoPetWon = tonumber(Saved.ufoWon) or 0
     		Saved.earningsSince = os.time()
     		SaveDirty = true
     		saveStats(true)
@@ -33789,6 +33802,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     UI.MoonStatRow = RewardsStatsBox:AddStat({ Icon = GameIcons.MoonChest, Text = "Moon chests", Value = "0", Size = 28 })
     UI.UfoStatRow = RewardsStatsBox:AddStat({ Icon = GameIcons.Alien, Text = "UFOs helped", Value = "0", Size = 28 })
     UI.UfoWonStatRow = RewardsStatsBox:AddStat({ Icon = "trophy", Text = "UFOs won  /  top 3", Value = "0 / 0", Size = 22 })
+    UI.UfoRateStatRow = RewardsStatsBox:AddStat({ Icon = GameIcons.Alien, Text = "Alien Eggs / h  before  /  with pet hits", Value = "- / -", Size = 22 })
     UI.UpgradeStatRow = RewardsStatsBox:AddStat({ Icon = "trending-up", Text = "Upgrades bought", Value = "0", Size = 22 })
     UI.WorldStatRow = RewardsStatsBox:AddStat({ Icon = "globe", Text = "Worlds bought", Value = "0", Size = 22 })
     UI.TreeStatRow = RewardsStatsBox:AddStat({ Icon = "git-branch", Text = "Tree nodes bought", Value = "0", Size = 22 })
@@ -33810,6 +33824,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     		Saved.ufoHits = 0
     		Saved.ufoWon = 0
     		Saved.ufoTop3 = 0
+    		Saved.ufoPetWon = 0
+    		Saved.ufoPetFarm = tonumber(Saved.farmTime) or 0
     		Saved.upgradesBought = 0
     		Saved.worldsBought = 0
     		Saved.treeBought = 0
@@ -33877,7 +33893,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     
     -- every automatic toggle (Stop Everything switches these off); no master switch and no global planner
     Auto.farmNames = {
-    	"AutoFarm", "AutoTap", "FarmWorldOn", "AutoUfo", "UfoTravel", "UfoHop", "AutoBuyWorlds",
+    	"AutoFarm", "AutoTap", "PetStrike", "FarmWorldOn", "AutoUfo", "UfoTravel", "UfoHop", "AutoBuyWorlds",
     	"AutoGift", "AutoPartyEgg", "AutoFruitMachine", "AutoGroupChest", "AutoMoonChest", "AutoKeyCraft",
     	"AutoVipChest", "AutoPartner", "AutoUniverseZone", "AutoQuests", "AutoBen", "AutoCodes", "AutoFriend",
     	"AutoFriendSend", "AutoFriendAccept", "AutoHatch", "EggSmart", "EggAutoTravel", "AutoInvEggs", "IndexHunter",
@@ -33975,6 +33991,15 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     		if not v then
     			lockedTarget = nil
     		end
+    	end,
+    })
+    FarmBox:AddToggle("PetStrike", {
+    	Text = "Pet Strikes Without Walking",
+    	Description = "Test: walking pets hit at once. Try it on an alt first",
+    	Tooltip = "Sends the game's own pet hit for pets that are still walking to their target, at each pet's attack speed. Needs Auto Farm. It checks itself every 60 seconds: if your coins and rubies per second do not rise, or the server rejects the hits, it switches off for this session. Test it on an alt account first.",
+    	Default = false,
+    	Callback = function(v)
+    		S.petStrike = v == true
     	end,
     })
     FarmBox:AddDivider()
@@ -37821,6 +37846,135 @@ end
     			return rank, mine, best
     		end
     
+    		-- the client's pets: workspace.PlayerPets[name] models filtered like the game's getPets (dump 98722-98757)
+    		local PetHit = { ufoLast = setmetatable({}, { __mode = "k" }), strikeLast = setmetatable({}, { __mode = "k" }), mod = nil, modTry = -1e9, ufo = {} }
+    		function PetHit.pets()
+    			local folder = workspace:FindFirstChild("PlayerPets")
+    			folder = folder and folder:FindFirstChild(LocalPlayer.Name)
+    			if not folder then
+    				return {}
+    			end
+    			local list = {}
+    			for _, child in ipairs(folder:GetChildren()) do
+    				if child:IsA("Model") and child.PrimaryPart then
+    					table.insert(list, child)
+    				end
+    			end
+    			if PetHit.mod == nil and os.clock() - PetHit.modTry > 30 then
+    				PetHit.modTry = os.clock()
+    				pcall(function()
+    					PetHit.mod = require(ReplicatedStorage.Modules:WaitForChild("EquippedPetsModule", 5))
+    				end)
+    			end
+    			local mod = PetHit.mod
+    			if type(mod) == "table" and type(mod.FilterRealPetModels) == "function" then
+    				local ok, real = pcall(mod.FilterRealPetModels, LocalPlayer, list)
+    				if ok and type(real) == "table" then
+    					return real
+    				end
+    			end
+    			return list
+    		end
+    		-- per-pet attack cooldown v563 of the client (dump 102583-102607)
+    		function PetHit.cooldown(onMoon)
+    			local tree = tonumber(readData("VariousBoosts", "TreeAttackSpeedMult"))
+    			local mult = if tree and tree == tree and tree >= 1 then math.min(tree, 10) else 1
+    			local pet = tonumber(readData("TrustedStats", "PetAttackSpeedMultiplier"))
+    			pet = if pet and pet == pet and pet >= 0 and pet < math.huge then math.min(pet, 2) else 1
+    			if pet > 1 then
+    				mult *= pet
+    			end
+    			if onMoon then
+    				local moon = tonumber(readData("TrustedStats", "MoonPetAttackSpeedMultiplier"))
+    				if moon and moon == moon and moon >= 0 and moon < math.huge then
+    					mult *= moon
+    				end
+    			end
+    			if mult > 1 then
+    				return math.max(1 / mult, 0.15)
+    			end
+    			return 1
+    		end
+    		function PetHit.ready(last, pet, cd, now)
+    			local t = last[pet]
+    			if t and now - t < cd then
+    				return false
+    			end
+    			last[pet] = now
+    			return true
+    		end
+    		-- UFO: every pet attack on AlienEventEgg fires Hit(pet.Name, ToyInstanceId) (dump 99743-99746); pets the game already
+    		-- has on the UFO orbit (17.6 studs, dump 98705) are left to the game, the ones still walking are added here
+    		function PetHit.ufoPets(hit, egg)
+    			local U = PetHit.ufo
+    			local now = os.clock()
+    			if U.egg ~= egg then
+    				U.egg, U.startAt, U.off, U.compared = egg, now, false, false
+    				U.baseDmg, U.baseAt, U.baseRate, U.petDmg, U.petAt = nil, nil, nil, nil, nil
+    				U.winAt, U.winDmg, U.winPets, U.winHits = now, Ufo.myDmg, {}, 0
+    			end
+    			-- first 5 s clicks only: the damage baseline for the check below
+    			if now - U.startAt < 5 then
+    				if U.baseDmg == nil and Ufo.myDmg then
+    					U.baseDmg, U.baseAt = Ufo.myDmg, now
+    				end
+    				return
+    			end
+    			if U.baseRate == nil then
+    				U.baseRate = if U.baseDmg and Ufo.myDmg and now - U.baseAt > 1 then (Ufo.myDmg - U.baseDmg) / (now - U.baseAt) else false
+    				U.petDmg, U.petAt = Ufo.myDmg, now
+    			end
+    			if U.off then
+    				return
+    			end
+    			local zone = egg:GetAttribute("Zone")
+    			if zone ~= nil and zone ~= readData("BreakableData", "Area") then
+    				return
+    			end
+    			local primary = egg:FindFirstChild("Primary") or egg.PrimaryPart
+    			if not (primary and primary:IsA("BasePart")) then
+    				return
+    			end
+    			local center = primary.Position
+    			if (getCharPos() - center).Magnitude > 60 then
+    				return
+    			end
+    			local cd = PetHit.cooldown(false)
+    			for _, pet in ipairs(PetHit.pets()) do
+    				local pp = pet.PrimaryPart
+    				if pp then
+    					local off = pp.Position - center
+    					if Vector3.new(off.X, 0, off.Z).Magnitude > 25.6 and PetHit.ready(PetHit.ufoLast, pet, cd, now) then
+    						hit:FireServer(pet.Name, pet:GetAttribute("ToyInstanceId"))
+    						U.winPets[pet] = true
+    						U.winHits += 1
+    					end
+    				end
+    			end
+    			if now - U.winAt >= 10 then
+    				local pets = 0
+    				for _ in pairs(U.winPets) do
+    					pets += 1
+    				end
+    				local dmg = if Ufo.myDmg and U.winDmg then formatNumber(Ufo.myDmg - U.winDmg) else "?"
+    				Auto.log("UFO", string.format("hit pets=%d dmg=%s hits=%d cd=%.2f", pets, dmg, U.winHits, cd))
+    				U.winAt, U.winDmg, U.winPets, U.winHits = now, Ufo.myDmg, {}, 0
+    			end
+    			if not U.compared and now - U.startAt >= 20 then
+    				U.compared = true
+    				if type(U.baseRate) == "number" and U.petDmg and Ufo.myDmg and now - U.petAt > 1 then
+    					local rate = (Ufo.myDmg - U.petDmg) / (now - U.petAt)
+    					Auto.log("UFO", string.format("pethit dmg/s=%s->%s", formatNumber(U.baseRate), formatNumber(rate)))
+    					if rate <= U.baseRate then
+    						U.off = true
+    						Auto.log("UFO", "pethit no effect, clicks only for this UFO")
+    					end
+    				else
+    					Auto.log("UFO", "pethit dmg/s=? (not in the top 3, kept on)")
+    				end
+    			end
+    		end
+
     		local function finalizeUfo(result)
     			if Ufo.finalized then
     				return
@@ -37950,6 +38104,10 @@ end
     						Saved.ufoHits += 1
     						SaveDirty = true
     						Ufo.status = "Hitting"
+    						local okPet, errPet = pcall(PetHit.ufoPets, hit, egg)
+    						if not okPet then
+    							diag("ufopet", errPet)
+    						end
     					end
     				end)
     				if not ok then
@@ -37958,6 +38116,238 @@ end
     			end
     		end)
     
+    		-- Pet Strikes Without Walking (opt-in test, blatant.md finding 1): StrikeService.Submit {CoinId, 1, petName, splash?}
+    		-- exactly like StrikeClient.Strike (dump 104129-104190) for pets that are still walking; measures itself every 60 s
+    		local Probe = { state = nil, dead = false, sent = 0, res = 0, flag = 0, nogain = 0, pets = {} }
+    		function Probe.gameSent()
+    			local ok, value = pcall(function()
+    				return LocalPlayer.PlayerScripts["Breakables Breaking Handler"].StrikeClient:GetAttribute("Sent")
+    			end)
+    			return if ok then tonumber(value) or 0 else 0
+    		end
+    		function Probe.snap()
+    			local now = os.clock()
+    			return { at = now, coins = Session.earned.Coins or 0, rubies = Session.earned.Rubies or 0, sent = Probe.sent, res = Probe.res, flag = Probe.flag, game = Probe.gameSent() }
+    		end
+    		function Probe.kill(result, extra)
+    			Probe.dead = true
+    			Probe.state = nil
+    			Auto.log("PROBE", "petstrike result=" .. result .. (if extra then " " .. extra else "") .. " off for this session")
+    			if Toggles.PetStrike and Toggles.PetStrike.Value then
+    				pcall(Toggles.PetStrike.SetValue, Toggles.PetStrike, false)
+    			end
+    		end
+    		-- a breakable the pets are on: within its orbit radius + 2 (dump 98705-98720, 102548)
+    		function Probe.busy(pet, list)
+    			local pp = pet.PrimaryPart
+    			if not pp then
+    				return true
+    			end
+    			for _, b in ipairs(list) do
+    				local part = b.Parent and (b.PrimaryPart or b:FindFirstChild("Primary"))
+    				if part and part:IsA("BasePart") then
+    					local r = math.max(math.sqrt((part.Size.X / 2) ^ 2 + (part.Size.Z / 2) ^ 2) + 4, 6) + 2
+    					local off = part.Position - pp.Position
+    					if Vector3.new(off.X, 0, off.Z).Magnitude <= r then
+    						return true
+    					end
+    				end
+    			end
+    			return false
+    		end
+    		-- collectSplash of the client: up to 12 CoinIds within 30 studs, nearest first, only with the Lightning charm (dump 104038-104107)
+    		function Probe.splash(target, part)
+    			local boost = tonumber(readData("VariousBoosts", "CharmsLightningBoost"))
+    			if not (boost and boost == boost and boost > 0) then
+    				return nil
+    			end
+    			local near = {}
+    			for _, child in ipairs(target.Parent:GetChildren()) do
+    				if child ~= target and child:IsA("Model") and child.Name ~= "AlienEventEgg" then
+    					local id = child:GetAttribute("CoinId")
+    					local p = typeof(id) == "string" and id ~= "" and (child.PrimaryPart or child:FindFirstChild("Primary"))
+    					if p then
+    						local dist = (p.Position - part.Position).Magnitude
+    						if dist <= 30 then
+    							table.insert(near, { id = id, dist = dist })
+    						end
+    					end
+    				end
+    			end
+    			if #near == 0 then
+    				return nil
+    			end
+    			table.sort(near, function(a, b) return a.dist < b.dist end)
+    			local ids = {}
+    			for i = 1, math.min(#near, 12) do
+    				ids[i] = near[i].id
+    			end
+    			return ids
+    		end
+    		function Probe.fire(now)
+    			local submit = Auto.knitRemote("StrikeService", "RE", "Submit")
+    			if not submit then
+    				return
+    			end
+    			local zone = readData("BreakableData", "Area")
+    			if type(zone) ~= "string" or zone == "" then
+    				zone = Stats.lastArea
+    			end
+    			if type(zone) ~= "string" or zone == "" then
+    				return
+    			end
+    			local list = getCachedBreakables(zone)
+    			local target = nil
+    			local root = getCharPos()
+    			if lockedTarget and isLockValid(lockedTarget) then
+    				local pos = getModelPosition(lockedTarget)
+    				if pos and (pos - root).Magnitude <= 40 then
+    					target = lockedTarget
+    				end
+    			end
+    			if not target then
+    				for _, e in ipairs(getSortedTargets(list)) do
+    					if e.dist <= 40 and isLockValid(e.target) then
+    						target = e.target
+    						break
+    					end
+    				end
+    			end
+    			if not (target and target.Name ~= "AlienEventEgg") then
+    				return
+    			end
+    			local coinId = target:GetAttribute("CoinId")
+    			local part = target.PrimaryPart or target:FindFirstChild("Primary")
+    			if typeof(coinId) ~= "string" or coinId == "" or not part then
+    				return
+    			end
+    			local cd = PetHit.cooldown(target.Parent ~= nil and target.Parent.Name == "TheMoon")
+    			local splash = Probe.splash(target, part)
+    			local packet = {}
+    			for _, pet in ipairs(PetHit.pets()) do
+    				if #packet >= 96 then
+    					break
+    				end
+    				if not Probe.busy(pet, list) and PetHit.ready(PetHit.strikeLast, pet, cd, now) then
+    					local entry = { coinId, 1, pet.Name }
+    					if splash then
+    						entry[4] = splash
+    					end
+    					table.insert(packet, entry)
+    					Probe.pets[pet] = true
+    				end
+    			end
+    			if #packet > 0 then
+    				submit:FireServer(packet)
+    				Probe.sent += #packet
+    			end
+    		end
+    		function Probe.window()
+    			local a, b = Probe.base, Probe.snap()
+    			local w = Probe.win
+    			local secs = math.max(b.at - w.at, 1)
+    			local coins, rubies = (b.coins - w.coins) / secs, (b.rubies - w.rubies) / secs
+    			local sent = b.sent - w.sent
+    			local expect = sent + (b.game - w.game)
+    			local res = b.res - w.res
+    			local flag = b.flag - w.flag
+    			local recv = if expect > 0 then res / expect else 1
+    			local flagRate = if res > 0 then flag / res else 0
+    			local pets = 0
+    			for _ in pairs(Probe.pets) do
+    				pets += 1
+    			end
+    			Probe.pets = {}
+    			local gain = (a.coins > 0 and coins >= a.coins * 1.05) or (a.rubies > 0 and rubies >= a.rubies * 1.05)
+    			local stats = string.format("sent=%d pets=%d recv=%.2f flag32=%.2f coins/s=%s->%s rubies/s=%s->%s", sent, pets, recv, flagRate, formatNumber(a.coins), formatNumber(coins), formatNumber(a.rubies), formatNumber(rubies))
+    			Probe.win = b
+    			if sent >= 50 and (recv < 0.9 or flagRate > a.flagRate + 0.1) then
+    				Probe.kill("rejected", stats)
+    				return
+    			end
+    			if gain then
+    				Probe.nogain = 0
+    				Auto.log("PROBE", "petstrike result=gain " .. stats)
+    			else
+    				Probe.nogain += 1
+    				Auto.log("PROBE", "petstrike result=nogain " .. stats)
+    				if Probe.nogain >= 3 then
+    					Probe.kill("nogain")
+    				end
+    			end
+    		end
+    		task.spawn(function()
+    			pcall(function()
+    				Library:GiveSignal(game:GetService("GuiService").ErrorMessageChanged:Connect(function(message)
+    					if Probe.state == "test" then
+    						Saved.petStrikeKicked = os.time()
+    						SaveDirty = true
+    						pcall(saveStats, true)
+    						Probe.kill("kicked", "msg=" .. tostring(message))
+    					end
+    				end))
+    			end)
+    			while alive() do
+    				task.wait(0.1)
+    				local ok, err = pcall(function()
+    					if not S.petStrike or Probe.dead or not S.autoFarm or (S.autoUfo and Ufo.engaged) then
+    						if Probe.state then
+    							Auto.log("PROBE", "petstrike paused")
+    						end
+    						Probe.state = nil
+    						return
+    					end
+    					local now = os.clock()
+    					if Probe.state == nil then
+    						if (tonumber(Saved.petStrikeKicked) or 0) > 0 then
+    							Probe.kill("blocked", "(kicked on " .. os.date("%Y-%m-%d %H:%M", Saved.petStrikeKicked) .. ")")
+    							return
+    						end
+    						if ReplicatedStorage:GetAttribute("ServerStrikeAuthority") ~= true then
+    							Probe.kill("inactive", "(ServerStrikeAuthority off)")
+    							return
+    						end
+    						hookEvent("petStrikeResults", "StrikeService", "Results", function(list)
+    							if type(list) ~= "table" then
+    								return
+    							end
+    							for _, v in ipairs(list) do
+    								if type(v) == "table" then
+    									Probe.res += 1
+    									if typeof(v[4]) == "number" and bit32.band(v[4], 32) ~= 0 then
+    										Probe.flag += 1
+    									end
+    								end
+    							end
+    						end)
+    						Probe.state = "base"
+    						Probe.win = Probe.snap()
+    						Auto.log("PROBE", "petstrike start, 60 s baseline without strikes")
+    						return
+    					end
+    					if Probe.state == "base" then
+    						if now - Probe.win.at >= 60 then
+    							local b, w = Probe.snap(), Probe.win
+    							local secs = math.max(b.at - w.at, 1)
+    							local res = b.res - w.res
+    							Probe.base = { coins = (b.coins - w.coins) / secs, rubies = (b.rubies - w.rubies) / secs, flagRate = if res > 0 then (b.flag - w.flag) / res else 0 }
+    							Probe.win = b
+    							Probe.state = "test"
+    							Auto.log("PROBE", string.format("petstrike baseline coins/s=%s rubies/s=%s flag32=%.2f, strikes on", formatNumber(Probe.base.coins), formatNumber(Probe.base.rubies), Probe.base.flagRate))
+    						end
+    						return
+    					end
+    					Probe.fire(now)
+    					if now - Probe.win.at >= 60 then
+    						Probe.window()
+    					end
+    				end)
+    				if not ok then
+    					diag("petstrike", err)
+    				end
+    			end
+    		end)
+
     		local function ufoTrip()
     			local world = Ufo.needTravel
     			if not world then return end
@@ -45222,6 +45612,12 @@ end
     			setStat(UI.HookSentRow, nil, formatNumber(Saved.webhooksSent))
     			setStat(UI.UfoStatRow, nil, formatNumber(Saved.ufoBroken))
     			setStat(UI.UfoWonStatRow, nil, string.format("%s / %s", formatNumber(tonumber(Saved.ufoWon) or 0), formatNumber(tonumber(Saved.ufoTop3) or 0)))
+    			do
+    				local before = tonumber(Saved.ufoBeforeRate) or -1
+    				local hours = ((tonumber(Saved.farmTime) or 0) - (tonumber(Saved.ufoPetFarm) or 0)) / 3600
+    				local won = (tonumber(Saved.ufoWon) or 0) - (tonumber(Saved.ufoPetWon) or 0)
+    				setStat(UI.UfoRateStatRow, nil, string.format("%s / %s", if before >= 0 then string.format("%.2f", before) else "-", if hours >= 0.25 and won >= 0 then string.format("%.2f", won / hours) else "-"))
+    			end
     			setStat(UI.UpgradeStatRow, nil, formatNumber(Saved.upgradesBought))
     			setStat(UI.WorldStatRow, nil, formatNumber(Saved.worldsBought))
     			setStat(UI.TreeStatRow, nil, formatNumber(Saved.treeBought))
