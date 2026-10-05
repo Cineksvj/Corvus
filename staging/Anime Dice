@@ -23443,14 +23443,10 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                 }
     
                 local ResizeTween
+                local ResizeTarget
                 local CollapseArrowTween
-    
+
                 function Groupbox:Resize()
-                    if ResizeTween then
-                        StopTween(ResizeTween, true)
-                        ResizeTween = nil
-                    end
-    
                     local TopSize = (GroupboxTop.AbsoluteSize.Y / Library.DPIScale)
                     local ContainerSize = (GroupboxList.AbsoluteContentSize.Y / Library.DPIScale) + 14
                     if Groupbox.PoppedOut then
@@ -23460,7 +23456,19 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                     local TargetSize = UDim2.new(1, 0, 0, if Groupbox.Collapsed then TopSize else (TopSize + 1 + ContainerSize))
                     GroupboxContainer.Size = UDim2.new(1, 0, 0, ContainerSize)
                     GroupboxLine.Visible = not Groupbox.Collapsed
-    
+
+                    -- live labels fire AbsoluteContentSize often: keep a running tween to the same size, skip a resize to the current size
+                    if ResizeTween then
+                        if ResizeTarget == TargetSize then
+                            return
+                        end
+                        StopTween(ResizeTween, true)
+                        ResizeTween = nil
+                    elseif GroupboxHolder.Size == TargetSize then
+                        return
+                    end
+                    ResizeTarget = TargetSize
+
                     if Library.Animations and Library.Animations.Groupbox then
                         local TweenInfo = Library.GroupboxTweenInfo or TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
                         local Tween = TweenService:Create(GroupboxHolder, TweenInfo, { Size = TargetSize })
@@ -27678,7 +27686,7 @@ end
                 if Info.AutoLoad ~= false then
                     task.defer(function()
                         pcall(SaveManager.LoadAutoloadConfig, SaveManager)
-                        if Library.OnAutoload then pcall(Library.OnAutoload) end
+                        Library:FireAutoload()
                     end)
                 end
             end
@@ -31425,6 +31433,147 @@ end
 			return Result
 		end
 	end
+	-- CORVUS-STARTLOG: standard owner log lines for every hub. The hub sets Library.LoadLogger (its log function);
+	-- BOOT comes from the hub, START + AUTOLOAD + CLICK come from here unless the hub set its own OnAutoload/OnUserToggle.
+	-- A hub that logs these itself opts out with Library.OnAutoload = false / Library.OnUserToggle = nil.
+	function Library:CorvusLog(Line: string)
+		if typeof(Library.LoadLogger) == "function" then
+			pcall(Library.LoadLogger, tostring(Line))
+		end
+	end
+	local function TogglesOn(): { string }
+		local Names = {}
+		for Name, Toggle in Library.Toggles do
+			if typeof(Name) == "string" and typeof(Toggle) == "table" and Toggle.Value == true then
+				table.insert(Names, Name)
+			end
+		end
+		table.sort(Names)
+		return Names
+	end
+	function Library:LogStart()
+		if Library.StartLogged then
+			return
+		end
+		Library.StartLogged = true
+		local Total, On = 0, #TogglesOn()
+		for Name in Library.Toggles do
+			if typeof(Name) == "string" then
+				Total += 1
+			end
+		end
+		local Shown = CorvusLoadTimes.shown
+		Library:CorvusLog(string.format(
+			"START hub loaded | place %s | toggles %d on of %d | window %ss",
+			tostring(game.PlaceId), On, Total, if Shown then string.format("%.1f", Shown - CorvusLoadT0) else "-"
+		))
+	end
+	function Library:FireAutoload()
+		if Library.AutoloadFired then
+			return
+		end
+		Library.AutoloadFired = true
+		Library:LogStart()
+		local Hook = Library.OnAutoload
+		if Hook == false then
+			return
+		end
+		if typeof(Hook) == "function" then
+			pcall(Hook)
+			return
+		end
+		local Names = TogglesOn()
+		Library:CorvusLog("AUTOLOAD toggles=" .. (if #Names > 0 then table.concat(Names, ",") else "-"))
+	end
+	Library.OnUserToggle = function(Name, Value)
+		Library:CorvusLog("CLICK " .. tostring(Name) .. "=" .. tostring(Value))
+	end
+	do
+		local BaseCreateWindowLog = Library.CreateWindow
+		function Library:CreateWindow(...)
+			local Window = BaseCreateWindowLog(self, ...)
+			if not Library.StartFallback then
+				Library.StartFallback = true
+				task.delay(20, function()
+					if not Library.Unloaded then
+						Library:LogStart()
+					end
+				end)
+			end
+			return Window
+		end
+	end
+	-- Quick Start rule: a second control for an existing toggle in another groupbox. Both stay in sync both ways,
+	-- the original keeps the only callback and the only config key (the mirror is not in Library.Toggles).
+	function Library:MirrorToggle(Idx: string, Box: any, Opts: any?)
+		Opts = if typeof(Opts) == "table" then Opts else {}
+		local Original = Library.Toggles[Idx]
+		if typeof(Original) ~= "table" or typeof(Box) ~= "table" or typeof(Box.AddToggle) ~= "function" then
+			return nil
+		end
+		local Key = {}
+		local Mirror = Box:AddToggle(Key, {
+			Text = Opts.Text or Original.Text,
+			Description = Opts.Description,
+			Tooltip = Opts.Tooltip or Original.Tooltip,
+			DisabledTooltip = Original.DisabledTooltip,
+			Risky = Original.Risky,
+			Default = Original.Value == true,
+		})
+		Library.Toggles[Key] = nil
+		if not Mirror then
+			return nil
+		end
+		Mirror.MirrorOf = Idx
+		local ShowValue = Mirror.SetValue
+		local Syncing = false
+		local function Sync()
+			if Syncing or Mirror.Destroyed then
+				return
+			end
+			Syncing = true
+			if Mirror.Value ~= Original.Value then
+				pcall(ShowValue, Mirror, Original.Value)
+			end
+			Syncing = false
+		end
+		local BaseSet = Original.SetValue
+		Original.SetValue = function(Self, Value)
+			BaseSet(Self, Value)
+			Sync()
+		end
+		local BaseDisabled = Original.SetDisabled
+		if typeof(BaseDisabled) == "function" then
+			Original.SetDisabled = function(Self, Disabled)
+				BaseDisabled(Self, Disabled)
+				if not Mirror.Destroyed then
+					pcall(Mirror.SetDisabled, Mirror, Disabled)
+				end
+			end
+			if Original.Disabled then
+				pcall(Mirror.SetDisabled, Mirror, true)
+			end
+		end
+		-- the mirror's own switch (click, quick bar) drives the original; Sync then repaints the mirror
+		Mirror.SetValue = function(_, Value)
+			Original:SetValue(Value)
+		end
+		local Holder = Mirror.Holder
+		if typeof(Holder) == "Instance" and Holder:IsA("GuiButton") then
+			table.insert(Mirror.Connections, Holder.MouseButton1Click:Connect(function()
+				-- deferred so the value is the one after the click, whatever order the connections fire in
+				task.defer(function()
+					if not Original.Disabled and Library.OnUserToggle then
+						pcall(Library.OnUserToggle, Idx, Original.Value)
+					end
+				end)
+			end))
+			table.insert(Mirror.Connections, Holder.MouseButton2Click:Connect(function()
+				Library:StartQuickBind("Toggle", Idx, tostring(Original.Text))
+			end))
+		end
+		return Mirror
+	end
 	getgenv().CorvusLibrary = Library
     return Library
     end)()
@@ -31911,21 +32060,27 @@ do
 		return if type(value) == "string" and value ~= "" then value else default
 	end
 	Status = "Idle"
+	-- STATUS goes to the log only when the kind of work changes: numbers are masked, so "floor 41" -> "floor 42" or a
+	-- new roll count is not a new line (the 2026-10-05 owner log had 800 STATUS lines in 12 minutes).
 	local StatusSeen, StatusSeenCount = {}, 0
+	function N.statusShape(text)
+		return (string.gsub(tostring(text), "%d[%d,%.]*%a?", "#"))
+	end
 	function setStatus(text)
 		if Status ~= text then
 			local now = os.clock()
-			if now - (StatusSeen[text] or -1e9) > 4 then
+			local shape = N.statusShape(text)
+			if shape ~= N.statusShape(Status) and now - (StatusSeen[shape] or -1e9) > 60 then
 				log("STATUS", text)
-			end
-			if not StatusSeen[text] then
-				StatusSeenCount += 1
-				if StatusSeenCount > 400 then
-					table.clear(StatusSeen)
-					StatusSeenCount = 0
+				if not StatusSeen[shape] then
+					StatusSeenCount += 1
+					if StatusSeenCount > 400 then
+						table.clear(StatusSeen)
+						StatusSeenCount = 0
+					end
 				end
+				StatusSeen[shape] = now
 			end
-			StatusSeen[text] = now
 			Log.statusAt = now
 		end
 		Status = text
@@ -32223,8 +32378,13 @@ do
 		end
 		for _, name in ipairs({ "Jackpot Spin", "Lucky Spin" }) do
 			if selected(Options.SpinTypes, name) and N.amount(name) > 0 then
+				-- A spin multiplies the luck of one roll: inside a Luck Event (x2.5 luck) the same spin is worth 2.5x.
+				if N.holdForEvent and N.holdForEvent("Luck Event", "spins") then
+					return
+				end
 				fire(R.spin, name)
 				Session.spins += 1
+				log("SPIN used", name, "left", N.amount(name) - 1, "weather", tostring(N.weatherNow and N.weatherNow() or "none"))
 				task.wait(0.4)
 				return
 			end
@@ -32539,30 +32699,69 @@ do
 	-- With high luck the game stops rolling plain low units but still rolls their Silver/Gold versions, so nearly
 	-- every roll is "mutated". Only the mutations picked in Keep Mutations are protected, the rest is judged by value.
 	N.MutationNames = { "Silver", "Gold", "Emerald", "Diamond", "Ruby", "Rainbow" }
-	-- relax 1 (storage full, rolling blocked): the extra best units are not kept any more.
-	-- relax 2: mutations picked in Keep Mutations may go too. Plot, team, locked and rare units are never sold.
-	function N.sellPlan(relax)
+	-- Keep policy per mutation (telemetry 2026-10-05: 153 units kept "by mutation" filled the storage and blocked
+	-- rolling 11-29 % of the time):
+	--   Keep Mutations      = soft keep: kept while there is room. When the storage is full and rolling is blocked,
+	--                         the lowest value ones go first, only as many as needed to free room.
+	--   Never Sell Mutations = protect list: never sold (with Keep Rarity, plot, team and locked units).
+	-- relax 1 (rolling blocked): the extra best copies may go. relax 2: soft-kept mutations may go too.
+	-- need = how many units must go: the relaxed ones are only added (lowest value first) until the plan reaches it.
+	function N.sellPlan(relax, need)
 		relax = relax or 0
 		local list = N.units()
-		local keepTop = #N.unlockedSlots() + (if relax >= 1 then 0 else math.floor(optionNumber("KeepExtra", 4)))
+		local slots = #N.unlockedSlots()
+		local keepTop = slots + math.floor(optionNumber("KeepExtra", 4))
 		local keepRank = N.rarityRank(optionText("KeepRarity", "Celestial"))
-		local plan = {}
-		local why = { best = 0, plot = 0, team = 0, locked = 0, mutation = 0, rarity = 0, op = 0 }
+		local plan, soft = {}, {}
+		local why = { best = 0, plot = 0, team = 0, locked = 0, mutation = 0, protected = 0, rarity = 0, op = 0 }
 		for i, info in ipairs(list) do
-			local reason = if i <= keepTop
+			local extra = i > slots and i <= keepTop
+			local reason = if i <= slots
 				then "best"
 				elseif info.slot ~= nil then "plot"
 				elseif info.team then "team"
 				elseif info.locked then "locked"
-				elseif relax < 2 and info.mutation and selected(Options.KeepMutations, info.mutation) then "mutation"
+				elseif info.mutation and selected(Options.ProtectMutations, info.mutation) then "protected"
 				elseif keepRank > 0 and N.rarityRank(info.rarity) >= keepRank then "rarity"
+				elseif extra then "best"
+				elseif info.mutation and selected(Options.KeepMutations, info.mutation) then "mutation"
 				else nil
+			local softKind = nil
+			if reason == "best" and extra then
+				softKind = if info.mutation and selected(Options.KeepMutations, info.mutation) then "mutation" else "extra"
+			elseif reason == "mutation" then
+				softKind = "mutation"
+			end
+			if (softKind == "extra" and relax >= 1) or (softKind == "mutation" and relax >= 2) then
+				table.insert(soft, { info = info, kind = softKind })
+			end
 			if reason then
 				why[reason] += 1
 			else
 				table.insert(plan, info)
 			end
 		end
+		local relaxed = { extra = 0, mutation = 0 }
+		if #soft > 0 then
+			-- Extra copies before kept mutations, each lowest value first.
+			table.sort(soft, function(a, b)
+				if a.kind ~= b.kind then
+					return a.kind == "extra"
+				end
+				if a.info.income ~= b.info.income then
+					return a.info.income < b.info.income
+				end
+				return tostring(a.info.key) < tostring(b.info.key)
+			end)
+			for _, item in ipairs(soft) do
+				if need and #plan >= need then
+					break
+				end
+				table.insert(plan, item.info)
+				relaxed[item.kind] += 1
+			end
+		end
+		N.Sell.relaxed = relaxed
 		if relax == 0 then
 			N.Sell.why = why
 		end
@@ -32577,23 +32776,33 @@ do
 			return false
 		end
 		N.Sell.at = os.clock()
-		local relax = 0
-		if N.Roll.fullSince then
-			local stuck = os.clock() - N.Roll.fullSince
-			-- Extra copies earn nothing while rolling is blocked (new drops refill any slot a rebirth opens), so they go
-			-- at once. Kept mutations are the player's own protection and only go after 2 minutes.
-			relax = if stuck > 120 then 2 else 1
+		local relax, need = 0, nil
+		if on("AutoRoll") and N.inventoryFull() then
+			-- Rolling is blocked: units off the plot earn nothing, so free room at once. Extra copies go first, then
+			-- the soft-kept mutations, lowest value first, until the storage is back under "Sell When Storage Is"
+			-- (at least a few rolls of room so it does not stop again after one roll). The protect list stays.
+			relax = 2
+			local target = math.floor(N.storage() * math.clamp(optionNumber("SellAt", 80), 10, 100) / 100)
+			local rolls = math.max(N.buff("Rolls", 1) or 1, 1)
+			need = math.max(N.UnitCache.count - math.min(target, N.storage() - rolls * 5), rolls * 5)
 		end
-		local plan = N.sellPlan(relax)
-		if relax > 0 and #plan > 0 then
-			log("SELL storage stuck, selling kept units too (relax " .. relax .. ")", #plan)
+		local plan = N.sellPlan(relax, need)
+		local relaxed = N.Sell.relaxed or { extra = 0, mutation = 0 }
+		if relax > 0 and relaxed.extra + relaxed.mutation > 0 then
+			log(string.format("SELL storage full, rolling blocked: %d weak, %d extra copies, %d kept-mutation units (lowest value first, Never Sell list kept)", #plan - relaxed.extra - relaxed.mutation, relaxed.extra, relaxed.mutation))
 		end
 		if #plan == 0 then
+			N.sellPlan(0)
 			local why = N.Sell.why or {}
 			local text = string.format(
-				"nothing to sell, kept: %d best, %d on plot, %d team, %d locked, %d by mutation, %d by rarity, %d excluded",
-				why.best or 0, why.plot or 0, why.team or 0, why.locked or 0, why.mutation or 0, why.rarity or 0, why.op or 0
+				"nothing to sell, kept: %d best, %d on plot, %d team, %d locked, %d soft mutation, %d never-sell mutation, %d by rarity",
+				why.best or 0, why.plot or 0, why.team or 0, why.locked or 0, why.mutation or 0, why.protected or 0, why.rarity or 0
 			)
+			if relax > 0 then
+				-- Only the player's own protection is left: say so once and show it in Status, never sell it.
+				text = "storage full of protected units, rolling waits: " .. text .. " (loosen Never Sell Mutations or Always Keep From Rarity)"
+				setStatus("Storage full of protected units, loosen the Never Sell lists")
+			end
 			if text ~= N.Sell.lastWhy then
 				N.Sell.lastWhy = text
 				log("SELL", text)
@@ -32844,6 +33053,83 @@ end
 do
 	local R = N.R
 	N.Reward = { at = {}, codesTried = {}, groupChecked = nil, log = {}, claimTries = {} }
+	-- Weather (WeatherService, dump line 43947): every 900-1800 s the server starts a random event for 300 s and
+	-- puts its model (named like the event) into workspace; the ActiveWeather property sends {name, startedAt,
+	-- duration}. Luck Event = Luck x2.5, Cash Event = Money x2.5 (multiplier bucket, stacks with everything).
+	N.WeatherNames = { "Luck Event", "Cash Event", "Roll Speed Event", "Trait Event", "Grade Event" }
+	N.Weather = { value = nil, current = nil, lastSeen = {}, start = os.clock(), heldAt = {} }
+	N.onRemote("WeatherService/RP/ActiveWeather", function(value)
+		N.Weather.value = if type(value) == "table" then value else false
+	end)
+	function N.weatherNow()
+		local W = N.Weather
+		if type(W.value) == "table" and type(W.value.name) == "string" then
+			local left = 1
+			pcall(function()
+				left = (tonumber(W.value.startedAt) or 0) + (tonumber(W.value.duration) or 300) - workspace:GetServerTimeNow()
+			end)
+			if left > 0 then
+				return W.value.name
+			end
+		end
+		for _, name in ipairs(N.WeatherNames) do
+			if workspace:FindFirstChild(name) then
+				return name
+			end
+		end
+		return nil
+	end
+	-- Called every few seconds: logs the start and end of every event and remembers when each kind was last seen.
+	function N.weatherTick()
+		local W = N.Weather
+		local now = N.weatherNow()
+		if now then
+			W.lastSeen[now] = os.clock()
+		end
+		if now ~= W.current then
+			log("WEATHER", if now then now .. " started" else tostring(W.current) .. " ended")
+			W.current = now
+		end
+		return now
+	end
+	-- True while an item should wait for its event. Never longer than 3 h after that event was last seen (or the hub
+	-- started): the same event kind comes back about every 2.3 h on average, so items never pile up for good.
+	function N.holdForEvent(event, what)
+		if not on("WaitForEvents") then
+			return false
+		end
+		local W = N.Weather
+		if N.weatherNow() == event then
+			return false
+		end
+		if os.clock() - (W.lastSeen[event] or W.start) > 10800 then
+			return false
+		end
+		if os.clock() - (W.heldAt[what] or -1e9) > 600 then
+			W.heldAt[what] = os.clock()
+			log("WEATHER holding", what, "for the next", event)
+		end
+		return true
+	end
+	function N.boostEvent(category)
+		category = tostring(category)
+		if string.find(category, "Luck", 1, true) and not string.find(category, "Trait", 1, true) and not string.find(category, "Grade", 1, true) then
+			return "Luck Event"
+		elseif string.find(category, "Income", 1, true) or string.find(category, "Money", 1, true) or string.find(category, "Cash", 1, true) then
+			return "Cash Event"
+		end
+		return nil
+	end
+	-- Quest targets (QuestConfig, dump line 32025): daily 2 towers / 1000 rolls / 500 sold, weekly 15 / 7500 / 5000.
+	-- True while a quest of this kind is not reached and not claimed yet.
+	function N.questNeeds(id)
+		for _, quest in ipairs(N.questList()) do
+			if quest.id == id and not quest.claimed and quest.progress < quest.target then
+				return true, quest
+			end
+		end
+		return false, nil
+	end
 	local function due(key, seconds)
 		local at = N.Reward.at
 		if os.clock() >= (at[key] or 0) then
@@ -32882,7 +33168,10 @@ do
 	-- Known codes: HubRepo .. "Codes" ({ game: [codes] }) is fetched at start and every 6 h. Each code is redeemed once
 	-- per account (2 s apart) through CodesService/RE/RedeemCode; the result is the game's own RedeemedCodes data.
 	-- Redeemed and invalid codes are remembered in Corvus/AD_codes_<UserId>.json.
-	N.Codes = { known = {}, state = { redeemed = {}, invalid = {} }, fetchedAt = -1e9, sentAt = -1e9, loaded = false, noRepoLogged = false }
+	-- Built-in copy of tools/codes/Codes.json (build.py fills it), so the codes work even when the online list is not
+	-- reachable; the online list adds newer codes on top.
+	N.BuiltInCodes = { "JPCALLING", "UPDATE6", "400KLIKES", "UPDATE5", "250KLIKES", "100KLIKES", "40KCCU", "30KCCU", "UPDATE4", "20KCCU", "10KCCU", "5KCCU", "1KCCU", "UPDATE3", "UPDATE2", "UPDATE1", "RELEASE" }
+	N.Codes = { known = table.clone(N.BuiltInCodes), state = { redeemed = {}, invalid = {} }, fetchedAt = -1e9, sentAt = -1e9, loaded = false, noRepoLogged = false }
 	local CodeFile = "Corvus/AD_codes_" .. tostring(LocalPlayer.UserId) .. ".json"
 	local function loadCodes()
 		local C = N.Codes
@@ -32925,7 +33214,7 @@ do
 			data = if okJson then decoded else nil
 		end
 		if type(data) ~= "table" then
-			log("CODES list unreadable")
+			log("CODES online list unreachable, using", #C.known, "built-in codes")
 			return false
 		end
 		local list = data[GameName] or data["Anime Dice"]
@@ -33146,12 +33435,16 @@ do
 				end
 			end
 		end
-		for _, pick in pairs(best) do
-			fire(R.boost, pick.key)
-			Session.boosts += 1
-			log("BOOST used", pick.name)
-			task.wait(0.4)
-			return true
+		for category, pick in pairs(best) do
+			-- Luck boosts start inside a Luck Event, income boosts inside a Cash Event (x2.5 on top), when picked.
+			local event = N.boostEvent(category)
+			if not (event and N.holdForEvent(event, category .. " boosts")) then
+				fire(R.boost, pick.key)
+				Session.boosts += 1
+				log("BOOST used", pick.name, "weather", tostring(N.weatherNow() or "none"))
+				task.wait(0.4)
+				return true
+			end
 		end
 		return false
 	end
@@ -34265,9 +34558,30 @@ do
 		end
 		return total
 	end
+	-- Towers run while Auto Tower is on, or while Claim Quests is on and a tower quest (daily 2, weekly 15 = 25
+	-- tickets) is not reached yet: those tickets are worth having even when nothing else needs towers.
+	function N.towerWanted()
+		if on("AutoTower") then
+			return true, nil
+		end
+		if on("AutoQuests") then
+			local need, quest = N.questNeeds("Towers")
+			if need then
+				return true, quest
+			end
+		end
+		return false, nil
+	end
 	function N.towerRun()
 		if T.running then
 			return false
+		end
+		local wanted, quest = N.towerWanted()
+		if not wanted then
+			return false
+		end
+		if quest and not on("AutoTower") then
+			log("QUEST", quest.period, "tower quest", quest.progress .. "/" .. quest.target, "- running a tower for it")
 		end
 		local tower, problem = N.pickTower()
 		if not tower then
@@ -34284,19 +34598,38 @@ do
 			task.wait(1.2)
 		end
 		local ok, started = invoke(R.playTower, 10, tower.name)
+		local pending = nil
 		if not ok or started ~= true then
-			T.lastText = "Could not start " .. tower.name .. " (needs a tower team, retrying)"
-			task.wait(3.5)
-			return false
+			-- The server refuses PlayTower while it still holds a run for us (TowerService line 38497, u68[player]):
+			-- after a hub restart mid-run that run waits forever (owner log 2026-10-05: 80 refused PlayTower calls).
+			-- Ask for the next floor: if a run is open it goes on (or ends if it was cancelled) instead of blocking.
+			local okFloor, sequence = invoke(R.floor, 10)
+			if okFloor and type(sequence) == "table" then
+				pending = sequence
+				T.failStreak = 0
+				log("TOWER picked up a run the server still had open")
+			else
+				T.failStreak = (T.failStreak or 0) + 1
+				T.lastText = "Could not start " .. tower.name .. " (needs a tower team, retrying)"
+				task.wait(math.min(3.5 * 2 ^ math.min(T.failStreak - 1, 4), 60))
+				return false
+			end
+		else
+			T.failStreak = 0
 		end
 		T.running, T.name, T.floor = true, tower.name, 0
 		Session.towerRuns += 1
 		local rewards = {}
-		local finished, misses = false, 0
+		local finished, misses, endedRun = false, 0, false
 		-- An error in the loop must never leave T.running stuck on (the tower would never run again).
 		local loopOk, loopError = pcall(function()
-			while alive() and on("AutoTower") do
-				local okFloor, sequence = invoke(R.floor, 10)
+			while alive() and N.towerWanted() do
+				local okFloor, sequence
+				if pending then
+					okFloor, sequence, pending = true, pending, nil
+				else
+					okFloor, sequence = invoke(R.floor, 10)
+				end
 				if not okFloor or type(sequence) ~= "table" then
 					misses += 1
 					if misses > 40 then
@@ -34320,6 +34653,7 @@ do
 					setStatus(string.format("%s  \u{00B7}  floor %d", tower.name, T.floor))
 					task.wait(N.sequenceWait(sequence) + 0.05)
 					if ended then
+						endedRun = true
 						finished = tower.maxFloors ~= nil and T.floor >= tower.maxFloors
 						break
 					end
@@ -34329,7 +34663,7 @@ do
 		if not loopOk then
 			log("ERROR", "tower run", tostring(loopError))
 		end
-		if not on("AutoTower") or not loopOk then
+		if (not endedRun and (not alive() or not N.towerWanted())) or not loopOk then
 			invoke(R.cancelTower, 5)
 		end
 		if finished then
@@ -34401,8 +34735,9 @@ do
 	Tabs.Towers = Tabs.Upgrades
 	Tabs.Rewards = N.addTab("Rewards", "gift", "Daily, codes, quests, tickets, boosts and rerolls")
 	Tabs.Items = Tabs.Rewards
-	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and rates")
-	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts")
+	-- Stats and Webhook share one tab (packed tabs: each alone had too few controls).
+	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress, rates and Discord webhook posts")
+	Tabs.Webhook = Tabs.Stats
 	if Window.AddMiscTab then
 		pcall(function()
 			Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
@@ -34410,38 +34745,26 @@ do
 	end
 	Labels = {}
 	do
-			local QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "sparkles")
-			-- No master switch and no preset: every automation is its own toggle and starts off.
-			QuickBox:AddToggle("AutoRoll", {
-				Text = "Auto Roll (Fast)",
-				Default = false,
-				Tooltip = "Rolls again the moment the server allows it, without waiting for the roll animation. Turns the game's own slower auto roll off",
-			})
-			QuickBox:AddLabel({
-				Text = '<font transparency="0.35">Every automation is its own switch in the tabs. Nothing turns on by itself.</font>',
-				DoesWrap = true,
-			})
-			QuickBox:AddButton({
-				Text = "Stop Everything",
-				Tooltip = "Turns every automation off",
-				Func = function()
-					N.stopAll()
-				end,
-			})
-			QuickBox:AddButton({
-				Text = "Reset Hub Options",
-				Tooltip = "Puts every toggle, dropdown, slider and input back to its default. Saved configs are not deleted",
-				Func = function()
-					N.askReset()
-				end,
-			})
-		local RollBox = Tabs.Main:AddRightGroupbox("Spins", "dice-5")
-			RollBox:AddToggle("AutoSpin", {
+		-- Quick Start: the main loop toggles as two-way mirrors of the real ones (filled at the end of this file, once
+		-- the real toggles exist), then Stop Everything and Reset Hub Options. No master switch, nothing preset.
+		N.QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "sparkles")
+		local RollBox = Tabs.Main:AddRightGroupbox("Rolling", "dice-5")
+		RollBox:AddToggle("AutoRoll", {
+			Text = "Auto Roll (Fast)",
+			Default = false,
+			Tooltip = "Rolls again the moment the server allows it, without waiting for the roll animation. Turns the game's own slower auto roll off",
+		})
+		RollBox:AddToggle("AutoSpin", {
 			Text = "Use Spins",
 			Default = false,
 			Tooltip = "Uses a Lucky Spin (100x) or Jackpot Spin (1000x) before a roll. Spins multiply your dice luck, so they are worth more with a better dice",
 		})
 		RollBox:AddDropdown("SpinTypes", { Text = "Spins To Use", Values = { "Lucky Spin", "Jackpot Spin" }, Default = { "Lucky Spin", "Jackpot Spin" }, Multi = true, AllowNull = true })
+		RollBox:AddToggle("WaitForEvents", {
+			Text = "Save Spins And Boosts For Events",
+			Default = false,
+			Tooltip = "Spins and luck boosts wait for the server's Luck Event (x2.5 luck), income boosts for the Cash Event (x2.5 cash). Never longer than 3 hours, then they are used anyway",
+		})
 		local DiceBox = Tabs.Main:AddRightGroupbox("Dice", "dice-6")
 		DiceBox:AddToggle("AutoBuyDice", { Text = "Auto Buy Best Dice", Default = false, Tooltip = "Buys the luckiest dice you can afford" })
 		DiceBox:AddToggle("AutoEquipDice", { Text = "Auto Equip Best Dice", Default = false })
@@ -34475,12 +34798,20 @@ do
 		SellBox:AddSlider("KeepExtra", { Text = "Also Keep Best", Default = 4, Min = 0, Max = 50, Rounding = 0, Suffix = " units", Tooltip = "Keeps this many best units besides the plot, for swaps and towers" })
 		SellBox:AddDropdown("KeepRarity", { Text = "Always Keep From Rarity", Values = N.RarityOrder, Default = "Celestial" })
 		SellBox:AddDropdown("KeepMutations", {
-			Text = "Always Keep Mutations",
+			Text = "Keep Mutations",
 			Values = N.MutationNames,
 			Default = { "Emerald", "Diamond", "Ruby", "Rainbow" },
 			Multi = true,
 			AllowNull = true,
-			Tooltip = "With high luck almost every roll is Silver or Gold, so those are judged by value like any other unit",
+			Tooltip = "Kept while there is room. When the storage is full and rolling stops, the weakest of them are sold first, only as many as needed",
+		})
+		SellBox:AddDropdown("ProtectMutations", {
+			Text = "Never Sell Mutations",
+			Values = N.MutationNames,
+			Default = {},
+			Multi = true,
+			AllowNull = true,
+			Tooltip = "Never sold, not even when the storage is full. Too many of them can stop rolling, the Status line then says so",
 		})
 		SellBox:AddDropdown("GameAutoSell", {
 			Text = "Game Auto Sell",
@@ -34494,12 +34825,12 @@ do
 				task.spawn(function()
 					local wasOn = on("AutoSell")
 					if not wasOn then
-						Toggles.AutoSell:SetValue(true)
+						N.setToggleBy("AutoSell", true, "Sell Now")
 					end
 					N.Sell.at = -1e9
 					N.sellStep(true)
 					if not wasOn then
-						Toggles.AutoSell:SetValue(false)
+						N.setToggleBy("AutoSell", false, "Sell Now")
 					end
 				end)
 			end,
@@ -34815,7 +35146,11 @@ do
 		RewardBox:AddToggle("AutoKnownCodes", { Text = "Auto redeem known codes", Default = false, Tooltip = "Gets the newest code list from Corvus at start and every 6 hours and redeems each code once on this account" })
 		Labels.Rewards = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
 		local QuestBox = Tabs.Rewards:AddRightGroupbox("Quests", "scroll-text")
-		QuestBox:AddToggle("AutoQuests", { Text = "Claim Quests", Default = false })
+		QuestBox:AddToggle("AutoQuests", {
+			Text = "Claim Quests",
+			Default = false,
+			Tooltip = "Claims finished quests for Tickets. Also runs the towers a tower quest still needs (2 a day, 15 a week) when Auto Tower is off",
+		})
 		QuestBox:AddToggle("AutoTicketPasses", {
 			Text = "Buy Ticket Gamepasses",
 			Default = false,
@@ -34828,7 +35163,15 @@ do
 		local BoostBox = Tabs.Items:AddLeftGroupbox("Boosts", "zap")
 		BoostBox:AddToggle("AutoBoosts", { Text = "Auto Use Boosts", Default = false, Tooltip = "Keeps one boost running per picked kind, the strongest one you own" })
 		BoostBox:AddDropdown("BoostOrder", { Text = "Use Order", Values = { "Strongest first", "Weakest first" }, Default = "Strongest first", Tooltip = "Weakest first saves your strong boosts for later" })
-		BoostBox:AddDropdown("BoostCats", { Text = "Boost Kinds", Values = N.boostCategories(), Default = { "Luck", "Income" }, Multi = true, AllowNull = true })
+		-- Every luck and income kind by default: the tower drops (Dragon, Cursed, Pirate, Leaf, Slayer) are their own
+		-- kinds and run next to the plain ones (owner log 2026-10-05: tower boosts were piling up unused).
+		local boostKinds, boostDefault = N.boostCategories(), {}
+		for _, kind in ipairs(boostKinds) do
+			if N.boostEvent(kind) then
+				table.insert(boostDefault, kind)
+			end
+		end
+		BoostBox:AddDropdown("BoostCats", { Text = "Boost Kinds", Values = boostKinds, Default = boostDefault, Multi = true, AllowNull = true })
 		local RerollBox = Tabs.Items:AddRightGroupbox("Trait And Grade Rerolls", "wand-sparkles")
 		RerollBox:AddToggle("AutoTrait", { Text = "Auto Trait Reroll", Default = false, Tooltip = "Rerolls traits on your best plot units until they reach the target. Samurai and better are protected by the game" })
 		RerollBox:AddDropdown("TraitTarget", { Text = "Trait Target", Values = N.rankNames("trait"), Default = "Samurai" })
@@ -34839,6 +35182,94 @@ do
 		RerollBox:AddSlider("GradeUnits", { Text = "Units", Default = 3, Min = 1, Max = 16, Rounding = 0, Suffix = " best" })
 		RerollBox:AddSlider("GradeReserve", { Text = "Keep Gems", Default = 0, Min = 0, Max = 100, Rounding = 0 })
 		Labels.Reroll = RerollBox:AddLabel({ Text = "-", DoesWrap = true })
+	end
+	-- A hub action that flips a toggle says so in the log (Stop Everything, Quick Setup, Sell Now, commands); the
+	-- toggle watcher in p09 logs every other change that was not a click as "config".
+	N.ToggleWatch = { snap = nil, expect = {} }
+	function N.setToggleBy(name, value, source)
+		local toggle = Toggles[name]
+		if toggle and toggle.Value ~= value then
+			N.ToggleWatch.expect[name] = { value = value, source = source }
+			toggle:SetValue(value)
+		end
+	end
+	-- Quick Start mirrors: a second toggle on Main bound both ways to the real one in its own tab. The mirror is never
+	-- saved (SaveManager ignore), clicks on it are logged under the real name, Stop Everything and configs only touch
+	-- the real toggle and the mirror follows within 0.1 s (N.syncMirrors in the draw thread).
+	N.Mirrors = {}
+	N.QuickStart = { "AutoRoll", "SmartSpend", "AutoSell", "AutoTower", "AutoCollect", "AutoEquipBest" }
+	function N.mirrorToggle(idx, box, opts)
+		local original = Toggles[idx]
+		if not original then
+			return nil
+		end
+		if Library.MirrorToggle then
+			local ok, mirror = pcall(Library.MirrorToggle, Library, idx, box, opts)
+			if ok and mirror then
+				return mirror
+			end
+		end
+		local mirrorIdx = "QS_" .. idx
+		local mirror = box:AddToggle(mirrorIdx, {
+			Text = opts.Text or original.Text or idx,
+			Default = false,
+			Tooltip = opts.Tooltip or original.Tooltip,
+			Callback = function(value)
+				local real = Toggles[idx]
+				if real and real.Value ~= value then
+					real:SetValue(value)
+				end
+			end,
+		})
+		table.insert(N.Mirrors, { idx = idx, mirror = mirror })
+		return mirror
+	end
+	function N.syncMirrors()
+		for _, pair in ipairs(N.Mirrors) do
+			local real = Toggles[pair.idx]
+			if real and pair.mirror and pair.mirror.Value ~= real.Value then
+				pair.mirror:SetValue(real.Value)
+			end
+		end
+	end
+	do
+		local box = N.QuickBox
+		local texts = {
+			AutoRoll = { Text = "Auto Roll (Fast)" },
+			SmartSpend = { Text = "Smart Spending", Tooltip = "Spends cash and tickets on what pays back fastest (slot levels, dice, upgrades, rebirth, ticket gamepasses). Same switch as in Upgrades" },
+			AutoSell = { Text = "Auto Sell Weak Units" },
+			AutoTower = { Text = "Auto Tower" },
+			AutoCollect = { Text = "Auto Collect Plot Cash" },
+			AutoEquipBest = { Text = "Auto Equip Best Units" },
+		}
+		for _, idx in ipairs(N.QuickStart) do
+			N.mirrorToggle(idx, box, texts[idx] or {})
+		end
+		local ignore = {}
+		for _, pair in ipairs(N.Mirrors) do
+			table.insert(ignore, "QS_" .. pair.idx)
+		end
+		if #ignore > 0 then
+			pcall(SaveManager.SetIgnoreIndexes, SaveManager, ignore)
+		end
+		box:AddLabel({
+			Text = '<font transparency="0.35">Same switches as in their tabs. Every other feature has its own switch there. Nothing turns on by itself.</font>',
+			DoesWrap = true,
+		})
+		box:AddButton({
+			Text = "Stop Everything",
+			Tooltip = "Turns every automation off",
+			Func = function()
+				N.stopAll()
+			end,
+		})
+		box:AddButton({
+			Text = "Reset Hub Options",
+			Tooltip = "Puts every toggle, dropdown, slider and input back to its default. Saved configs are not deleted",
+			Func = function()
+				N.askReset()
+			end,
+		})
 	end
 end
 N.StatRows = {}
@@ -34869,7 +35300,7 @@ do
 	N.StatRows.Rebirth = statRow(ProgressBox, "refresh-cw", "Rebirth", 22)
 	N.StatRows.Luck = statRow(ProgressBox, "clover", "Luck", 22, "FontColor")
 	N.StatRows.Time = statRow(ProgressBox, "clock", "Session", 22, "FontColor")
-	local RollStats = Tabs.Stats:AddRightGroupbox("Rolling", "dice-5")
+	local RollStats = Tabs.Stats:AddLeftGroupbox("Rolling", "dice-5")
 	N.StatRows.Rolls = statRow(RollStats, "dice-5", "Rolls this session", 28)
 	N.StatRows.RollRate = statRow(RollStats, "activity", "Rolls per hour", 22, "FontColor")
 	N.StatRows.Best = statRow(RollStats, "crown", "Best roll", 22, "FontColor")
@@ -34930,10 +35361,13 @@ do
 	end
 	function Debug.running()
 		local running = {}
-		for name, toggle in pairs(Toggles) do
-			if type(toggle) == "table" and toggle.Value == true and string.sub(name, 1, 4) == "Auto" then
+		for _, name in ipairs(N.AllAutoToggles or {}) do
+			if on(name) then
 				table.insert(running, name)
 			end
+		end
+		if on("WaitForEvents") then
+			table.insert(running, "WaitForEvents")
 		end
 		table.sort(running)
 		return running
@@ -34971,7 +35405,7 @@ do
 			"Status: " .. tostring(Status),
 			"Running: " .. table.concat(Debug.running(), ", "),
 			string.format(
-				"Game: cash %s, rebirth %d, dice %s, luck x%s, roll every %.2fs, units %d/%d, plot $%s/s, tickets %d, gems %d, trait rerolls %d",
+				"Game: cash %s, rebirth %d, dice %s, luck x%s, roll every %.2fs, units %d/%d, plot $%s/s, tickets %d, gems %d, trait rerolls %d, weather %s",
 				formatNumber(N.money()),
 				N.rebirth(),
 				tostring(N.field("Dice", "?")),
@@ -34982,7 +35416,8 @@ do
 				formatNumber(N.plotIncome()),
 				N.amount("Tickets"),
 				N.amount("Gems"),
-				N.amount("Trait Reroll")
+				N.amount("Trait Reroll"),
+				tostring(N.weatherNow and N.weatherNow() or "none")
 			),
 			"Perf: " .. Debug.perfText(),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
@@ -35038,10 +35473,10 @@ do
 	end
 	function N.stopAll()
 		for _, name in ipairs(N.AllAutoToggles) do
-			local toggle = Toggles[name]
-			if toggle and toggle.Value then
-				toggle:SetValue(false)
-			end
+			N.setToggleBy(name, false, "Stop Everything")
+		end
+		if N.syncMirrors then
+			N.syncMirrors()
 		end
 		notify("Corvus", "Everything is off", 3)
 	end
@@ -35321,7 +35756,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 	end)
 	if Tabs.Webhook then
 		pcall(function()
-			local HookBox = Tabs.Webhook:AddLeftGroupbox("Discord Webhook", "webhook")
+			local HookBox = Tabs.Webhook:AddRightGroupbox("Discord Webhook", "webhook")
 				HookBox:AddToggle("WebhookOn", {
 					Text = "Post to Discord",
 					Default = false,
@@ -35395,7 +35830,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 	end
 end
 do
-	local function setToggles(names, args)
+	local function setToggles(names, args, source)
 		local word = args and args[1] and string.lower(tostring(args[1])) or ""
 		local first = Toggles[names[1]]
 		local state
@@ -35407,10 +35842,7 @@ do
 			state = not (first and first.Value)
 		end
 		for _, name in ipairs(names) do
-			local toggle = Toggles[name]
-			if toggle then
-				toggle:SetValue(state)
-			end
+			N.setToggleBy(name, state, source or "command")
 		end
 		return state
 	end
@@ -35527,7 +35959,7 @@ do
 					Choices = {
 						{ Id = "roll", Title = "Roll fast", Description = "Rolls the moment the server allows, without the animation", Icon = "dice-5", Color = "#fab428" },
 						{ Id = "plot", Title = "Plot income", Description = "Collects cash, puts your best units on the plot and levels them", Icon = "house", Color = "#3ccf91" },
-						{ Id = "sell", Title = "Sell weak units", Description = "Keeps storage free, never sells your plot, team, mutated or rare units", Icon = "badge-dollar-sign", Color = "#5fb8ff" },
+						{ Id = "sell", Title = "Sell weak units", Description = "Keeps storage free so rolling never stops, never sells your plot, team or protected units", Icon = "badge-dollar-sign", Color = "#5fb8ff" },
 						{ Id = "upgrades", Title = "Buy upgrades", Description = "Best dice, the upgrade tree and rebirths when you can afford them", Icon = "arrow-big-up", Color = "#ff9a3c" },
 						{ Id = "towers", Title = "Towers", Description = "Runs the hardest tower your team can finish, over and over", Icon = "castle", Color = "#c77dff" },
 						{ Id = "rewards", Title = "Claim rewards", Description = "Daily, offline, group, codes and quests", Icon = "gift", Color = "#ff5d8f" },
@@ -35545,7 +35977,7 @@ do
 					rewards = { "AutoDaily", "AutoOffline", "AutoGroup", "AutoCodes", "AutoQuests", "AutoTicketPasses" },
 				}
 				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] then "on" else "off" })
+					setToggles(names, { if chosen[id] then "on" else "off" }, "Quick Setup")
 				end
 				N.markSetupDone()
 
@@ -35590,20 +36022,66 @@ function N.askReset()
 		Library:AskResetHubOptions(Library.ShareIgnore)
 	end
 end
--- What changed a toggle is always in the log: the saved config at start (AUTOLOAD) or the player's click (CLICK).
-Library.OnAutoload = function()
+-- What changed a toggle is always in the log: the saved config (AUTOLOAD, TOGGLE config), the player's click (CLICK)
+-- or a hub action (TOGGLE Stop Everything / Quick Setup / Sell Now / command).
+-- The Obsidian SaveManager applies every saved value with task.defer, so the library calls OnAutoload before the
+-- values are in (owner log 2026-10-05: AUTOLOAD listed nothing, 19 toggles were on). The list is taken a moment later.
+local function onToggleList()
 	local names = {}
 	for name, toggle in pairs(Toggles) do
-		if toggle.Value == true then
+		if type(toggle) == "table" and toggle.Value == true and not string.match(name, "^QS_") then
 			table.insert(names, name)
 		end
 	end
 	table.sort(names)
-	log("AUTOLOAD toggles=" .. (if #names > 0 then table.concat(names, ",") else "-"))
+	return names
+end
+Library.OnAutoload = function()
+	task.delay(0.5, function()
+		local names = onToggleList()
+		log("AUTOLOAD toggles=" .. (if #names > 0 then table.concat(names, ",") else "-"))
+	end)
 end
 Library.OnUserToggle = function(name, value)
-	log("CLICK " .. tostring(name) .. "=" .. tostring(value))
+	name = tostring(name)
+	local real = string.match(name, "^QS_(.+)$") or name
+	N.ToggleWatch.expect[real] = { value = value == true, source = "click" }
+	log("CLICK " .. real .. "=" .. tostring(value) .. (if real ~= name then " (Quick Start)" else ""))
 end
+-- Watcher: every change of a toggle that no click or hub action announced is logged as coming from a config.
+function N.watchToggles()
+	local W = N.ToggleWatch
+	local first = W.snap == nil
+	W.snap = W.snap or {}
+	local changed = {}
+	for name, toggle in pairs(Toggles) do
+		if type(toggle) == "table" and not string.match(name, "^QS_") then
+			local value = toggle.Value == true
+			local before = W.snap[name]
+			if not first and before ~= nil and before ~= value then
+				local expect = W.expect[name]
+				local source = if expect and expect.value == value then expect.source else "config"
+				W.expect[name] = nil
+				if source ~= "click" then
+					changed[source] = changed[source] or {}
+					table.insert(changed[source], name .. "=" .. tostring(value))
+				end
+			end
+			W.snap[name] = value
+		end
+	end
+	for source, list in pairs(changed) do
+		table.sort(list)
+		log("TOGGLE by " .. source .. ": " .. table.concat(list, ","))
+	end
+end
+N.watchToggles()
+task.spawn(function()
+	while alive() do
+		task.wait(1)
+		pcall(N.watchToggles)
+	end
+end)
 if Window.AddInfoTab then
 	local DonateMethods = {
 		{
@@ -35757,6 +36235,9 @@ do
 		if choreDue("rewards", 3) then
 			N.rewardStep()
 		end
+		if choreDue("weather", 3) then
+			N.weatherTick()
+		end
 		if choreDue("boosts", 5) then
 			N.boostStep()
 		end
@@ -35770,7 +36251,7 @@ do
 		task.wait(0.25)
 	end)
 	loop("tower loop", function()
-		if on("AutoTower") and not N.manualRunning() then
+		if not N.manualRunning() and N.towerWanted() then
 			N.towerRun()
 			task.wait(1)
 		else
@@ -35785,140 +36266,159 @@ do
 	end
 	-- Builds every label text here, the draw thread below only copies strings.
 	N.InfoText = {}
+	local slow = false
 	task.spawn(function()
 		while alive() do
 			local started = os.clock()
 			local ok, err = pcall(function()
+				-- Only the texts of the open tab are built, nothing while the menu is hidden (owner log 2026-10-05: this
+				-- thread used up to 6.3 s per 30 s at fps 9 while it rebuilt every tab and the plan twice a second).
 				local I = N.InfoText
-				local list = N.units()
+				local mainTab, plotTab, upTab, rewardsTab = shown(Tabs.Main), shown(Tabs.Plot), shown(Tabs.Upgrades), shown(Tabs.Rewards)
+				local list = if mainTab or plotTab then N.units() else {}
 				local diceName = tostring(N.field("Dice", "Basic"))
 				local dice = N.call(N.G.Dice.Get, diceName)
-				I.info = string.format(
-					"<b>$%s</b>  \u{00B7}  plot $%s/s  \u{00B7}  rebirth <b>%d</b>\nLuck <b>x%s</b>  \u{00B7}  roll every <b>%.2fs</b>\nUnits <b>%d/%d</b>  \u{00B7}  %s rolls this session",
-					formatNumber(N.money()),
-					formatNumber(N.plotIncome()),
-					N.rebirth(),
-					formatNumber(N.buff("Luck", 1) or 1),
-					N.rollDuration(),
-					#list,
-					N.storage(),
-					formatNumber(Session.rolls)
-				)
-				local recent = {}
-				for _, info in ipairs(Session.recent) do
-					table.insert(recent, string.format('<font color="%s">%s</font>', N.rarityColor(info.rarity), N.unitText(info)))
-				end
-				I.recent = (if #recent > 0 then "Last rolls:\n" .. table.concat(recent, "\n") else '<font transparency="0.4">No rolls yet</font>')
-					.. "\nBest: <b>" .. (Session.best or "none yet") .. "</b>"
-				local nextDice
-				for _, d in ipairs(N.diceList()) do
-					if not nextDice and d.price and not N.ownsDice(d.name) and d.luck > (tonumber(type(dice) == "table" and dice.luck) or 0) then
-						nextDice = d
+				if mainTab then
+					I.info = string.format(
+						"<b>$%s</b>  \u{00B7}  plot $%s/s  \u{00B7}  rebirth <b>%d</b>\nLuck <b>x%s</b>  \u{00B7}  roll every <b>%.2fs</b>\nUnits <b>%d/%d</b>  \u{00B7}  %s rolls this session",
+						formatNumber(N.money()),
+						formatNumber(N.plotIncome()),
+						N.rebirth(),
+						formatNumber(N.buff("Luck", 1) or 1),
+						N.rollDuration(),
+						#list,
+						N.storage(),
+						formatNumber(Session.rolls)
+					)
+					local recent = {}
+					for _, info in ipairs(Session.recent) do
+						table.insert(recent, string.format('<font color="%s">%s</font>', N.rarityColor(info.rarity), N.unitText(info)))
 					end
-				end
-				I.dice = string.format(
-					"Using <b>%s</b> (x%s luck)%s",
-					diceName,
-					formatNumber(tonumber(type(dice) == "table" and dice.luck) or 1),
-					if nextDice then string.format("\nNext: <b>%s</b> x%s for $%s", nextDice.name, formatNumber(nextDice.luck), formatNumber(nextDice.price)) else "\nYou own the best dice"
-				)
-				local plotted, worst = 0, nil
-				for _, info in ipairs(list) do
-					if info.slot then
-						plotted += 1
-						if not worst or info.income < worst.income then
-							worst = info
+					I.recent = (if #recent > 0 then "Last rolls:\n" .. table.concat(recent, "\n") else '<font transparency="0.4">No rolls yet</font>')
+						.. "\nBest: <b>" .. (Session.best or "none yet") .. "</b>"
+					local nextDice
+					for _, d in ipairs(N.diceList()) do
+						if not nextDice and d.price and not N.ownsDice(d.name) and d.luck > (tonumber(type(dice) == "table" and dice.luck) or 0) then
+							nextDice = d
 						end
 					end
-				end
-				local levelPick = N.levelPick()
-				I.plot = string.format(
-					"<b>%d/%d</b> slots used  \u{00B7}  earning <b>$%s/s</b>\nCollected <b>$%s</b> this session%s%s",
-					plotted,
-					#N.unlockedSlots(),
-					formatNumber(N.plotIncome()),
-					formatNumber(Session.collected),
-					if worst then string.format("\nWeakest on the plot: %s $%s/s", worst.name, formatNumber(worst.income)) else "",
-					if levelPick then string.format("\nNext level: <b>%s</b> to Lv %d for $%s", levelPick.name, levelPick.level + 1, formatNumber(N.levelPrice(levelPick))) else ""
-				)
-				local plan = N.sellPlan()
-				local why = N.Sell.why or {}
-				I.sell = string.format(
-					"%s\nKept: %d best, %d mutation, %d rarity, %d locked\nSold <b>%d</b> this session for <b>$%s</b>",
-					if #plan > 0 then "Can sell <b>" .. #plan .. "</b> weak units" else '<font transparency="0.4">Nothing to sell right now</font>',
-					why.best or 0,
-					why.mutation or 0,
-					why.rarity or 0,
-					why.locked or 0,
-					Session.sold,
-					formatNumber(Session.soldCash)
-				)
-				local available = N.upgradeAvailable()
-				local nextUp = N.upgradeNext()
-				I.upgrades = if nextUp
-					then string.format("Next: <b>%s</b> for $%s\n%d upgrades open in the tree", nextUp.name, formatNumber(nextUp.price), #available)
-					else "Every picked branch is bought"
-				local nextRebirth = N.nextRebirth()
-				I.rebirth = if nextRebirth
-					then string.format(
-						"Rebirth <b>%d</b>  \u{00B7}  next costs <b>$%s</b>\nGives x%s luck and x%s cash",
-						N.rebirth(),
-						formatNumber(nextRebirth.cost),
-						formatNumber(nextRebirth.luckMultiplier),
-						formatNumber(nextRebirth.moneyMultiplier)
+					I.dice = string.format(
+						"Using <b>%s</b> (x%s luck)%s",
+						diceName,
+						formatNumber(tonumber(type(dice) == "table" and dice.luck) or 1),
+						if nextDice then string.format("\nNext: <b>%s</b> x%s for $%s", nextDice.name, formatNumber(nextDice.luck), formatNumber(nextDice.price)) else "\nYou own the best dice"
 					)
-					else "Max rebirth reached"
-				I.shop = if #N.Shop.log > 0 then table.concat(N.Shop.log, "\n") else '<font transparency="0.4">Nothing bought yet</font>'
-				local T = N.Tower
-				local towerLines = {}
-				table.insert(towerLines, if T.running then string.format("<b>%s</b>  \u{00B7}  floor %d", tostring(T.name), T.floor) else (T.lastText ~= "" and T.lastText or "Not running"))
-				table.insert(towerLines, string.format("Runs <b>%d</b>  \u{00B7}  cleared <b>%d</b>  \u{00B7}  floors <b>%d</b>", Session.towerRuns, Session.towerClears, Session.towerFloors))
-				if #T.rewards > 0 then
-					table.insert(towerLines, "Last drops: " .. table.concat(T.rewards, ", "))
-				end
-				I.tower = table.concat(towerLines, "\n")
-				-- The fight simulations and the spending plan are the heavy ones: only worked out while you look at them.
-				if shown(Tabs.Towers) and choreDue("towerOdds", 5) then
-					local team = N.towerTeam()
-					local odds = {}
-					for _, tower in ipairs(N.towerList()) do
-						local cleared, finished = N.simulateTower(tower, team)
-						table.insert(odds, string.format("%s: %s", tower.name, if finished then '<font color="#60d696">clears all ' .. cleared .. "</font>" else "floor " .. cleared))
+					local weather = N.weatherNow()
+					if weather then
+						I.info ..= '\n<font color="#60d696">' .. weather .. " is on</font>"
 					end
-					I.towerOdds = if #team > 0 then table.concat(odds, "\n") else "You need units first"
+				end
+				if plotTab then
+					local plotted, worst = 0, nil
+					for _, info in ipairs(list) do
+						if info.slot then
+							plotted += 1
+							if not worst or info.income < worst.income then
+								worst = info
+							end
+						end
+					end
+					local levelPick = N.levelPick()
+					I.plot = string.format(
+						"<b>%d/%d</b> slots used  \u{00B7}  earning <b>$%s/s</b>\nCollected <b>$%s</b> this session%s%s",
+						plotted,
+						#N.unlockedSlots(),
+						formatNumber(N.plotIncome()),
+						formatNumber(Session.collected),
+						if worst then string.format("\nWeakest on the plot: %s $%s/s", worst.name, formatNumber(worst.income)) else "",
+						if levelPick then string.format("\nNext level: <b>%s</b> to Lv %d for $%s", levelPick.name, levelPick.level + 1, formatNumber(N.levelPrice(levelPick))) else ""
+					)
+					local plan = N.sellPlan()
+					local why = N.Sell.why or {}
+					I.sell = string.format(
+						"%s\nKept: %d best, %d mutation, %d never sell, %d rarity, %d locked\nSold <b>%d</b> this session for <b>$%s</b>",
+						if #plan > 0 then "Can sell <b>" .. #plan .. "</b> weak units" else '<font transparency="0.4">Nothing to sell right now</font>',
+						why.best or 0,
+						why.mutation or 0,
+						why.protected or 0,
+						why.rarity or 0,
+						why.locked or 0,
+						Session.sold,
+						formatNumber(Session.soldCash)
+					)
+				end
+				if upTab then
+					local available = N.upgradeAvailable()
+					local nextUp = N.upgradeNext()
+					I.upgrades = if nextUp
+						then string.format("Next: <b>%s</b> for $%s\n%d upgrades open in the tree", nextUp.name, formatNumber(nextUp.price), #available)
+						else "Every picked branch is bought"
+					local nextRebirth = N.nextRebirth()
+					I.rebirth = if nextRebirth
+						then string.format(
+							"Rebirth <b>%d</b>  \u{00B7}  next costs <b>$%s</b>\nGives x%s luck and x%s cash",
+							N.rebirth(),
+							formatNumber(nextRebirth.cost),
+							formatNumber(nextRebirth.luckMultiplier),
+							formatNumber(nextRebirth.moneyMultiplier)
+						)
+						else "Max rebirth reached"
+					I.shop = if #N.Shop.log > 0 then table.concat(N.Shop.log, "\n") else '<font transparency="0.4">Nothing bought yet</font>'
+					local T = N.Tower
+					local towerLines = {}
+					table.insert(towerLines, if T.running then string.format("<b>%s</b>  \u{00B7}  floor %d", tostring(T.name), T.floor) else (T.lastText ~= "" and T.lastText or "Not running"))
+					table.insert(towerLines, string.format("Runs <b>%d</b>  \u{00B7}  cleared <b>%d</b>  \u{00B7}  floors <b>%d</b>", Session.towerRuns, Session.towerClears, Session.towerFloors))
+					if #T.rewards > 0 then
+						table.insert(towerLines, "Last drops: " .. table.concat(T.rewards, ", "))
+					end
+					I.tower = table.concat(towerLines, "\n")
+					-- The fight simulations and the spending plan are the heavy ones: only worked out while you look at them.
+					if shown(Tabs.Towers) and choreDue("towerOdds", 5) then
+						local team = N.towerTeam()
+						local odds = {}
+						for _, tower in ipairs(N.towerList()) do
+							local cleared, finished = N.simulateTower(tower, team)
+							table.insert(odds, string.format("%s: %s", tower.name, if finished then '<font color="#60d696">clears all ' .. cleared .. "</font>" else "floor " .. cleared))
+						end
+						I.towerOdds = if #team > 0 then table.concat(odds, "\n") else "You need units first"
+					end
 				end
 				if on("SmartSpend") then
 					I.spend = N.spendText()
-				elseif (shown(Tabs.Upgrades) or shown(Tabs.Main)) and choreDue("spendText", 2) then
+				elseif (upTab or mainTab) and choreDue("spendText", if slow then 30 else 10) then
 					N.Spend.plan = N.spendOptions()
 					I.spend = N.spendText()
 				end
-				local quests = {}
-				for _, quest in ipairs(N.questList()) do
-					table.insert(quests, string.format("%s %s: %s/%s%s", quest.period, quest.id, formatNumber(quest.progress), formatNumber(quest.target), if quest.claimed then " \u{2713}" else ""))
+				if rewardsTab then
+					local quests = {}
+					for _, quest in ipairs(N.questList()) do
+						table.insert(quests, string.format("%s %s: %s/%s%s", quest.period, quest.id, formatNumber(quest.progress), formatNumber(quest.target), if quest.claimed then " \u{2713}" else ""))
+					end
+					I.quests = string.format("Tickets <b>%d</b>\n%s", N.amount("Tickets"), table.concat(quests, "\n"))
+					local left = N.dailyLeft()
+					I.rewards = string.format(
+						"Daily %s  \u{00B7}  codes used <b>%d</b>\n%s%s",
+						if left <= 0 then "<b>ready</b>" else "in " .. N.longTime(left),
+						Session.codes,
+						N.codesText(),
+						if #N.Reward.log > 0 then "\n" .. table.concat(N.Reward.log, "\n") else ""
+					)
+					I.reroll = string.format(
+						"Trait Rerolls <b>%d</b>  \u{00B7}  Gems <b>%d</b>\nUsed this session: %d traits, %d grades",
+						N.amount("Trait Reroll"),
+						N.amount("Gems"),
+						Session.traitRolls,
+						Session.gradeRolls
+					)
 				end
-				I.quests = string.format("Tickets <b>%d</b>\n%s", N.amount("Tickets"), table.concat(quests, "\n"))
-				local left = N.dailyLeft()
-				I.rewards = string.format(
-					"Daily %s  \u{00B7}  codes used <b>%d</b>\n%s%s",
-					if left <= 0 then "<b>ready</b>" else "in " .. N.longTime(left),
-					Session.codes,
-					N.codesText(),
-					if #N.Reward.log > 0 then "\n" .. table.concat(N.Reward.log, "\n") else ""
-				)
-				I.reroll = string.format(
-					"Trait Rerolls <b>%d</b>  \u{00B7}  Gems <b>%d</b>\nUsed this session: %d traits, %d grades",
-					N.amount("Trait Reroll"),
-					N.amount("Gems"),
-					Session.traitRolls,
-					Session.gradeRolls
-				)
 			end)
 			if not ok then
 				reportError("info", err)
 			end
 			Perf.work.info = (Perf.work.info or 0) + (os.clock() - started)
-			task.wait(0.5)
+			-- A weak device (fps under 25 in the last PERF window) gets the texts less often.
+			slow = Perf.last ~= nil and Perf.last.fps < 25
+			task.wait(if slow then 1.5 else 0.5)
 		end
 	end)
 	-- Draws the slot tiles: swaps a model only when the unit on a slot changes, sets text only when it changed.
@@ -36057,6 +36557,7 @@ do
 			frame += 1
 			local started = os.clock()
 			group(UIQueue.flush)
+			group(N.syncMirrors)
 			if frame % 3 == 0 then
 				local I = N.InfoText
 				if shown(Tabs.Main) or shown(Tabs.Roll) then
