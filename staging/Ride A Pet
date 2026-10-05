@@ -4738,6 +4738,7 @@ end
 				Close(false, "outside")
 			end)
 		end
+		local ModalOpenedAt = os.clock()
 		pcall(function()
 			KeyConnection = UserInputService.InputBegan:Connect(function(Input, Processed)
 				if Input.UserInputType ~= Enum.UserInputType.Keyboard then
@@ -4745,7 +4746,7 @@ end
 				end
 				if Input.KeyCode == Enum.KeyCode.Escape then
 					Close(false, "close")
-				elseif not Processed and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
+				elseif not Processed and not Opts.Warning and os.clock() - ModalOpenedAt > 0.8 and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
 					Close(true, "key")
 				end
 			end)
@@ -9308,6 +9309,9 @@ if Toggle.Disabled then
 return
 end
 Toggle:SetValue(not Toggle.Value)
+if typeof(Idx) == "string" and Library.OnUserToggle then
+	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+end
 end)
 )
 if typeof(Toggle.Tooltip) == "string" or typeof(Toggle.DisabledTooltip) == "string" then
@@ -9562,6 +9566,9 @@ if Toggle.Disabled then
 return
 end
 Toggle:SetValue(not Toggle.Value)
+if typeof(Idx) == "string" and Library.OnUserToggle then
+	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+end
 end)
 )
 table.insert(
@@ -15542,6 +15549,28 @@ return Value, Value ~= Default
 end
 return nil, false
 end
+function Library:ResetHubOptions(Ignore: any): (boolean, any)
+	local Ok, Json = pcall(HttpService.JSONEncode, HttpService, { v = 1, g = game.GameId, d = {} })
+	if not Ok then
+		return false, "Could not reset"
+	end
+	return Library:ImportShareCode("CORVUS-" .. Library.Base64Encode(Json), Ignore)
+end
+
+function Library:AskResetHubOptions(Ignore: any)
+	return Library:ShowModal({
+		Icon = "rotate-ccw",
+		Title = "Reset all options to defaults?",
+		Text = "Every toggle, dropdown, slider and input of this hub goes back to its default value. Saved configs are not deleted.",
+		ConfirmText = "Reset",
+		CancelText = "Cancel",
+		OnConfirm = function()
+			local Ok, Result = Library:ResetHubOptions(Ignore)
+			Library:Notify({ Title = "Reset Hub Options", Description = if Ok then string.format("%d options reset", Result) else tostring(Result), Time = 4 })
+		end,
+	})
+end
+
 function Library:ExportShareCode(Ignore: any): (string?, any)
 local Changed = {}
 local Count = 0
@@ -24817,6 +24846,7 @@ end,
 if Info.AutoLoad ~= false then
 task.defer(function()
 pcall(SaveManager.LoadAutoloadConfig, SaveManager)
+if Library.OnAutoload then pcall(Library.OnAutoload) end
 end)
 end
 end
@@ -26978,6 +27008,9 @@ Button.MouseButton1Click:Connect(function()
 local Toggle = Library.Toggles[Item.Toggle]
 if Toggle and not Toggle.Disabled then
 Toggle:SetValue(not Toggle.Value)
+if typeof(Item.Toggle) == "string" and Library.OnUserToggle then
+	pcall(Library.OnUserToggle, Item.Toggle, Toggle.Value)
+end
 end
 end)
 table.insert(DockButtons, Entry)
@@ -28448,7 +28481,7 @@ return
 end
 Library:GiveSignal(remote.OnClientEvent:Connect(function(...)
 local args = table.pack(...)
-if not quiet then
+if not quiet and N.anyAuto and N.anyAuto() then
 log("EVENT", path .. "(" .. argsText(args, 1, args.n) .. ")")
 end
 task.spawn(function()
@@ -29734,6 +29767,7 @@ if last and os.clock() - last.at < 4 and not (Log.teleportAt and Log.teleportAt 
 local drift = (root.Position - last.pos).Magnitude
 if drift > 15 then
 N.Moves.snaps += 1
+N.noteSnapback("drift")
 log(
 "MOVE drift",
 math.floor(drift) .. " studs from where it was put",
@@ -29785,9 +29819,42 @@ end
 table.clear(Noclip.saved)
 end
 end))
+-- Snapback fallback: 2 snapbacks within 60 s drop the mode one step (Blatant -> Fast -> Safe); the faster mode is retried after 10 minutes.
+N.Snap = { times = {}, level = 0, at = -1e9 }
+local MoveRank = { Safe = 1, Fast = 2, Blatant = 3 }
+local MoveByRank = { "Safe", "Fast", "Blatant" }
+function N.chosenMoveMode()
+local v = optionText("MoveMode", "Blatant")
+return if v == "Fast" or v == "Safe" then v else "Blatant"
+end
 function N.moveMode()
-local v = optionText("MoveMode", "Safe")
-return if v == "Fast" or v == "Blatant" then v else "Safe"
+local base = N.chosenMoveMode()
+local S = N.Snap
+if S.level > 0 and os.clock() - S.at >= 600 then
+S.level = 0
+table.clear(S.times)
+log("MOVE retry", base, "after 10 minutes")
+end
+return MoveByRank[math.max(1, MoveRank[base] - S.level)]
+end
+function N.noteSnapback(kind)
+local S = N.Snap
+local from = N.moveMode()
+if from == "Safe" then
+return
+end
+local now = os.clock()
+table.insert(S.times, now)
+while #S.times > 0 and now - S.times[1] > 60 do
+table.remove(S.times, 1)
+end
+if #S.times >= 2 then
+local count = #S.times
+table.clear(S.times)
+S.level += 1
+S.at = now
+log("MOVE fallback", from, "->", N.moveMode(), "(snapbacks " .. count .. ", " .. tostring(kind) .. ")")
+end
 end
 function N.safeSpeed()
 local hum = humanoid()
@@ -29860,6 +29927,7 @@ return false
 end
 if expected and (root.Position - expected).Magnitude > 15 then
 N.Moves.pushes += 1
+N.noteSnapback("pushed")
 log(
 "MOVE pushed while gliding",
 math.floor((root.Position - expected).Magnitude) .. " studs",
@@ -30160,7 +30228,7 @@ for _, cfg in ipairs(folder and folder:GetChildren() or {}) do
 local info = eggInfo(cfg)
 if info and not eggClaimed(cfg, info.name) then
 table.insert(list, info)
-elseif not EggDiag[cfg] then
+elseif not EggDiag[cfg] and N.anyAuto and N.anyAuto() then
 EggDiag[cfg] = true
 if info then
 log("EGG skipped as already claimed this cycle", info.name, "cycle", tostring(cfg:GetAttribute("Cycle")), "claimed", tostring(claimedCycles()[info.name]))
@@ -30256,43 +30324,18 @@ end
 Farm.skip[id] = nil
 return false
 end
--- Farm Mode: Normal keeps the player's own picks authoritative, OP lets the planner override every choice.
-function N.farmMode()
-local option = Options.FarmMode
-return if option and option.Value == "My filters" then "My filters" else "Best value"
-end
+-- No master switch. The Smart Planner toggle lets the planner pick eggs by weather and buy by payback.
 function N.farmOP()
-return on("AutoFarmOP") and N.farmMode() == "Best value"
+return on("AutoSmartPlan")
 end
 function N.farmAny()
-return on("AutoFarmOP")
-end
--- Exclude from OP: while Auto Farm Everything OP runs, anything picked in OPExclude is never sold, fed, used or spent.
-N.opLogged = {}
-function N.opExcluded(key)
-if not N.farmOP() or not selected(Options.OPExclude, key) then
 return false
 end
-if not N.opLogged[key] then
-N.opLogged[key] = true
-log("OP exclude", key)
+-- No exclude list any more: every sell, feed and spend is its own switch with its own filters.
+function N.opExcluded()
+return false
 end
-return true
-end
-function N.opEggProtected(info)
-if N.opExcluded(tostring(info.rarity) .. " pets and eggs") then
-return true
-end
-if (info.mutation or info.spawnMutation) and N.opExcluded("Mutated eggs") then
-return true
-end
-local cfg = N.eggConfig(info.name)
-if
-(info.item:GetAttribute("AdminSpawn") == true or (cfg and (cfg.Event or cfg.Limited or cfg.AdminOnly)))
-and N.opExcluded("Event eggs")
-then
-return true
-end
+function N.opEggProtected()
 return false
 end
 function N.nothingPicked(option)
@@ -32488,7 +32531,7 @@ function P.nextText()
 return P.upNext()[1] or "nothing to buy right now"
 end
 function P.approve(kind, cost, key)
-if (P.dirty and os.clock() - P.at > 1) or os.clock() - P.at > 5 then
+if ((P.dirty and os.clock() - P.at > 1) or os.clock() - P.at > 5) and (on("AutoSmartPlan") or on("AutoBuyNests") or on("AutoLuck") or on("AutoRebirth") or on("AutoShop") or on("AutoFeed") or on("AutoLanterns")) then
 local ok, err = pcall(P.compute)
 if not ok then
 log("PLAN error", tostring(err))
@@ -32833,7 +32876,7 @@ end,
 })
 end)
 end
-Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything, egg farm and status")
+Tabs.Main = N.addTab("Main", "house", "Quick start, egg farm and status")
 Tabs.Eggs = N.addTab("Eggs", "egg", "Egg filters, volcano and the eggs on the map")
 Tabs.Plot = N.addTab("Plot", "layout-grid", "Nests, hatching, pets and feeding")
 Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Luck, rebirth, shop and selling eggs")
@@ -32866,128 +32909,20 @@ end
 return list
 end
 do
-local OPBox = Tabs.Main:AddLeftGroupbox("Auto Farm Everything", "zap")
+local OPBox = Tabs.Main:AddLeftGroupbox("Quick Start", "zap")
 N.EverythingBox = OPBox
-N.FarmRunMap = {
-{ "Auto Farm eggs", "AutoFarm" },
-{ "Pause Egg Timer", "PauseEggTimer" },
-{ "Remote Collect", "RemoteCollect" },
-{ "Remote Egg Pickup", "RemotePickup" },
-{ "Place eggs in nests", "AutoPlaceEggs" },
-{ "Hatch eggs", "AutoHatch" },
-{ "Place best pets", "AutoPlacePets" },
-{ "Collect pet cash", "AutoCollect" },
-{ "Claim index rewards", "AutoIndex" },
-{ "Collect fusions", "AutoFusionCollect" },
-{ "Claim offline cash", "AutoOffline" },
-{ "Claim event boost", "AutoEventBoost" },
-{ "Claim group meat", "AutoGroupMeat" },
-{ "Auto favorite", "AutoFavorite" },
-{ "Place lanterns", "AutoLanterns" },
-{ "Use radars", "AutoRadar" },
-{ "Dip eggs in the volcano", "VolcanoDip" },
-{ "Buy nests (spends cash)", "AutoBuyNests" },
-{ "Upgrade luck (spends cash)", "AutoLuck" },
-{ "Rebirth (spends cash)", "AutoRebirth" },
-{ "Shop (spends cash)", "AutoShop" },
-{ "Feed pets (uses food)", "AutoFeed" },
-{ "Sell eggs (sells)", "AutoSell" },
-}
-N.FarmRunValues = {}
-for _, entry in ipairs(N.FarmRunMap) do
-table.insert(N.FarmRunValues, entry[1])
-end
-function N.myRunNames()
-local names = {}
-for _, entry in ipairs(N.FarmRunMap) do
-if selected(Options.FarmRun, entry[1]) then
-table.insert(names, entry[2])
-end
-end
-return names
-end
-OPBox:AddToggle("AutoFarmOP", {
-Text = "Auto Farm Everything",
+OPBox:AddToggle("AutoSmartPlan", {
+Text = "Smart Planner (best value)",
 Default = false,
-Tooltip = "Runs the farm in the Mode below. Never saved: it always starts switched off. Best value: the planner buys, feeds, sells and spends for max profit and can sell your pets and eggs. My filters: only the loops you pick in Run, with your own filters, nothing is sold, fed or spent unless you pick it.",
-Callback = function(value)
-if N.opBusy or not Toggles.AutoFarmOP then
-return
-end
-if value and N.farmMode() == "Best value" and not N.opConfirmed then
-N.opBusy = true
-Toggles.AutoFarmOP:SetValue(false)
-N.opBusy = false
-N.askOP()
-return
-end
-task.spawn(N.farmAll, value, true)
-end,
-})
-OPBox:AddDropdown("FarmMode", {
-Text = "Mode",
-Values = { "Best value", "My filters" },
-Default = "Best value",
-Tooltip = "Best value: the planner picks the most profitable action for you (Exclude applies). My filters: no planner, runs only the loops picked in Run with your own egg filters, priorities and switches. Change the mode while it runs and Auto Farm Everything switches itself off, turn it on again.",
-Callback = function(value)
-if Options.FarmRun and Options.FarmRun.SetVisible then
-pcall(Options.FarmRun.SetVisible, Options.FarmRun, value == "My filters")
-end
-if Options.OPExclude and Options.OPExclude.SetVisible then
-pcall(Options.OPExclude.SetVisible, Options.OPExclude, value ~= "My filters")
-end
-if Toggles.AutoFarmOP and Toggles.AutoFarmOP.Value and not N.opBusy then
-log("FARM mode changed to", tostring(value), "while on: switched off")
-Toggles.AutoFarmOP:SetValue(false)
-notify("Corvus", "Mode changed, Auto Farm Everything switched off. Turn it on again.", 5)
-end
-end,
-})
-OPBox:AddDropdown("FarmRun", {
-Text = "Run",
-Values = N.FarmRunValues,
-Default = {
-"Auto Farm eggs",
-"Place eggs in nests",
-"Hatch eggs",
-"Place best pets",
-"Collect pet cash",
-"Claim index rewards",
-"Collect fusions",
-"Claim offline cash",
-},
-Multi = true,
-AllowNull = true,
-Visible = false,
-Tooltip = "My filters mode only: the loops that run when you turn Auto Farm Everything on. Auto Farm eggs follows your Target Pets, rarity filters and priority. Safe defaults: nothing is sold, fed, consumed or spent. Items marked in brackets are optional and use cash, food or eggs.",
-Callback = function()
-if N.farmMode() == "My filters" and Toggles.AutoFarmOP and Toggles.AutoFarmOP.Value then
-N.applyRun()
-end
-end,
-})
-N.OPExcludeValues = {}
-for _, rarity in ipairs(N.RarityList) do
-table.insert(N.OPExcludeValues, rarity .. " pets and eggs")
-end
-for _, name in ipairs({ "Mutated eggs", "Event eggs", "Food items", "Lanterns", "Radars", "Shop items", "Luck upgrades", "Rebirth", "Money reserve" }) do
-table.insert(N.OPExcludeValues, name)
-end
-OPBox:AddDropdown("OPExclude", {
-Text = "Exclude",
-Values = N.OPExcludeValues,
-Default = { "Legendary pets and eggs", "Mythic pets and eggs", "Divine pets and eggs", "Ethereal pets and eggs", "Secret pets and eggs", "Mutated eggs", "Event eggs", "Money reserve" },
-Multi = true,
-AllowNull = true,
-Tooltip = "While Auto Farm Everything OP runs, these are never sold, fed, used or spent: eggs and pets of those rarities, mutated or event eggs, food, lanterns, radars, shop purchases, luck upgrades, rebirth. Money reserve keeps your Keep Cash amount untouched (OP ignores Keep Cash otherwise).",
+Tooltip = "Lets the planner pick eggs by weather bonus and buy shop items and upgrades by profit payback, with real game odds. It never sells or feeds on its own: Auto Sell and Auto Feed stay on their own switches.",
 })
 OPBox:AddLabel({
-Text = '<font transparency="0.4">Everything picked here is skipped by every OP action. Logged as OP exclude in the debug log.</font>',
+Text = '<font transparency="0.4">Every automation is its own switch in the tabs. Nothing turns on by itself.</font>',
 DoesWrap = true,
 })
 OPBox:AddButton({
 Text = "Stop Everything",
-Tooltip = "Turns Auto Farm Everything and every automatic switch off",
+Tooltip = "Turns every automatic switch off",
 Func = function()
 for _, name in ipairs(N.AllAutoToggles or {}) do
 local toggle = Toggles[name]
@@ -32997,6 +32932,13 @@ end
 end
 log("STOP everything")
 notify("Corvus", "Everything stopped", 3)
+end,
+})
+OPBox:AddButton({
+Text = "Reset Hub Options",
+Tooltip = "Puts every control back to its default after a confirmation. Saved configs are not deleted.",
+Func = function()
+Library:AskResetHubOptions({ MenuKeybind = true })
 end,
 })
 local FarmBox = Tabs.Main:AddLeftGroupbox("Egg Farm", "rocket")
@@ -33159,31 +33101,11 @@ Options.FarmRarities:SetValue(N.rarityPick("Common"))
 end,
 })
 local MoveBox = Tabs.Player:AddLeftGroupbox("Movement", "wind")
-N.EverythingBox:AddButton({
-Text = "Recommended Settings",
-Tooltip = "Safe riding, terrain path and a bigger return margin: the server never sends you back or fails a delivery",
-Func = function()
-for name, value in pairs({ MoveMode = "Safe", SafePercent = 90, TravelPath = "Over terrain", ReturnMargin = 3, PickupDelay = 0.3, MaxDistance = 0, FarmPriority = "Best Value" }) do
-local option = Options[name]
-if option then
-pcall(option.SetValue, option, value)
-end
-end
-for name, value in pairs({ RideOnTrips = true, WaitOnPlot = true, TeleportIfFar = false }) do
-local toggle = Toggles[name]
-if toggle then
-pcall(toggle.SetValue, toggle, value)
-end
-end
-log("SETTINGS recommended applied")
-notify("Corvus", "Recommended settings on: Safe riding, terrain path, 3s return margin", 5)
-end,
-})
 MoveBox:AddDropdown("MoveMode", {
 Text = "Mode",
 Values = { "Safe", "Fast", "Blatant" },
-Default = "Safe",
-Tooltip = "Safe flies at your pet's own riding speed. Fast flies at the speed below. Blatant teleports to each egg and straight back.",
+Default = "Blatant",
+Tooltip = "Blatant teleports to each egg and straight back. Fast flies at the speed below. Safe flies at your pet's own riding speed. If the server snaps you back twice within a minute, Corvus drops one step by itself and retries after 10 minutes.",
 })
 MoveBox:AddSlider("SafePercent", {
 Text = "Safe Speed",
@@ -33397,7 +33319,7 @@ Tooltip = "Sets your best lantern next to growing eggs, they come out heavier",
 })
 ExtraBox:AddToggle("AutoCollect", {
 Text = "Collect Pet Cash",
-Default = true,
+Default = false,
 Tooltip = "Walks past your pets to pick up their cash when the game's auto collect is off",
 })
 Labels.Extras = ExtraBox:AddLabel({ Text = "-", DoesWrap = true })
@@ -33478,10 +33400,10 @@ task.spawn(N.runManual, N.sellEggs, true)
 end,
 })
 local FreeBox = Tabs.Rewards:AddLeftGroupbox("Free Rewards", "gift")
-FreeBox:AddToggle("AutoIndex", { Text = "Auto Claim Index Rewards", Default = true })
+FreeBox:AddToggle("AutoIndex", { Text = "Auto Claim Index Rewards", Default = false })
 FreeBox:AddToggle("AutoFusionCollect", {
 Text = "Auto Collect Fusions",
-Default = true,
+Default = false,
 Tooltip = "Reveals and collects a finished fusion from the machine. Starting a fusion stays manual because it uses up your pets",
 })
 FreeBox:AddToggle("FusionGoToMachine", {
@@ -33489,7 +33411,7 @@ Text = "Go To Fusion Machine If Needed",
 Default = true,
 Tooltip = "If collecting from far away does not work, Corvus walks to the machine, collects and goes back to farming",
 })
-FreeBox:AddToggle("AutoOffline", { Text = "Auto Claim Offline Cash", Default = true })
+FreeBox:AddToggle("AutoOffline", { Text = "Auto Claim Offline Cash", Default = false })
 FreeBox:AddToggle("AutoEventBoost", {
 Text = "Auto Claim Event Boost",
 Default = false,
@@ -34456,7 +34378,9 @@ end,
 })
 end
 local PlotToggles = { "AutoBuyNests", "AutoPlaceEggs", "AutoHatch" }
-N.FarmAllNames = {
+N.AllAutoToggles = {
+"AutoSmartPlan",
+"AutoEventBoost",
 "AutoFarm",
 "AutoBuyNests",
 "AutoPlaceEggs",
@@ -34472,121 +34396,41 @@ N.FarmAllNames = {
 "AutoRadar",
 "AutoGroupMeat",
 "VolcanoDip",
-"AutoEventBoost",
-"AutoIndex",
-"AutoOffline",
-"AutoFusionCollect",
 "AutoCollect",
+"AutoIndex",
+"AutoFusionCollect",
+"AutoOffline",
 }
-N.FarmAllSet = {}
-N.FarmOPSet = {}
-function N.askOP()
-if not Library.ShowConfirmCard then
+function N.anyAuto()
+for _, name in ipairs(N.AllAutoToggles) do
+if on(name) then
+return true
+end
+end
+return false
+end
+-- Log hooks: AUTOLOAD once after the saved config loads, CLICK on every manual toggle change.
+local AutoloadLogged = false
+Library.OnAutoload = function()
+if AutoloadLogged then
 return
 end
-Library:ShowConfirmCard({
-Title = "Enable Auto Farm Everything?",
-Text = "Full automatic: the planner buys, feeds, sells and spends for max profit. It can sell your pets and eggs. If you only want parts of it, use the single switches in the other tabs.",
-ConfirmText = "I understand, enable",
-Warning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
-CancelText = "Cancel",
-OnConfirm = function()
-log("OP confirmed")
-N.opConfirmed = true
-if Toggles.AutoFarmOP then
-Toggles.AutoFarmOP:SetValue(true)
-end
-end,
-})
-end
-function N.applyRun()
-local want = {}
-for _, name in ipairs(N.myRunNames()) do
-want[name] = true
-end
-for name in pairs(N.FarmOPSet) do
-local toggle = Toggles[name]
-if not want[name] and toggle and toggle.Value then
-toggle:SetValue(false)
-end
-if not want[name] then
-N.FarmOPSet[name] = nil
+AutoloadLogged = true
+local names = {}
+for name, toggle in pairs(Toggles) do
+if type(name) == "string" and toggle.Value == true and string.sub(name, 1, 6) ~= "Corvus" then
+table.insert(names, name)
 end
 end
-for name in pairs(want) do
-local toggle = Toggles[name]
-if toggle and not toggle.Value then
-N.FarmOPSet[name] = true
-toggle:SetValue(true)
+table.sort(names)
+log("AUTOLOAD toggles=" .. (if #names > 0 then table.concat(names, ",") else "none"))
 end
+Library.OnUserToggle = function(name, value)
+log("CLICK " .. tostring(name) .. "=" .. tostring(value))
 end
-log("FARM MY FILTERS run list updated")
-end
-function N.farmAll(value, op)
-local set = if op then N.FarmOPSet else N.FarmAllSet
-local tag = if op then "FARM OP" else "FARM ALL"
-if value then
-local best = not op or N.farmMode() == "Best value"
-local names = if best then N.FarmAllNames else N.myRunNames()
-if op and best and Options.MoveMode then
-N.opPrevMove = N.opPrevMove or Options.MoveMode.Value
-pcall(Options.MoveMode.SetValue, Options.MoveMode, "Blatant")
-log("OP movement Blatant (fastest the server allows)")
-end
-for _, name in ipairs(names) do
-local toggle = Toggles[name]
-if toggle and not toggle.Value then
-set[name] = true
-toggle:SetValue(true)
-end
-end
-local turned = {}
-for name in pairs(set) do
-table.insert(turned, name)
-end
-table.sort(turned)
-log(tag .. " on, switched on:", if #turned > 0 then table.concat(turned, ",") else "nothing new, all were on already")
-else
-for name in pairs(set) do
-local toggle = Toggles[name]
-if toggle and toggle.Value then
-toggle:SetValue(false)
-end
-end
-if op and N.opPrevMove and Options.MoveMode then
-pcall(Options.MoveMode.SetValue, Options.MoveMode, N.opPrevMove)
-N.opPrevMove = nil
-end
-if op then
-N.FarmOPSet = {}
-else
-N.FarmAllSet = {}
-end
-log(tag .. " off")
-end
-end
-N.AllAutoToggles = {
-"AutoFarmOP",
-"AutoEventBoost",
-"AutoFarm",
-"AutoBuyNests",
-"AutoPlaceEggs",
-"AutoHatch",
-"AutoPlacePets",
-"AutoFavorite",
-"AutoFeed",
-"AutoLanterns",
-"AutoLuck",
-"AutoRebirth",
-"AutoShop",
-"AutoSell",
-"AutoRadar",
-"AutoGroupMeat",
-"VolcanoDip",
-}
 if Library.AddCommand then
 pcall(function()
-toggleCommand("farmall", { "everything", "afk", "farmop", "op" }, { "AutoFarmOP" }, "Auto Farm Everything")
+toggleCommand("planner", { "smart", "smartplan" }, { "AutoSmartPlan" }, "Smart Planner")
 toggleCommand("farm", { "autofarm", "eggs" }, { "AutoFarm" }, "Auto Farm Eggs")
 toggleCommand("plot", { "nests", "hatch" }, PlotToggles, "Nests, placing and hatching")
 toggleCommand("pets", { "placepets" }, { "AutoPlacePets" }, "Auto Place Best Pets")
@@ -34598,19 +34442,6 @@ toggleCommand("noclip", { "nc" }, { "Noclip" }, "Noclip")
 toggleCommand("esp", { "eggesp" }, { "EggESP" }, "Egg ESP")
 toggleCommand("volcano", { "dip" }, { "VolcanoDip" }, "Volcano dips")
 toggleCommand("radar", { "autoradar" }, { "AutoRadar" }, "Auto Use Radars")
-Library:AddCommand({
-Name = "all",
-Aliases = { "fullfarm" },
-Description = "Turns the whole farm on: eggs, plot, pets, feeding and luck",
-Source = GameName,
-Callback = function()
-setToggles(
-{ "AutoFarm", "AutoBuyNests", "AutoPlaceEggs", "AutoHatch", "AutoPlacePets", "AutoFeed", "AutoLuck" },
-{ "on" }
-)
-return "Full farm on"
-end,
-})
 Library:AddCommand({
 Name = "stop",
 Aliases = { "alloff" },
@@ -34774,7 +34605,7 @@ end
 if Library.SetQuickBar then
 pcall(function()
 Library:SetQuickBar({
-{ Toggle = "AutoFarmOP", Icon = "rocket", Label = "Farm All" },
+{ Toggle = "AutoSmartPlan", Icon = "rocket", Label = "Planner" },
 { Toggle = "AutoFarm", Icon = "egg", Label = "Farm" },
 { Toggle = "AutoPlaceEggs", Icon = "house", Label = "Nests" },
 { Toggle = "AutoHatch", Icon = "sparkles", Label = "Hatch" },
@@ -34802,24 +34633,6 @@ return isfile(SetupFlag)
 end)
 return not ok or done == true
 end
-function N.modeToast()
-local flag = "Corvus/RAP_farmmode_toast.txt"
-local seen = false
-pcall(function()
-seen = isfile(flag)
-end)
-if seen then
-return
-end
-pcall(function()
-if makefolder and isfolder and not isfolder("Corvus") then
-makefolder("Corvus")
-end
-writefile(flag, "1")
-end)
-notify("Auto Farm Everything", "Auto Farm Everything on Main is now the full automatic farm.", 10)
-end
-task.delay(6, N.modeToast)
 function N.openWizard()
 if not Library.ShowWizard then
 return
@@ -34834,15 +34647,8 @@ Title = "What should Corvus do for you?",
 Description = "Pick everything you want running. Tap again to unpick.",
 Multi = true,
 Required = true,
-Default = { "everything" },
+Default = {},
 Choices = {
-{
-Id = "everything",
-Title = "Auto Farm Everything",
-Description = "Full automatic, the planner buys, feeds and sells for max profit",
-Icon = "rocket",
-Color = "#60d696",
-},
 {
 Id = "farm",
 Title = "Farm eggs",
@@ -34898,7 +34704,7 @@ Color = "#ff78c8",
 Id = "move",
 Title = "How should Corvus travel?",
 Description = "You can change this later in the Main tab.",
-Default = "Safe",
+Default = "Blatant",
 SingleColumn = true,
 ChoiceHeight = 54,
 Choices = {
@@ -34925,7 +34731,7 @@ Color = "#ff5d8f",
 },
 },
 Visible = function(state)
-return type(state.tasks) == "table" and (state.tasks.farm == true or state.tasks.everything == true or state.tasks.op == true)
+return type(state.tasks) == "table" and (state.tasks.farm == true)
 end,
 },
 {
@@ -34966,7 +34772,7 @@ Color = "#9085e9",
 },
 },
 Visible = function(state)
-return type(state.tasks) == "table" and (state.tasks.farm == true or state.tasks.everything == true or state.tasks.op == true)
+return type(state.tasks) == "table" and (state.tasks.farm == true)
 end,
 },
 },
@@ -34981,14 +34787,18 @@ luck = { "AutoLuck", "AutoShop" },
 rebirth = { "AutoRebirth" },
 esp = { "EggESP" },
 }
-if picked.op or picked.everything then
-setToggles({ "AutoFarmOP" }, { "on" })
-else
+local turned = {}
 for id, names in pairs(groups) do
-setToggles(names, { if picked[id] then "on" else "off" })
+if picked[id] then
+setToggles(names, { "on" })
+for _, n in ipairs(names) do
+table.insert(turned, n)
 end
 end
-if picked.farm or picked.everything then
+end
+table.sort(turned)
+log("QUICKSETUP applied toggles=" .. (if #turned > 0 then table.concat(turned, ",") else "none"))
+if picked.farm then
 if type(values.move) == "string" then
 pcall(Options.MoveMode.SetValue, Options.MoveMode, values.move)
 end
@@ -35631,16 +35441,6 @@ end,
 end)
 end
 end
-pcall(function()
-local mine = N.farmMode() == "My filters"
-Options.FarmRun:SetVisible(mine)
-Options.OPExclude:SetVisible(not mine)
-end)
-pcall(function()
-Library.ShareIgnore = Library.ShareIgnore or {}
-Library.ShareIgnore.AutoFarmOP = true
-SaveManager:SetIgnoreIndexes({ "AutoFarmOP" })
-end)
 if Window.AddSettingsTab then
 local ok, tab = pcall(Window.AddSettingsTab, Window, {
 ThemeManager = ThemeManager,
@@ -35659,12 +35459,13 @@ pcall(function()
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
-SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoFarmOP" })
+SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
 ThemeManager:SetFolder("Corvus")
 SaveManager:SetFolder("Corvus/RideAPet")
 SaveManager:BuildConfigSection(Tabs.Settings)
 ThemeManager:ApplyToTab(Tabs.Settings)
 SaveManager:LoadAutoloadConfig()
+if Library.OnAutoload then pcall(Library.OnAutoload) end
 end)
 end
 if Window.AddInfoTab then
@@ -36124,7 +35925,7 @@ for _, w in ipairs(N.weatherState()) do
 active[w.name] = true
 if not W.seen[w.name] then
 W.seen[w.name] = true
-log("WEATHER", w.name, string.format("mult=%.4g until=%ds", w.mult, math.floor(w.left)))
+if N.anyAuto() then log("WEATHER", w.name, string.format("mult=%.4g until=%ds", w.mult, math.floor(w.left))) end
 if w.mutation and (on("AutoFarm") or N.farmAny()) then
 log("WEATHER prioritise eggs")
 end
@@ -36133,7 +35934,7 @@ end
 for name in pairs(W.seen) do
 if not active[name] then
 W.seen[name] = nil
-log("WEATHER", name, "ended")
+if N.anyAuto() then log("WEATHER", name, "ended") end
 end
 end
 end
