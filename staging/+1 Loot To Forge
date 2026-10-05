@@ -31816,6 +31816,9 @@ do
 		["WorldBoss/TryClaimBossRewardRE"] = true,
 		["Season/LuckRE"] = true,
 		["Season/ExchangeGoodsRE"] = true,
+		-- Blatant probes (p05_probes, blatant.md): the game's own calls, sent sooner.
+		["Dungeon/StartRoundRE"] = true,
+		["Train/IntoAutoTrainRE"] = true,
 	}
 	local AllowedInvoke = {
 		["Profile/GetTotalDataRF"] = true,
@@ -31825,6 +31828,9 @@ do
 		["Dungeon/TryIntoDungeonRF"] = true,
 		["Code/TryUseCodeRF"] = true,
 		["Backpack/EnhantEquipmentRF"] = true,
+		["Stage/StageFinishedRF"] = true,
+		["Stage/GetOreRF"] = true,
+		["Dungeon/CompleteRoundRF"] = true,
 	}
 	-- Bindable events are the game's own buttons: ExitFightBE is the Return button (banks the ores),
 	-- ATKOnceBE is one click of the attack button.
@@ -31839,6 +31845,8 @@ do
 		["Attack/AttackEnemyBE"] = true,
 		["Attack/EnemyHitBE"] = true,
 		["Profile/GetTotalDataRF"] = true,
+		["Stage/GetOreRF"] = true,
+		["Dungeon/StartRoundRE"] = true,
 	}
 	function N.remote(path)
 		local node = ReplicatedStorage:FindFirstChild("Remote")
@@ -32448,6 +32456,11 @@ do
 			local row = levels[tonumber(upgrade.Level) or 0]
 			max = (tonumber(row and row.Number) or 4) + (tonumber(upgrade.Number) or 0)
 		end
+		-- Ores taken straight from the server (Blatant pickup, p05_probes) never touch the HUD counter.
+		local F = N.Fight
+		if F and (F.direct or 0) > 0 and not F.hudCounts then
+			now = (now or 0) + F.direct
+		end
 		return now or 0, max
 	end
 end
@@ -32910,6 +32923,10 @@ do
 		end
 	end
 	function N.auraStep()
+		-- Instant tower floors must not kill the game's enemies (the game would complete that floor again).
+		if N.Tower and N.Tower.fastRunning then
+			return 0
+		end
 		if not N.want("KillAura") or N.dead() or os.clock() - N.Aura.at < math.clamp(optionNumber("AuraSpeed", 0.1), 0.1, 2) then
 			return 0
 		end
@@ -33007,11 +33024,17 @@ do
 		end
 		local packNow = N.pack()
 		setStatus("Banking ores (" .. reason .. ")")
-		log("BANK", reason, "stage", F.stage, "pack", packNow)
+		log("BANK", reason, "stage", F.stage, "pack", packNow, if (F.direct or 0) > 0 then "direct " .. F.direct else "")
+		local lootSnap = N.lootBankStart and N.lootBankStart()
 		N.bindable(N.R.exitFight, true)
 		waitFor(function()
 			return N.fightMode() ~= "Stage"
 		end, 4)
+		F.direct = 0
+		F.lootedSpawn = false
+		if lootSnap then
+			pcall(N.lootBankEnd, lootSnap, if F.runStartedAt then os.clock() - F.runStartedAt else nil, F.runTarget or F.stage)
+		end
 		Session.banks += 1
 		-- A full pack is a complete run: it calibrates the planner's run model (seconds per run at this depth).
 		if reason == "pack full" and F.runStartedAt and N.planNoteRun then
@@ -33043,6 +33066,7 @@ do
 		F.clearedAt = nil
 		F.lastHp = nil
 		F.lastHit = os.clock()
+		F.lootedSpawn = false
 		setStatus("Entering stage " .. n)
 		N.tp(part.CFrame + Vector3.new(0, 2, 0))
 		local id = "Stage_" .. n
@@ -33067,6 +33091,14 @@ do
 		F.runTarget = target
 		F.runStartedAt = os.clock()
 		F.seen = {}
+		F.direct = 0
+		F.directClears = 0
+		-- Coins/s the run model expects before this run (the stage_loot probe compares the real run with it).
+		F.coinsBefore = nil
+		if N.farmValue then
+			local _, cap = N.pack()
+			F.coinsBefore = N.call(N.farmValue, target, cap)
+		end
 		Session.runs += 1
 		F.lastRun = string.format("target stage %d, power %s", target, formatNumber(N.power()))
 		log("RUN", Session.runs, F.lastRun)
@@ -33106,6 +33138,15 @@ do
 			F.seen[F.stage] = true
 			F.idleSince = nil
 			F.clearedAt = nil
+			-- Blatant pickup: this spawn's ores were rolled when it appeared, take them before the fight.
+			if not F.lootedSpawn and F.stage >= N.stageTarget() and N.directLootWanted and N.directLootWanted() then
+				F.lootedSpawn = true
+				if packNow < packMax then
+					setStatus(string.format("Stage %d: taking the ores  \u{00B7}  pack %d/%d", F.stage, packNow, packMax))
+					N.directLoot(F.stage)
+					packNow, packMax = N.pack()
+				end
+			end
 			local target = enemies[1]
 			if F.target ~= target.model then
 				F.target = target.model
@@ -33153,7 +33194,14 @@ do
 		local target = N.stageTarget()
 		-- The pack is small and deeper stages drop better ores, so ores are only picked on the deepest stage of
 		-- the run (unless every stage is picked on purpose). Low stages are just cleared to unlock the next one.
-		local pickHere = optionText("PickOres", "Deepest stage only") == "Every stage" or F.stage >= target or os.clock() < N.Super.pickUntil
+		local pickHere = optionText("PickOres", "Deepest stage only") == "Every stage" or F.stage >= target
+		if F.lootedSpawn then
+			-- The ores of this spawn were already taken from the server: the drops on the ground are the same ones.
+			pickHere = false
+		end
+		if os.clock() < N.Super.pickUntil then
+			pickHere = true
+		end
 		local pickStart = os.clock()
 		if pickHere and N.collectOne() then
 			if N.planNotePick then
@@ -33174,6 +33222,7 @@ do
 				return
 			end
 			F.clearedAt = nil
+			F.lootedSpawn = false
 			Session.stages += 1
 			Session.bestStage = math.max(Session.bestStage, F.stage)
 			F.seen[F.stage] = nil
@@ -33216,6 +33265,8 @@ do
 				Session.deaths += 1
 				if kind == "StageDead" then
 					Session.lostRuns += 1
+					F.direct = 0
+					F.lootedSpawn = false
 					F.hard[F.stage] = os.clock() + 600
 					logProblem("Died on stage " .. tostring(F.stage) .. ", the pack was lost")
 					if N.Events.lostRun then
@@ -33711,7 +33762,9 @@ do
 			return false
 		end
 		local current = tonumber(LocalPlayer:GetAttribute("AutoTrainAreaID"))
-		if current ~= area.id then
+		-- Blatant: the server took the better free area (p05_probes train_area), stay where it put you.
+		local held = N.trainZoneHold and N.trainZoneHold(current)
+		if current ~= area.id and not held then
 			local part = N.trainPart(area.id)
 			if not part then
 				logProblem("No AutoTrainArea." .. area.id)
@@ -33729,6 +33782,13 @@ do
 		end
 		N.Train.area = area.id
 		N.Train.since = N.Train.since or os.clock()
+		if not held and N.probeOk and N.probeOk("train_area") and N.blatant("TrainSpeed") and os.clock() - (N.Train.zoneAt or -1e9) > 60 then
+			local zone = N.trainZone()
+			if zone then
+				N.Train.zoneAt = os.clock()
+				fire("Train/IntoAutoTrainRE", zone.id)
+			end
+		end
 		local best = N.Plan and N.Plan.best
 		setStatus(string.format(
 			"Training in area %d (x%s)  \u{00B7}  level %d%s",
@@ -33843,6 +33903,8 @@ do
 		end
 		Session.towerRuns += 1
 		N.Tower.startedAt = os.clock()
+		N.Tower.fastTried = false
+		N.Tower.roundAt = nil
 		N.Tower.round = floor
 		N.Tower.emptySince = nil
 		N.Tower.last = "Run " .. Session.towerRuns .. " from floor " .. floor
@@ -33854,7 +33916,26 @@ do
 	function N.towerStep()
 		local T = N.Tower
 		local round = LocalPlayer:GetAttribute("CurrentRound")
+		-- Blatant: instant floors (p05_probes), once per run, after the game has started its first floor (1 s).
+		if not T.fastTried and N.towerFastWanted and N.towerFastWanted() and round ~= nil then
+			if os.clock() - (T.startedAt or 0) < 1.5 then
+				task.wait(0.2)
+				return
+			end
+			T.fastTried = true
+			if N.towerFast() then
+				return
+			end
+		end
 		if round ~= nil and round ~= T.round then
+			-- Seconds per floor of the game's own flow: the baseline of the instant floors probe.
+			if T.roundAt and tonumber(round) == (tonumber(T.round) or 0) + 1 then
+				local secs = os.clock() - T.roundAt
+				if secs > 0.5 and secs < 120 then
+					T.perFloor = if T.perFloor then T.perFloor * 0.7 + secs * 0.3 else secs
+				end
+			end
+			T.roundAt = os.clock()
 			T.round = round
 			if T.lastDeathRound > 0 and (tonumber(round) or 0) > T.lastDeathRound then
 				T.deathStreak = 0
@@ -33978,8 +34059,8 @@ do
 			return
 		end
 		task.wait(4.5)
-		fire(N.R.bossCard, "1")
-		N.Boss.last = "Boss down, reward card picked"
+		local cards = if N.bossCards then N.bossCards() else (fire(N.R.bossCard, "1") and 1)
+		N.Boss.last = if (tonumber(cards) or 0) > 1 then "Boss down, " .. cards .. " reward cards taken" else "Boss down, reward card picked"
 	end)
 	-- Rewards. Every one is checked against the player data first, so nothing is spammed.
 	N.Reward = { log = {}, tried = {} }
@@ -34435,6 +34516,583 @@ do
 		end)
 	end
 end
+do
+	-- Blatant probes (blatant.md, dump pv33715). Faster ways the dump shows the server may take: each one is tried
+	-- once per game version (PlaceVersion), kept only when the server really pays (measured, never assumed) and
+	-- logged as "PROBE <name> result=accepted|rejected gain=<x>". Rejected = the hub keeps the game's own way.
+	-- No anticheat in the dump (notes.md), so Blatant is the default of every speed dropdown.
+	local Pr = { file = "Corvus_LTF_probes.txt", results = {}, version = "?" }
+	N.Probe = Pr
+	pcall(function()
+		Pr.version = tostring(game.PlaceVersion)
+	end)
+	N.ProbeNames = { "stage_loot", "train_rate", "train_area", "train_keep", "tower_fast", "boss_cards" }
+	function N.probeEncode()
+		local lines = { "version=" .. Pr.version }
+		for _, name in ipairs(N.ProbeNames) do
+			local r = Pr.results[name]
+			if r then
+				table.insert(lines, string.format("%s|%s|%.4f|%s", name, r.result, tonumber(r.gain) or 0, tostring(r.value or "")))
+			end
+		end
+		return table.concat(lines, "\n")
+	end
+	function N.probeDecode(text)
+		text = tostring(text or "")
+		local results = {}
+		local version = string.match(text, "^version=([^\n]*)")
+		for name, result, gain, value in string.gmatch(text, "([%w_]+)|(%a+)|([^|\n]+)|([^\n]*)") do
+			if result == "accepted" or result == "rejected" then
+				results[name] = { result = result, gain = tonumber(gain) or 0, value = if value ~= "" then value else nil }
+			end
+		end
+		return version, results
+	end
+	local function save()
+		if type(writefile) == "function" then
+			pcall(writefile, Pr.file, N.probeEncode())
+		end
+	end
+	pcall(function()
+		if type(isfile) == "function" and type(readfile) == "function" and isfile(Pr.file) then
+			local version, results = N.probeDecode(readfile(Pr.file))
+			if version == Pr.version then
+				Pr.results = results
+				local parts = {}
+				for name, r in pairs(results) do
+					table.insert(parts, name .. "=" .. r.result)
+				end
+				table.sort(parts)
+				log("PROBE remembered for version", Pr.version, table.concat(parts, " "))
+			else
+				log("PROBE game version", Pr.version, "(saved " .. tostring(version) .. "), measuring again")
+			end
+		end
+	end)
+	function N.probe(name)
+		return Pr.results[name]
+	end
+	function N.probeOk(name)
+		local r = Pr.results[name]
+		return r ~= nil and r.result == "accepted"
+	end
+	-- Not rejected: still to be measured, or accepted.
+	function N.probeOpen(name)
+		local r = Pr.results[name]
+		return r == nil or r.result == "accepted"
+	end
+	function N.probeDone(name, accepted, gain, value, detail)
+		gain = tonumber(gain) or 0
+		if gain ~= gain or gain == math.huge or gain == -math.huge then
+			gain = 0
+		end
+		gain = math.clamp(gain, 0, 999)
+		Pr.results[name] = { result = if accepted then "accepted" else "rejected", gain = gain, value = value }
+		log("PROBE", name, "result=" .. Pr.results[name].result, string.format("gain=%.2f", gain), detail or "")
+		save()
+	end
+	function N.blatant(option)
+		return string.sub(optionText(option, "Blatant"), 1, 7) == "Blatant"
+	end
+	N.SpeedValues = {
+		LootSpeed = { "Blatant (instant pickup)", "Legit (walk to drops)" },
+		TrainSpeed = { "Blatant (fastest the server takes)", "Legit (game speed)" },
+		TowerSpeed = { "Blatant (instant floors)", "Legit (fight every floor)" },
+		BossCards = { "Blatant (every card)", "Legit (one card)" },
+	}
+	-- Short plain-words line for the status labels.
+	function N.probeText(name)
+		local r = Pr.results[name]
+		if not r then
+			return "measuring on the next try"
+		elseif r.result == "accepted" then
+			return string.format("server takes it (x%.2f)", r.gain or 0)
+		end
+		return "server refused, game speed used"
+	end
+
+	-- (1) Stage loot. The game asks the server for a stage's ores the moment its enemies spawn (StageUtils
+	-- CreateStageEnemys -> StageFinishedRF("Stage_N"), dump 24799-24824) and every pickup is GetOreRF(uuid)
+	-- (OreUtils.CreateOres 24518). Blatant takes the rolled ores at once, up to the free pack slots, best rarity
+	-- first; the kill and the 30 s respawn stay the game's. Accepted only when the bank really adds them.
+	N.Loot = { empty = 0, short = 0, last = "" }
+	function N.directLootWanted()
+		return N.blatant("LootSpeed") and N.probeOpen("stage_loot")
+	end
+	function N.directLoot(stageN)
+		local F = N.Fight
+		local L = N.Loot
+		local ok, tab = invoke("Stage/StageFinishedRF", 8, "Stage_" .. tostring(stageN))
+		if not ok or type(tab) ~= "table" or next(tab) == nil then
+			L.empty += 1
+			if N.probe("stage_loot") == nil and L.empty >= 3 then
+				N.probeDone("stage_loot", false, 0, nil, "answer=" .. brief(tab))
+			end
+			return 0
+		end
+		local list = {}
+		for uuid, id in pairs(tab) do
+			if type(id) ~= "table" then
+				local rarity = N.rarityText(N.call(N.G.Ore.GetRarity, id))
+				if allows(Options.PickRarities, rarity) then
+					table.insert(list, { uuid = uuid, id = id, rank = N.rarityRank(rarity) })
+				end
+			end
+		end
+		table.sort(list, function(a, b)
+			if a.rank ~= b.rank then
+				return a.rank > b.rank
+			end
+			return tostring(a.uuid) < tostring(b.uuid)
+		end)
+		local hudBefore = select(1, N.pack()) - (if F.hudCounts then 0 else (F.direct or 0))
+		local picked = 0
+		local started = os.clock()
+		for _, entry in ipairs(list) do
+			local now, max = N.pack()
+			if now >= max then
+				break
+			end
+			invoke("Stage/GetOreRF", 5, entry.uuid)
+			F.direct = (F.direct or 0) + 1
+			picked += 1
+			Session.ores += 1
+		end
+		-- The planner's run model learns the real seconds per ore of this way of picking.
+		if picked > 0 then
+			F.directClears = (F.directClears or 0) + 1
+		end
+		if picked > 0 and N.planNotePick then
+			N.planNotePick(math.max((os.clock() - started) / picked, 0.02))
+		end
+		if picked > 0 and F.hudCounts == nil then
+			-- Does the HUD count server pickups by itself? Then the hub must not add them a second time.
+			task.wait(0.3)
+			local hudNow = select(1, N.pack()) - F.direct
+			F.hudCounts = hudNow >= hudBefore + picked
+			if F.hudCounts then
+				log("LOOT the HUD counts direct pickups itself")
+			end
+		end
+		L.last = string.format("Stage %d: took %d ores straight from the server", stageN, picked)
+		log("LOOT direct stage", stageN, "picked", picked, "of", #list, "pack", select(1, N.pack()))
+		return picked
+	end
+	-- Called by N.bank: snapshot before the Return button, verdict after the bank lands in the backpack.
+	function N.lootBankStart()
+		local F = N.Fight
+		if (F.direct or 0) <= 0 then
+			return nil
+		end
+		local packNow = N.pack()
+		local snap = { ores = N.oreTotal(), direct = F.direct, regular = math.max(packNow - F.direct, 0), total = packNow, clears = F.directClears or 1 }
+		F.directClears = 0
+		return snap
+	end
+	function N.lootBankEnd(snap, seconds, target)
+		if not snap or N.probeOk("stage_loot") then
+			return
+		end
+		local L = N.Loot
+		local need = snap.regular + math.max(1, math.floor(snap.direct * 0.7))
+		local arrived = waitFor(function()
+			return N.oreTotal() - snap.ores >= need
+		end, 6)
+		local gained = N.oreTotal() - snap.ores
+		if arrived then
+			local ev = N.stageOreEV and N.stageOreEV(target) or nil
+			local mult = if N.coinMult then N.coinMult() else 1
+			local after = if ev and seconds and seconds > 0 then snap.total / seconds * ev * mult else nil
+			local before = N.Fight.coinsBefore
+			if (not before or before <= 0) and after and seconds and seconds > 0 then
+				-- No run model yet: the same run with the walk (about 0.62 s per ore) and the 2.5 s drop wait per clear.
+				before = after * seconds / (seconds + snap.total * 0.62 + 2.5 * math.max(snap.clears, 1))
+			end
+			local gain = if after and before and before > 0 then after / before else 0
+			N.probeDone(
+				"stage_loot",
+				true,
+				gain,
+				nil,
+				string.format("ores=%d/%d coins/s before=%s after=%s", gained, snap.total, if before then formatNumber(before) else "?", if after then formatNumber(after) else "?")
+			)
+		elseif gained <= snap.regular then
+			N.probeDone("stage_loot", false, 0, nil, string.format("ores=%d of %d, the %d direct ores never arrived", gained, snap.total, snap.direct))
+		else
+			L.short += 1
+			log("PROBE stage_loot unclear", "ores", gained, "of", snap.total, "try", L.short)
+			if L.short >= 3 then
+				N.probeDone("stage_loot", false, 0, nil, "three banks came up short")
+			end
+		end
+	end
+
+	-- (2)+(3) Training. TrainCTRL.TrainOnce (dump 30880) is the game's own train click: its only limit is the
+	-- client attribute LastTrainTick (0.15 s), the game's auto train clicks every 0.2 s. The ladder tries 0.15,
+	-- 0.1, 0.075 and 0.05 s for 15 s each (exp per train-once value from Eco power) and keeps the fastest step
+	-- that still gained 8 %. Then IntoAutoTrainRE(best free area) is tried from the open area (the rebirth gate
+	-- is client-side, 41629): kept when exp/s rises 20 %. Then the same clicks during stage runs (the game trains
+	-- in fights too, 24317): kept when exp keeps coming while farming.
+	N.Boost = { i = 1, rates = {}, raws = {}, win = nil, area = nil, areaRate = nil, last = "" }
+	N.TrainLadder = { 0.2, 0.15, 0.1, 0.075, 0.05 }
+	N.BoostWindow = 15
+	local Ladder = N.TrainLadder
+	function N.trainCtrl()
+		if Pr.ctrl == nil then
+			Pr.ctrl = false
+			pcall(function()
+				local node = ReplicatedStorage:FindFirstChild("CTRL")
+				node = node and node:FindFirstChild("TrainCTRL")
+				if node then
+					local module = require(node)
+					if type(module) == "table" and type(module.TrainOnce) == "function" then
+						Pr.ctrl = module
+					end
+				end
+			end)
+		end
+		return Pr.ctrl or nil
+	end
+	local function trainOnce()
+		local ctrl = N.trainCtrl()
+		if not ctrl then
+			return false
+		end
+		pcall(function()
+			LocalPlayer:SetAttribute("LastTrainTick", 0)
+		end)
+		return (pcall(ctrl.TrainOnce))
+	end
+	N.trainOnceBoost = trainOnce
+	function N.boostContext()
+		if not N.want("AutoTrain") or not N.blatant("TrainSpeed") or N.dead() or N.manualRunning() then
+			return nil
+		end
+		local mode = N.fightMode()
+		if mode == nil and LocalPlayer:GetAttribute("AutoTrainAreaID") ~= nil then
+			return "area"
+		elseif mode == "Stage" then
+			return "fight"
+		end
+		return nil
+	end
+	function N.trainCadence()
+		local r = Pr.results.train_rate
+		if r and r.result == "accepted" then
+			return tonumber(r.value)
+		end
+		return nil
+	end
+	-- Ladder decision (pure): the next step while the newest one still gained 8 % on the best so far, else nil and
+	-- the best step.
+	function N.ladderNext(rates, i)
+		local best = 1
+		for k = 2, i do
+			if rates[k] and rates[best] and rates[k] >= rates[best] * 1.08 then
+				best = k
+			end
+		end
+		if i >= #Ladder or (i >= 2 and best ~= i) then
+			return nil, best
+		end
+		return i + 1, best
+	end
+	-- The best free (never paid) area above the best open one, and the best open one.
+	function N.trainZone()
+		local open = N.bestTrainArea()
+		if not open then
+			return nil, nil
+		end
+		local best
+		for _, area in ipairs(N.trainAreas()) do
+			if not area.pay and area.basic > open.basic and (not best or area.basic > best.basic) then
+				best = area
+			end
+		end
+		return best, open
+	end
+	-- Area id the training counts in: the zone when its probe is running or was accepted, else nil.
+	function N.trainZoneHold(current)
+		if not N.blatant("TrainSpeed") or not N.probeOpen("train_area") then
+			return false
+		end
+		local zone = N.trainZone()
+		return zone ~= nil and tonumber(current) == zone.id and (N.probeOk("train_area") or N.Boost.area ~= nil)
+	end
+	-- Multiplier of the area the server trains in (the accepted zone, else the area you stand in).
+	function N.trainEffectiveBasic(basic)
+		if N.blatant("TrainSpeed") and N.probeOk("train_area") then
+			local zone = N.trainZone()
+			if zone and zone.basic > (basic or 0) then
+				return zone.basic
+			end
+		end
+		return basic
+	end
+	-- Share of the area exp/s that keeps coming in during stage runs (0 when not accepted).
+	function N.trainKeepRatio()
+		if not N.want("AutoTrain") or not N.blatant("TrainSpeed") or not N.probeOk("train_keep") then
+			return 0
+		end
+		return math.clamp(tonumber(Pr.results.train_keep.value) or 0, 0, 0.95)
+	end
+	local function windowStart(B, ctx)
+		B.win = {
+			at = os.clock(),
+			power = N.power(),
+			once = math.max(tonumber(N.call(N.G.Calc.CCTrainOncePower, LocalPlayer)) or 1, 1),
+			area = LocalPlayer:GetAttribute("AutoTrainAreaID"),
+			ctx = ctx,
+		}
+	end
+	-- Raw exp/s and exp/s per train-once value once the window is full, nil while it runs.
+	local function windowRate(B)
+		local w = B.win
+		local secs = os.clock() - w.at
+		if secs < N.BoostWindow then
+			return nil
+		end
+		B.win = nil
+		local raw = math.max(N.power() - w.power, 0) / secs
+		return raw, raw / w.once
+	end
+	local function ladderStep(B)
+		if not N.trainCtrl() then
+			N.probeDone("train_rate", false, 0, nil, "no TrainCTRL module")
+			return
+		end
+		if not B.win then
+			windowStart(B, "area")
+		end
+		local cadence = Ladder[B.i]
+		if B.i > 1 then
+			trainOnce()
+		end
+		local raw, perOnce = windowRate(B)
+		if raw then
+			B.rates[B.i], B.raws[B.i] = perOnce, raw
+			log(string.format("PROBE train_rate cadence=%.3f result=%s exp/s", cadence, formatNumber(raw)))
+			local nextI, best = N.ladderNext(B.rates, B.i)
+			if nextI then
+				B.i = nextI
+			else
+				local gain = B.rates[best] / math.max(B.rates[1] or 0, 1e-9)
+				if (B.rates[1] or 0) <= 0 then
+					gain = if B.rates[best] > 0 then 99 else 0
+				end
+				B.areaRate = B.raws[best]
+				N.probeDone("train_rate", best > 1 and gain >= 1.1, gain, Ladder[best], string.format("cadence=%.3f", Ladder[best]))
+				B.i, B.rates, B.raws = 1, {}, {}
+			end
+			return
+		end
+		task.wait(if B.i > 1 then cadence else 0.25)
+	end
+	local function areaStep(B, zone, open)
+		local cadence = N.trainCadence()
+		B.area = B.area or { step = 1 }
+		local A = B.area
+		if not B.win then
+			windowStart(B, "area")
+		end
+		if cadence then
+			trainOnce()
+		end
+		local raw = windowRate(B)
+		if raw then
+			if A.step == 1 then
+				A.base = raw
+				A.step = 2
+				fire("Train/IntoAutoTrainRE", zone.id)
+				task.wait(2)
+				A.attr = LocalPlayer:GetAttribute("AutoTrainAreaID")
+				B.win = nil
+			else
+				local gain = raw / math.max(A.base or 0, 1e-9)
+				local accepted = (A.base or 0) > 0 and gain >= 1.2
+				B.area = nil
+				if accepted then
+					B.areaRate = raw
+				else
+					fire("Train/IntoAutoTrainRE", open.id)
+				end
+				N.probeDone("train_area", accepted, gain, zone.id, string.format("id=%d open=%d attr=%s", zone.id, open.id, tostring(A.attr)))
+			end
+			return
+		end
+		task.wait(cadence or 0.25)
+	end
+	local function keepStep(B, cadence)
+		if not B.win then
+			windowStart(B, "fight")
+		end
+		trainOnce()
+		local raw = windowRate(B)
+		if raw then
+			local ratio = raw / math.max(B.areaRate, 1e-9)
+			N.probeDone(
+				"train_keep",
+				ratio >= 0.05,
+				1 + ratio,
+				string.format("%.3f", math.min(ratio, 0.95)),
+				string.format("fight exp/s=%s area exp/s=%s attr=%s", formatNumber(raw), formatNumber(B.areaRate), tostring(LocalPlayer:GetAttribute("AutoTrainAreaID")))
+			)
+			return
+		end
+		task.wait(cadence)
+	end
+	-- One step of the training boost loop (p10). Every wait is inside, so the loop never spins.
+	function N.trainBoostStep()
+		local B = N.Boost
+		local ctx = N.boostContext()
+		if not ctx then
+			B.win = nil
+			task.wait(0.3)
+			return
+		end
+		if B.win and (B.win.ctx ~= ctx or B.win.area ~= LocalPlayer:GetAttribute("AutoTrainAreaID") or N.power() < B.win.power) then
+			B.win = nil -- moved, changed area or rebirthed: the window starts again
+		end
+		local cadence = N.trainCadence()
+		if ctx == "area" then
+			if N.probe("train_rate") == nil then
+				ladderStep(B)
+				return
+			end
+			local zone, open = N.trainZone()
+			if zone and N.probe("train_area") == nil then
+				areaStep(B, zone, open)
+				return
+			end
+			if not cadence then
+				task.wait(0.5)
+				return
+			end
+			-- Keep measuring the area speed: the fight probe compares with it.
+			if not B.win then
+				windowStart(B, "area")
+			end
+			trainOnce()
+			local raw = windowRate(B)
+			if raw and raw > 0 then
+				B.areaRate = raw
+			end
+			B.last = string.format("Training clicks every %.2f s", cadence)
+			task.wait(cadence)
+			return
+		end
+		-- Stage run: train while farming.
+		if not cadence or not N.probeOpen("train_keep") then
+			task.wait(0.5)
+			return
+		end
+		if N.probe("train_keep") == nil then
+			if not B.areaRate then
+				task.wait(0.5)
+				return
+			end
+			keepStep(B, cadence)
+			return
+		end
+		trainOnce()
+		task.wait(cadence)
+	end
+
+	-- (4) Tower. Floors are completed by the client: DungeonData.StartRound(r) = StartRoundRE, CompleteRound(r) =
+	-- CompleteRoundRF(r) returns that floor's loot (dump 52230, DungeonManager 23803-23841). Blatant starts and
+	-- completes each floor back to back from the floor the run started on, never kills anything meanwhile (so the
+	-- game never completes a floor a second time) and leaves at the first floor the server does not pay.
+	function N.towerFastWanted()
+		return N.blatant("TowerSpeed") and N.probeOpen("tower_fast")
+	end
+	function N.towerFast()
+		local T = N.Tower
+		local round = tonumber(LocalPlayer:GetAttribute("CurrentRound"))
+		local last = N.towerFloors()
+		if not round or not last or round > last then
+			return false
+		end
+		T.fastRunning = true
+		local started = os.clock()
+		local done, answer = 0, nil
+		for r = round, last do
+			if N.fightMode() ~= "Dungeon" or not alive() then
+				break
+			end
+			setStatus(string.format("Tower floor %d: instant clear", r))
+			fire("Dungeon/StartRoundRE", r)
+			task.wait(0.15)
+			local ok, loot = invoke("Dungeon/CompleteRoundRF", 8, r)
+			if answer == nil then
+				answer = brief(loot)
+			end
+			if not ok or type(loot) ~= "table" or next(loot) == nil then
+				break
+			end
+			done += 1
+		end
+		local secs = math.max(os.clock() - started, 0.01)
+		if N.probe("tower_fast") == nil then
+			if done > 0 then
+				local legit = T.perFloor or 5
+				local fast = secs / done
+				N.probeDone("tower_fast", true, legit / fast, nil, string.format("floors=%d in %.1fs, legit %.1fs/floor, first answer %s", done, secs, legit, tostring(answer)))
+			else
+				N.probeDone("tower_fast", false, 0, nil, "first answer " .. tostring(answer))
+			end
+		end
+		T.last = string.format("Instant floors: %d paid in %.1f s", done, secs)
+		log("TOWER fast", "floors", done, "from", round, "in", string.format("%.1fs", secs))
+		if done > 0 then
+			fire(N.R.towerExit)
+			waitFor(function()
+				return N.fightMode() ~= "Dungeon"
+			end, 5)
+		end
+		T.fastRunning = false
+		return done > 0
+	end
+
+	-- (5) World boss cards. WorldBossGUI.OpenBossRewardUI (dump 51518) builds 8 cards, each click fires
+	-- TryClaimBossRewardRE(k); ShowCardVFX writes the owner's UserID on the card. Blatant clicks all 8 and keeps
+	-- doing so only when more than one card comes out as yours.
+	function N.bossCardsMine()
+		local mine, seen = 0, 0
+		pcall(function()
+			local cards = LocalPlayer.PlayerGui.BossFight.BossReward.Cards
+			for _, card in ipairs(cards:GetChildren()) do
+				local owner = card:GetAttribute("UserID")
+				if owner ~= nil then
+					seen += 1
+					if owner == LocalPlayer.UserId then
+						mine += 1
+					end
+				end
+			end
+		end)
+		return mine, seen
+	end
+	function N.bossCards()
+		if not (N.blatant("BossCards") and N.probeOpen("boss_cards")) then
+			fire(N.R.bossCard, "1")
+			return 1
+		end
+		for k = 1, 8 do
+			fire(N.R.bossCard, tostring(k))
+			task.wait(0.3)
+		end
+		task.wait(2)
+		local mine, seen = N.bossCardsMine()
+		if N.probe("boss_cards") == nil then
+			if seen == 0 then
+				log("PROBE boss_cards result=unknown, no card owners shown")
+			else
+				N.probeDone("boss_cards", mine >= 2, mine, mine, string.format("cards=%d of %d shown", mine, seen))
+			end
+		end
+		return mine
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -34669,6 +35327,12 @@ do
 			AllowNull = true,
 			Tooltip = "Only ores of the picked rarities go into your pack. Untick the low ones to keep the pack for the good drops",
 		})
+		StageBox:AddDropdown("LootSpeed", {
+			Text = "Ore Pickup",
+			Values = N.SpeedValues.LootSpeed,
+			Default = N.SpeedValues.LootSpeed[1],
+			Tooltip = "Blatant takes the ores of the deepest stage straight from the server as soon as they spawn, no walking to the drops. The hub checks the first bank and goes back to walking if the server does not pay them",
+		})
 		StageBox:AddSlider("StuckSeconds", { Text = "Give Up On A Stage After", Default = 20, Min = 5, Max = 120, Rounding = 0, Suffix = " s without damage" })
 		local SuperBox = Tabs.Farm:AddLeftGroupbox("Super Loot", "gem")
 		SuperBox:AddToggle("AutoSuperLoot", {
@@ -34776,6 +35440,12 @@ do
 			end
 		end
 		TrainBox:AddDropdown("TrainArea", { Text = "Area", Values = areaNames, Default = "Best open" })
+		TrainBox:AddDropdown("TrainSpeed", {
+			Text = "Training Speed",
+			Values = N.SpeedValues.TrainSpeed,
+			Default = N.SpeedValues.TrainSpeed[1],
+			Tooltip = "Blatant measures the fastest training clicks the server still counts, tries the best free area and keeps training during stage runs. Anything that does not add exp goes back to the game's own speed",
+		})
 		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
@@ -34786,12 +35456,24 @@ do
 			Tooltip = "Uses your Tower Tickets: enters, clears floor after floor and collects the rewards. Opens at rebirth 2",
 		})
 		TowerBox:AddDropdown("TowerStart", { Text = "Start At", Values = { "Highest unlocked", "Floor 1" }, Default = "Highest unlocked" })
+		TowerBox:AddDropdown("TowerSpeed", {
+			Text = "Floor Speed",
+			Values = N.SpeedValues.TowerSpeed,
+			Default = N.SpeedValues.TowerSpeed[1],
+			Tooltip = "Blatant completes floor after floor right away and leaves at the first floor the server does not pay. If it pays none, the hub fights the floors as usual",
+		})
 		Labels.Tower = TowerBox:AddLabel({ Text = "-", DoesWrap = true })
 		local BossBox = Tabs.Farm:AddRightGroupbox("World Boss", "skull")
 		BossBox:AddToggle("AutoWorldBoss", {
 			Text = "Auto World Boss",
 			Default = false,
 			Tooltip = "Joins every world boss, fights it and picks a reward card. Stage runs wait while it is up",
+		})
+		BossBox:AddDropdown("BossCards", {
+			Text = "Reward Cards",
+			Values = N.SpeedValues.BossCards,
+			Default = N.SpeedValues.BossCards[1],
+			Tooltip = "Blatant clicks all 8 reward cards. If the server gives you only one, the next bosses get a single click",
 		})
 		Labels.Boss = BossBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
@@ -35794,7 +36476,9 @@ do
 			if E.last and E.lastAt and power >= E.last and now - E.lastAt >= 5 then
 				local rate = (power - E.last) / (now - E.lastAt)
 				if rate > 0 then
-					E.unit = ema(E.unit, rate / (areaBasic(area) * expBasic(N.rebirth())), 0.3)
+					-- The area the server trains in (an accepted Blatant zone counts with its own multiplier).
+					local basic = if N.trainEffectiveBasic then N.trainEffectiveBasic(areaBasic(area)) else areaBasic(area)
+					E.unit = ema(E.unit, rate / (basic * expBasic(N.rebirth())), 0.3)
 				end
 				E.last, E.lastAt = power, now
 			elseif not E.last or power < E.last then
@@ -35859,9 +36543,15 @@ do
 	function N.expRate()
 		local area = N.bestTrainArea()
 		local basic = if area then area.basic else 1
+		if N.trainEffectiveBasic then
+			basic = N.trainEffectiveBasic(basic)
+		end
 		if P.exp.unit then
 			return P.exp.unit * basic * expBasic(N.rebirth())
 		end
+		-- Not measured yet: the game's formula at the measured Blatant click speed (0.2 s = the game's own).
+		local cadence = N.trainCadence and N.blatant("TrainSpeed") and N.trainCadence() or nil
+		local clicks = if cadence and cadence > 0 then 1 / cadence else 5
 		local once = num(N.call(N.G.Calc.CCTrainOncePower, LocalPlayer), nil)
 		if not once or once <= 0 then
 			return nil
@@ -35871,7 +36561,7 @@ do
 			once = once / areaBasic(inArea)
 		end
 		local crit = math.clamp(num(N.call(N.G.Calc.CCCrit, LocalPlayer), 0), 0, 1)
-		return once * basic * 5 * (1 + 0.5 * crit)
+		return once * basic * clicks * (1 + 0.5 * crit)
 	end
 	-- Exp left to the next rebirth and the cost growth q between this rebirth and the next one.
 	-- Cached for one second: the forge pricing asks for it once per possible item.
@@ -36009,6 +36699,12 @@ do
 				u += tickets * tower.perRun / (income * P.H * 0.5)
 			end
 			local k = P.H * math.log(1 + math.max(u, 0)) / T
+			-- Blatant train-while-farming (probe train_keep, measured ratio c of the area exp/s): the exp per second is
+			-- rate x (s + c(1-s)), so the best share becomes s* = 1 - 1 / (k (1 - c)).
+			local keep = if N.trainKeepRatio then N.trainKeepRatio() else 0
+			if keep > 0 then
+				k *= 1 - keep
+			end
 			target = if k > 1 then 1 - 1 / k else 0
 			local payback = T / math.max(u, 1e-9)
 			local need = 0
@@ -37147,6 +37843,8 @@ do
 			task.wait(0.3)
 		end
 	end)
+	-- Blatant training clicks and their probes (p05_probes): only while Auto Train (or the planner) trains.
+	loop("train boost", N.trainBoostStep)
 	-- Remote-only chores: they never move the character, so they run next to the movement loop.
 	loop("chores", function()
 		if N.manualRunning() then
@@ -37326,11 +38024,22 @@ do
 				)
 				local area = N.bestTrainArea()
 				I.train = string.format(
-					"%s\nLevel <b>%d</b>  \u{00B7}  trained %s this session",
+					"%s\nLevel <b>%d</b>  \u{00B7}  trained %s this session%s",
 					if area then string.format("Best open area: <b>%d</b> (x%s)", area.id, formatNumber(area.basic)) else "No area open",
 					N.level(),
-					N.longTime(Session.trainSeconds)
+					N.longTime(Session.trainSeconds),
+					if N.blatant("TrainSpeed")
+						then string.format(
+							"\nFast clicks: %s\nBetter area: %s\nWhile farming: %s",
+							N.probeText("train_rate"),
+							N.probeText("train_area"),
+							N.probeText("train_keep")
+						)
+						else ""
 				)
+				if N.blatant("LootSpeed") then
+					I.info ..= "\nInstant pickup: " .. N.probeText("stage_loot")
+				end
 				local ups = {}
 				for _, kind3 in ipairs(N.UpgradeKinds) do
 					local nextUp = N.upgradeNext(kind3)
@@ -37390,13 +38099,13 @@ do
 					tonumber(N.store("Dungeon").maxRound) or 0,
 					if N.rebirth() < 2 then "\n<font color=\"#fab428\">Opens at rebirth 2</font>" elseif os.clock() < N.Tower.pauseUntil then "\n<font color=\"#fab428\">Resting " .. N.longTime(N.Tower.pauseUntil - os.clock()) .. " (stuck)</font>" elseif N.power() < (N.Tower.needPower or 0) then "\n<font color=\"#fab428\">Too strong, waiting for power " .. formatNumber(N.Tower.needPower) .. "</font>" else "",
 					Session.towerRuns,
-					if N.Tower.last ~= "" then "\n" .. N.Tower.last else ""
+					(if N.Tower.last ~= "" then "\n" .. N.Tower.last else "") .. (if N.blatant("TowerSpeed") then "\nInstant floors: " .. N.probeText("tower_fast") else "")
 				)
 				I.boss = string.format(
 					"%s\nFights this session <b>%d</b>%s",
 					if N.bossActive() then '<font color="#60d696">World boss is up</font>' else "No world boss right now",
 					Session.bossFights,
-					if N.Boss.last ~= "" then "\n" .. N.Boss.last else ""
+					(if N.Boss.last ~= "" then "\n" .. N.Boss.last else "") .. (if N.blatant("BossCards") then "\nEvery card: " .. N.probeText("boss_cards") else "")
 				)
 				I.rewards = string.format("Claimed <b>%d</b> this session%s", Session.claims, if #N.Reward.log > 0 then "\n" .. table.concat(N.Reward.log, "\n") else "")
 				local index, class, rarity = N.classNow()
