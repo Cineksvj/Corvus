@@ -29433,29 +29433,66 @@ local BootOk, BootError = xpcall(function()
 		end
 		-- Event pickups (stars): every opened sea sends their ids (OnPickupsCreated, pickup id -> plate) and the game
 		-- claims one with CollectEventService.Collect(eventId, id) when you walk close. Blatant claims all of them at once.
-		local StarClaims = {}
+		-- CollectEventConfig: RATE_LIMIT_MAX 500 claims per RATE_LIMIT_TIME 20 s, then PUNISH_TIME 10 s. A deep sea
+		-- has 100+ pickups per wave, so claims stay under 450 per 20 s, run straight on the remote (they never wait
+		-- behind the waves) and pause 12 s when the server starts saying no.
+		local Stars = { claims = {}, pausedUntil = 0, refused = 0, queue = {} }
+		Game.stars = Stars
+		local function collectRemote()
+			local folder = KnitServices and KnitServices:FindFirstChild("CollectEventService")
+			folder = folder and folder:FindFirstChild("RF")
+			return folder and folder:FindFirstChild("Collect")
+		end
 		onEvent("CollectEventService", "OnPickupsCreated", function(payload)
 			if not (on("AutoStars") and isBlatant()) or type(payload) ~= "table" or type(payload.events) ~= "table" then
 				return
 			end
 			for eventId, event in pairs(payload.events) do
 				for pickupId in pairs(type(event) == "table" and type(event.pickups) == "table" and event.pickups or {}) do
-					local now = os.clock()
-					while #StarClaims > 0 and StarClaims[1] < now - 60 do
-						table.remove(StarClaims, 1)
+					if #Stars.queue < 2000 then
+						table.insert(Stars.queue, { eventId, pickupId, os.clock() })
 					end
-					if #StarClaims >= 300 then
-						return
-					end
-					table.insert(StarClaims, now)
+				end
+			end
+		end)
+		task.spawn(function()
+			while alive() do
+				local now = os.clock()
+				while #Stars.claims > 0 and Stars.claims[1] < now - 20 do
+					table.remove(Stars.claims, 1)
+				end
+				-- pickups vanish with their wave: drop the ones older than 15 s
+				while #Stars.queue > 0 and Stars.queue[1][3] < now - 15 do
+					table.remove(Stars.queue, 1)
+				end
+				local remote = collectRemote()
+				if remote and now >= Stars.pausedUntil and #Stars.queue > 0 and #Stars.claims < 450 then
+					local item = table.remove(Stars.queue, 1)
+					table.insert(Stars.claims, now)
 					task.spawn(function()
-						local ok, result = call("CollectEventService", "Collect", eventId, pickupId)
+						local ok, result = pcall(function()
+							return remote:InvokeServer(item[1], item[2])
+						end)
 						if ok and result ~= false then
+							Stars.refused = 0
 							Session.stars += 1
 							Saved.stars += 1
 							SaveDirty = true
+						else
+							Stars.refused += 1
+							if Stars.refused >= 8 then
+								Stars.refused = 0
+								Stars.pausedUntil = os.clock() + 12
+								log("STARS server said no 8 times, pause 12s, collected", Session.stars)
+							end
 						end
 					end)
+					task.wait(0.045)
+				else
+					task.wait(0.1)
+				end
+			end
+		end)
 				end
 			end
 		end)
