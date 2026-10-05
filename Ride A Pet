@@ -27349,6 +27349,7 @@ local Allowed = {
 ["Game/ActivateRadar"] = true,
 ["Game/RadarState"] = true,
 ["Game/FusionAction"] = true,
+["Game/ClaimEventReward"] = true,
 ["Plot/Nests"] = true,
 ["Plot/Upgrades"] = true,
 ["Net/VolcanoDip"] = true,
@@ -27394,6 +27395,23 @@ if not Quiet[path] or not ok then
 log("FIRE", path .. "(" .. argsText(args, 1, args.n) .. ")", if ok then "" else "failed: " .. tostring(err))
 end
 return ok
+end
+function N.invoke(path, ...)
+if not Allowed[path] then
+log("BLOCKED", path)
+return false
+end
+local remote = remoteOf(path)
+if not remote or not remote:IsA("RemoteFunction") then
+log("NO REMOTE", path)
+return false
+end
+local args = table.pack(...)
+local ok, result = pcall(function()
+return remote:InvokeServer(table.unpack(args, 1, args.n))
+end)
+log("INVOKE", path .. "(" .. argsText(args, 1, args.n) .. ")", if ok then tostring(result) else "failed: " .. tostring(result))
+return ok, result
 end
 function N.onEvent(path, fn, quiet)
 task.spawn(function()
@@ -29813,6 +29831,35 @@ end
 function N.spendable()
 return N.cash() - reserveCash()
 end
+-- Luck has no measured payback, a rebirth does: +1 multiplier on (n+1), so it adds income / (n+1) per second.
+-- While the pet it needs is owned and it pays back within 4 hours, luck leaves the rebirth price alone.
+N.RebirthSaving = false
+function N.rebirthReserve()
+local saving = 0
+if on("AutoRebirth") then
+local n = N.rebirths()
+if n < N.rebirthCap() then
+local need = N.rebirthNeed(n)
+if not need or N.ownsPet(need) then
+local cost = N.rebirthCost(n)
+local stats = LocalPlayer:FindFirstChild("leaderstats")
+local item = stats and stats:FindFirstChild("Income/s")
+local income = item and tonumber(item.Value) or 0
+if income <= 0 or cost / (income / (n + 1)) <= 14400 then
+saving = cost
+end
+end
+end
+end
+if (saving > 0) ~= N.RebirthSaving then
+N.RebirthSaving = saving > 0
+log("REBIRTH", if saving > 0 then "luck waits, saving $" .. formatNumber(saving) else "luck can spend again")
+end
+return saving
+end
+function N.luckSpendable()
+return N.spendable() - N.rebirthReserve()
+end
 function N.nestList()
 local plot = N.myPlot()
 local folder = plot and plot:FindFirstChild("Nests")
@@ -30605,7 +30652,7 @@ end
 local bought = 0
 while alive() and bought < 25 and on("AutoLuck") do
 local price = N.luckPrice(N.paidLuckUpgrades())
-if N.spendable() < price then
+if N.luckSpendable() < price then
 break
 end
 local before = N.luckUpgrades()
@@ -31220,13 +31267,15 @@ DiscordDescription = "Keyless scripts, updates and support",
 })
 end)
 end
-Tabs.Main = N.addTab("Main", "egg", "Ride out, grab eggs, bring them home")
-Tabs.Plot = N.addTab("Plot", "house", "Nests, hatching, pets and feeding")
-Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Luck, rebirth, shop and selling")
+Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything, egg farm and status")
+Tabs.Eggs = N.addTab("Eggs", "egg", "Egg filters, volcano and the eggs on the map")
+Tabs.Plot = N.addTab("Plot", "layout-grid", "Nests, hatching, pets and feeding")
+Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Luck, rebirth and shop")
 Tabs.Rewards = N.addTab("Rewards", "gift", "Free rewards, radars and weather")
-Tabs.Visuals = N.addTab("Visuals", "eye", "Egg ESP with pet odds")
-Tabs.Stats = N.addTab("Stats", "chart-column", "Session and all-time progress")
-Tabs.Analytics = N.addTab("Analytics", "chart-spline", "Live rates, trends and goals")
+Tabs.Items = N.addTab("Items", "backpack", "Selling eggs")
+Tabs.Player = N.addTab("Player", "user", "Movement, egg ESP and alerts")
+Tabs.Stats = N.addTab("Stats", "chart-column", "Session, all-time progress and analytics")
+Tabs.Webhook = N.addTab("Webhook", "webhook", "Posts to your Discord")
 if Window.AddMiscTab then
 pcall(function()
 Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
@@ -31252,7 +31301,17 @@ end
 return list
 end
 do
-local FarmBox = Tabs.Main:AddLeftGroupbox("Egg Farm", "egg")
+local FarmBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "rocket")
+FarmBox:AddToggle("FarmAll", {
+Text = "Auto Farm Everything",
+Default = false,
+Tooltip = "One switch for the whole game: egg farm, nests, hatching, best pets, feeding, lanterns, luck, rebirth, shop, selling, radars, volcano, group meat and the event boost. Luck waits for a rebirth that pays back fast. Turning it off turns off only what it turned on.",
+Callback = function(value)
+if N.farmAll then
+task.spawn(N.farmAll, value)
+end
+end,
+})
 FarmBox:AddToggle("AutoFarm", {
 Text = "Auto Farm Eggs",
 Default = false,
@@ -31324,7 +31383,7 @@ Func = function()
 task.spawn(N.runManual, N.deliverBasket)
 end,
 })
-local FilterBox = Tabs.Main:AddLeftGroupbox("Egg Filters", "funnel")
+local FilterBox = Tabs.Eggs:AddLeftGroupbox("Egg Filters", "funnel")
 FilterBox:AddDropdown(
 "FarmRarities",
 { Text = "Rarities", Values = N.EggRarities, Default = N.EggRarities, Multi = true, AllowNull = true }
@@ -31396,7 +31455,7 @@ Func = function()
 Options.FarmRarities:SetValue(N.rarityPick("Common"))
 end,
 })
-local MoveBox = Tabs.Main:AddRightGroupbox("Movement", "wind")
+local MoveBox = Tabs.Player:AddLeftGroupbox("Movement", "wind")
 MoveBox:AddButton({
 Text = "Recommended Settings",
 Tooltip = "Safe riding, terrain path and a bigger return margin: the server never sends you back or fails a delivery",
@@ -31498,7 +31557,7 @@ Func = function()
 fire("Game/BasketDrop")
 end,
 })
-local VolcanoBox = Tabs.Main:AddRightGroupbox("Volcano", "flame")
+local VolcanoBox = Tabs.Eggs:AddRightGroupbox("Volcano", "flame")
 VolcanoBox:AddToggle("VolcanoDip", {
 Text = "Dip Eggs In The Volcano",
 Default = false,
@@ -31693,7 +31752,7 @@ Func = function()
 task.spawn(N.runManual, N.shopTick, true)
 end,
 })
-local SellBox = Tabs.Upgrades:AddRightGroupbox("Sell Eggs", "banknote")
+local SellBox = Tabs.Items:AddLeftGroupbox("Sell Eggs", "banknote")
 SellBox:AddToggle(
 "AutoSell",
 { Text = "Auto Sell Eggs", Default = false, Tooltip = "Sells the eggs you do not want to Richie" }
@@ -31727,6 +31786,11 @@ Default = true,
 Tooltip = "If collecting from far away does not work, Corvus walks to the machine, collects and goes back to farming",
 })
 FreeBox:AddToggle("AutoOffline", { Text = "Auto Claim Offline Cash", Default = true })
+FreeBox:AddToggle("AutoEventBoost", {
+Text = "Auto Claim Event Boost",
+Default = false,
+Tooltip = "Claims the game's free event income boost the moment a Roblox event of the game has started (the claim stays open 12 hours). Free boost, nothing is spent.",
+})
 FreeBox:AddToggle(
 "AutoGroupMeat",
 { Text = "Auto Claim Group Meat", Default = false, Tooltip = "Once a day, needs the game's group" }
@@ -31918,11 +31982,11 @@ N.Analytics.feed = FeedBox:AddFeed(
 end
 end)
 pcall(function()
-local ListBox = Tabs.Main:AddLeftGroupbox("World Eggs", "map")
+local ListBox = Tabs.Eggs:AddLeftGroupbox("World Eggs", "map")
 Labels.World = ListBox:AddLabel({ Text = '<font transparency="0.4">Scanning the map...</font>', DoesWrap = true })
 end)
 pcall(function()
-local RatesBox = Tabs.Analytics:AddLeftGroupbox("Live Rates", "activity")
+local RatesBox = Tabs.Stats:AddLeftGroupbox("Rate Trends", "activity")
 if RatesBox.AddStatTiles then
 N.Analytics.tiles = RatesBox:AddStatTiles({
 Tiles = {
@@ -31937,7 +32001,7 @@ RatesBox:AddLabel({
 Text = '<font transparency="0.45">Per hour over the last 5 minutes. Arrows compare with your last hour.</font>',
 DoesWrap = true,
 })
-local TrendBox = Tabs.Analytics:AddLeftGroupbox("Trend", "chart-spline")
+local TrendBox = Tabs.Stats:AddLeftGroupbox("Trend", "chart-spline")
 if TrendBox.AddChart then
 N.Analytics.chart = TrendBox:AddChart("TrendChart", {
 Metrics = { "Money", "Eggs", "Hatches", "Trips", "Lost" },
@@ -31951,7 +32015,7 @@ end
 end,
 })
 end
-local HatchBox = Tabs.Analytics:AddLeftGroupbox("Hatches by Rarity", "sparkles")
+local HatchBox = Tabs.Stats:AddLeftGroupbox("Hatches by Rarity", "sparkles")
 if HatchBox.AddBarChart then
 N.Analytics.hatchBars = HatchBox:AddBarChart({
 Scopes = { "Session", "All time" },
@@ -31963,7 +32027,7 @@ end
 end,
 })
 end
-local GoalsBox = Tabs.Analytics:AddRightGroupbox("Goals", "target")
+local GoalsBox = Tabs.Stats:AddRightGroupbox("Goals", "target")
 if GoalsBox.AddGoals then
 N.Analytics.goals = GoalsBox:AddGoals("GoalCards", {
 EmptyText = "No goals yet. Pick one below and Corvus tracks it with a live ETA.",
@@ -31990,7 +32054,7 @@ Func = function()
 N.Analytics.clearGoals()
 end,
 })
-local RarityBox = Tabs.Analytics:AddRightGroupbox("Eggs by Rarity", "gem")
+local RarityBox = Tabs.Stats:AddRightGroupbox("Eggs by Rarity", "gem")
 if RarityBox.AddBarChart then
 N.Analytics.rarityBars = RarityBox:AddBarChart({
 Scopes = { "Session", "All time" },
@@ -32002,7 +32066,7 @@ end
 end,
 })
 end
-local MutationBox = Tabs.Analytics:AddRightGroupbox("Hatches by Mutation", "flame")
+local MutationBox = Tabs.Stats:AddRightGroupbox("Hatches by Mutation", "flame")
 if MutationBox.AddBarChart then
 N.Analytics.mutationBars = MutationBox:AddBarChart({
 Scopes = { "Session", "All time" },
@@ -32145,7 +32209,7 @@ end
 return list
 end
 function N.Analytics.draw(force)
-local active = Library.Toggled ~= false and (Library.ActiveTab == nil or Library.ActiveTab == Tabs.Analytics)
+local active = Library.Toggled ~= false and (Library.ActiveTab == nil or Library.ActiveTab == Tabs.Stats)
 if not active and force ~= true then
 return
 end
@@ -32512,7 +32576,7 @@ end
 end
 end
 do
-local EspBox = Tabs.Visuals:AddLeftGroupbox("Egg ESP", "eye")
+local EspBox = Tabs.Player:AddRightGroupbox("Egg ESP", "eye")
 EspBox:AddToggle(
 "EggESP",
 {
@@ -32539,7 +32603,7 @@ EspBox:AddToggle("ESPShowDistance", { Text = "Show Distance", Default = true })
 EspBox:AddToggle("ESPMarkTarget", { Text = "Mark Farm Target", Default = true })
 EspBox:AddSlider("ESPMax", { Text = "Max Eggs Shown", Default = 25, Min = 5, Max = 80, Rounding = 0, HideMax = true })
 EspBox:AddSlider("ESPTextSize", { Text = "Text Size", Default = 14, Min = 10, Max = 24, Rounding = 0, HideMax = true })
-local AlertBox = Tabs.Visuals:AddLeftGroupbox("Spawn Alerts", "bell")
+local AlertBox = Tabs.Player:AddRightGroupbox("Spawn Alerts", "bell")
 AlertBox:AddToggle(
 "SpawnAlerts",
 { Text = "Alert On Rare Spawns", Default = true, Tooltip = "Pops a notification when a rare egg lands on the map" }
@@ -32555,7 +32619,7 @@ AllowNull = true,
 }
 )
 AlertBox:AddToggle("AlertEvents", { Text = "Alert On Event Eggs", Default = true, Tooltip = "Admin and spotlight eggs" })
-local OddsBox = Tabs.Visuals:AddRightGroupbox("Hatch Odds", "dices")
+local OddsBox = Tabs.Player:AddLeftGroupbox("Hatch Odds", "dices")
 local showOdds
 OddsBox:AddDropdown("OddsEgg", {
 Text = "Egg",
@@ -32688,7 +32752,58 @@ end,
 })
 end
 local PlotToggles = { "AutoBuyNests", "AutoPlaceEggs", "AutoHatch" }
+N.FarmAllNames = {
+"AutoFarm",
+"AutoBuyNests",
+"AutoPlaceEggs",
+"AutoHatch",
+"AutoPlacePets",
+"AutoFavorite",
+"AutoFeed",
+"AutoLanterns",
+"AutoLuck",
+"AutoRebirth",
+"AutoShop",
+"AutoSell",
+"AutoRadar",
+"AutoGroupMeat",
+"VolcanoDip",
+"AutoEventBoost",
+"AutoIndex",
+"AutoOffline",
+"AutoFusionCollect",
+"AutoCollect",
+}
+N.FarmAllSet = {}
+function N.farmAll(value)
+if value then
+for _, name in ipairs(N.FarmAllNames) do
+local toggle = Toggles[name]
+if toggle and not toggle.Value then
+N.FarmAllSet[name] = true
+toggle:SetValue(true)
+end
+end
+local turned = {}
+for name in pairs(N.FarmAllSet) do
+table.insert(turned, name)
+end
+table.sort(turned)
+log("FARM ALL on, switched on:", if #turned > 0 then table.concat(turned, ",") else "nothing new, all were on already")
+else
+for name in pairs(N.FarmAllSet) do
+local toggle = Toggles[name]
+if toggle and toggle.Value then
+toggle:SetValue(false)
+end
+end
+N.FarmAllSet = {}
+log("FARM ALL off")
+end
+end
 N.AllAutoToggles = {
+"FarmAll",
+"AutoEventBoost",
 "AutoFarm",
 "AutoBuyNests",
 "AutoPlaceEggs",
@@ -32707,6 +32822,7 @@ N.AllAutoToggles = {
 }
 if Library.AddCommand then
 pcall(function()
+toggleCommand("farmall", { "everything", "afk" }, { "FarmAll" }, "Auto Farm Everything")
 toggleCommand("farm", { "autofarm", "eggs" }, { "AutoFarm" }, "Auto Farm Eggs")
 toggleCommand("plot", { "nests", "hatch" }, PlotToggles, "Nests, placing and hatching")
 toggleCommand("pets", { "placepets" }, { "AutoPlacePets" }, "Auto Place Best Pets")
@@ -32894,6 +33010,7 @@ end
 if Library.SetQuickBar then
 pcall(function()
 Library:SetQuickBar({
+{ Toggle = "FarmAll", Icon = "rocket", Label = "Farm All" },
 { Toggle = "AutoFarm", Icon = "egg", Label = "Farm" },
 { Toggle = "AutoPlaceEggs", Icon = "house", Label = "Nests" },
 { Toggle = "AutoHatch", Icon = "sparkles", Label = "Hatch" },
@@ -32935,8 +33052,15 @@ Title = "What should Corvus do for you?",
 Description = "Pick everything you want running. Tap again to unpick.",
 Multi = true,
 Required = true,
-Default = { "farm", "plot", "pets", "luck" },
+Default = { "everything" },
 Choices = {
+{
+Id = "everything",
+Title = "Auto Farm Everything",
+Description = "One switch for the whole game, with the best order worked out for you",
+Icon = "rocket",
+Color = "#60d696",
+},
 {
 Id = "farm",
 Title = "Farm eggs",
@@ -33019,7 +33143,7 @@ Color = "#ff5d8f",
 },
 },
 Visible = function(state)
-return type(state.tasks) == "table" and state.tasks.farm == true
+return type(state.tasks) == "table" and (state.tasks.farm == true or state.tasks.everything == true)
 end,
 },
 {
@@ -33060,7 +33184,7 @@ Color = "#9085e9",
 },
 },
 Visible = function(state)
-return type(state.tasks) == "table" and state.tasks.farm == true
+return type(state.tasks) == "table" and (state.tasks.farm == true or state.tasks.everything == true)
 end,
 },
 },
@@ -33075,10 +33199,14 @@ luck = { "AutoLuck", "AutoShop" },
 rebirth = { "AutoRebirth" },
 esp = { "EggESP" },
 }
+if picked.everything then
+setToggles({ "FarmAll" }, { "on" })
+else
 for id, names in pairs(groups) do
 setToggles(names, { if picked[id] then "on" else "off" })
 end
-if picked.farm then
+end
+if picked.farm or picked.everything then
 if type(values.move) == "string" then
 pcall(Options.MoveMode.SetValue, Options.MoveMode, values.move)
 end
@@ -33621,9 +33749,9 @@ Library:OnUnload(function()
 log("UNLOAD")
 flushLog(true)
 end)
-if Tabs.Misc then
+if Tabs.Webhook then
 pcall(function()
-local HookBox = Tabs.Misc:AddLeftGroupbox("Discord Webhook", "webhook")
+local HookBox = Tabs.Webhook:AddLeftGroupbox("Discord Webhook", "webhook")
 HookBox:AddToggle("WebhookOn", {
 Text = "Post to Discord",
 Default = false,
@@ -33649,7 +33777,7 @@ AllowNull = true,
 })
 HookBox:AddToggle(
 "WebhookSpawns",
-{ Text = "Post rare spawns", Default = true, Tooltip = "Uses the Spawn Alerts rarities from the Visuals tab" }
+{ Text = "Post rare spawns", Default = true, Tooltip = "Uses the Spawn Alerts rarities from the Player tab" }
 )
 HookBox:AddSlider("WebhookReport", {
 Text = "Report every",
@@ -33804,12 +33932,14 @@ Note = "Only send on BNB Smart Chain (BEP20)",
 for _, tab in ipairs({
 Tabs.Info,
 Tabs.Main,
+Tabs.Eggs,
 Tabs.Plot,
 Tabs.Upgrades,
 Tabs.Rewards,
-Tabs.Visuals,
+Tabs.Items,
+Tabs.Player,
 Tabs.Stats,
-Tabs.Analytics,
+Tabs.Webhook,
 Tabs.Misc,
 Tabs.Settings,
 }) do
@@ -34086,6 +34216,60 @@ log("FUSION", kind, if far then "(from a distance)" else "")
 end
 return true
 end
+N.Event = { at = -1e9, tried = {} }
+local function eventUnix(value)
+if typeof(value) == "DateTime" then
+return value.UnixTimestamp
+elseif type(value) == "number" then
+return value
+elseif type(value) == "string" then
+local ok, dt = pcall(DateTime.fromIsoDate, value)
+return ok and dt and dt.UnixTimestamp or nil
+elseif type(value) == "table" and type(value.UnixTimestamp) == "number" then
+return value.UnixTimestamp
+end
+return nil
+end
+function N.eventTick()
+local E = N.Event
+if os.time() < (tonumber(N.playerAttr("EventBoostUntil")) or 0) then
+return false
+end
+if os.clock() - E.at < 180 then
+return false
+end
+E.at = os.clock()
+local ok, events = pcall(function()
+return game:GetService("SocialService"):GetUpcomingExperienceEventsAsync()
+end)
+if not ok or type(events) ~= "table" then
+return false
+end
+local now = os.time()
+for _, ev in ipairs(events) do
+if type(ev) == "table" and ev.Id ~= nil and ev.HasStarted then
+local id = tostring(ev.Id)
+local start
+for _, key in ipairs({ "StartTime", "StartUtc", "StartTimeUtc", "StartsAt", "Start" }) do
+start = eventUnix(ev[key])
+if start then
+break
+end
+end
+if (not start or now < start + 43200) and os.clock() >= (E.tried[id] or 0) then
+E.tried[id] = os.clock() + 900
+N.invoke("Game/ClaimEventReward", id)
+task.wait(1.5)
+if os.time() < (tonumber(N.playerAttr("EventBoostUntil")) or 0) then
+Session.claimed += 1
+Track.event("Event", "Event boost claimed", tostring(ev.Title or "Event"), "gift", "#60d696")
+end
+return true
+end
+end
+end
+return false
+end
 local Jobs = {
 { "AutoHatch", "hatch", 3, N.hatchEggs },
 { "AutoFusionCollect", "fusion", 5, N.fusionTick },
@@ -34094,6 +34278,7 @@ local Jobs = {
 { "AutoRebirth", "rebirth", 5, N.rebirthTick },
 { "AutoIndex", "index", 20, N.indexTick },
 { "AutoOffline", "offline", 10, N.offlineTick },
+{ "AutoEventBoost", "event", 30, N.eventTick },
 { "AutoFavorite", "favorite", 10, N.favoriteTick },
 }
 while alive() do
@@ -34111,7 +34296,7 @@ end
 end)
 task.spawn(function()
 while alive() do
-local wanted = on("EggESP") or on("AutoFarm") or shown(Tabs.Main)
+local wanted = on("EggESP") or on("AutoFarm") or shown(Tabs.Main) or shown(Tabs.Eggs)
 if wanted then
 local started = os.clock()
 local ok, err = xpcall(N.scanEggs, debug.traceback)
@@ -34143,7 +34328,7 @@ while alive() do
 local started = os.clock()
 drawTick += 1
 group(UIQueue.flush)
-if shown(Tabs.Main) then
+if shown(Tabs.Main) or shown(Tabs.Eggs) then
 group(function()
 Labels.Status:SetText(Status)
 end)
