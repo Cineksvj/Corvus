@@ -29298,7 +29298,7 @@ local BootOk, BootError = xpcall(function()
 					log("TRAIN+SEA the server did not start training here")
 				end
 			elseif TS.state == "trying" then
-				if I.fails - TS.fails >= 3 then
+				if I.fails >= 3 then
 					TS.state = "no"
 					call("TrainingService", "StopTraining")
 					log("TRAIN+SEA off: the sea does not open while training")
@@ -29376,8 +29376,16 @@ local BootOk, BootError = xpcall(function()
 				end
 			end
 			local floor = Game.plotFloor and Game.plotFloor() or 0
+			local anyIndex = false
 			for _, item in ipairs(list) do
 				item.gain = Game.itemGain and Game.itemGain(item.info, floor) or 0
+				item.idx = 0
+				if item.info.kind ~= "Egg" and not item.info.special and Game.indexGain then
+					item.idx = Game.indexGain(item.info.type, item.info.mutation)
+					if item.idx > 0 then
+						anyIndex = true
+					end
+				end
 			end
 			table.sort(list, function(a, b)
 				if a.gain ~= b.gain then
@@ -29393,6 +29401,28 @@ local BootOk, BootError = xpcall(function()
 				Sea.gainAt = os.clock()
 			end
 			Sea.preview = { matching = #list, total = total, at = os.clock() }
+			if anyIndex and capacity > 1 and #list > 1 then
+				-- six copies of one missing animal unlock the index entry once: the copies after the first count without it
+				local chosen, seen, pool = {}, {}, list
+				for _ = 1, math.min(capacity, #pool) do
+					local bestAt, bestGain
+					for i, item in ipairs(pool) do
+						local g = item.gain
+						if item.idx > 0 and seen[item.info.type .. "|" .. item.info.mutation] then
+							g -= item.idx
+						end
+						if not bestAt or g > bestGain then
+							bestAt, bestGain = i, g
+						end
+					end
+					local item = table.remove(pool, bestAt)
+					table.insert(chosen, item)
+					if item.idx > 0 then
+						seen[item.info.type .. "|" .. item.info.mutation] = true
+					end
+				end
+				list = chosen
+			end
 			local ids, infos = {}, {}
 			for i = 1, math.min(capacity, #list) do
 				table.insert(ids, list[i].id)
@@ -29516,7 +29546,9 @@ local BootOk, BootError = xpcall(function()
 				setStatus("Knocked down, waiting")
 				return false
 			end
-			stopTraining()
+			if not (isBlatant() and (TS.state == "trying" or TS.state == "works")) then
+				stopTraining()
+			end
 			local leftovers = carriedModels()
 			if #leftovers > 0 then
 				local infos = {}
@@ -30074,7 +30106,7 @@ local BootOk, BootError = xpcall(function()
 						freedAny = true
 					end
 					local ok, result = call("EggService", "HatchEgg", id)
-					if not (ok and result) and freeSlot() then
+					if not (ok and result) and (placedStats()) >= maxAnimals() and freeSlot() then
 						freedAny = true
 						ok, result = call("EggService", "HatchEgg", id)
 					end
@@ -30233,7 +30265,7 @@ local BootOk, BootError = xpcall(function()
 			IndexCache.at, IndexCache.value, IndexCache.done = os.clock(), base * 0.1 / (1 + 0.1 * done), done
 			return IndexCache.value
 		end
-		function Game.indexGain(brainrotType, mutation)
+		local function indexGainRaw(brainrotType, mutation)
 			mutation = mutation or "NORMAL"
 			local data = Data()
 			local unlocked = data and data.UnlockedBrainrots
@@ -30270,6 +30302,24 @@ local BootOk, BootError = xpcall(function()
 				end
 			end
 			return total
+		end
+		local IndexGainCache, IndexGainSize = {}, 0
+		-- every wave asks this for every item: the scan over all eggs is cached for a few seconds
+		function Game.indexGain(brainrotType, mutation)
+			mutation = mutation or "NORMAL"
+			local key = tostring(brainrotType) .. "|" .. tostring(mutation)
+			local hit = IndexGainCache[key]
+			if hit and os.clock() - hit.at < 8 then
+				return hit.value
+			end
+			local value = indexGainRaw(brainrotType, mutation)
+			if IndexGainSize > 800 then
+				table.clear(IndexGainCache)
+				IndexGainSize = 0
+			end
+			IndexGainCache[key] = { at = os.clock(), value = value }
+			IndexGainSize += 1
+			return value
 		end
 		function Game.itemGain(info, floor)
 			if info.kind == "Egg" then
@@ -30669,11 +30719,26 @@ local BootOk, BootError = xpcall(function()
 			table.sort(list, function(a, b)
 				return (tonumber(Staffs[a].luck) or 0) > (tonumber(Staffs[b].luck) or 0)
 			end)
-			for i, key in ipairs(list) do
-				if on("AutoFarmAll") and not Game.spendOk("Staff:" .. key, Staffs[key].cost) then
-					continue
+			local ownedLuck, ownedTime = 0, 0
+			for ownedKey in pairs(owned) do
+				local ownedCfg = staffOf(ownedKey)
+				if ownedCfg then
+					ownedLuck = math.max(ownedLuck, effectiveLuck(ownedCfg, owned))
+					ownedTime = math.max(ownedTime, tonumber(ownedCfg.time) or 0)
 				end
-				if i > 3 or cash() < Staffs[key].cost then
+			end
+			local tried = 0
+			for _, key in ipairs(list) do
+				if on("AutoFarmAll") then
+					-- a staff with no more luck (and no longer sea when you walk) is wasted cash
+					local betterLuck = effectiveLuck(Staffs[key], owned) > ownedLuck
+					local betterTime = not isBlatant() and (tonumber(Staffs[key].time) or 0) > ownedTime
+					if not (betterLuck or betterTime) or not Game.spendOk("Staff:" .. key, Staffs[key].cost) then
+						continue
+					end
+				end
+				tried += 1
+				if tried > 3 or cash() < Staffs[key].cost then
 					break
 				end
 				setStatus("Buying the " .. tostring(Staffs[key].name or key) .. " staff")
@@ -30753,11 +30818,22 @@ local BootOk, BootError = xpcall(function()
 			table.sort(list, function(a, b)
 				return (tonumber(TrainTools[a].gainPerTrain) or 0) > (tonumber(TrainTools[b].gainPerTrain) or 0)
 			end)
-			for i, id in ipairs(list) do
-				if on("AutoFarmAll") and not Game.spendOk("Dumbbell:" .. id, TrainTools[id].cost) then
-					continue
+			local ownedGain = 0
+			for ownedId in pairs(owned) do
+				local ownedCfg = TrainTools[ownedId]
+				if type(ownedCfg) == "table" then
+					ownedGain = math.max(ownedGain, toolGain(ownedCfg, owned))
 				end
-				if i > 3 or cash() < TrainTools[id].cost then
+			end
+			local tried = 0
+			for _, id in ipairs(list) do
+				if on("AutoFarmAll") then
+					if (tonumber(TrainTools[id].gainPerTrain) or 0) <= ownedGain or not Game.spendOk("Dumbbell:" .. id, TrainTools[id].cost) then
+						continue
+					end
+				end
+				tried += 1
+				if tried > 3 or cash() < TrainTools[id].cost then
 					break
 				end
 				call("TrainingService", "BuyTrainTool", id)
@@ -30933,7 +31009,7 @@ local BootOk, BootError = xpcall(function()
 				local now = os.clock()
 				if Schedule.phase == "sea" then
 					local seaTime = now - Schedule.since
-					local dry = seaTime >= 120 and now - math.max(Sea.gainAt or 0, Schedule.since) >= 90
+					local dry = isBlatant() and seaTime >= 120 and now - math.max(Sea.gainAt or 0, Schedule.since) >= 90
 					if (seaTime >= 300 or dry) and not isWaveActive() then
 						Schedule.phase, Schedule.since, Schedule.reach = "train", now, waveReach()
 						log("SCHEDULE train until reach", Schedule.reach + 1, "power", power())
@@ -30957,6 +31033,7 @@ local BootOk, BootError = xpcall(function()
 			end
 			return Schedule.phase == "train"
 		end
+		local PlaytimeTried = {}
 		function playtimeTick()
 			local pc = controller("PlaytimeRewardController")
 			if not pc or type(Game.PlaytimeRewardConfig) ~= "table" then
@@ -30966,13 +31043,14 @@ local BootOk, BootError = xpcall(function()
 			seconds = okTime and tonumber(seconds) or 0
 			for i, gift in ipairs(Game.PlaytimeRewardConfig) do
 				local okClaimed, claimed = pcall(pc.IsGiftClaimed, pc, i)
-				if okClaimed and not claimed and type(gift) == "table" and seconds >= (tonumber(gift.time) or math.huge) then
+				if okClaimed and not claimed and type(gift) == "table" and seconds >= (tonumber(gift.time) or math.huge) and (PlaytimeTried[i] or 0) <= os.clock() then
 					local ok, result = pcall(pc.ClaimGift, pc, i)
 					if ok and result then
 						Session.claimed += 1
 						Track.event("Gift", "Playtime gift " .. i, tostring(gift.name or ""), "gift", "#ff5d8f")
 						return true
 					end
+					PlaytimeTried[i] = os.clock() + 90
 					return false
 				end
 			end
@@ -31359,7 +31437,7 @@ local BootOk, BootError = xpcall(function()
 				return nil
 			end
 			local multi = tonumber(modifier("CashMulti")) or 1
-			local _, base, worst = placedStats()
+			local placedAmount, base, worst = placedStats()
 			local plot = base * multi
 			local sellRate = (Metrics.current("Sold") or 0) / 3600
 			local income = plot + sellRate
@@ -31370,14 +31448,19 @@ local BootOk, BootError = xpcall(function()
 				end
 			end
 			add("Carry", nextUpgradePrice("Carry"), sellRate / math.max(maxPickup(), 1), "Carry")
-			add("PlotUpgrade", nextUpgradePrice("PlotUpgrade"), worst * multi + plot * 0.05 / math.max(multi, 1), "Upgrade Base")
+			-- a new slot only pays when the plot is full (a free slot already waits for an animal)
+			local slotGain = if placedAmount >= maxAnimals() then worst * multi else 0
+			add("PlotUpgrade", nextUpgradePrice("PlotUpgrade"), slotGain + plot * 0.05 / math.max(multi, 1), "Upgrade Base")
 			local nextR, curR = Rebirths[rebirths() + 1], Rebirths[rebirths()]
 			if type(nextR) == "table" then
 				local curM = type(curR) == "table" and tonumber(curR.CashMulti) or 1
 				add("Rebirth", nextRebirthCost(), plot * ((tonumber(nextR.CashMulti) or 1) / curM - 1), "Rebirth")
 			end
 			local owned = type(data.OwnedPickaxes) == "table" and data.OwnedPickaxes or {}
-			local luck = math.max(tonumber(currentLuck()) or 1, 1)
+			-- compare staff to staff: the luck modifier also holds potions and server luck, which every staff gets
+			local bestKey = bestOwnedStaff()
+			local bestCfg = bestKey and staffOf(bestKey)
+			local luck = math.max(bestCfg and effectiveLuck(bestCfg, owned) or tonumber(currentLuck()) or 1, 1)
 			for key, cfg in pairs(Staffs) do
 				local cost = type(cfg) == "table" and tonumber(cfg.cost)
 				if cost and not owned[key] and not cfg.passRequired and not cfg.hideIfNotOwned and not cfg.isSpecial and (tonumber(cfg.luck) or 0) > luck then
