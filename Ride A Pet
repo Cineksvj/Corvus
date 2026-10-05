@@ -27983,7 +27983,8 @@ local cap = math.clamp(tonumber(cfg.MaxReductionPercent) or 80, 0, 99)
 return 1 - math.min(steps * math.max(per, 0), cap) / 100
 end
 local DefaultBreak = { Common = 20, Rare = 25, Epic = 35, Legendary = 30, Mythic = 30, Divine = 27, Ethereal = 21 }
-function N.breakSeconds(eggName)
+N.BreakLearn = {}
+function N.baseBreakSeconds(eggName)
 local cfg = N.eggConfig(eggName)
 if cfg and tonumber(cfg.BreakSeconds) then
 return tonumber(cfg.BreakSeconds)
@@ -27991,6 +27992,20 @@ end
 local rarity = N.eggRarity(eggName)
 local timers = N.tableOr(N.GeneralData.EggBreakTimer)
 return tonumber(timers[rarity]) or DefaultBreak[rarity] or 20
+end
+function N.breakSeconds(eggName, pos)
+local rarity = N.eggRarity(eggName)
+local seconds = N.baseBreakSeconds(eggName) + (tonumber(N.GeneralData.EggBreakTouchBonus) or 0)
+local bonus = N.tableOr(N.GeneralData.EggBreakDistanceBonus)[rarity]
+if type(bonus) == "table" and typeof(pos) == "Vector3" then
+local home = N.plotSpot and N.plotSpot(0, 0)
+if home then
+local d = Vector3.new(pos.X - home.X, 0, pos.Z - home.Z).Magnitude
+seconds += math.floor(math.max(0, d - (tonumber(bonus.From) or math.huge)) / math.max(tonumber(bonus.Step) or 20, 1)) * (tonumber(bonus.PerStep) or 0)
+end
+end
+-- the game's real timers seen on pickups (never more than +30 s)
+return seconds + math.clamp(N.BreakLearn[rarity] or 0, 0, 30)
 end
 function N.luckUpgrades()
 return math.floor(tonumber(N.savedValue("HatchUpgrades")) or 0)
@@ -29080,7 +29095,7 @@ spotlight = cfg:GetAttribute("Spotlight") == true,
 admin = cfg:GetAttribute("AdminSpawn") == true,
 maze = N.hasTag(cfg, "EggPickupRequiresLineOfSight"),
 private = private ~= nil,
-breakSeconds = N.breakSeconds(name),
+breakSeconds = N.breakSeconds(name, position),
 }
 end
 -- Eggs the hub cannot read or skips as already claimed are written to the log once each (with their attributes),
@@ -29342,6 +29357,16 @@ weight = tonumber(child:GetAttribute("Weight")) or 1,
 info.kg = N.eggKG(info.weight)
 end
 Carry.items[child] = { info = info, addedAt = os.clock() }
+local actual = (tonumber(child:GetAttribute("BreakAt")) or 0) - serverNow()
+if actual > 0 and actual < 600 then
+local predicted = N.breakSeconds(name) - (N.BreakLearn[info.rarity] or 0)
+local extra = actual - predicted
+-- learn slowly and on the safe side: the smallest extra the game has given for this rarity
+if extra > 0 then
+local old = N.BreakLearn[info.rarity]
+N.BreakLearn[info.rarity] = if old then math.min(old, extra) * 0.7 + extra * 0.3 else extra * 0.8
+end
+end
 log(
 "BASKET +",
 name,
