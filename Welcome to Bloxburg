@@ -31376,6 +31376,9 @@ do
 			entry.money += math.max(gained, 0)
 			entry.seconds += seconds
 			N.Pay.jobs[job] = entry
+			if N.planPay then
+				N.planPay(job, math.max(gained, 0), seconds)
+			end
 		end
 	end
 	function N.paySave()
@@ -33384,9 +33387,7 @@ do
 	end
 end
 
--- Best Pay (auto): tries every job a few minutes (the Pay box keeps its real $/h), then works the one that pays you
--- the most and checks again every 15 minutes. Jobs that cannot start or earn nothing fall to the bottom by themselves.
-N.Best = { current = nil, since = 0, tried = {} }
+-- Job names in the Jobs dropdown -> the game's job keys. Best Pay (auto) is decided in p05_jobs6_plan.lua.
 N.JobKeys = {
 	Hairdresser = "StylezHairdresser",
 	Janitor = "SchoolJanitor",
@@ -33403,49 +33404,6 @@ N.JobKeys = {
 	["Fisherman (beta)"] = "HutFisherman",
 	["Woodcutter (beta)"] = "LumberWoodcutter",
 }
-do
-	local Explore = { "Hairdresser", "BloxBurgers Cashier", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Fisherman (beta)", "Woodcutter (beta)" }
-	local function rate(name)
-		local entry = N.Pay.jobs[N.JobKeys[name]]
-		if entry and entry.seconds >= 300 then
-			return entry.money / entry.seconds * 3600
-		end
-		return nil
-	end
-	function N.bestJobPick()
-		local now = os.clock()
-		local cur = N.Best.current
-		if cur then
-			N.Best.tried[cur] = (N.Best.tried[cur] or 0) + (now - (N.Best.tick or now))
-		end
-		N.Best.tick = now
-		if cur and now - N.Best.since < (if rate(cur) then 900 else 480) then
-			return cur
-		end
-		local pick
-		-- explore: a job with no real pay data yet that this session has not already given 8 minutes
-		for _, name in ipairs(Explore) do
-			if not rate(name) and (N.Best.tried[name] or 0) < 480 then
-				pick = name
-				break
-			end
-		end
-		if not pick then
-			local bestRate = -1
-			for _, name in ipairs(Explore) do
-				local r = rate(name) or 0
-				if r > bestRate then
-					pick, bestRate = name, r
-				end
-			end
-		end
-		if pick ~= cur then
-			log("BEST job", tostring(cur), "->", tostring(pick), "rate", rate(pick) and math.floor(rate(pick)) or "measuring")
-		end
-		N.Best.current, N.Best.since = pick, now
-		return pick
-	end
-end
 -- Tool jobs: Hut Fisherman and Lumber Woodcutter. The server gives the Fishing Rod / Hatchet when the shift starts
 -- (RequiredEquipment) and the job ends if you swap the item. Both are plain hotbar actions of the game:
 --   UseFishingRod {State = true, Pos = water point}  (cast), then {State = false, Time = seconds since the cast} (pull)
@@ -33719,6 +33677,529 @@ do
 		end
 	end
 end
+-- Best Pay (auto) on the profit engine v2 (CLAUDE.md.txt 8.00): time is the currency, so every job is a value per
+-- hour over the rest of a 24 h horizon, with its uncertainty, and the hub explores a job only while the expected gain
+-- of knowing it beats the money lost measuring it.
+--   E(job) = measured $/h + (job level rewards + pay growth from level ups reached within the horizon) / horizon
+--   measured $/h: lifetime money / shift seconds (N.Pay), uncertainty from 60 s pay windows (Welford sums)
+--   level rewards: JobData (reaching level 1..10 pays $100 .. $21000), XP to the next level (level+1)^2.218812493,
+--   XP per second measured live from ClientStats Job/Jobs/<job>/XP
+--   explore: knowledge gradient (expected improvement over the best known job after m more windows) times the time
+--   left, minus the money lost while measuring (and walking there); a job that earns $0 for two windows drops out.
+-- School (SchoolData): the seniority bonus multiplies the pay of every job. The hub cannot attend classes (four
+-- different minigames, graded on the server), so it only computes whether school would pay back within the horizon
+-- and logs it (PLAN school ...); it also measures real class results when you attend one yourself.
+N.Plan = { text = "", current = nil, pickAt = 0, started = true, decidedAt = -1e9, loggedAt = -1e9, schoolAt = -1e9, lastLine = "", win = {}, skip = {}, startFails = {}, startups = {}, school = nil, tickAt = -1e9 }
+do
+	local P = N.Plan
+	-- bump when a job farm gets fixed: jobs marked as failed under an older tag are measured again from zero
+	local TAG = "v2-2026-10-05"
+	local WINDOW = 60
+	local Explore = { "Hairdresser", "BloxBurgers Cashier", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Fisherman (beta)", "Woodcutter (beta)" }
+	local NameOf = {}
+	for name, key in pairs(N.JobKeys) do
+		NameOf[key] = name
+	end
+	-- JobData / SkillData: money for reaching level i, and the XP needed at level L for L+1
+	local LevelMoney = { 100, 100, 400, 1000, 2000, 4000, 7000, 10000, 15000, 21000 }
+	local function reqXP(level)
+		return (level + 1) ^ 2.218812493
+	end
+	-- SchoolData: GetSeniorityJobBonusMultiplierFromLevel(completed levels), the SchoolApp shows overall level - 1
+	local SeniorityMult = { [0] = 1, 1.05, 1.1, 1.15, 1.2 }
+	local SeniorityNeed = { 50, 125, 250, 375 }
+	local Subjects = { { "Science", "Intelligence" }, { "Language", "Writing" }, { "Art", "Art" }, { "PE", "Athletic" } }
+	local SeniorityPoints = { ["A+"] = 10, A = 9, B = 6, C = 2, D = 1, F = 0 }
+	local SkillExp = { ["A+"] = 120, A = 96, B = 72, C = 48, D = 24, F = 0 }
+	local ASSUMED_GRADE = "A"
+	local CYCLE = 0.008888888888888889 -- TimeService game minutes per real second / 60 (school speed)
+
+	local function stat(path)
+		local jh = N.jobHandler()
+		if not jh then
+			return nil
+		end
+		return tonumber(isolated(function()
+			local ok, value = pcall(function()
+				return jh.Modules.ClientStats:Get(path)
+			end)
+			return if ok then value else nil
+		end))
+	end
+	local function realSeconds(gameMinutes, school)
+		local jh = N.jobHandler()
+		local value = jh and isolated(function()
+			local ok, v = pcall(function()
+				return jh.Shared.TimeService:GameMinutesToRealSeconds(gameMinutes, school)
+			end)
+			return if ok then v else nil
+		end)
+		value = tonumber(value)
+		return if value and value > 0 then value else gameMinutes / (CYCLE * 60)
+	end
+	local function horizon()
+		return math.max(86400 - (os.clock() - Session.started), 3600)
+	end
+	local function money(n)
+		return (if n < 0 then "-$" else "$") .. formatNumber(math.floor(math.abs(n)))
+	end
+	-- standard normal pdf / cdf (Abramowitz-Stegun 26.2.17)
+	local function pdf(z)
+		return 0.3989422804014327 * math.exp(-z * z / 2)
+	end
+	local function cdf(z)
+		local t = 1 / (1 + 0.2316419 * math.abs(z))
+		local p = pdf(z) * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+		return if z > 0 then 1 - p else p
+	end
+	-- expected improvement E[max(X - best, 0)], X ~ N(mu, s)
+	local function improvement(mu, s, best)
+		if s <= 0 then
+			return math.max(mu - best, 0)
+		end
+		local z = (mu - best) / s
+		return s * pdf(z) + (mu - best) * cdf(z)
+	end
+	local function startup()
+		local n, sum = 0, 0
+		for _, s in ipairs(P.startups) do
+			n += 1
+			sum += s
+		end
+		return if n > 0 then sum / n else 60
+	end
+
+	-- one shift second of pay from N.paySample: 60 s windows give the spread of the $/h estimate
+	function N.planPay(key, gained, seconds)
+		local entry = N.Pay.jobs[key]
+		if not entry then
+			return
+		end
+		local level = N.Levels and N.Levels[key]
+		if level then
+			entry.lv = entry.lv or {}
+			local bucket = entry.lv[tostring(level)] or { m = 0, s = 0 }
+			bucket.m += gained
+			bucket.s += seconds
+			entry.lv[tostring(level)] = bucket
+		end
+		local win = P.win[key] or { m = 0, s = 0 }
+		P.win[key] = win
+		win.m += gained
+		win.s += seconds
+		if win.s >= WINDOW then
+			P.win[key] = nil
+			local r = win.m / win.s * 3600
+			local w = entry.w or { n = 0, sx = 0, sxx = 0 }
+			w.n += 1
+			w.sx += r
+			w.sxx += r * r
+			entry.w = w
+			if w.n >= 2 and entry.money <= 0 and entry.fail ~= TAG then
+				entry.fail = TAG
+				log("PLAN drop", NameOf[key] or key, "earned $0 in", math.floor(entry.seconds), "s of shift")
+			end
+		end
+	end
+
+	-- XP per second of the job you are working (level ups add the rest of the old level)
+	local function sampleXP(key, now)
+		local level = N.jobLevel(key)
+		local xp = stat("Job/Jobs/" .. key .. "/XP") or 0
+		N.Levels = N.Levels or {}
+		N.Levels[key] = level
+		local last = P.xpLast
+		local entry = N.Pay.jobs[key]
+		if entry and last and last.key == key and now - last.at < 90 then
+			local gained
+			if level == last.level then
+				gained = xp - last.xp
+			elseif level > last.level then
+				gained = reqXP(last.level) - last.xp + xp
+				for l = last.level + 1, level - 1 do
+					gained += reqXP(l)
+				end
+				log("PLAN level up", NameOf[key] or key, last.level, "->", level)
+			end
+			if gained and gained >= 0 then
+				entry.xp = (entry.xp or 0) + gained
+				entry.xpSec = (entry.xpSec or 0) + (now - last.at)
+			end
+		end
+		P.xpLast = { key = key, level = level, xp = xp, at = now }
+	end
+
+	-- level rewards and pay growth reached within h seconds when working only this job
+	local function promotion(level, xp, xpRate, rate, growth, h)
+		local t, l, value = 0, level, 0
+		while xpRate > 0 and l < 10 do
+			local dt = math.max(reqXP(l) - xp, 0) / xpRate
+			if t + dt > h then
+				break
+			end
+			t += dt
+			l += 1
+			xp = 0
+			value += LevelMoney[l] + rate * ((1 + growth) ^ (l - level) - (1 + growth) ^ (l - 1 - level)) * (h - t) / 3600
+		end
+		return value, l, t
+	end
+
+	-- pay change per job level, measured when two neighbouring levels both have 5 min of shift
+	local function growthOf(entry, level)
+		local lv = entry and entry.lv
+		local a, b = lv and lv[tostring(level)], lv and lv[tostring(level - 1)]
+		if a and b and a.s >= 300 and b.s >= 300 and b.m > 0 then
+			return math.clamp(a.m / a.s / (b.m / b.s) - 1, -0.5, 1)
+		end
+		return nil
+	end
+
+	local function estimates(h)
+		local list, known = {}, {}
+		local sdSum, sdN, xpSum, xpN, gSum, gN = 0, 0, 0, 0, 0, 0
+		for _, name in ipairs(Explore) do
+			local key = N.JobKeys[name]
+			local entry = N.Pay.jobs[key]
+			if entry and entry.fail and entry.fail ~= TAG then
+				N.Pay.jobs[key] = { money = 0, seconds = 0 }
+				entry = nil
+				log("PLAN retry", name, "(job farm updated since it failed)")
+			end
+			local c = { name = name, key = key, entry = entry }
+			c.level = (N.Levels and N.Levels[key]) or N.jobLevel(key)
+			c.xp = stat("Job/Jobs/" .. key .. "/XP") or 0
+			c.failed = (entry ~= nil and entry.fail == TAG) or P.skip[name] == true
+			local w = entry and entry.w
+			c.n = if w then w.n elseif entry then math.floor((entry.seconds or 0) / WINDOW) else 0
+			if entry and (entry.seconds or 0) > 0 and c.n >= 1 then
+				c.rate = entry.money / entry.seconds * 3600
+				if w and w.n >= 2 then
+					c.sdw = math.sqrt(math.max(w.sxx - w.sx * w.sx / w.n, 0) / (w.n - 1))
+					sdSum += c.sdw
+					sdN += 1
+				end
+			end
+			if entry and (entry.xpSec or 0) >= 60 then
+				c.xpRate = entry.xp / entry.xpSec
+				xpSum += c.xpRate
+				xpN += 1
+			end
+			c.growth = growthOf(entry, c.level)
+			if c.growth then
+				gSum += c.growth
+				gN += 1
+			end
+			table.insert(list, c)
+			if c.rate and c.n >= 2 and not c.failed then
+				table.insert(known, c)
+			end
+		end
+		local pooledSd = if sdN > 0 then sdSum / sdN else nil
+		local pooledXp = if xpN > 0 then xpSum / xpN else 0
+		local pooledG = if gN > 0 then gSum / gN else 0
+		-- prior for an unmeasured job: mean and spread of the measured jobs
+		local mean, spread = nil, nil
+		if #known > 0 then
+			local s, ss = 0, 0
+			for _, c in ipairs(known) do
+				s += c.rate
+				ss += c.rate * c.rate
+			end
+			mean = s / #known
+			if #known >= 2 then
+				spread = math.sqrt(math.max(ss - s * s / #known, 0) / (#known - 1))
+			end
+		end
+		for _, c in ipairs(list) do
+			c.sdw = c.sdw or pooledSd or (if mean then mean * 0.5 else 0)
+			local rate = c.rate or mean or 0
+			if c.failed then
+				c.sigma = 0
+			elseif c.rate and c.n >= 2 then
+				c.sigma = c.sdw / math.sqrt(c.n)
+			elseif c.rate then
+				c.sigma = c.sdw
+			else
+				c.sigma = spread or c.sdw
+			end
+			local promo, toLevel, at = promotion(c.level, c.xp, c.xpRate or pooledXp, rate, c.growth or pooledG, h)
+			c.R = rate
+			c.promo, c.toLevel, c.levelAt = promo, toLevel, at
+			c.E = if c.failed then 0 else rate + promo / (h / 3600)
+			c.nextLevel = if (c.xpRate or pooledXp) > 0 and c.level < 10 then math.max(reqXP(c.level) - c.xp, 0) / (c.xpRate or pooledXp) else nil
+		end
+		return list, known
+	end
+
+	-- School: is the next seniority level worth the work time it costs, inside the horizon?
+	function N.schoolPlan(rate, h)
+		local overall = stat("SchoolProgress/SchoolOverallSeniorityLevel") or 1
+		local done = math.clamp(math.floor(overall) - 1, 0, 4)
+		if done >= 4 then
+			return { done = done, text = "graduated, +20% on every job" }
+		end
+		local need = SeniorityNeed[done + 1]
+		local points = P.classPoints or SeniorityPoints[ASSUMED_GRADE]
+		local skillPerClass = P.classSkill or SkillExp[ASSUMED_GRADE] / 60
+		local days, classes, skillMoney = 0, 0, 0
+		for _, pair in ipairs(Subjects) do
+			local subject, skill = pair[1], pair[2]
+			local have = stat("SchoolProgress/" .. subject .. "SeniorityLevel/" .. subject .. "CurrentSeniorityExperience") or 0
+			local k = math.ceil(math.max(need - have, 0) / math.max(points, 1))
+			days = math.max(days, k)
+			classes += k
+			local level = stat("SkillData/" .. skill) or 0
+			local xp = (stat("SkillData/" .. skill .. "/XP") or 0) + k * skillPerClass
+			while level < 10 and xp >= reqXP(level) do
+				xp -= reqXP(level)
+				level += 1
+				skillMoney += LevelMoney[level]
+			end
+		end
+		local day = realSeconds(1440, false)
+		local block = realSeconds(420, true)
+		-- you cannot attend while clocked in: each school day costs the class block plus leaving and coming back
+		local lost = days * (block + 2 * startup())
+		local finish = math.max(days - 1, 0) * day + block
+		local bonus = SeniorityMult[done + 1] / SeniorityMult[done] - 1
+		local gain = rate * bonus * math.max(h - finish, 0) / 3600
+		local cost = rate * lost / 3600
+		local net = gain + skillMoney - cost
+		return {
+			done = done,
+			bonus = bonus,
+			days = days,
+			classes = classes,
+			lost = lost,
+			finish = finish,
+			gain = gain,
+			skill = skillMoney,
+			cost = cost,
+			net = net,
+			payback = if rate * bonus > 0 then (cost - skillMoney) / (rate * bonus) * 3600 else math.huge,
+			grade = if P.classPoints then "measured" else ASSUMED_GRADE,
+			text = string.format("%s to +%d%% pay: %d school days (%.1f h of work), %s", if net > 0 then "Worth it" else "Not worth it", math.floor((SeniorityMult[done + 1] - 1) * 100 + 0.5), days, lost / 3600, (if net > 0 then "+" else "") .. money(net) .. " in 24 h"),
+		}
+	end
+
+	local function schoolLog(rate, h)
+		local S = N.schoolPlan(rate, h)
+		P.school = S
+		if S.net then
+			log(string.format("PLAN school level=%d next=+%d%% classes=%d days=%d lost=%.2fh finish=%.1fh gain=%s skill=%s cost=%s net=%s payback=%s grade=%s rate=%s/h", S.done, math.floor(S.bonus * 100 + 0.5), S.classes, S.days, S.lost / 3600, S.finish / 3600, money(S.gain), money(S.skill), money(S.cost), money(S.net), if S.payback < 1e9 then string.format("%.1fh", S.payback / 3600) else "never", S.grade, money(rate)))
+		else
+			log("PLAN school", S.text)
+		end
+		return S
+	end
+
+	-- every second from the info loop: measures real class results when you attend school yourself
+	function N.planTick()
+		local now = os.clock()
+		if now - P.tickAt < 5 then
+			return
+		end
+		P.tickAt = now
+		local char = LocalPlayer.Character
+		local room = char and char:GetAttribute("CurrentClassroom")
+		room = if type(room) == "string" and room ~= "" then room else nil
+		if room ~= P.room then
+			if P.room and P.snap then
+				local s = P.snap
+				local senior = (stat("SchoolProgress/" .. s.subject .. "SeniorityLevel/" .. s.subject .. "CurrentSeniorityExperience") or 0) - s.senior
+				local skill = (stat("SkillData/" .. s.skill .. "/XP") or 0) - s.skillXp
+				local skillLevel = stat("SkillData/" .. s.skill) or 0
+				if skillLevel > s.skillLevel then
+					skill = nil
+				end
+				log("SCHOOL class end", s.subject, "seniority +", senior, "skill xp +", skill or "level up", "after", math.floor(now - s.at), "s")
+				if senior >= 0 and now - s.at > 60 then
+					P.classPoints = if P.classPoints then (P.classPoints + senior) / 2 else senior
+					if skill and skill >= 0 then
+						P.classSkill = if P.classSkill then (P.classSkill + skill) / 2 else skill
+					end
+				end
+				P.snap = nil
+			end
+			if room then
+				for _, pair in ipairs(Subjects) do
+					if pair[1] == room then
+						P.snap = {
+							subject = room,
+							skill = pair[2],
+							at = now,
+							senior = stat("SchoolProgress/" .. room .. "SeniorityLevel/" .. room .. "CurrentSeniorityExperience") or 0,
+							skillXp = stat("SkillData/" .. pair[2] .. "/XP") or 0,
+							skillLevel = stat("SkillData/" .. pair[2]) or 0,
+						}
+					end
+				end
+				log("SCHOOL class start", room)
+			end
+			P.room = room
+		end
+		-- without Best Pay the school value is still shown, from the best job you measured
+		if now - P.schoolAt > 600 and now - P.decidedAt > 600 then
+			P.schoolAt = now
+			local best = 0
+			for _, entry in pairs(N.Pay.jobs) do
+				if type(entry) == "table" and (entry.seconds or 0) >= 300 then
+					best = math.max(best, entry.money / entry.seconds * 3600)
+				end
+			end
+			if best > 0 then
+				local S = schoolLog(best, horizon())
+				P.text = "School: " .. S.text
+			end
+		end
+	end
+
+	local function choose(now)
+		local h = horizon()
+		local list, known = estimates(h)
+		local cur = P.current
+		local curC
+		for _, c in ipairs(list) do
+			if c.name == cur then
+				curC = c
+			end
+		end
+		local up = startup()
+		local pick, mode, eta, why
+		if #known == 0 then
+			-- nothing measured yet: keep measuring the current job, else the first one not dropped
+			if curC and not curC.failed then
+				pick, mode, why = cur, "explore", "no job measured yet"
+			else
+				for _, c in ipairs(list) do
+					if not c.failed then
+						pick, mode, why = c.name, "explore", "no job measured yet"
+						break
+					end
+				end
+			end
+			eta = 2 * WINDOW
+		else
+			table.sort(known, function(a, b)
+				return a.E > b.E
+			end)
+			local best = known[1]
+			local Estar = best.E
+			-- knowledge gradient over m more windows, minus what measuring costs
+			local bestNet, bestC, bestT = 0, nil, 0
+			for _, c in ipairs(list) do
+				if not c.failed and c.sigma > 0 and c ~= best then
+					local isCur = c.name == cur
+					for _, m in ipairs({ 1, 2, 4, 8 }) do
+						local s = c.sigma * c.sigma / math.sqrt(c.sigma * c.sigma + c.sdw * c.sdw / m)
+						local walk = if isCur then 0 else up
+						local te = m * WINDOW + walk
+						local pBetter = 1 - cdf((Estar - c.E) / math.max(s, 1e-9))
+						local value = improvement(c.E, s, Estar) * math.max(h - te, 0) / 3600
+						local loss = (Estar - c.E) * m * WINDOW / 3600 + Estar * walk * (2 - pBetter) / 3600
+						if value - loss > bestNet then
+							bestNet, bestC, bestT = value - loss, c, te
+						end
+					end
+				end
+			end
+			if bestC then
+				pick, mode, eta = bestC.name, "explore", bestT
+				why = string.format("value of measuring %s > cost", money(bestNet))
+			else
+				pick, mode = best.name, "exploit"
+				-- stay on the current job when the switch (walk, new shift) costs more than the gain
+				if curC and curC ~= best and not curC.failed and curC.rate and curC.n >= 2 then
+					local gainSwitch = (best.E - curC.E) * math.max(h - up, 0) / 3600 - curC.E * up / 3600
+					if gainSwitch <= 0 then
+						pick = cur
+					end
+				end
+				for _, c in ipairs(list) do
+					if c.name == pick then
+						eta = c.nextLevel
+						why = string.format("rate %s/h level %d promo %s by lvl %d", money(c.R), c.level, money(c.promo), c.toLevel)
+					end
+				end
+			end
+		end
+		-- alternatives for the log: the next best values
+		table.sort(list, function(a, b)
+			return a.E > b.E
+		end)
+		local alt, shown = {}, 0
+		for _, c in ipairs(list) do
+			if c.name ~= pick and shown < 2 and not c.failed then
+				shown += 1
+				table.insert(alt, string.format("%s:%s/h%s", c.name, money(c.E), if c.n >= 2 then "" else "?"))
+			end
+		end
+		local pickC
+		for _, c in ipairs(list) do
+			if c.name == pick then
+				pickC = c
+			end
+		end
+		if now - P.schoolAt > 600 and #known > 0 then
+			P.schoolAt = now
+			schoolLog(known[1].R, h)
+		end
+		local line = string.format("PLAN best=%s gain/h=%s eta=%s alt=%s mode=%s why=%s h=%.1fh", tostring(pick), pickC and money(pickC.E) or "?", if eta then tostring(math.floor(eta)) .. "s" else "-", table.concat(alt, ","), tostring(mode), tostring(why), h / 3600)
+		local school = P.school
+		if school and school.net then
+			line ..= " school=" .. money(school.net)
+		end
+		if pick ~= P.lastPick or now - P.loggedAt > 300 then
+			P.loggedAt = now
+			log(line)
+		end
+		P.lastPick = pick
+		P.text = string.format("Plan: <b>%s</b> %s/h%s", tostring(pick), pickC and money(pickC.E) or "?", if mode == "explore" then " (measuring)" else "") .. (if school then "\nSchool: " .. school.text else "")
+		return pick
+	end
+
+	function N.bestJobPick()
+		local now = os.clock()
+		local cur = P.current
+		-- a new pick first has to reach its shift: no re-deciding while walking there
+		if cur and not P.started then
+			local key = N.JobKeys[cur]
+			if N.currentJob() == key then
+				P.started = true
+				table.insert(P.startups, now - P.pickAt)
+				if #P.startups > 8 then
+					table.remove(P.startups, 1)
+				end
+			elseif now - P.pickAt > math.max(180, 3 * startup()) then
+				P.startFails[cur] = (P.startFails[cur] or 0) + 1
+				log("PLAN start failed", cur, "after", math.floor(now - P.pickAt), "s, try", P.startFails[cur])
+				if P.startFails[cur] >= 2 then
+					P.skip[cur] = true
+					log("PLAN drop", cur, "shift did not start twice")
+				end
+				P.started = true
+				P.decidedAt = -1e9
+			else
+				return cur
+			end
+		end
+		if cur and N.currentJob() == N.JobKeys[cur] and now - (P.xpAt or -1e9) >= 15 then
+			P.xpAt = now
+			sampleXP(N.JobKeys[cur], now)
+		end
+		if now - P.decidedAt < 15 then
+			return cur
+		end
+		P.decidedAt = now
+		local pick = choose(now)
+		if pick ~= cur then
+			log("BEST job", tostring(cur), "->", tostring(pick))
+			P.current, P.pickAt, P.started = pick, now, false
+		end
+		return pick
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -33776,7 +34257,7 @@ do
 		QuickBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "One switch: Auto Work on Best Pay (auto). It tries every job, then keeps working the one that really paid you the most per hour. Turning it off clocks you out and gives your own job pick back",
+			Tooltip = "One switch: Auto Work on Best Pay (auto). It measures what every job really pays you plus its level rewards, tests a new job only while that can pay off, and keeps the best one. Turning it off clocks you out and gives your own job pick back",
 			Callback = function(value)
 				task.defer(function()
 					if value then
@@ -33818,7 +34299,7 @@ do
 		Text = "Job",
 		Values = { "Best Pay (auto)", "Hairdresser", "BloxBurgers Cashier", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Fisherman (beta)", "Woodcutter (beta)", "Taxi (beta)" },
 		Default = "Hairdresser",
-		Tooltip = "Best Pay (auto) tries each job a few minutes, then keeps working the one that really paid you the most per hour",
+		Tooltip = "Best Pay (auto) measures each job's real pay and level rewards, and keeps working the one worth the most over the next 24 h",
 	})
 	JobBox:AddDropdown("JobSpeed", {
 		Text = "Speed",
@@ -34677,7 +35158,8 @@ do
 						log("EFF", N.currentJob(), "efficiency", eff, "reason", tostring(tip), "level", N.Levels[N.currentJob()], "shift pay", N.shiftEarnings())
 					end
 				end
-				N.InfoText.pay = N.payText()
+				N.planTick()
+				N.InfoText.pay = N.payText() .. (if N.Plan.text ~= "" then "\n\n" .. N.Plan.text else "")
 				local job = N.currentJob()
 				N.InfoText.job = if job == "" then "not working" else job
 				N.InfoText.jobText = string.format(
