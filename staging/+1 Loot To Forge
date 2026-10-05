@@ -26105,15 +26105,12 @@ end)
             local SupportedGames = Info.SupportedGames or {
                 { Name = "+1 Stone Skipping", PlaceId = 111543903102439 },
                 { Name = "Anime Dice", PlaceId = 113290951185459 },
-                { Name = "Bizarre", PlaceId = 135621866300031 },
                 { Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
                 { Name = "Loot To Forge", PlaceId = 118805555015549 },
                 { Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
                 { Name = "Pets Universe", PlaceId = 74629631798007 },
                 { Name = "Ride A Pet", PlaceId = 124216119978534 },
-                { Name = "Steal An Egg", PlaceId = 107778070777162 },
                 { Name = "Steal From The Rich", PlaceId = 120475074479690 },
-                { Name = "Voltline Electric Scooters", PlaceId = 118315378611589 },
                 { Name = "Welcome to Bloxburg", PlaceId = 185655149 },
             }
             local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
@@ -31777,11 +31774,14 @@ do
 		return if type(value) == "string" and value ~= "" then value else default
 	end
 	-- Auto Farm Everything = full automatic: the planner overrides the manual picks (stage, forge kind, class target).
+	function N.mode()
+		return optionText("FarmMode", "Best value")
+	end
 	function N.opActive()
-		return on("AutoFarmBest")
+		return on("AutoFarmBest") and N.mode() ~= "My filters"
 	end
 	function N.farmMode()
-		return if N.opActive() then "Auto Farm Everything" else "Manual"
+		return if N.opActive() then "Auto Farm Everything" elseif on("AutoFarmBest") then "My filters" else "Manual"
 	end
 	function N.pickText(name, default)
 		if N.opActive() then
@@ -34108,11 +34108,52 @@ do
 			"AutoSeasonLuck", "AutoSeasonShop", "AutoTowerTicket", "AutoQuests", "AutoUpdateRewards", "AutoPotions", "AutoClassRoll",
 		}
 		N.FarmApplied = nil
+		-- My filters: the loops picked in "Run" map to these toggles. Nothing destructive (no forge, sell, enhance, class roll, season buys).
+		N.RunMap = {
+			["Farm stages"] = { "AutoStages", "KillAura" },
+			["Train"] = { "AutoTrain" },
+			["Tower"] = { "AutoTower", "AutoTowerTicket" },
+			["Boss"] = { "AutoWorldBoss" },
+			["Online gifts"] = { "AutoOnline" },
+			["Offline reward"] = { "AutoOffline" },
+			["Index"] = { "AutoIndex" },
+			["Quests"] = { "AutoQuests", "AutoUpdateRewards" },
+			["Season claims"] = { "AutoSeason" },
+			["Auto Friend"] = { "AutoFriend" },
+		}
+		N.RunValues = { "Farm stages", "Train", "Tower", "Boss", "Online gifts", "Offline reward", "Index", "Quests", "Season claims", "Auto Friend" }
+		function N.farmList()
+			if N.mode() ~= "My filters" then
+				return N.FarmOPOn
+			end
+			local picks = Options.FarmRun and Options.FarmRun.Value or {}
+			local list = {}
+			for _, key in ipairs(N.RunValues) do
+				if picks[key] then
+					for _, name in ipairs(N.RunMap[key]) do
+						table.insert(list, name)
+					end
+				end
+			end
+			return list
+		end
 		function N.applyFarm(value)
 			local list
 			if value then
-				list = N.FarmOPOn
-				N.FarmApplied = list
+				list = N.farmList()
+				if N.mode() == "My filters" then
+					-- only what this switch flips is switched off again later
+					local flipped = {}
+					for _, name in ipairs(list) do
+						local toggle = Toggles[name]
+						if toggle and not toggle.Value then
+							table.insert(flipped, name)
+						end
+					end
+					N.FarmApplied = flipped
+				else
+					N.FarmApplied = list
+				end
 			else
 				list = N.FarmApplied or {}
 				N.FarmApplied = nil
@@ -34123,46 +34164,14 @@ do
 					toggle:SetValue(value)
 				end
 			end
-			log("FARM", if value then "on" else "off", #list)
+			log("FARM", if value then "on" else "off", N.mode(), #list)
 		end
-		-- Remember Auto Farm Everything (default off): neither switch is part of a saved config (SaveManager ignore list),
-		-- the state lives in Corvus/LTF_auto_farm.txt and is restored only when Remember is on.
-		local FarmFile = "Corvus/LTF_auto_farm.txt"
-		function N.saveFarmState()
-			if N.FarmGuard or N.FarmRestoring then
-				return
-			end
-			pcall(function()
-				if makefolder and isfolder and not isfolder("Corvus") then
-					makefolder("Corvus")
-				end
-				local remember = on("RememberFarm")
-				writefile(FarmFile, string.format("remember=%d farm=%d", if remember then 1 else 0, if remember and on("AutoFarmBest") then 1 else 0))
-			end)
-		end
+		-- The master switch is never saved or restored (no Remember).
 		function N.farmEnable()
 			N.FarmQuiet = true
 			Toggles.AutoFarmBest:SetValue(true)
 			N.FarmQuiet = false
 			N.applyFarm(true)
-			N.saveFarmState()
-		end
-		function N.restoreFarm()
-			local ok, text = pcall(function()
-				return readfile(FarmFile)
-			end)
-			if not ok or type(text) ~= "string" or string.find(text, "remember=1", 1, true) == nil or not alive() then
-				return
-			end
-			N.FarmRestoring = true
-			pcall(function()
-				Toggles.RememberFarm:SetValue(true)
-			end)
-			N.FarmRestoring = false
-			if string.find(text, "farm=1", 1, true) and not on("AutoFarmBest") then
-				log("REMEMBER restore Auto Farm Everything")
-				N.farmEnable()
-			end
 		end
 		N.OPText = "Full automatic: the planner trains, farms, forges, enhances, rolls classes and spends for max profit. Can consume or sell your items (Exclude protects the ones you pick)."
 		N.OPWarn = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
@@ -34186,7 +34195,11 @@ do
 				task.defer(function()
 					if not value then
 						N.applyFarm(false)
-						N.saveFarmState()
+						return
+					end
+					if N.mode() == "My filters" then
+						-- no planner, no destructive action: no card needed
+						N.applyFarm(true)
 						return
 					end
 					-- The toggle stays off until the card is confirmed.
@@ -34200,14 +34213,42 @@ do
 				end)
 			end,
 		})
-		QuickBox:AddToggle("RememberFarm", {
-			Text = "Remember Auto Farm Everything",
-			Default = false,
-			Tooltip = "Starts Auto Farm Everything again the next time the hub loads. " .. N.OPWarn,
+		QuickBox:AddDropdown("FarmMode", {
+			Text = "Mode",
+			Values = { "Best value", "My filters" },
+			Default = "Best value",
+			Tooltip = "Best value: the planner decides everything (buys, sells, targets) within Exclude. My filters: no planner and nothing destroyed, only the loops picked in Run, with your own settings",
 			Callback = function()
-				task.defer(N.saveFarmState)
+				if N.RunDrop then
+					N.RunDrop:SetVisible(N.mode() == "My filters")
+				end
+				if N.FarmModeSeen ~= nil and N.FarmModeSeen ~= N.mode() and on("AutoFarmBest") then
+					-- the running set belongs to the old mode: stop it, the player starts again
+					N.applyFarm(false)
+					N.FarmQuiet = true
+					Toggles.AutoFarmBest:SetValue(false)
+					N.FarmQuiet = false
+					notify("Auto Farm Everything", "Mode changed, switch it on again", 4)
+				end
+				N.FarmModeSeen = N.mode()
 			end,
 		})
+		N.RunDrop = QuickBox:AddDropdown("FarmRun", {
+			Text = "Run",
+			Values = N.RunValues,
+			Default = N.RunValues,
+			Multi = true,
+			AllowNull = true,
+			Visible = false,
+			Tooltip = "My filters: the loops Auto Farm Everything starts. Forging, selling, enhancing, class rolls and season purchases are never started from here. Your other settings stay as you set them",
+			Callback = function()
+				if N.mode() == "My filters" and on("AutoFarmBest") and N.FarmApplied ~= nil then
+					N.applyFarm(false)
+					N.applyFarm(true)
+				end
+			end,
+		})
+		N.FarmModeSeen = "Best value"
 		QuickBox:AddDropdown("FarmExclude", {
 			Text = "Exclude",
 			Values = N.ExcludeValues,
@@ -36373,12 +36414,11 @@ do
 		})
 	end
 end
--- Auto Farm Everything and its Remember switch are never part of a saved config (see Remember in p06).
+-- Auto Farm Everything is never part of a saved config (never restored); Mode and Run are normal options.
 pcall(function()
 	if type(SaveManager) == "table" then
 		SaveManager.Ignore = SaveManager.Ignore or {}
 		SaveManager.Ignore.AutoFarmBest = true
-		SaveManager.Ignore.RememberFarm = true
 	end
 end)
 if Window.AddSettingsTab then
@@ -36900,12 +36940,6 @@ do
 				end
 			end
 			task.wait(10)
-		end
-	end)
-	-- Remember Auto Farm Everything: restored once the start-up guard is over.
-	task.delay(10.5, function()
-		if alive() then
-			pcall(N.restoreFarm)
 		end
 	end)
 	local function shown(tab)
