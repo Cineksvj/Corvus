@@ -17114,6 +17114,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
     
         local CommunityState = { Fetching = false, Fetched = false, Listeners = {} }
         Library.CommunityState = CommunityState
+        Library.FetchCommunity = FetchCommunity
     
         local function FetchCommunity(Code: string?)
             if not Code or CommunityState.Fetching or CommunityState.Fetched then
@@ -20276,7 +20277,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 CanvasSize = UDim2.fromScale(0, 0),
                 Position = UDim2.fromOffset(0, 49),
                 ScrollBarThickness = 0,
-                Size = UDim2.new(0, InitialLeftWidth, 1, -70),
+                Size = UDim2.new(0, InitialLeftWidth, 1, -100),
                 Parent = MainFrame,
             })
             New("UIListLayout", {
@@ -20310,6 +20311,140 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 Parent = Container,
             })
     
+            do
+                local DiscordBlurple = Color3.fromRGB(88, 101, 242)
+                local FooterHeight = 32
+                local Footer = New("TextButton", {
+                    AnchorPoint = Vector2.new(0, 1),
+                    AutoButtonColor = false,
+                    BackgroundColor3 = "MainColor",
+                    BackgroundTransparency = 0.2,
+                    Name = "DiscordFooter",
+                    Position = UDim2.new(0, 4, 1, -24),
+                    Size = UDim2.new(0, InitialLeftWidth - 8, 0, FooterHeight),
+                    Text = "",
+                    ZIndex = 3,
+                    Parent = MainFrame,
+                })
+                New("UICorner", {
+                    CornerRadius = UDim.new(0, 8),
+                    Parent = Footer,
+                })
+                New("UIStroke", {
+                    Color = "AccentColor",
+                    Transparency = 0.6,
+                    Parent = Footer,
+                })
+                local FooterIcon = New("ImageLabel", {
+                    AnchorPoint = Vector2.new(0, 0.5),
+                    BackgroundTransparency = 1,
+                    ImageColor3 = DiscordBlurple,
+                    Position = UDim2.new(0, 8, 0.5, 0),
+                    Size = UDim2.fromOffset(16, 16),
+                    ZIndex = 4,
+                    Parent = Footer,
+                })
+                local FooterIconData = Library:GetCustomIcon("message-circle") or Library:GetCustomIcon("users")
+                if FooterIconData then
+                    Library:ApplyLucideIcon(FooterIcon, FooterIconData)
+                end
+                local FooterTitle = New("TextLabel", {
+                    BackgroundTransparency = 1,
+                    FontFace = GetBoldFont,
+                    Position = UDim2.fromOffset(30, 3),
+                    Size = UDim2.new(1, -34, 0, 14),
+                    Text = "Discord",
+                    TextColor3 = "FontColor",
+                    TextSize = 12,
+                    TextTruncate = Enum.TextTruncate.AtEnd,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 4,
+                    Parent = Footer,
+                })
+                local FooterSub = New("TextLabel", {
+                    BackgroundTransparency = 1,
+                    Position = UDim2.fromOffset(30, 17),
+                    Size = UDim2.new(1, -34, 0, 12),
+                    Text = "Join our Discord",
+                    TextColor3 = "FontColor",
+                    TextSize = 10,
+                    TextTransparency = 0.35,
+                    TextTruncate = Enum.TextTruncate.AtEnd,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 4,
+                    Parent = Footer,
+                })
+                local FooterWidth = InitialLeftWidth
+                local function FooterLayout()
+                    local Narrow = Library.IsMobile or FooterWidth < 150
+                    local Tiny = FooterWidth < 100
+                    FooterTitle.Visible = not Tiny
+                    FooterSub.Visible = not Tiny and not Narrow
+                    FooterTitle.Position = if Narrow then UDim2.fromOffset(30, 9) else UDim2.fromOffset(30, 3)
+                    FooterIcon.AnchorPoint = if Tiny then Vector2.new(0.5, 0.5) else Vector2.new(0, 0.5)
+                    FooterIcon.Position = if Tiny then UDim2.new(0.5, 0, 0.5, 0) else UDim2.new(0, 8, 0.5, 0)
+                end
+                FooterLayout()
+                local function FooterPaint()
+                    if not Footer.Parent then
+                        return
+                    end
+                    local State = Library.CommunityState
+                    if State and (State.Online or State.Members) then
+                        local function Digits(Value)
+                            if typeof(Value) ~= "number" then
+                                return "?"
+                            end
+                            local Out = string.reverse(tostring(math.floor(Value)))
+                            Out = string.reverse((string.gsub(Out, "(%d%d%d)", "%1,")))
+                            if string.sub(Out, 1, 1) == "," then
+                                Out = string.sub(Out, 2)
+                            end
+                            return Out
+                        end
+                        FooterSub.Text = string.format("%s online \u{00B7} %s members", Digits(State.Online), Digits(State.Members))
+                    end
+                end
+                Library.SidebarDiscordFrame = Footer
+                Library.SidebarDiscord = {
+                    Resize = function(Width)
+                        FooterWidth = Width
+                        Footer.Size = UDim2.new(0, math.max(Width - 8, 16), 0, FooterHeight)
+                        FooterLayout()
+                    end,
+                }
+                Footer.MouseButton1Click:Connect(function()
+                    local Invite = tostring(Library.DiscordInvite or "https://discord.gg/PdQvN2bDCu")
+                    if Library:CopyToClipboard(Invite, false) then
+                        Library:Notify({
+                            Title = "Invite copied",
+                            Description = "Paste it in Discord",
+                            Time = 3,
+                        })
+                    end
+                end)
+                task.delay(2, function()
+                    if Library.Unloaded or not Footer.Parent then
+                        return
+                    end
+                    local Invite = tostring(Library.DiscordInvite or "https://discord.gg/PdQvN2bDCu")
+                    local State = Library.CommunityState
+                    if State and Library.FetchCommunity then
+                        table.insert(State.Listeners, FooterPaint)
+                        FooterPaint()
+                        local _, Code = ParseDiscordInvite(Invite)
+                        Library.FetchCommunity(Code)
+                    end
+                    if not Library.DiscordToastShown then
+                        Library.DiscordToastShown = true
+                        Library:Notify({
+                            Title = "Corvus",
+                            Description = "Join our Discord for updates, codes and support: " .. Invite,
+                            Time = 6,
+                        })
+                    end
+                end)
+            end
             Library.WindowContainer = Container
         end
     
@@ -20652,7 +20787,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 RestoringTo = nil
     
                 if #MinimizeHidden == 0 then
-                    for _, Gui in { TopBar, TopLine, DividerLine, Tabs, Container, BottomBackground, BottomBar, BottomLine } do
+                    for _, Gui in { TopBar, TopLine, DividerLine, Tabs, Container, BottomBackground, BottomBar, BottomLine, Library.SidebarDiscordFrame } do
                         if Gui and Gui.Visible then
                             Gui.Visible = false
                             table.insert(MinimizeHidden, Gui)
@@ -21243,7 +21378,10 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
     
             TitleHolder.Size = UDim2.new(0, Width, 1, 0)
             RightWrapper.Size = UDim2.new(1, -Width - TopbarRightInset - 8 - 1, 1, -16)
-            Tabs.Size = UDim2.new(0, Width, 1, -70)
+            Tabs.Size = UDim2.new(0, Width, 1, -100)
+            if Library.SidebarDiscord then
+                Library.SidebarDiscord.Resize(Width)
+            end
             Container.Size = UDim2.new(1, -Width - 1, 1, -70)
     
             if WindowInfo.EnableCompacting then
