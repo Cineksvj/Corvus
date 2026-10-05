@@ -32465,6 +32465,14 @@ do
 	end)
 	N.onEvent("WorldUnlockStarted", function(data)
 		log("WORLD unlock started", brief(data))
+		local id = type(data) == "table" and data.Id or nil
+		local kind = id ~= nil and N.Secret and N.Secret.ids[id]
+		if kind then
+			N.Secret.viaPortal += 1
+			N.Secret.unlockedIds = N.Secret.unlockedIds or {}
+			N.Secret.unlockedIds[id] = true
+			log("WORLD unlocked via secret", tostring(id), "kind", kind)
+		end
 	end)
 	N.onEvent("WorldUnlockEnded", function()
 		log("WORLD unlock ended", "now in", N.worldId())
@@ -32481,8 +32489,82 @@ N.Throw = { id = nil, pressedAt = -1e9, startedAt = -1e9, finishedAt = -1e9, noS
 -- Direct throws (Throw Speed Blatant / Fast, ideas.md "Blatant discovery" A and B): the hub sends the game's own
 -- Request("Throw", RequestId) with its own RequestIds. mine[RequestId] = the hub's request (started / rejected /
 -- cancelled), byId[server throw Id] = RequestId.
-N.Direct = { seq = 100000 + math.random(0, 899) * 1000, mine = {}, byId = {}, rejectRun = 0, offUntil = 0, hook = nil, dropped = 0, logs = 0 }
-N.Parallel = { off = false, rejectRun = 0, ok = 0, logs = 0, sentAt = -1e9 }
+N.Direct = { seq = 100000 + math.random(0, 899) * 1000, mine = {}, byId = {}, rejectRun = 0, offUntil = 0, hook = nil, dropped = 0, logs = 0, allow = {} }
+-- Per-account memory of what the server answered (Corvus/STONE_probe_<UserId>.txt, key=value lines): zone/world probe
+-- refusals with the requirement the server named, spending from the training stand, the measured secret odds.
+N.ProbeMem = { file = "Corvus/STONE_probe_" .. tostring(LocalPlayer.UserId) .. ".txt", data = {}, loaded = false }
+function N.probeGet(key)
+	local M = N.ProbeMem
+	if not M.loaded then
+		M.loaded = true
+		local ok, text = pcall(function()
+			return readfile(M.file)
+		end)
+		if ok and type(text) == "string" then
+			for k, v in string.gmatch(text, "([^=\n]+)=([^\n]*)") do
+				M.data[k] = v
+			end
+		end
+	end
+	return M.data[key]
+end
+function N.probeSet(key, value)
+	N.probeGet(key)
+	if N.ProbeMem.data[key] == value then
+		return
+	end
+	N.ProbeMem.data[key] = value
+	local lines = {}
+	for k, v in pairs(N.ProbeMem.data) do
+		table.insert(lines, k .. "=" .. tostring(v))
+	end
+	table.sort(lines)
+	pcall(function()
+		if makefolder and isfolder and not isfolder("Corvus") then
+			makefolder("Corvus")
+		end
+		writefile(N.ProbeMem.file, table.concat(lines, "\n"))
+	end)
+end
+-- Secret / Colossus odds measured on our own ThrowStarted packets (every started throw is one roll, rerolled ones too),
+-- kept per account. ids[throw Id] = "secret"/"colossus" until the throw ends (portal check).
+N.Secret = { n = 0, s = 0, c = 0, ids = {}, portalMiss = 0, portalOff = false, ratio = nil, viaPortal = 0, loaded = false }
+function N.secretStats()
+	local S = N.Secret
+	if not S.loaded then
+		S.loaded = true
+		local saved = N.probeGet("secret")
+		if saved then
+			local n, s, c = string.match(saved, "^(%d+),(%d+),(%d+)$")
+			S.n, S.s, S.c = tonumber(n) or 0, tonumber(s) or 0, tonumber(c) or 0
+		end
+		S.portalOff = N.probeGet("portal") == "off"
+	end
+	return S
+end
+-- Odds per roll: the game's long-run stage (SecretThrow.Stages[3] Chance 0.02, Colossus Chances[3] 0.0025) as a prior
+-- worth 50 rolls, blended with what this account measured. Returns secret, colossus.
+function N.secretOdds()
+	local S = N.secretStats()
+	local cfg = N.G and N.G.Balance and N.G.Balance.SecretThrow or {}
+	local stages = cfg.Stages or {}
+	local last = stages[#stages]
+	local ps = tonumber(last and last.Chance) or 0.02
+	local cc = cfg.Colossus and cfg.Colossus.Chances or {}
+	local pc = tonumber(cc[#cc]) or 0.0025
+	local w = 50
+	return (S.s + ps * w) / (S.n + w), (S.c + pc * w) / (S.n + w)
+end
+function N.secretOddsText()
+	local S = N.secretStats()
+	if S.n <= 0 then
+		return ""
+	end
+	return string.format("\nSecret odds measured: %d secret, %d colossus in %d rolls", S.s, S.c, S.n)
+end
+-- Secret Reroll (opt-in toggle, default off): CancelThrow our own throw at ThrowStarted when it is not a Secret/Colossus
+-- and throw again after the cooldown. A/B measured once per session (PROBE reroll), switched off by the server's answers.
+N.Reroll = { off = false, why = "", attempts = 0, secrets = 0, noCancel = 0, ab = nil, kept = nil, logs = 0, lastCancelAt = -1e9, say = "" }
 local function liveCount()
 	local n = 0
 	for _ in pairs(N.Throw.live) do
@@ -32505,7 +32587,20 @@ N.onEvent("ThrowStarted", function(data)
 		if mine then
 			mine.started = true
 			mine.id = data.Id
+			mine.secret, mine.colossus = data.Secret == true, data.Colossus == true
 			N.Direct.byId[data.Id or "?"] = data.RequestId
+		end
+		local SS = N.secretStats()
+		SS.n += 1
+		if data.Colossus == true then
+			SS.c += 1
+			SS.ids[data.Id or "?"] = "colossus"
+		elseif data.Secret == true then
+			SS.s += 1
+			SS.ids[data.Id or "?"] = "secret"
+		end
+		if SS.n % 10 == 0 or data.Secret == true or data.Colossus == true then
+			N.probeSet("secret", string.format("%d,%d,%d", SS.n, SS.s, SS.c))
 		end
 	end
 end)
@@ -32515,17 +32610,17 @@ N.onEvent("ThrowRejected", function(data)
 		if mine then
 			mine.rejected = tostring(data.Message)
 			N.Direct.mine[data.RequestId] = nil
-			-- A refused second throw (parallel probe) is the expected answer, not a "too early": no back-off.
-			if mine.parallel then
-				return
+			-- A throw refused right after a reroll cancel: the server does not take the reroll, stop it.
+			if os.clock() - N.Reroll.lastCancelAt < 3 then
+				N.rerollOff("ThrowRejected after a cancel: " .. tostring(data.Message))
 			end
 		end
 		Session.rejected += 1
 		N.Throw.pending = liveCount() > 0
 		N.Throw.rejectedAt = os.clock()
-		-- Back off: the server refused a throw sent too early. Wait longer before the next one, never faster (direct
-		-- throws step faster towards the game's 0.8 s cooldown).
-		N.Throw.extraGap = math.min(1.5, N.Throw.extraGap + (if mine then 0.25 else 0.15))
+		-- Back off: the server refused a throw sent too early. Direct throws already wait the game's Throw.Cooldown, so
+		-- they step up by 0.05 s; the button by 0.15 s.
+		N.Throw.extraGap = math.min(1.5, N.Throw.extraGap + (if mine then 0.05 else 0.15))
 		N.Throw.okRun = 0
 		log("THROW gap=" .. string.format("%.2f", os.clock() - N.Throw.finishedAt), "accepted=false", "backoff", string.format("%.2f", N.Throw.extraGap), tostring(data.Message))
 	end
@@ -32540,15 +32635,26 @@ local function throwEnded(kind, data)
 		N.Throw.secret, N.Throw.colossus = entry.secret, entry.colossus
 	end
 	local req = N.Direct.byId[data.Id or "?"]
+	local rerolled = false
 	if req then
 		N.Direct.byId[data.Id or "?"] = nil
 		local mine = N.Direct.mine[req]
 		N.Direct.mine[req] = nil
 		if mine and kind == "ThrowCancelled" then
 			mine.cancelled = true
-			-- The server dropped one of our throws (a second throw displaced the first, or the game's client cancelled it).
-			N.noteDirectCancel(mine)
+			-- The server dropped one of our throws (not our own reroll cancel): count it as a refusal.
+			rerolled = mine.reroll == true
+			if not rerolled then
+				N.noteDirectCancel(mine)
+			end
 		end
+	end
+	local secretKind = N.Secret.ids[data.Id or "?"]
+	if secretKind then
+		-- Kept a little longer: WorldUnlockStarted may name this throw Id after it lands.
+		task.delay(30, function()
+			N.Secret.ids[data.Id or "?"] = nil
+		end)
 	end
 	N.Throw.pending = liveCount() > 0
 	local lastEnd = N.Throw.finishedAt
@@ -32561,7 +32667,9 @@ local function throwEnded(kind, data)
 		end
 	end
 	if kind == "ThrowCancelled" then
-		log("THROW cancelled", tostring(data.Id))
+		if not rerolled then
+			log("THROW cancelled", tostring(data.Id))
+		end
 		return
 	end
 	local wins = tonumber(data.Wins) or 0
@@ -32588,8 +32696,14 @@ local function throwEnded(kind, data)
 		-- Seconds per throw = time since the previous throw ended (parallel throws share the time), the first from the press.
 		N.notePlanThrow(wins, if lastEnd > N.Throw.pressedAt then os.clock() - lastEnd else os.clock() - N.Throw.pressedAt)
 	end
-	if Session.throws <= 3 or Session.throws % 25 == 0 or N.Throw.secret then
-		log("THROW", "#" .. Session.throws, "wins", brief(wins), "dist", math.floor(dist), "secret", tostring(N.Throw.secret), "colossus", tostring(N.Throw.colossus))
+	local portal
+	if secretKind and N.secretPortalCheck then
+		portal = N.secretPortalCheck(secretKind, data.Id, dist)
+	elseif not secretKind and N.noteThrowDistance then
+		N.noteThrowDistance(dist)
+	end
+	if Session.throws <= 3 or Session.throws % 25 == 0 or N.Throw.secret or N.Throw.colossus then
+		log("THROW", "#" .. Session.throws, "wins", brief(wins), "dist", math.floor(dist), "secret", tostring(N.Throw.secret), "colossus", tostring(N.Throw.colossus), if portal ~= nil then "portal=" .. tostring(portal) else "")
 	end
 	if N.Events.throw then
 		pcall(N.Events.throw, wins, dist, N.Throw.secret)
@@ -32810,7 +32924,7 @@ function N.directHook()
 		local function hook(self, ...)
 			if self == remote and D.active then
 				local action, id = ...
-				if action == "CancelThrow" and D.mine[id] and getnamecallmethod() == "FireServer" then
+				if action == "CancelThrow" and D.mine[id] and not D.allow[id] and getnamecallmethod() == "FireServer" then
 					D.dropped += 1
 					return nil
 				end
@@ -32824,23 +32938,32 @@ function N.directHook()
 	log("THROW direct hook", if ok then "on" else "failed: " .. tostring(err))
 	return ok
 end
--- Which throw path runs now: "parallel" (two in flight), "direct", "button" (the game's button, no pause) or "legit".
--- The pick comes from the self-measuring probe (N.ThrowProbe) among what the Throw Speed allows and what is not
--- switched off by the server's answers.
+-- Which throw path runs now: "direct", "button" (the game's button, no pause) or "legit". The pick comes from the
+-- self-measuring probe (N.ThrowProbe) among what the Throw Speed allows and what is not switched off by the server's
+-- answers. A second throw in flight was removed: the server refuses it ("Finish your current throw first.", owner log
+-- 2026-10-05 22:53).
 N.ThrowProbe = { score = {}, win = nil, cur = nil, reprobeAt = 0, say = "", logs = 0 }
 local function throwCandidates()
-	local speed = N.throwSpeed()
-	if speed == "legit" then
+	if N.throwSpeed() == "legit" then
 		return { "legit" }
-	elseif speed == "fast" then
-		return { "direct", "button" }
 	end
-	return { "parallel", "direct", "button" }
+	return { "direct", "button" }
+end
+-- True once every allowed mode has a score (the reroll A/B waits for it so the two measurements never mix).
+function N.throwProbeDone()
+	local list = throwCandidates()
+	if #list < 2 or N.throwSpeed() ~= "blatant" then
+		return true
+	end
+	for _, m in ipairs(list) do
+		if N.ThrowProbe.score[m] == nil and N.throwModeAvailable(m) then
+			return false
+		end
+	end
+	return true
 end
 function N.throwModeAvailable(mode)
-	if mode == "parallel" then
-		return not N.Parallel.off and N.throwModeAvailable("direct")
-	elseif mode == "direct" then
+	if mode == "direct" then
 		local D = N.Direct
 		if os.clock() < D.offUntil then
 			return false
@@ -32852,7 +32975,7 @@ end
 function N.throwMode()
 	local list = throwCandidates()
 	local TP = N.ThrowProbe
-	if TP.cur and table.find(list, TP.cur) and N.throwModeAvailable(TP.cur) then
+	if TP.cur and N.throwSpeed() == "blatant" and table.find(list, TP.cur) and N.throwModeAvailable(TP.cur) then
 		return TP.cur
 	end
 	for _, mode in ipairs(list) do
@@ -32867,14 +32990,15 @@ end
 function N.throwProbeTick(mode)
 	local TP = N.ThrowProbe
 	local list = throwCandidates()
-	if #list < 2 then
+	-- Fast throws direct without measuring (the button only as the fallback); Blatant measures and keeps the faster.
+	if #list < 2 or N.throwSpeed() ~= "blatant" then
 		TP.win = nil
 		return
 	end
 	local secs = Session.throwSeconds
 	local W = TP.win
-	-- A world probe trip measures the world, not the throw mode.
-	if N.ZoneProbe.world then
+	-- A world probe trip measures the world, not the throw mode; reroll windows change the throw count on purpose.
+	if N.ZoneProbe.world or (N.rerollActive and N.rerollActive()) then
 		TP.win = nil
 		return
 	end
@@ -32954,27 +33078,84 @@ local function directFailed(why)
 		log("THROW direct fallback", "the game's button for 10 min after 3 refusals")
 	end
 end
-local function parallelFailed(why)
-	local P = N.Parallel
-	P.rejectRun += 1
-	log("THROW parallel rejected", why, "run", P.rejectRun)
-	if P.rejectRun >= 3 and not P.off then
-		P.off = true
-		log("THROW parallel off", "single direct throws for this session")
-	end
+function N.noteDirectCancel(_mine)
+	directFailed("cancelled by the server")
 end
-function N.noteDirectCancel(mine)
-	if mine.parallel or liveCount() > 0 then
-		parallelFailed("a throw was cancelled while two were in flight")
-	else
-		directFailed("cancelled by the server")
+-- Secret Reroll ---------------------------------------------------------------------------------------------------
+function N.rerollOff(why)
+	local R = N.Reroll
+	if R.off then
+		return
 	end
+	R.off, R.why, R.ab = true, why, nil
+	R.say = "off: " .. why
+	log("THROW reroll off", why)
+end
+-- Rerolling now: the toggle on, not switched off, direct throws, and the A/B reroll window, kept after it, or the
+-- Smart Planner's unlock hunt (a Secret/Colossus reaches the next world's portal sooner than training).
+function N.rerollActive()
+	local R = N.Reroll
+	if R.off or not on("SecretReroll") or N.throwMode() ~= "direct" or N.ZoneProbe.world then
+		return false
+	end
+	if N.planner() and N.Plan and N.Plan.why == "unlock hunt" then
+		return true
+	end
+	if R.kept == true then
+		return true
+	end
+	return R.ab ~= nil and R.ab.phase == "reroll"
+end
+-- Which rolls are kept: a Colossus always, a Secret unless the unlock hunt needs a Colossus.
+function N.rerollKeep(mine)
+	if mine.colossus then
+		return true
+	end
+	if N.planner() and N.Plan and N.Plan.why == "unlock hunt" and N.Plan.huntKind == "colossus" then
+		return false
+	end
+	return mine.secret == true
+end
+-- A/B once per session (after the throw mode probe): 120 s of normal direct throws (A), then 180 s with rerolls (B).
+-- Kept when B pays > 1.1x A in Wins per throwing minute. Logs PROBE reroll.
+function N.rerollTick()
+	local R = N.Reroll
+	if R.off or not on("SecretReroll") or R.kept ~= nil or N.throwMode() ~= "direct" or N.ZoneProbe.world or not N.throwProbeDone() then
+		return
+	end
+	local secs, wins = Session.throwSeconds, Session.winsFromThrows
+	local ab = R.ab
+	if not ab then
+		R.ab = { phase = "base", secs = secs, wins = wins }
+		R.say = "measuring normal throws (A, 120 s)"
+		return
+	end
+	local span = secs - ab.secs
+	if ab.phase == "base" then
+		if span < 120 then
+			return
+		end
+		ab.base = (wins - ab.wins) * 60 / span
+		ab.phase, ab.secs, ab.wins, ab.attempts, ab.secrets = "reroll", secs, wins, R.attempts, R.secrets
+		R.say = "measuring rerolls (B, 180 s)"
+		log("PROBE reroll base", "wins/min", brief(ab.base), "in", string.format("%.0fs", span))
+		return
+	end
+	if span < 180 then
+		return
+	end
+	local rate = (wins - ab.wins) * 60 / span
+	local k, n = R.secrets - ab.secrets, R.attempts - ab.attempts
+	R.kept = rate > ab.base * 1.1
+	R.ab = nil
+	log("PROBE reroll", "result=" .. brief(rate) .. "/min", "secrets=" .. k .. "/" .. n, "base=" .. brief(ab.base) .. "/min", "kept=" .. tostring(R.kept))
+	R.say = string.format("%s: %s Wins/min with rerolls vs %s without (%d secrets in %d rolls)", if R.kept then "kept" else "not worth it", formatNumber(rate), formatNumber(ab.base), k, n)
 end
 -- Sends one hub throw and waits up to 2 s for the server's answer. Returns "started", "rejected" or "none".
-local function sendDirect(parallel)
+local function sendDirect()
 	local D = N.Direct
 	local req = nextRequestId()
-	local mine = { sentAt = os.clock(), parallel = parallel }
+	local mine = { sentAt = os.clock(), req = req }
 	D.mine[req] = mine
 	if not send("Throw", req) then
 		D.mine[req] = nil
@@ -32996,37 +33177,52 @@ local function sendDirect(parallel)
 	end
 	return (if mine.rejected ~= nil or mine.cancelled then "rejected" else "none"), mine
 end
--- Probe B: a second Throw while ours is in flight. Accepted = its own ThrowStarted and the first one not cancelled.
-local function parallelStep()
-	local T, P = N.Throw, N.Parallel
-	local now = os.clock()
-	if liveCount() ~= 1 or now - T.startedAt < 0.3 or now - P.sentAt < 0.3 then
-		return false
+-- Our own CancelThrow for a roll that is not kept (the hook lets exactly this id through).
+local function rerollCancel(mine)
+	local R, D = N.Reroll, N.Direct
+	R.attempts += 1
+	mine.reroll = true
+	D.allow[mine.req] = true
+	R.lastCancelAt = os.clock()
+	send("CancelThrow", mine.req)
+	local cancelled = waitFor(function()
+		return mine.cancelled == true
+	end, 2)
+	D.allow[mine.req] = nil
+	R.logs += 1
+	if R.logs <= 10 or R.logs % 50 == 0 or not cancelled then
+		log("THROW reroll", "attempt=" .. R.attempts, "secret=false", "colossus=false", "cancelled=" .. tostring(cancelled), "msg=" .. tostring(mine.rejected or "-"))
 	end
-	P.sentAt = now
-	local result, mine = sendDirect(true)
-	if result == "started" then
-		P.rejectRun = 0
-		P.ok += 1
-		P.logs += 1
-		if P.logs <= 5 or P.logs % 100 == 0 then
-			log("THROW parallel accepted=true", "in flight", liveCount(), "ok", P.ok)
+	if cancelled then
+		R.noCancel = 0
+	else
+		R.noCancel += 1
+		if R.noCancel >= 3 then
+			N.rerollOff("no ThrowCancelled 3 times")
 		end
-		return true
 	end
-	parallelFailed(if result == "rejected" then "msg=" .. tostring(mine.rejected or "cancelled") else "no ThrowStarted in 2 s")
-	return false
 end
--- Probe A: Throw 0.15 s after ThrowFinished (Network.RequestInterval) instead of the client's 0.8 s cooldown.
+-- Direct throw: Request("Throw", RequestId) once the server's own cooldown (GameBalance Throw.Cooldown 0.8 s, "Ready in a
+-- moment..." before it) is over.
 local function directStep(gap)
 	local T, D = N.Throw, N.Direct
 	T.pressedAt = os.clock()
-	local result, mine = sendDirect(false)
+	local result, mine = sendDirect()
 	if result == "started" then
 		D.rejectRun = 0
 		D.logs += 1
 		if D.logs <= 5 or D.logs % 50 == 0 then
 			log("THROW direct gap=" .. (if gap then string.format("%.2f", gap) else "first"), "accepted=true", "dropped cancels", D.dropped)
+		end
+		if N.rerollActive() then
+			if N.rerollKeep(mine) then
+				local R = N.Reroll
+				R.attempts += 1
+				R.secrets += 1
+				log("THROW reroll", "attempt=" .. R.attempts, "secret=" .. tostring(mine.secret == true), "colossus=" .. tostring(mine.colossus == true), "cancelled=false", "msg=kept")
+			else
+				rerollCancel(mine)
+			end
 		end
 		return true
 	end
@@ -33055,6 +33251,7 @@ function N.throwStep()
 	local activity = N.activity()
 	local mode = N.throwMode()
 	N.throwProbeTick(mode)
+	N.rerollTick()
 	-- A throw whose ThrowFinished never came (world change, lost packet) is forgotten after 30 s, so a ghost never
 	-- counts as "in flight".
 	for id, entry in pairs(T.live) do
@@ -33064,10 +33261,7 @@ function N.throwStep()
 	end
 	T.pending = liveCount() > 0
 	if T.pending and os.clock() - T.startedAt < 30 then
-		if mode == "parallel" and parallelStep() then
-			return true
-		end
-		setStatus("Throwing" .. (if T.secret then " (secret throw)" else "") .. (if liveCount() > 1 then " x" .. liveCount() else ""))
+		setStatus("Throwing" .. (if T.colossus then " (colossus throw)" elseif T.secret then " (secret throw)" else ""))
 		task.wait(if mode == "button" or mode == "legit" then 0.2 else 0.05)
 		return true
 	end
@@ -33076,7 +33270,7 @@ function N.throwStep()
 	end
 	T.pending = false
 	-- Direct: the server's State may still say Throw for a moment after ThrowFinished.
-	if activity == "Throw" and (mode == "direct" or mode == "parallel") and os.clock() - T.finishedAt < 2 then
+	if activity == "Throw" and mode == "direct" and os.clock() - T.finishedAt < 2 then
 		task.wait(0.05)
 		return false
 	end
@@ -33112,9 +33306,11 @@ function N.throwStep()
 		end
 		task.wait(0.4)
 	end
-	if mode == "direct" or mode == "parallel" then
-		-- 0.15 s after ThrowFinished (the game's Network.RequestInterval) plus the back-off after a refusal.
-		local pause = 0.15 + T.extraGap - (os.clock() - T.finishedAt)
+	if mode == "direct" then
+		-- The server's cooldown after a throw ends (Throw.Cooldown 0.8 s; owner log 2026-10-05: 0.20/0.48/0.72 s refused
+		-- "Ready in a moment...", 0.82 s accepted) plus 0.02 s, plus the back-off after a refusal.
+		local cfg = N.G and N.G.Balance and N.G.Balance.Throw
+		local pause = (tonumber(cfg and cfg.Cooldown) or 0.8) + 0.02 + T.extraGap - (os.clock() - T.finishedAt)
 		if pause > 0 then
 			task.wait(pause)
 		end
@@ -33374,6 +33570,35 @@ local function zoneBaseSample()
 		Z.sample = nil
 	end
 end
+-- The server's answer to a probe is kept per account (N.ProbeMem "zone:<World/zone>"): "pass" (until the pass is
+-- owned), "rebirths:<n>" (until Rebirths + BonusRebirths reach n), "other:<r>" / "slower:<r>" (until the rebirths change).
+function N.zoneRefusalHolds(zone)
+	local saved = N.probeGet("zone:" .. zoneKey(zone.name))
+	if not saved then
+		return false
+	end
+	local kind, n = string.match(saved, "^(%a+):?(%-?%d*)$")
+	if kind == "pass" then
+		return not zone.owned
+	elseif kind == "rebirths" then
+		return N.effRebirths() < (tonumber(n) or 0)
+	end
+	return N.effRebirths() == tonumber(n)
+end
+-- What the server named as the requirement (its Notice during the probe, e.g. "Requires 100 rebirths to train here."),
+-- else the hub's own lock reason. Returns the saved value and plain words.
+local function zoneRefusal(zone, since)
+	local notice = if (N.Event.noticeAt or -1e9) >= since then tostring(N.Event.notice or "") else ""
+	local need = tonumber(string.match(notice, "[Rr]equires (%d+) rebirth"))
+	if need then
+		return "rebirths:" .. need, "retry at " .. need .. " rebirths", notice
+	elseif string.find(string.lower(notice), "pass", 1, true) or not zone.owned then
+		return "pass", "retry when the training pass is owned", notice
+	elseif N.effRebirths() < zone.need then
+		return "rebirths:" .. zone.need, "retry at " .. zone.need .. " rebirths", notice
+	end
+	return "other:" .. N.effRebirths(), "retry after the next rebirth", notice
+end
 -- The best locked stand not probed yet in this world, with a bigger bonus than the zone we train in.
 function N.zoneProbeCandidate()
 	local Z = N.ZoneProbe
@@ -33382,7 +33607,7 @@ function N.zoneProbeCandidate()
 		return nil
 	end
 	for _, zone in ipairs(N.zones()) do
-		if zone.bonus > base.bonus and not Z.done[zoneKey(zone.name)] and N.zoneLock(zone) ~= nil and N.zoneStandPart(zone) then
+		if zone.bonus > base.bonus and not Z.done[zoneKey(zone.name)] and N.zoneLock(zone) ~= nil and N.zoneStandPart(zone) and not N.zoneRefusalHolds(zone) then
 			return zone
 		end
 	end
@@ -33407,6 +33632,7 @@ function N.zoneProbeStep()
 	local key = zoneKey(zone.name)
 	Z.done[key] = true
 	local why = N.zoneLock(zone)
+	local since = os.clock()
 	setStatus("Zone probe: " .. zone.name)
 	send("StopPractice", nil)
 	waitFor(function()
@@ -33420,8 +33646,12 @@ function N.zoneProbeStep()
 		return N.activity() == "Practice"
 	end, 5)
 	if not started then
-		Z.last = zone.name .. ": the server did not start training (" .. tostring(why) .. ")"
-		log("TRAIN zone probe", zone.name, "started=false", "lock", tostring(why))
+		-- The Notice may come a moment after the stand refuses.
+		task.wait(0.3)
+		local saved, retry, notice = zoneRefusal(zone, since)
+		N.probeSet("zone:" .. key, saved)
+		Z.last = zone.name .. ": the server did not start training (" .. tostring(why) .. "), " .. retry
+		log("TRAIN zone probe", zone.name, "started=false", "lock", tostring(why), "server=" .. (if notice ~= "" then notice else "no notice"), "saved " .. saved, "(" .. retry .. ")")
 		log("PROBE zone_" .. zone.name, "result=0", "base=" .. brief(base.rate))
 		N.Train.zone = nil
 		return false
@@ -33446,6 +33676,7 @@ function N.zoneProbeStep()
 		return true
 	end
 	Z.last = string.format("%s locked: %s skill/s vs %s at %s", zone.name, formatNumber(rate), formatNumber(base.rate), tostring(base.zone))
+	N.probeSet("zone:" .. key, "slower:" .. N.effRebirths())
 	send("StopPractice", nil)
 	N.Train.zone = nil
 	return false
@@ -33472,6 +33703,7 @@ function N.worldProbeStep()
 				return false
 			end
 			Z.last = string.format("World %s: %s Wins/s vs %s, back to %s", W.id, formatNumber(W.rate), formatNumber(W.base), W.from)
+			N.probeSet("world:" .. W.id, "worse:" .. N.effRebirths())
 		end
 		-- Travel back only between throws.
 		if N.activity() ~= "Idle" then
@@ -33494,16 +33726,32 @@ function N.worldProbeStep()
 	if not nextId or Z.worldDone[nextId] or N.worldUnlocked(nextId) or not base or base <= 0 then
 		return false
 	end
+	-- Saved answer per account: "refused" = the server wants the portal unlock (World<N>Unlocked), never retried before
+	-- it; "worse:<r>" = it paid less there, retried 10 rebirths later.
+	local saved = N.probeGet("world:" .. nextId)
+	if saved == "refused" then
+		Z.worldDone[nextId] = true
+		Z.last = "World " .. nextId .. ": the server keeps it locked until the portal unlock (saved)"
+		return false
+	end
+	local worse = tonumber(saved and string.match(saved, "^worse:(%d+)$"))
+	if worse and N.effRebirths() < worse + 10 then
+		Z.worldDone[nextId] = true
+		return false
+	end
 	Z.worldDone[nextId] = true
 	local from = N.worldId()
+	local since = os.clock()
 	send("TravelWorld", nextId)
 	local moved = waitFor(function()
 		return N.worldId() == nextId
 	end, 3)
 	log("WORLD probe", nextId, "moved=" .. tostring(moved), "from", from)
 	if not moved then
-		Z.last = "World " .. nextId .. ": the server keeps it locked"
-		log("PROBE world_" .. nextId, "result=0", "base=" .. brief(base))
+		local notice = if (N.Event.noticeAt or -1e9) >= since then tostring(N.Event.notice or "") else ""
+		N.probeSet("world:" .. nextId, "refused")
+		Z.last = "World " .. nextId .. ": the server keeps it locked until the portal unlock"
+		log("PROBE world_" .. nextId, "result=0", "base=" .. brief(base), "server=" .. (if notice ~= "" then notice else "no notice"), "saved refused (retry after the unlock)")
 		return false
 	end
 	Z.world = { id = nextId, from = from, base = base, secs = Session.throwSeconds, wins = Session.winsFromThrows, at = os.clock() }
@@ -33712,7 +33960,7 @@ function N.equipBestStone()
 	end
 	return false
 end
-function N.buyTrail(trail)
+function N.buyTrail(trail, stay)
 	if (N.Shop.refused[trail.Id] or 0) > os.clock() then
 		return false
 	end
@@ -33724,7 +33972,7 @@ function N.buyTrail(trail)
 		Session.trails += 1
 		N.Shop.last = "Bought " .. tostring(trail.Name)
 		log("BUY trail", trail.Id, "price", brief(trail.Price), "mult", brief(trail.WinsMultiplier))
-	else
+	elseif not stay then
 		N.Shop.refused[trail.Id] = os.clock() + 600
 		logProblem("Trail buy refused: " .. tostring(trail.Id))
 	end
@@ -33969,11 +34217,13 @@ function N.eggGain(eggId)
 	end
 	return gain, total
 end
-function N.hatch(egg)
-	if (N.Egg.refused[egg.id] or 0) > os.clock() or N.activity() ~= "Idle" then
+-- stay = hatch from where the player is (the training stand): no walk, no Idle check; a refusal is returned, not
+-- remembered (the caller falls back to the walk).
+function N.hatch(egg, stay)
+	if (N.Egg.refused[egg.id] or 0) > os.clock() or (not stay and N.activity() ~= "Idle") then
 		return false
 	end
-	if egg.display then
+	if egg.display and not stay then
 		local ok, pivot = pcall(function()
 			return egg.display:GetPivot()
 		end)
@@ -34001,8 +34251,11 @@ function N.hatch(egg)
 	local result = N.Egg.result
 	if ok and (result == nil or result.Success) then
 		Session.hatches += count
-		log("HATCH", egg.id, "x" .. count, "price", brief(egg.price * count), "pets", before, "->", #N.coll("Pets"))
+		log("HATCH", egg.id, "x" .. count, "price", brief(egg.price * count), "pets", before, "->", #N.coll("Pets"), if stay then "from " .. tostring(N.activity()) else "")
 		return true
+	end
+	if stay then
+		return false, tostring(result and result.Message or "no answer")
 	end
 	N.Egg.refused[egg.id] = os.clock() + 120
 	logProblem("Hatch refused: " .. egg.id .. " " .. tostring(result and result.Message or "no answer"))
@@ -34718,10 +34971,10 @@ end)
 -- (world Throw.Progression + DistanceMilestones, the game's Trajectory.Plan), the zone reached pays Wins (Zones[].Wins).
 -- Wins buy stones (x skill), trails (x wins) and eggs (pets, x skill). Rebirth multiplies skill and resets it.
 -- Skill is priced through the elasticity alpha = d ln(wins per throw) / d ln(skill) from the game's own tables.
-N.Plan = { at = -1e9, text = "", spendText = "", options = {}, f = 0.5, fBase = nil, goal = nil, chain = nil, rebirthSay = "", rebirthKey = "", rebirthLogAt = -1e9, alpha = 1, mode = "throw", blockEnds = 0, logAt = -1e9, lastKey = "", spendKey = "", why = "", say = "", next = nil, decisionKey = "" }
+N.Plan = { at = -1e9, text = "", spendText = "", options = {}, f = 0.5, fBase = nil, goal = nil, chain = nil, rebirthSay = "", rebirthKey = "", rebirthLogAt = -1e9, alpha = 1, mode = "throw", blockEnds = 0, logAt = -1e9, lastKey = "", spendKey = "", why = "", say = "", next = nil, decisionKey = "", huntKind = nil, unlockNormal = nil, routes = nil, route = nil, unlockKey = "", unlockLogAt = -1e9 }
 -- Rates are stored per unit of the game's skill multiplier (see N.skillScale) so a rate measured before a rebirth or a
 -- new stone is still comparable with one measured after it. trainNorm is also per unit of (1 + zone bonus).
-N.Rate = { trainNorm = nil, throwNorm = nil, throwWins = nil, secPerThrow = nil, winsPerThrow = nil, trainSkill = nil, throwSkill = nil, acc = {}, last = nil, logAt = -1e9, foldAt = os.clock() }
+N.Rate = { trainNorm = nil, throwNorm = nil, throwWins = nil, secPerThrow = nil, winsPerThrow = nil, trainSkill = nil, throwSkill = nil, distRatio = nil, acc = {}, last = nil, logAt = -1e9, foldAt = os.clock() }
 do
 	local P, R = N.Plan, N.Rate
 	local H = 86400
@@ -34895,7 +35148,97 @@ do
 		end
 		return N.skillForLevel(last.Level, cfg.Throw.Progression)
 	end
-	-- Seconds of training until the next world can be unlocked (0 = now, nil = no next world or no rate yet).
+	local function mapEndDist()
+		local cfg = N.worldCfg()
+		local milestones = cfg and cfg.Throw and cfg.Throw.DistanceMilestones or {}
+		local last = milestones[#milestones]
+		return last and tonumber(last.Distance) or nil
+	end
+	-- Inverse of throwDistance: the (fractional) level that throws this far.
+	function N.levelForDistance(dist, throw)
+		local base = tonumber(throw.BaseDistance) or 100
+		local from = 1
+		local milestones = throw.DistanceMilestones or {}
+		for i, m in ipairs(milestones) do
+			if dist <= m.Distance or i == #milestones then
+				if m.Distance <= base then
+					return m.Level
+				end
+				return math.clamp(from + (dist - base) / (m.Distance - base) * (m.Level - from), from, m.Level)
+			end
+			from, base = m.Level, m.Distance
+		end
+		return from
+	end
+	-- Real throws scatter around the model (owner log: 1128 / 1166 / 1307 studs at one skill): measured / modelled
+	-- distance of normal throws short of the map end, EMA, used in the Secret/Colossus thresholds.
+	function N.noteThrowDistance(dist)
+		local cfg = N.worldCfg()
+		if not (cfg and cfg.Throw) or not dist or dist <= 0 then
+			return
+		end
+		local _, model = N.baseWins(N.skill(), cfg)
+		local endDist = mapEndDist() or math.huge
+		if model and model > 0 and model < endDist - 1 and dist < endDist - 1 then
+			R.distRatio = math.clamp(ema(R.distRatio, dist / model, 0.1), 0.7, 1.3)
+		end
+	end
+	-- Skill whose throw times mult (Secret 1.5, Colossus 2: Trajectory.Plan applies the multiplier before the map-end cap,
+	-- dump 81296-81313) reaches the end of the map.
+	function N.secretEndSkill(mult)
+		local cfg = N.worldCfg()
+		local endDist = mapEndDist()
+		if not (cfg and cfg.Throw and endDist) then
+			return nil
+		end
+		local level = math.ceil(N.levelForDistance(endDist / (mult * (R.distRatio or 1)), cfg.Throw))
+		return N.skillForLevel(level, cfg.Throw.Progression)
+	end
+	-- Seconds per Secret roll: every started throw is a roll; with Secret Reroll a roll costs the 0.82 s cooldown plus
+	-- the start and cancel (~0.4 s), else a whole throw.
+	function N.rollSeconds()
+		if on("SecretReroll") and not N.Reroll.off and N.Reroll.kept ~= false and N.throwMode() == "direct" then
+			return 1.25
+		end
+		return R.secPerThrow or 10
+	end
+	-- The ways to the next world's portal: a normal throw at the map end, a Secret or a Colossus throw that lands in it.
+	-- Each: need = skill, train = seconds of training to it, wait = expected seconds of throwing for that roll, t = total.
+	-- A Colossus also goes past the Secret line, so the Secret wait uses both odds. Returns the routes and the fastest.
+	function N.unlockRoutes(S, T)
+		local E = N.mapEndSkill()
+		if not E then
+			return nil
+		end
+		local routes = { { kind = "normal", need = E, wait = 0 } }
+		local SS = N.secretStats()
+		local cfg = N.G.Balance.SecretThrow or {}
+		if not SS.portalOff then
+			local ps, pc = N.secretOdds()
+			local roll = N.rollSeconds()
+			local es = N.secretEndSkill(tonumber(cfg.DistanceMultiplier) or 1.5)
+			local ec = N.secretEndSkill(tonumber(cfg.Colossus and cfg.Colossus.DistanceMultiplier) or 2)
+			if es and ps + pc > 0 then
+				table.insert(routes, { kind = "secret", need = math.min(es, E), wait = roll / (ps + pc), p = ps + pc })
+			end
+			if ec and pc > 0 then
+				table.insert(routes, { kind = "colossus", need = math.min(ec, E), wait = roll / pc, p = pc })
+			end
+		end
+		local best
+		for _, r in ipairs(routes) do
+			r.train = if S >= r.need then 0 elseif T and T > 0 then (r.need - S) / T else math.huge
+			r.t = r.train + r.wait
+			if not best or r.t < best.t then
+				best = r
+			end
+		end
+		P.unlockNormal = if routes[1].t < math.huge then routes[1].t else nil
+		P.routes, P.route = routes, best
+		return routes, best
+	end
+	-- Seconds until the next world can be unlocked, the fastest route included (0 = the next throw, nil = no next world
+	-- or no rate yet), and that route.
 	function N.unlockEta()
 		if not N.nextWorldLocked() then
 			return nil
@@ -34904,12 +35247,36 @@ do
 		if N.atMapEnd(skill) then
 			return 0
 		end
-		local need = N.mapEndSkill()
-		local T = N.trainRateNow()
-		if not need or not T or T <= 0 then
+		local _, best = N.unlockRoutes(skill, N.trainRateNow())
+		if not best or best.t == math.huge then
 			return nil
 		end
-		return math.max(need - skill, 0) / T
+		return best.t, best
+	end
+	-- Planner check after every Secret/Colossus throw: did it land in the portal (map end)? A throw at the map end with
+	-- no unlock 6 s later is a miss; 2 misses = the server wants more (e.g. the "15Qa SKILL" in its notice), the routes
+	-- go back to the normal map end for this account ("portal=off" saved).
+	function N.secretPortalCheck(kind, id, dist)
+		local SS = N.secretStats()
+		local endDist = mapEndDist()
+		local reached = endDist ~= nil and dist >= endDist - 1
+		if reached and N.nextWorldLocked() and not SS.portalOff then
+			local nextId = N.worldCfg().NextWorldId
+			task.delay(6, function()
+				if (SS.unlockedIds and SS.unlockedIds[id]) or N.worldUnlocked(nextId) then
+					SS.portalMiss = 0
+					return
+				end
+				SS.portalMiss += 1
+				log("WORLD secret portal miss", kind, "dist", math.floor(dist), "skill", brief(N.skill()), "miss", SS.portalMiss)
+				if SS.portalMiss >= 2 then
+					SS.portalOff = true
+					N.probeSet("portal", "off")
+					log("WORLD secret portal off", "2 secret throws reached the map end without an unlock, back to the normal map end")
+				end
+			end)
+		end
+		return reached
 	end
 	function N.alpha()
 		local s = math.max(N.skill(), 1)
@@ -34979,9 +35346,26 @@ do
 		local T = N.trainRateNow()
 		local s = N.throwSkillNow()
 		local nextId = N.worldCfg() and N.worldCfg().NextWorldId
+		P.huntKind = nil
 		if N.nextWorldLocked() and N.atMapEnd(N.skill()) then
 			P.why = "unlock next world"
 			P.say = "Throwing: this skill reaches the end of the map, the next throw unlocks " .. tostring(nextId)
+			return 1
+		end
+		-- Unlock hunt: the skill already sends a Secret (x1.5) or Colossus (x2) throw into the portal and waiting for that
+		-- roll beats training to the normal map end: throw only (the throws pay Wins meanwhile).
+		local eta, route = N.unlockEta()
+		if route and route.kind ~= "normal" and route.train == 0 then
+			P.why = "unlock hunt"
+			P.huntKind = route.kind
+			P.say = string.format(
+				"Throwing for a %s: one landing in the portal opens %s (expected ~%s of throwing, %s chance per roll) instead of ~%s of training to the normal map end",
+				if route.kind == "colossus" then "Colossus" else "Secret",
+				tostring(nextId),
+				N.longTime(route.wait),
+				string.format("%.1f%%", (route.p or 0) * 100),
+				N.longTime(P.unlockNormal or 0)
+			)
 			return 1
 		end
 		if not T or T <= 0 then
@@ -34999,9 +35383,9 @@ do
 		P.fBase = f
 		-- The next world (better stones, eggs and zones) opens at the end of the map: when training gets there soon, only
 		-- train, unless throwing first for a better stone gets there sooner (the stone multiplies training too).
-		local eta = N.unlockEta()
-		if eta and eta > 0 and eta <= UnlockTrainLimit and T > s then
-			local goal = N.stoneFirst(eta, T, s, N.mapEndSkill())
+		local wait = route and route.wait or 0
+		if eta and eta > 0 and eta <= UnlockTrainLimit + wait and T > s then
+			local goal = N.stoneFirst(eta - wait, T, s, route and route.need or N.mapEndSkill())
 			if goal then
 				P.goal = goal
 				P.why = "throw for stone"
@@ -35017,7 +35401,19 @@ do
 				return 1
 			end
 			P.why = "train to unlock"
-			P.say = string.format("Training only: %s opens at the end of the map, about %s of training away", tostring(nextId), N.longTime(eta))
+			if route and route.kind ~= "normal" then
+				P.say = string.format(
+					"Training only: at %s skill a %s throw reaches the portal of %s (~%s of training, then ~%s of throwing for the roll; the normal map end needs ~%s)",
+					formatNumber(route.need),
+					if route.kind == "colossus" then "Colossus" else "Secret",
+					tostring(nextId),
+					N.longTime(route.train),
+					N.longTime(route.wait),
+					N.longTime(P.unlockNormal or 0)
+				)
+			else
+				P.say = string.format("Training only: %s opens at the end of the map, about %s of training away", tostring(nextId), N.longTime(eta))
+			end
 			return 0
 		end
 		P.why, P.say = why, say
@@ -35243,6 +35639,17 @@ do
 			local steps = N.rebirthSteps(60)
 			local S = N.skill()
 			local k, tk, t0 = N.unlockChain(S, E, T, steps)
+			-- Secret / Colossus routes: a lower skill target plus the wait for the roll (each checked with the chain too).
+			local routes = N.unlockRoutes(S, T) or {}
+			for _, route in ipairs(routes) do
+				if route.kind ~= "normal" then
+					local rk, rtk, rt0 = N.unlockChain(S, route.need, T, steps)
+					if rtk + route.wait < tk then
+						k, tk, E = rk, rtk + route.wait, route.need
+					end
+					t0 = math.min(t0, rt0 + route.wait)
+				end
+			end
 			local nextId = tostring(N.worldCfg().NextWorldId)
 			if tk <= H then
 				P.chain = { k = k, tk = tk, t0 = t0 }
@@ -35300,6 +35707,20 @@ do
 			P.logAt = os.clock()
 			log("PLAN", P.text)
 			log("PLAN decision", P.say)
+		end
+		-- The unlock routes with numbers (normal map end vs Secret / Colossus into the portal).
+		if N.nextWorldLocked() and P.routes and P.route then
+			local parts = {}
+			for _, r in ipairs(P.routes) do
+				table.insert(parts, string.format("%s need=%s train=%s wait=%s", r.kind, fmt(r.need), if r.train < math.huge then N.longTime(r.train) else "?", N.longTime(r.wait)))
+			end
+			local ps, pc = N.secretOdds()
+			local SS = N.secretStats()
+			local ukey = P.route.kind .. ":" .. tostring(P.route.train == 0)
+			if ukey ~= P.unlockKey or os.clock() - (P.unlockLogAt or -1e9) > 300 then
+				P.unlockKey, P.unlockLogAt = ukey, os.clock()
+				log("PLAN decision", "unlock route=" .. P.route.kind, "have=" .. fmt(N.skill()), table.concat(parts, " | "), string.format("odds secret=%.4f colossus=%.4f (measured %d/%d/%d)", ps, pc, SS.s, SS.c, SS.n), "roll=" .. fmt(N.rollSeconds()) .. "s", "dist ratio=" .. fmt(R.distRatio or 1), if SS.portalOff then "portal=off" else "")
+			end
 		end
 		do
 			local worth = N.rebirthWorth()
@@ -35495,6 +35916,50 @@ do
 		end
 		return false
 	end
+	-- Spending from the training stand (blatant.md #3): HatchEgg {EggId, Count, RequestId} and BuyTrail {Id} carry no
+	-- position (dump 10801-10805), only the client's egg prompt has a range. Probed once per account and remote
+	-- (N.ProbeMem "spend:egg" / "spend:trail" = "ok" or "no:<reason>"): accepted = bought and the server still says
+	-- Practice. Returns true when it bought here; false = walk there instead (the old StopPractice trip).
+	function N.spendInPlace(pick)
+		if not pick or (pick.kind ~= "egg" and pick.kind ~= "trail") or N.activity() ~= "Practice" then
+			return false
+		end
+		local key = "spend:" .. pick.kind
+		local saved = N.probeGet(key)
+		if saved and saved ~= "ok" then
+			return false
+		end
+		local remote = if pick.kind == "egg" then "HatchEgg" else "BuyTrail"
+		local far = -1
+		if pick.kind == "egg" and pick.item.display then
+			pcall(function()
+				far = math.floor((pick.item.display:GetPivot().Position - N.root().Position).Magnitude)
+			end)
+		end
+		local since = os.clock()
+		local ok, msg
+		if pick.kind == "egg" then
+			ok, msg = N.hatch(pick.item, true)
+		else
+			ok = N.buyTrail(pick.item, true)
+		end
+		local still = N.activity() == "Practice"
+		local accepted = ok == true and still
+		if not msg then
+			msg = if (N.Event.noticeAt or -1e9) >= since then tostring(N.Event.notice) else "-"
+		end
+		if saved == nil then
+			log("SPEND remote", remote, "in=Practice", "far=" .. far, "accepted=" .. tostring(accepted), "msg=" .. msg)
+			N.probeSet(key, if accepted then "ok" elseif ok then "no:stops training" else "no:" .. string.gsub(msg, "[=\n]", " "))
+		end
+		if ok then
+			log("BUY", pick.key, "cost", brief(pick.cost), "from the training stand")
+			if pick.kind == "trail" then
+				N.equipBestTrail()
+			end
+		end
+		return ok == true
+	end
 	-- "Up next" on the Main tab: what Corvus does now and next, in plain words (the PLAN lines stay in the log).
 	local function optionWords(o)
 		local item = o.item or {}
@@ -35551,6 +36016,8 @@ do
 			local eta = N.unlockEta()
 			if eta == 0 then
 				table.insert(lines, "Unlock " .. nextId .. " with the next throw")
+			elseif eta and planner and P.why == "unlock hunt" then
+				table.insert(lines, "A " .. (if P.huntKind == "colossus" then "Colossus" else "Secret") .. " throw opens " .. nextId .. " (~" .. N.longTime(eta) .. " of throwing expected)")
 			elseif eta and P.why == "train to unlock" then
 				table.insert(lines, "Train until " .. nextId .. " unlock (~" .. N.longTime(eta) .. ")")
 			elseif eta then
@@ -35733,7 +36200,7 @@ do
 				Text = "Throw Speed",
 				Values = { "Legit (game pace)", "Fast", "Blatant" },
 				Default = "Blatant",
-				Tooltip = "Blatant (default): throws again 0.15 s after a throw lands and tries a second throw in flight, keeps whatever the server accepts and measures best. Fast: throws again 0.15 s after a throw lands. Legit: the game's own button at its Auto Wins pace (about 2.4 s between throws)",
+				Tooltip = "Blatant (default): throws again 0.82 s after a throw lands (the server's own cooldown), measures it against the game's button and keeps the faster. Fast: the same 0.82 s throws without the measuring. Legit: the game's own button at its Auto Wins pace (about 2.4 s between throws)",
 			})
 			ThrowBox:AddDropdown("MoveMode", {
 				Text = "Movement",
@@ -35745,6 +36212,11 @@ do
 			Text = "Skip Animations",
 			Default = true,
 			Tooltip = "While Corvus throws: speeds up throw animation tracks and hides the secret throw overlay. The server still decides when a throw ends, so this only hides the show. A hatch reveal that blocks the Throw button is always closed",
+		})
+		ThrowBox:AddToggle("SecretReroll", {
+			Text = "Secret Reroll",
+			Default = false,
+			Tooltip = "Blatant/Fast only. Cancels a normal throw the moment it starts and throws again, until a Secret (x1.5 distance, x3 Wins) or Colossus (x2, x10) comes. Measures itself once (2 min normal, 3 min rerolling) and stays on only when it pays more Wins per minute",
 		})
 		Labels.Throw = ThrowBox:AddLabel({ Text = "-", DoesWrap = true })
 		local TrainBox = Tabs.Farm:AddRightGroupbox("Train", "dumbbell")
@@ -37109,13 +37581,20 @@ do
 		if act == "Idle" and idleChores() then
 			return
 		end
-		-- Training never passes through Idle: leave it now and then when the planner wants to buy something.
-		if act == "Practice" and (N.planner() or on("AutoBuyStones") or on("AutoBuyTrails") or on("AutoHatch")) and choreDue("trainSpend", 30) and N.nextBuy() then
-			send("StopPractice", nil)
-			waitFor(function()
-				return N.activity() ~= "Practice"
-			end, 3)
-			return
+		-- Training never passes through Idle: eggs and trails are bought from the stand when the server takes it (probed once
+		-- per account, N.spendInPlace), anything else leaves training now and then.
+		if act == "Practice" and (N.planner() or on("AutoBuyStones") or on("AutoBuyTrails") or on("AutoHatch")) and choreDue("trainSpendHere", 3) then
+			local pick = N.nextBuy()
+			if pick and N.spendInPlace(pick) then
+				return
+			end
+			if pick and choreDue("trainSpend", 30) then
+				send("StopPractice", nil)
+				waitFor(function()
+					return N.activity() ~= "Practice"
+				end, 3)
+				return
+			end
 		end
 		local mode = N.planMode()
 		N.Mode = mode
@@ -37258,7 +37737,7 @@ do
 						if speed == "blatant" then "Blatant" else "Fast",
 						N.throwMode(),
 						if N.ThrowProbe.say ~= "" then " (" .. N.ThrowProbe.say .. ")" else "",
-						if speed == "blatant" and N.Parallel.off then "\nSecond throw in flight: the server refuses it" elseif N.Parallel.ok > 0 then "\nSecond throw in flight: accepted " .. N.Parallel.ok .. "x" else ""
+						if on("SecretReroll") then "\nSecret Reroll: " .. (if N.Reroll.say ~= "" then N.Reroll.say else "waiting for the throw speed measurement") .. N.secretOddsText() else N.secretOddsText()
 					)
 				I.throw = string.format(
 					"Distance now ~<b>%d</b> studs, zone pays <b>%s</b> wins (x%s trail)\nLast: %s\nThrows <b>%d</b>, secret <b>%d</b>, refused <b>%d</b>\n%s\n%s",
