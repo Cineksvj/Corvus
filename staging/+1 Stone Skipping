@@ -5606,11 +5606,12 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         if Library.ConfirmPrompt and Library.ConfirmPrompt.Parent then
             return
         end
+        local Extra = if Opts.Warning then 64 else 0
         local Root = New("Frame", {
             AnchorPoint = Vector2.new(1, 1),
             BackgroundTransparency = 1,
             Position = UDim2.new(1, 340, 1, -12),
-            Size = UDim2.fromOffset(320, 232),
+            Size = UDim2.fromOffset(320, 232 + Extra),
             ZIndex = 60,
             Parent = Library.ScreenGui,
         })
@@ -5676,13 +5677,29 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             ZIndex = 63,
             Parent = Content,
         })
+        if Opts.Warning then
+        	New("TextLabel", {
+        		BackgroundTransparency = 1,
+        		FontFace = GetBoldFont,
+        		Position = UDim2.fromOffset(14, 166),
+        		Size = UDim2.new(1, -28, 0, 60),
+        		Text = tostring(Opts.Warning),
+        		TextColor3 = Color3.fromRGB(255, 140, 60),
+        		TextSize = 12,
+        		TextWrapped = true,
+        		TextXAlignment = Enum.TextXAlignment.Left,
+        		TextYAlignment = Enum.TextYAlignment.Top,
+        		ZIndex = 63,
+        		Parent = Content,
+        	})
+        end
         local Confirm = New("TextButton", {
             AutoButtonColor = false,
             BackgroundColor3 = "AccentColor",
             FontFace = GetBoldFont,
-            Position = UDim2.fromOffset(12, 182),
+            Position = UDim2.fromOffset(12, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
-            Text = tostring(Opts.ConfirmText or "Confirm"),
+            Text = tostring(Opts.ConfirmText or "Confirm"), TextWrapped = true,
             TextColor3 = "BackgroundColor",
             TextSize = 14,
             ZIndex = 63,
@@ -5693,7 +5710,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             AutoButtonColor = false,
             BackgroundColor3 = "BackgroundColor",
             FontFace = GetBoldFont,
-            Position = UDim2.new(0.5, 4, 0, 182),
+            Position = UDim2.new(0.5, 4, 0, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
             Text = tostring(Opts.CancelText or "Cancel"),
             TextColor3 = "FontColor",
@@ -31384,6 +31401,12 @@ do
 			log("NO REMOTE", "SkippingNetwork.Request")
 			return false
 		end
+		-- Same cadence as the game's client: at most one request per Network.RequestInterval (0.15 s).
+		local gap = (tonumber(N.G and N.G.Balance and N.G.Balance.Network and N.G.Balance.Network.RequestInterval) or 0.15) - (os.clock() - (N.Sent.at or -1e9))
+		if gap > 0 and coroutine.isyieldable() then
+			task.wait(gap)
+		end
+		N.Sent.at = os.clock()
 		local ok, err = pcall(function()
 			remote:FireServer(action, payload)
 		end)
@@ -31572,9 +31595,14 @@ do
 		end
 		return yes
 	end
-	-- Max throw rate (Blatant): no pause between throws beyond the game's own cooldown.
+	-- Max throw rate (Blatant, opt-in): no pause between throws beyond the game's own cooldown. Safe (default) keeps the
+	-- pace of the game's own Auto Wins pass. OP does not switch it on by itself.
 	function N.blatant()
-		return N.opActive() or optionText("ThrowSpeed", "Max (Blatant)") == "Max (Blatant)"
+		return optionText("ThrowSpeed", "Legit (game pace)") == "Max (Blatant)"
+	end
+	-- Movement: Walk (Safe, default) walks like a player; Teleport (opt-in) moves the character instantly.
+	function N.safeMove()
+		return optionText("MoveMode", "Walk (Safe)") ~= "Teleport (Fast)"
 	end
 	function N.pickText(name, default)
 		if N.opActive() then
@@ -31781,6 +31809,59 @@ do
 		return (pcall(function()
 			char:PivotTo(cf)
 		end))
+	end
+	-- Goes to a spot the way the player would: Walk (Safe) uses Humanoid:MoveTo (again every 2 s, a jump when stuck)
+	-- and gives up after the timeout; Teleport (Fast) pivots there. Returns true when the character is there.
+	N.Walk = { fails = 0 }
+	function N.goTo(cf, near, timeout)
+		near = near or 4
+		local target = cf.Position
+		local root = N.root()
+		if not root then
+			return false
+		end
+		local flat = function()
+			local p = N.root() and N.root().Position or target
+			return Vector3.new(p.X - target.X, 0, p.Z - target.Z).Magnitude
+		end
+		if flat() <= near then
+			return true
+		end
+		if not N.safeMove() then
+			N.tp(cf)
+			return true
+		end
+		local hum = N.humanoid()
+		if not hum then
+			return false
+		end
+		local started, lastDist, lastAt, sentAt = os.clock(), flat(), os.clock(), -1e9
+		timeout = timeout or 25
+		while os.clock() - started < timeout and alive() do
+			if os.clock() - sentAt >= 2 then
+				sentAt = os.clock()
+				pcall(function()
+					hum:MoveTo(target)
+				end)
+			end
+			local d = flat()
+			if d <= near then
+				N.Walk.fails = 0
+				return true
+			end
+			if lastDist - d > 1 then
+				lastDist, lastAt = d, os.clock()
+			elseif os.clock() - lastAt > 1.5 then
+				lastAt = os.clock()
+				pcall(function()
+					hum.Jump = true
+				end)
+			end
+			task.wait(0.1)
+		end
+		N.Walk.fails += 1
+		logProblem(string.format("Walk did not reach the spot (%.0f studs left). Movement Teleport (Fast) skips walking", flat()))
+		return false
 	end
 	-- Streaming: parts far away may not exist on the client yet.
 	function N.streamAround(pos)
@@ -32073,7 +32154,9 @@ function N.throwStep()
 			return false
 		end
 		setStatus("Going to the launch zone")
-		N.tp(zone.CFrame + Vector3.new(0, zone.Size.Y / 2 + 3, 0))
+		if not N.goTo(zone.CFrame + Vector3.new(0, zone.Size.Y / 2 + 3, 0), 6) then
+			return false
+		end
 		task.wait(0.4)
 	end
 	-- Legit pace = the game's Auto Wins pass (2 s between throws plus 0.35 s settle). Blatant throws as soon as the
@@ -32247,7 +32330,7 @@ function N.trainStep()
 		return false
 	end
 	setStatus("Going to " .. zone.name)
-	N.tp(cf)
+	N.goTo(cf, 3)
 	local started = waitFor(function()
 		return N.activity() == "Practice"
 	end, 6)
@@ -32338,7 +32421,7 @@ function N.buyStone(stone)
 				return shop:GetPivot()
 			end)
 			if okPivot then
-				N.tp(pivot + Vector3.new(0, 4, 0))
+				N.goTo(pivot + Vector3.new(0, 4, 0), 8)
 				task.wait(0.3)
 				send("Buy", stone.Id)
 				ok = waitFor(function()
@@ -32517,6 +32600,14 @@ function N.petInfo(entry)
 end
 -- The game's PetCatalog.CanFuseBase: Normal pets of fusion rarities, never Admin or premium egg pets.
 local FusionRarity = { Common = true, Uncommon = true, Rare = true, Epic = true, Legendary = true, Mythical = true, Divine = true, Ascended = true, Eternal = true }
+-- Pet rarities (template attribute Rarity; the dump has Common..Legendary, Rainbow, Special, Hacked Admin, Exclusive
+-- packs; PetCatalog lists Mythical..Eternal as fusion rarities). Any other rarity in the templates is added.
+N.PetRarities = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical", "Divine", "Ascended", "Eternal", "Rainbow", "Special", "Hacked Admin", "Exclusive" }
+for _, def in pairs(N.petDefs().byId) do
+	if not table.find(N.PetRarities, def.rarity) then
+		table.insert(N.PetRarities, def.rarity)
+	end
+end
 local PremiumEgg = { Special = true, PirateSpecial = true, Astronaut = true, Chocolatier = true, Dragon = true, HackedAdmin = true }
 function N.canFuse(info)
 	local def = info.def
@@ -32630,7 +32721,7 @@ function N.hatch(egg)
 			return egg.display:GetPivot()
 		end)
 		if ok then
-			N.tp(pivot + Vector3.new(0, 3, 5))
+			N.goTo(pivot + Vector3.new(0, 3, 5), 6)
 			task.wait(0.3)
 		end
 	end
@@ -32666,8 +32757,8 @@ end
 -- The game's own Settings page has "Auto Equip Best Pets" (Settings.AutoEquipBestPetsEnabled): Equip Best turns it on
 -- once so new hatches are equipped by the game itself.
 function N.gameSettingOn(name)
-	local settings = N.coll("Settings")
-	if settings[name] == true or (N.Sent.settingAt and os.clock() - N.Sent.settingAt < 60) then
+	local gameSettings = N.coll("Settings")
+	if gameSettings[name] == true or (N.Sent.settingAt and os.clock() - N.Sent.settingAt < 60) then
 		return false
 	end
 	N.Sent.settingAt = os.clock()
@@ -32989,7 +33080,7 @@ function N.travel(id)
 		local portal = N.worldModel() and N.worldModel():FindFirstChild("WorldPortal")
 		local zone = portal and portal:FindFirstChild("OpenZone")
 		if zone and zone:IsA("BasePart") then
-			N.tp(zone.CFrame)
+			N.goTo(zone.CFrame, 4)
 			task.wait(0.4)
 			send("TravelWorld", id)
 			ok = waitFor(function()
@@ -33798,11 +33889,12 @@ do
 		end)
 	end
 	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+	Tabs.OP = N.addTab("Auto OP", "flame", "Auto Farm Everything OP and what it must never touch")
 	Tabs.Throw = N.addTab("Farm", "target", "Throwing, training and animations")
 	Tabs.Train = Tabs.Throw
 	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Stones, trails, rebirth and worlds")
 	Tabs.Rewards = N.addTab("Rewards", "gift", "Daily, gifts, offline, index, codes and friends")
-	Tabs.Items = N.addTab("Items", "backpack", "Eggs, pets and potions")
+	Tabs.Items = N.addTab("Items", "backpack", "Eggs, pets, auto delete and potions")
 	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and rates")
 	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts")
 	if Window.AddMiscTab then
@@ -33822,6 +33914,7 @@ do
 		{ "AutoOffline", "Offline skill", true },
 		{ "AutoGroupReward", "Group reward", true },
 		{ "AutoIndex", "Pet index", true },
+		{ "AutoCodes", "Redeem codes", true },
 		{ "AutoFriend", "Auto Friend", true },
 		{ "AutoRebirth", "Rebirth (resets skill)", false },
 		{ "AutoBuyStones", "Buy stones (spends Wins)", false },
@@ -33829,6 +33922,7 @@ do
 		{ "AutoHatch", "Hatch eggs (spends Wins)", false },
 		{ "AutoOpenEggs", "Open inventory eggs", false },
 		{ "AutoFuse", "Fuse pets (uses up pets)", false },
+		{ "AutoDeletePets", "Delete junk pets (uses up pets)", false },
 		{ "AutoPotions", "Use potions (uses up potions)", false },
 	}
 	N.FarmLabel, N.FarmKey = {}, {}
@@ -33885,6 +33979,7 @@ do
 	end
 	-- OP needs a confirmation: a card with Enable OP / Cancel (or a second click within 10 s without the card).
 	N.OP = { confirmed = false, ignore = false, armedUntil = 0, card = nil }
+	N.OPWarning = "Full automatic. Uses the game\'s remotes faster than a normal player: the game\'s anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
 	function N.confirmOP()
 		N.OP.confirmed = true
 		log("OP confirmed")
@@ -33919,7 +34014,7 @@ do
 				local card = Instance.new("Frame")
 				card.AnchorPoint = Vector2.new(1, 1)
 				card.Position = UDim2.new(1, -12, 1, -12)
-				card.Size = UDim2.fromOffset(300, 176)
+				card.Size = UDim2.fromOffset(320, 236)
 				card.BackgroundColor3 = main
 				card.ZIndex = 60
 				Instance.new("UICorner", card).CornerRadius = UDim.new(0, 6)
@@ -33943,9 +34038,9 @@ do
 				local body = Instance.new("TextLabel", card)
 				body.BackgroundTransparency = 1
 				body.Position = UDim2.fromOffset(12, 40)
-				body.Size = UDim2.new(1, -24, 0, 80)
+				body.Size = UDim2.new(1, -24, 0, 76)
 				body.Font = Enum.Font.Gotham
-				body.Text = "The planner takes over everything: it spends your Wins on stones, trails and eggs, uses up potions, fuses pets and rebirths (resets your skill). Your own picks are ignored while it runs."
+				body.Text = "The planner takes over everything: it spends your Wins on stones, trails and eggs, uses up potions, fuses and deletes spare pets and rebirths (resets your skill). Only the Exclude from OP list is kept."
 				body.TextColor3 = font
 				body.TextTransparency = 0.25
 				body.TextSize = 12
@@ -33953,6 +34048,19 @@ do
 				body.TextXAlignment = Enum.TextXAlignment.Left
 				body.TextYAlignment = Enum.TextYAlignment.Top
 				body.ZIndex = 61
+				-- The ban warning, in red above the buttons.
+				local warning = Instance.new("TextLabel", card)
+				warning.BackgroundTransparency = 1
+				warning.Position = UDim2.fromOffset(12, 118)
+				warning.Size = UDim2.new(1, -24, 0, 66)
+				warning.Font = Enum.Font.GothamBold
+				warning.Text = N.OPWarning
+				warning.TextColor3 = Color3.fromRGB(255, 107, 74)
+				warning.TextSize = 12
+				warning.TextWrapped = true
+				warning.TextXAlignment = Enum.TextXAlignment.Left
+				warning.TextYAlignment = Enum.TextYAlignment.Top
+				warning.ZIndex = 61
 				local function button(text, x, color, fn)
 					local b = Instance.new("TextButton", card)
 					b.AutoButtonColor = true
@@ -33961,20 +34069,22 @@ do
 					b.Size = UDim2.new(0.5, -16, 0, 32)
 					b.Font = Enum.Font.GothamBold
 					b.Text = text
-					b.TextColor3 = if color == accent then main else font
+					b.TextColor3 = if color ~= main then main else font
+					b.TextScaled = #text > 12
+					b.TextWrapped = true
 					b.TextSize = 14
 					b.ZIndex = 62
 					Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
 					b.MouseButton1Click:Connect(fn)
 				end
-				button("Enable OP", 0, accent, N.confirmOP)
+				button("I understand, enable OP", 0, Color3.fromRGB(255, 107, 74), N.confirmOP)
 				button("Cancel", 0.5, main, N.cancelOP)
 				card.Parent = gui
 				N.OP.card = card
 			end)
 		if not ok then
 			N.OP.armedUntil = os.clock() + 10
-			notify("Auto Farm Everything OP", "It spends Wins, uses potions, fuses pets and rebirths. Turn it on again within 10 s to confirm.", 8)
+			notify("Auto Farm Everything OP", N.OPWarning .. " Turn it on again within 10 s to confirm.", 10)
 		end
 	end
 	do
@@ -33998,10 +34108,98 @@ do
 			AllowNull = true,
 			Tooltip = "Pick what Auto Farm Everything switches on. The default is only safe things: nothing that spends, sells, uses up or fuses",
 		})
-		QuickBox:AddToggle("AutoFarmOP", {
+		QuickBox:AddLabel({
+			Text = '<font transparency="0.35">Turns on what is picked above and keeps your own choices. The planner that spends for you is on the Auto OP tab.</font>',
+			DoesWrap = true,
+		})
+		-- Recommended Settings: the setup Corvus would pick for a new player (Safe mode: game pace and walking, planner split, safe farm
+		-- set plus codes, pet care that only removes pets weaker than the team). Nothing that spends Wins.
+		function N.applyRecommended()
+			local farm = {}
+			for _, row in ipairs(N.FarmToggles) do
+				if row[3] or row[1] == "AutoOpenEggs" or row[1] == "AutoFuse" then
+					farm[row[2]] = true
+				end
+			end
+			local values = {
+				FarmSet = farm,
+				ThrowSpeed = "Legit (game pace)",
+				MoveMode = "Walk (Safe)",
+				TimeSplit = "Auto (planner)",
+				TrainZone = "Best open",
+				RebirthMode = "Auto (planner)",
+				DeleteRarities = { Common = true, Uncommon = true },
+				KeepBestPets = 10,
+			}
+			for name, value in pairs(values) do
+				local option = Options[name]
+				if option then
+					pcall(option.SetValue, option, value)
+				end
+			end
+			for name, value in pairs({ SkipAnimations = true, FuseForIndex = true, DeleteOnlyWeaker = true, KeepVariants = true, DiscardOnHatch = true, RememberAutoOP = false }) do
+				local toggle = Toggles[name]
+				if toggle then
+					pcall(toggle.SetValue, toggle, value)
+				end
+			end
+			log("SETTINGS recommended applied")
+			notify("Corvus", "Recommended settings on: Safe mode (game pace, walking), planner split, safe farm set with codes, fusing and index. Turn on Auto Farm Everything to start", 6)
+		end
+		QuickBox:AddButton({
+			Text = "Recommended Settings",
+			Tooltip = "Safe mode (game pace, walking), planner time split, the safe farm set plus codes, eggs and fusing for index. Spends no Wins",
+			Func = function()
+				N.applyRecommended()
+			end,
+		})
+		QuickBox:AddToggle("AutoThrow", { Text = "Auto Throw", Default = false, Tooltip = "Throws from the launch zone with the game's own Throw button" })
+		QuickBox:AddToggle("AutoTrain", { Text = "Auto Train", Default = false, Tooltip = "Stands in the best open training zone. With Auto Throw on too, the planner splits the time" })
+		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		Labels.Lines = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		Labels.Plan = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		StatusBox:AddButton({
+			Text = "Stop Everything",
+			Func = function()
+				N.stopAll()
+			end,
+		})
+	end
+	-- Auto OP tab: the OP toggle (confirmation card), Remember Auto OP and the Exclude from OP list.
+	N.OPState = "Corvus/STONE_auto_op_" .. tostring(LocalPlayer.UserId) .. ".txt"
+	function N.saveOPState(value)
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Corvus") then
+				makefolder("Corvus")
+			end
+			writefile(N.OPState, if value then "1" else "0")
+		end)
+	end
+	-- Configs never save or load AutoFarmOP (SaveManager ignore list). It only comes back after a rejoin when
+	-- Remember Auto OP is on and it was running when the player left.
+	function N.restoreOP()
+		if not on("RememberAutoOP") or on("AutoFarmOP") then
+			return false
+		end
+		local ok, text = pcall(function()
+			return readfile(N.OPState)
+		end)
+		if ok and text == "1" then
+			N.OP.confirmed = true
+			log("OP restored", "Remember Auto OP")
+			Toggles.AutoFarmOP:SetValue(true)
+			return true
+		end
+		return false
+	end
+	do
+		local OPBox = Tabs.OP:AddLeftGroupbox("Auto Farm Everything OP", "flame")
+		OPBox:AddToggle("AutoFarmOP", {
 			Text = "Auto Farm Everything OP",
 			Default = false,
-			Tooltip = "The planner does everything for the most Wins and progress: it CAN spend all your Wins, use up potions, fuse pets and rebirth. Asks to confirm first",
+			Tooltip = N.OPWarning .. " The planner does everything for the most Wins: it CAN spend all your Wins, use up potions, fuse and delete pets and rebirth, except what you exclude on the right. Asks to confirm first",
 			Callback = function(value)
 				if N.OP.ignore then
 					return
@@ -34024,36 +34222,81 @@ do
 				if not value then
 					N.OP.confirmed = false
 				end
+				N.saveOPState(value)
 				task.defer(function()
 					applyFarm("op", N.allFarm(), value)
 					log("FARM op", tostring(value))
 				end)
 			end,
 		})
-		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">Throws for Wins and trains Skill in the split the planner computes, with your picks. OP lets the planner spend too.</font>',
-			DoesWrap = true,
-		})
-		QuickBox:AddToggle("AutoThrow", { Text = "Auto Throw", Default = false, Tooltip = "Throws from the launch zone with the game's own Throw button" })
-		QuickBox:AddToggle("AutoTrain", { Text = "Auto Train", Default = false, Tooltip = "Stands in the best open training zone. With Auto Throw on too, the planner splits the time" })
-		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
-		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
-		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		Labels.Plan = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		StatusBox:AddButton({
-			Text = "Stop Everything",
-			Func = function()
-				N.stopAll()
+		OPBox:AddToggle("RememberAutoOP", {
+			Text = "Remember Auto OP",
+			Default = false,
+			Tooltip = N.OPWarning .. " Off: Auto OP always starts off, even when a config is loaded. On: if OP was running when you left, it starts again by itself after a rejoin or a new server",
+			Callback = function(value)
+				if value then
+					notify("Remember Auto OP", N.OPWarning, 10)
+				end
 			end,
 		})
+		OPBox:AddLabel({
+			Text = '<font color="#ff6b4a"><b>Full automatic. Uses the game\'s remotes faster than a normal player: the game\'s anticheat MAY BAN this account. Use at your own risk, preferably on an alt.</b></font>\n<font transparency="0.3">OP spends Wins on stones, trails and eggs, uses potions, fuses and deletes spare pets, opens eggs and rebirths (resets Skill). What is picked on the right is never touched.</font>',
+			DoesWrap = true,
+		})
+		Labels.OP = OPBox:AddLabel({ Text = "-", DoesWrap = true })
+		local ExcludeBox = Tabs.OP:AddRightGroupbox("Exclude from OP", "shield")
+		local values, defaults = {}, {}
+		for _, rarity in ipairs(N.PetRarities) do
+			table.insert(values, "Pets: " .. rarity)
+		end
+		table.insert(values, "Golden pets")
+		table.insert(values, "Diamond pets")
+		for _, egg in ipairs(N.G.Balance.EggInventory or {}) do
+			if type(egg) == "table" and egg.Id then
+				table.insert(values, "Egg: " .. tostring(egg.Id))
+			end
+		end
+		for _, potion in ipairs({ "Skill", "Win", "Luck" }) do
+			table.insert(values, "Potion: " .. potion)
+		end
+		for _, key in ipairs({ "Pets: Legendary", "Pets: Mythical", "Pets: Divine", "Pets: Ascended", "Pets: Eternal", "Pets: Rainbow", "Pets: Special", "Pets: Exclusive", "Pets: Hacked Admin", "Diamond pets", "Egg: Special", "Egg: PirateSpecial", "Egg: Astronaut", "Egg: Chocolatier", "Egg: Dragon", "Egg: HackedAdmin" }) do
+			if table.find(values, key) then
+				table.insert(defaults, key)
+			end
+		end
+		ExcludeBox:AddDropdown("ExcludeOP", {
+			Text = "Never sell, delete, fuse or use",
+			Values = values,
+			Default = defaults,
+			Multi = true,
+			AllowNull = true,
+			Tooltip = "OP never deletes or fuses pets of these rarities or variants, never opens these eggs and never drinks these potions",
+		})
+		Labels.Exclude = ExcludeBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
 		local ThrowBox = Tabs.Throw:AddLeftGroupbox("Throwing", "target")
 		ThrowBox:AddDropdown("ThrowSpeed", {
 			Text = "Throw Speed",
-			Values = { "Max (Blatant)", "Legit (game pace)" },
-			Default = "Max (Blatant)",
-			Tooltip = "Max throws again the moment the game allows it (its 0.8 s cooldown, the server checks every throw). Legit waits like the game's Auto Wins pass (about 2.4 s)",
+			Values = { "Legit (game pace)", "Max (Blatant)" },
+			Default = "Legit (game pace)",
+			Tooltip = "Legit (Safe, default) waits like the game's own Auto Wins pass (about 2.4 s between throws). Max (Blatant, at your own risk) throws again the moment the game's 0.8 s cooldown ends, faster than a normal player",
+			Callback = function(value)
+				if value == "Max (Blatant)" then
+					notify("Blatant", "Max throw rate is faster than a normal player. Use it at your own risk", 6)
+				end
+			end,
+		})
+		ThrowBox:AddDropdown("MoveMode", {
+			Text = "Movement",
+			Values = { "Walk (Safe)", "Teleport (Fast)" },
+			Default = "Walk (Safe)",
+			Tooltip = "Walk (Safe, default) walks to the launch zone, training stands, shops and eggs like a player. Teleport (Fast, at your own risk) moves you there instantly",
+			Callback = function(value)
+				if value == "Teleport (Fast)" then
+					notify("Teleport", "Teleporting is not how a normal player moves. Use it at your own risk", 6)
+				end
+			end,
 		})
 		ThrowBox:AddDropdown("TimeSplit", {
 			Text = "Time Split",
@@ -34103,14 +34346,28 @@ do
 		RewardBox:AddToggle("AutoGroupReward", { Text = "Claim Group Reward", Default = false, Tooltip = "Only when you are in the game's group" })
 		RewardBox:AddToggle("AutoIndex", { Text = "Claim Pet Index", Default = false })
 		Labels.Rewards = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
+		-- The game's Codes card (Menu > Codes, CodeInput) sends RedeemCode and gets CodeResult back.
 		local CodeBox = Tabs.Rewards:AddLeftGroupbox("Codes", "ticket")
+		CodeBox:AddToggle("AutoCodes", {
+			Text = "Auto Redeem Codes",
+			Default = false,
+			Tooltip = "Redeems every known code once on this account (the hub's list plus the online Corvus list) and remembers which worked",
+		})
+		CodeBox:AddButton({
+			Text = "Redeem all known",
+			Func = function()
+				N.redeemAllCodes()
+			end,
+		})
 		CodeBox:AddInput("CodeText", { Text = "Code", Placeholder = "Type a code from the game's socials", Finished = false, Default = "" })
 		CodeBox:AddButton({
 			Text = "Redeem",
 			Func = function()
 				N.redeemCode(Options.CodeText and Options.CodeText.Value)
+				pcall(Options.CodeText.SetValue, Options.CodeText, "")
 			end,
 		})
+		Labels.Codes = CodeBox:AddLabel({ Text = "-", DoesWrap = true })
 		do
 			local FPlayers = game:GetService("Players")
 			local FTeleport = game:GetService("TeleportService")
@@ -34234,8 +34491,39 @@ do
 		EggBox:AddToggle("AutoOpenEggs", { Text = "Open Inventory Eggs", Default = false, Tooltip = "Eggs from gifts and the daily reward, free to open" })
 		Labels.Eggs = EggBox:AddLabel({ Text = "-", DoesWrap = true })
 		local PetBox = Tabs.Items:AddRightGroupbox("Pets", "paw-print")
-		PetBox:AddToggle("AutoFuse", { Text = "Auto Fuse Spare Pets", Default = false, Tooltip = "3 identical pets you do not use become one Golden (x1.5) or Diamond pet when it beats your weakest equipped pet" })
+		PetBox:AddToggle("AutoFuse", { Text = "Auto Fuse Spare Pets", Default = false, Tooltip = "3 identical pets you do not use become one Golden (x1.5) or Diamond (x2) pet (the game's fuse machine) when it beats your weakest equipped pet" })
+		PetBox:AddToggle("FuseForIndex", { Text = "Fuse For Index", Default = true, Tooltip = "With Auto Fuse: also fuses spare pets whose Golden or Diamond version is missing from your pet index (every 10 entries = +1% luck)" })
 		Labels.Pets = PetBox:AddLabel({ Text = "-", DoesWrap = true })
+		local DeleteBox = Tabs.Items:AddLeftGroupbox("Auto Delete", "trash-2")
+		DeleteBox:AddToggle("AutoDeletePets", {
+			Text = "Auto Delete Pets",
+			Default = false,
+			Tooltip = "Deletes spare pets with the game's Delete Selected. Never equipped pets, your best pets, protected pets or pets missing from your index",
+		})
+		DeleteBox:AddDropdown("DeleteRarities", {
+			Text = "Delete rarities",
+			Values = N.PetRarities,
+			Default = { "Common", "Uncommon" },
+			Multi = true,
+			AllowNull = true,
+		})
+		DeleteBox:AddToggle("DeleteOnlyWeaker", { Text = "Only weaker than my team", Default = true, Tooltip = "Only deletes pets weaker than your weakest equipped pet, so nothing that could improve your team" })
+		DeleteBox:AddSlider("KeepBestPets", { Text = "Always keep best", Default = 10, Min = 3, Max = 100, Rounding = 0, Suffix = " pets", Tooltip = "Your strongest pets are never deleted (at least your equip slots)" })
+		DeleteBox:AddToggle("KeepVariants", { Text = "Keep Golden and Diamond", Default = true })
+		local petNames = {}
+		for _, def in pairs(N.petDefs().byId) do
+			if not table.find(petNames, def.name) then
+				table.insert(petNames, def.name)
+			end
+		end
+		table.sort(petNames)
+		DeleteBox:AddDropdown("ProtectPets", { Text = "Protect pets", Values = petNames, Default = {}, Multi = true, AllowNull = true, Searchable = true, Tooltip = "These pets are never deleted" })
+		DeleteBox:AddToggle("DiscardOnHatch", {
+			Text = "Also auto-delete on hatch",
+			Default = true,
+			Tooltip = "Uses the game's own AUTO-DELETED mark on egg pets: species of picked rarities that are weaker than your team and already in your index are deleted right when they hatch. Only marks set by Corvus are removed again",
+		})
+		Labels.Delete = DeleteBox:AddLabel({ Text = "-", DoesWrap = true })
 		local PotionBox = Tabs.Items:AddRightGroupbox("Potions", "flask-conical")
 		PotionBox:AddToggle("AutoPotions", { Text = "Auto Use Potions", Default = false, Tooltip = "Skill while training or throwing, Win while throwing, Luck right before a hatch" })
 		PotionBox:AddDropdown("PotionKinds", { Text = "Potion Kinds", Values = { "Skill", "Win", "Luck" }, Default = { "Skill", "Win", "Luck" }, Multi = true, AllowNull = true })
@@ -34275,7 +34563,26 @@ do
 	N.StatRows.Split = statRow(FarmStats, "clock", "Throwing / training", 22)
 	N.StatRows.Buys = statRow(FarmStats, "coins", "Stones / trails / hatched", 22)
 	N.StatRows.Claims = statRow(FarmStats, "gift", "Rewards / potions", 22)
+	local PetStats = Tabs.Stats:AddLeftGroupbox("Pets", "paw-print")
+	N.StatRows.Storage = statRow(PetStats, "package", "Pets / storage", 22)
+	N.StatRows.Power = statRow(PetStats, "zap", "Team power", 22)
+	N.StatRows.Index = statRow(PetStats, "book-open", "Index revealed / luck", 22)
+	N.StatRows.PetWork = statRow(PetStats, "trash-2", "Deleted / fused", 22, "FontColor")
+	local RewardStats = Tabs.Stats:AddRightGroupbox("Rewards & Codes", "gift")
+	N.StatRows.Codes = statRow(RewardStats, "ticket", "Codes worked / used / invalid", 22)
+	N.StatRows.Eggs = statRow(RewardStats, "egg", "Eggs opened", 22)
+	N.StatRows.Gift = statRow(RewardStats, "clock", "Next gift", 22, "FontColor")
 	function N.drawStats()
+		local total = N.petTotal()
+		local revealed = N.indexCounts()
+		local okCodes, usedCodes, badCodes = N.codeCounts()
+		N.StatRows.Storage.set(#N.coll("Pets") .. " / " .. N.petCapacity())
+		N.StatRows.Power.set(formatNumber(total))
+		N.StatRows.Index.set(revealed .. "  \u{00B7}  x" .. formatNumber(N.luck()))
+		N.StatRows.PetWork.set(formatNumber(N.Del.deleted) .. " / " .. Session.fusions)
+		N.StatRows.Codes.set(okCodes .. " / " .. usedCodes .. " / " .. badCodes)
+		N.StatRows.Eggs.set(tostring(Session.eggsOpened))
+		N.StatRows.Gift.set(N.InfoText and N.InfoText.gift or "-")
 		local elapsed = math.max(os.clock() - Session.started, 1)
 		local gained = math.max(N.wins() - (Session.winsStart or N.wins()), 0)
 		N.StatRows.Wins.set(formatNumber(N.wins()))
@@ -34525,6 +34832,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 					{ name = "Rebirth", value = tostring(N.rebirths()), inline = true },
 					{ name = "World", value = N.worldId(), inline = true },
 					{ name = "Throws", value = formatNumber(Session.throws), inline = true },
+					{ name = "Pets", value = #N.coll("Pets") .. " / " .. N.petCapacity(), inline = true },
+					{ name = "Luck", value = "x" .. formatNumber(N.luck()), inline = true },
 					{ name = "Best throw", value = formatNumber(Session.bestThrow) .. " wins", inline = true },
 					{ name = "Session", value = string.format("%dh %02dm", elapsed // 3600, (elapsed % 3600) // 60), inline = true },
 					{ name = "Player", value = playerField(), inline = true },
@@ -34547,6 +34856,32 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 					title = "\u{2726}  Rebirth " .. tostring(level),
 					description = "Skill multiplier went up.",
 					color = 16762930,
+					fields = { { name = "Player", value = playerField(), inline = true } },
+				})
+			end
+		end
+		N.Events.hatched = function(names)
+			if not (hookOn() and on("WebhookHatch")) then
+				return
+			end
+			for _, petId in ipairs(names) do
+				local info = N.petInfo({ PetId = petId })
+				if selected(Options.WebhookHatchRarities, info.rarity) then
+					queueEmbed({
+						title = "\u{2726}  Hatched " .. info.name,
+						description = "**" .. info.rarity .. "**" .. (if info.variant ~= "Normal" then " " .. info.variant else "") .. ", power **" .. formatNumber(info.power) .. "**.",
+						color = 11027200,
+						fields = { { name = "Player", value = playerField(), inline = true } },
+					})
+				end
+			end
+		end
+		N.Events.code = function(code, message)
+			if hookOn() and on("WebhookCodes") then
+				queueEmbed({
+					title = "\u{2726}  Code redeemed",
+					description = "**" .. tostring(code) .. "** " .. tostring(message or ""),
+					color = 6283215,
 					fields = { { name = "Player", value = playerField(), inline = true } },
 				})
 			end
@@ -34576,6 +34911,9 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 				if not enabled then
 					table.clear(Hook.queue)
 					return
+				end
+				if N.cardTick then
+					N.cardTick()
 				end
 				local embed = table.remove(Hook.queue, 1)
 				if embed then
@@ -34650,19 +34988,59 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		local UtilBox = holder:AddRightGroupbox("Utility", "wrench")
 		UtilBox:AddToggle("SpeedHack", { Text = "Walk Speed", Default = false })
 		UtilBox:AddSlider("WalkSpeed", { Text = "Speed", Default = 50, Min = 16, Max = 200, Rounding = 0 })
+		UtilBox:AddToggle("AfkGuard", {
+			Text = "Stop AFK Rejoin",
+			Default = true,
+			Tooltip = "The game moves you to a new server after 19 minutes without input (AfkRejoinController). While Corvus farms, a tiny mouse nudge every 2 minutes counts as input",
+		})
 	end)
+	-- Live stats card: one Discord message (POST ?wait=true gives its id) edited in place every 2 minutes.
+	local Card = { id = nil, at = -1e9, url = nil }
+	function N.cardTick()
+		local url = Options.WebhookUrl and Options.WebhookUrl.Value
+		if not (hookOn() and on("WebhookCard") and validWebhook(url)) then
+			return false
+		end
+		if os.clock() - Card.at < 120 then
+			return false
+		end
+		Card.at = os.clock()
+		if Card.url ~= url then
+			Card.url, Card.id = url, nil
+		end
+		local embed = reportEmbed("\u{2726}  Live stats")
+		embed.author = { name = GameName }
+		embed.footer = { text = "Corvus  \u{00B7}  " .. GameName .. "  \u{00B7}  updates every 2 min" }
+		embed.timestamp = DateTime.now():ToIsoDate()
+		local body = HttpService:JSONEncode({ username = "Corvus", allowed_mentions = { parse = {} }, embeds = { embed } })
+		if Card.id then
+			local response = httpRequest({ Url = url .. "/messages/" .. Card.id, Method = "PATCH", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+			local code = response and tonumber(response.StatusCode) or 0
+			if code >= 200 and code < 300 then
+				return true
+			end
+			Card.id = nil
+		end
+		local response = httpRequest({ Url = url .. "?wait=true", Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(response.Body)
+		end)
+		if ok and type(data) == "table" and data.id then
+			Card.id = tostring(data.id)
+			log("WEBHOOK card", Card.id)
+		end
+		return true
+	end
 	if Tabs.Webhook then
 		pcall(function()
 			local HookBox = Tabs.Webhook:AddLeftGroupbox("Discord Webhook", "webhook")
-				HookBox:AddToggle("WebhookOn", {
-					Text = "Post to Discord",
-					Default = false,
-					Tooltip = "Posts secret throws, rebirths, stones bought and a timed report to your own webhook",
-				})
-				HookBox:AddInput("WebhookUrl", { Text = "Webhook URL", Placeholder = "https://discord.com/api/webhooks/...", Finished = true, Default = "" })
-				HookBox:AddToggle("WebhookSecret", { Text = "Secret throws", Default = true })
-				HookBox:AddToggle("WebhookRebirths", { Text = "Rebirths", Default = true })
-				HookBox:AddToggle("WebhookBuys", { Text = "Stones bought", Default = false })
+			HookBox:AddToggle("WebhookOn", {
+				Text = "Post to Discord",
+				Default = false,
+				Tooltip = "Posts to your own Discord webhook: the events on the right, a timed report and a live stats card",
+			})
+			HookBox:AddInput("WebhookUrl", { Text = "Webhook URL", Placeholder = "https://discord.com/api/webhooks/...", Finished = true, Default = "" })
+			HookBox:AddToggle("WebhookCard", { Text = "Live stats card", Default = true, Tooltip = "One message with your Wins, Skill, rebirth, pets and session, edited every 2 minutes instead of new posts" })
 			HookBox:AddSlider("WebhookReport", {
 				Text = "Report every",
 				Default = 30,
@@ -34691,6 +35069,20 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 					end)
 				end,
 			})
+			local PostBox = Tabs.Webhook:AddRightGroupbox("Posts", "bell")
+			PostBox:AddToggle("WebhookSecret", { Text = "Secret throws", Default = true })
+			PostBox:AddToggle("WebhookRebirths", { Text = "Rebirths", Default = true })
+			PostBox:AddToggle("WebhookBuys", { Text = "Stones bought", Default = false })
+			PostBox:AddToggle("WebhookHatch", { Text = "Rare hatches", Default = true })
+			PostBox:AddDropdown("WebhookHatchRarities", {
+				Text = "Rare means",
+				Values = N.PetRarities,
+				Default = { "Legendary", "Mythical", "Divine", "Ascended", "Eternal", "Rainbow", "Special", "Hacked Admin" },
+				Multi = true,
+				AllowNull = true,
+			})
+			PostBox:AddToggle("WebhookCodes", { Text = "Codes redeemed", Default = true })
+			PostBox:AddLabel({ Text = '<font transparency="0.35">Each post goes out once, at most one every 2.5 s. Pick what is worth a ping.</font>', DoesWrap = true })
 		end)
 	end
 	if Tabs.Info then
@@ -34852,11 +35244,13 @@ do
 					Default = { "farm" },
 					Choices = {
 						{ Id = "farm", Title = "Auto Farm Everything", Description = "Safe farm: throws, trains in the best split, equips the best, claims every reward. Spends nothing", Icon = "sparkles", Color = "#60d696" },
-						{ Id = "op", Title = "OP (spends for you)", Description = "The planner does everything: buys stones, trails and eggs, uses potions, fuses pets, rebirths. Asks to confirm", Icon = "flame", Color = "#ff6b6b" },
-						{ Id = "throw", Title = "Throw", Description = "Throws for Wins at max rate", Icon = "target", Color = "#fab428" },
+						{ Id = "op", Title = "OP (spends for you)", Description = "Full automatic, ban risk: the game's anticheat MAY BAN this account. Planner buys, uses potions, fuses and deletes pets, rebirths. Asks to confirm", Icon = "flame", Color = "#ff6b6b" },
+						{ Id = "throw", Title = "Throw", Description = "Throws for Wins at the game's own pace (Safe)", Icon = "target", Color = "#fab428" },
 						{ Id = "train", Title = "Train", Description = "Trains Skill in the best open zone", Icon = "dumbbell", Color = "#3ccf91" },
 						{ Id = "spend", Title = "Smart Spending", Description = "Stones, trails and eggs by Wins gained per Win", Icon = "coins", Color = "#5fb8ff" },
 						{ Id = "rewards", Title = "Claim rewards", Description = "Daily, gifts, offline, group, index and inventory eggs", Icon = "gift", Color = "#ff5d8f" },
+						{ Id = "codes", Title = "Redeem codes", Description = "Every known code once on this account", Icon = "ticket", Color = "#b18cff" },
+						{ Id = "pets", Title = "Pet care", Description = "Equip best, fuse spare pets for index, delete Common and Uncommon pets weaker than your team", Icon = "paw-print", Color = "#f0b90b" },
 					},
 				},
 			},
@@ -34867,7 +35261,13 @@ do
 					train = { "AutoTrain" },
 					spend = { "AutoBuyStones", "AutoBuyTrails", "AutoHatch", "AutoEquipBest" },
 					rewards = { "AutoDaily", "AutoGifts", "AutoOffline", "AutoGroupReward", "AutoIndex", "AutoOpenEggs" },
+					codes = { "AutoCodes" },
 				}
+				-- Pet care works next to the farm too (it only keeps the team strong and the storage free).
+				setToggles({ "AutoEquipBest", "AutoFuse", "AutoDeletePets" }, { if chosen.pets then "on" else "off" })
+				if chosen.pets then
+					pcall(Options.DeleteRarities.SetValue, Options.DeleteRarities, { Common = true, Uncommon = true })
+				end
 				local farm = chosen.farm or chosen.op
 				for id, names in pairs(groups) do
 					setToggles(names, { if chosen[id] and not farm then "on" else "off" })
@@ -34893,6 +35293,18 @@ if Window.AddSettingsTab then
 		Folder = "StoneSkipping",
 		MenuKeybind = "RightControl",
 	})
+	-- AutoFarmOP is never saved in a config or loaded from one (also not through share codes): Remember Auto OP decides.
+	pcall(function()
+		SaveManager:SetIgnoreIndexes({ "AutoFarmOP" })
+	end)
+	pcall(function()
+		SaveManager.Ignore.AutoFarmOP = true
+	end)
+	task.delay(4, function()
+		if alive() then
+			pcall(N.restoreOP)
+		end
+	end)
 	if ok and tab then
 		Tabs.Settings = tab
 	else
@@ -35048,9 +35460,17 @@ do
 		if on("AutoEquipBest") and choreDue("equip", 15) then
 			N.equipBestStone()
 			N.equipBestTrail()
+			N.gameSettingOn("AutoEquipBestPetsEnabled")
 			if choreDue("pets", 120) then
 				N.equipBestPets()
 			end
+		end
+		-- Pet storage: delete spare pets first (frees room for hatching), then the game's auto-delete marks.
+		if on("AutoDeletePets") and choreDue("delete", if N.storageFree() < N.hatchCount() * 2 then 5 else 30) and N.deleteStep() then
+			return true
+		end
+		if choreDue("discard", 20) then
+			N.discardStep()
 		end
 		if (on("AutoBuyStones") or on("AutoBuyTrails") or on("AutoHatch")) and choreDue("spend", 3) then
 			if N.spendStep() then
@@ -35132,6 +35552,19 @@ do
 			if on("AutoOpenEggs") and choreDue("invEggs", 8) then
 				N.openInventoryEggs()
 			end
+			N.codeStep()
+		end
+		-- AFK: the game's AfkRejoinController asks the server for a new server after 19 min without input. A mouse move
+		-- through VirtualInputManager is input for the game and for Roblox's idle timer.
+		if on("AfkGuard") and anyAutoOn() and choreDue("afk", 120) then
+			pcall(function()
+				local vim = game:GetService("VirtualInputManager")
+				local camera = workspace.CurrentCamera
+				local size = camera and camera.ViewportSize or Vector2.new(800, 600)
+				vim:SendMouseMoveEvent(size.X / 2 + 1, size.Y / 2, game)
+				task.wait(0.05)
+				vim:SendMouseMoveEvent(size.X / 2, size.Y / 2, game)
+			end)
 		end
 		if on("SpeedHack") then
 			local hum = N.humanoid()
@@ -35266,6 +35699,61 @@ do
 				I.rewards = string.format("Claimed <b>%d</b> this session%s", Session.claims, if #N.Reward.log > 0 then "\n" .. table.concat(N.Reward.log, "\n") else "")
 				local total, weakest = N.petTotal()
 				I.eggs = string.format("Hatched <b>%d</b>, opened <b>%d</b>  \u{00B7}  luck x%s%s", Session.hatches, Session.eggsOpened, formatNumber(N.luck()), if N.Egg.last ~= "" then "\n" .. N.Egg.last else "")
+				local revealed, discovered = N.indexCounts()
+				local gifts = N.giftsReady()
+				local giftText = if #gifts > 0 then #gifts .. " ready" else "-"
+				do
+					local started = tonumber(s.GiftStartedAt)
+					local unlock = N.G.Balance.GiftRewards and N.G.Balance.GiftRewards.UnlockSeconds or {}
+					local claimed = N.coll("GiftClaimed")
+					if #gifts == 0 and started then
+						for i, seconds in ipairs(unlock) do
+							if not claimed[i] then
+								giftText = N.longTime(math.max(started + seconds, tonumber(s.GiftCooldownUntil) or 0) - N.serverTime())
+								break
+							end
+						end
+					end
+				end
+				I.gift = giftText
+				local okCodes, usedCodes, badCodes = N.codeCounts()
+				I.lines = string.format(
+					"Pets <b>%d/%d</b>  \u{00B7}  team power <b>%s</b>  \u{00B7}  luck x%s\nIndex <b>%d</b> revealed%s  \u{00B7}  next gift %s\nCodes %d worked, %d used, %d invalid  \u{00B7}  deleted %s",
+					#N.coll("Pets"),
+					N.petCapacity(),
+					formatNumber((N.petTotal())),
+					formatNumber(N.luck()),
+					revealed,
+					if discovered > 0 then " (+" .. discovered .. " to reveal)" else "",
+					giftText,
+					okCodes,
+					usedCodes,
+					badCodes,
+					formatNumber(N.Del.deleted)
+				)
+				local candidates = N.deleteCandidates()
+				I.delete = string.format(
+					"Storage <b>%d/%d</b>  \u{00B7}  %d spare pets match the rules%s\nAuto-delete on hatch: %d species marked by Corvus",
+					#N.coll("Pets"),
+					N.petCapacity(),
+					#candidates,
+					if N.Del.last ~= "" then "\n" .. N.Del.last else "",
+					(function()
+						local n = 0
+						for _ in pairs(N.Del.discards) do
+							n += 1
+						end
+						return n
+					end)()
+				)
+				I.codes = string.format("Known %d  \u{00B7}  worked %d, used %d, invalid %d\nLast: %s", #N.Codes.known, okCodes, usedCodes, badCodes, N.Codes.last)
+				I.op = string.format(
+					"OP is <b>%s</b>%s\nRemember Auto OP: %s",
+					if N.opActive() then "running" else "off",
+					if N.opActive() then "\n" .. Status else "",
+					if on("RememberAutoOP") then "on" else "off"
+				)
+				I.exclude = string.format("%d protected  \u{00B7}  OP skipped %d actions%s", #picked(Options.ExcludeOP), N.OPSkipped.count, if N.OPSkipped.last ~= "" then " (last: " .. N.OPSkipped.last .. ")" else "")
 				I.pets = string.format("%d pets, %d slots  \u{00B7}  power %s (weakest %s)%s", #N.coll("Pets"), N.petSlots(), formatNumber(total), formatNumber(weakest), if N.Fuse.last ~= "" then "\n" .. N.Fuse.last else "")
 			end)
 			if not ok then
@@ -35301,7 +35789,14 @@ do
 					group(function()
 						Labels.Status:SetText(Status)
 						Labels.Info:SetText(I.info or "-")
+						Labels.Lines:SetText(I.lines or "-")
 						Labels.Plan:SetText(I.plan or "-")
+					end)
+				end
+				if shown(Tabs.OP) then
+					group(function()
+						Labels.OP:SetText(I.op or "-")
+						Labels.Exclude:SetText(I.exclude or "-")
 					end)
 				end
 				if shown(Tabs.Throw) then
@@ -35324,12 +35819,14 @@ do
 				if shown(Tabs.Rewards) then
 					group(function()
 						Labels.Rewards:SetText(I.rewards or "-")
+						Labels.Codes:SetText(I.codes or "-")
 					end)
 				end
 				if shown(Tabs.Items) then
 					group(function()
 						Labels.Eggs:SetText(I.eggs or "-")
 						Labels.Pets:SetText(I.pets or "-")
+						Labels.Delete:SetText(I.delete or "-")
 					end)
 				end
 				if shown(Tabs.Stats) then
