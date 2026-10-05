@@ -5306,6 +5306,14 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         end
         local Url = if typeof(Code) == "string" and Code ~= "" then "https://discord.gg/" .. Code else Invite
 
+        local Copied = false
+        do
+            local Setter = setclipboard or toclipboard or (Clipboard and Clipboard.set)
+            if typeof(Setter) == "function" then
+                Copied = pcall(Setter, Url)
+            end
+        end
+
         local RequestFunction = GetRequestFunction()
         if typeof(RequestFunction) == "function" and typeof(Code) == "string" and Code ~= "" then
             for Port = 6463, 6472 do
@@ -5325,7 +5333,8 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 })
                 if Success and typeof(Response) == "table" then
                     local Status = tonumber(Response.StatusCode)
-                    if (Status and Status >= 200 and Status < 300) or Response.Success == true then
+                    local BodyText = tostring(Response.Body or "")
+                    if ((Status and Status >= 200 and Status < 300) or Response.Success == true) and not string.find(BodyText, '"evt":"ERROR"', 1, true) then
                         print("[Corvus] discord invite: rpc")
                         return true
                     end
@@ -5333,15 +5342,20 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             end
         end
 
-        local Opened = pcall(function()
+        -- OpenBrowserWindow is a silent no-op on most executors, so its result is never trusted
+        pcall(function()
             game:GetService("GuiService"):OpenBrowserWindow(Url)
         end)
-        if Opened then
-            print("[Corvus] discord invite: browser")
-            return true
-        end
 
-        Library:CopyToClipboard(Invite, "Invite copied")
+        if Copied then
+            Library:Notify({
+                Title = "Invite copied",
+                Description = "Paste it in your browser: " .. Url,
+                Time = 8,
+            })
+        else
+            Library:CopyToClipboard(Url, "Invite copied")
+        end
         print("[Corvus] discord invite: clipboard")
         return false
     end
@@ -11702,7 +11716,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                     return
                 end
     
-                Num = math.clamp(Num, Slider.Min, Slider.Max)
+                Num = math.clamp(Num, math.min(Slider.Min, Slider.Max), math.max(Slider.Min, Slider.Max))
     
                 Slider.Value = Num
                 Slider:Display()
@@ -21986,7 +22000,7 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         end
     
         function Window:SetSidebarWidth(Width)
-            Width = math.clamp(Width, 48, MainFrame.Size.X.Offset - WindowInfo.MinContainerWidth - 1)
+            Width = math.clamp(Width, 48, math.max(48, MainFrame.Size.X.Offset - WindowInfo.MinContainerWidth - 1))
     
             DividerLine.Position = UDim2.fromOffset(Width, 0)
     
