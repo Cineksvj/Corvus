@@ -32652,13 +32652,16 @@ do
 			})
 		end)
 	end
-	Tabs.Roll = N.addTab("Roll", "dice-5", "Rolling, dice and spins")
-	Tabs.Plot = N.addTab("Plot", "house", "Income, equip best and selling")
-	Tabs.Slots = N.addTab("Slots", "layout-grid", "Every slot with its unit, level and upgrades")
-	Tabs.Upgrades = N.addTab("Upgrades", "arrow-big-up", "Upgrade tree, rebirth and gear")
+	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+	Tabs.Roll = N.addTab("Roll", "dice-5", "Spins and dice")
 	Tabs.Towers = N.addTab("Towers", "castle", "Auto towers with your best team")
-	Tabs.Items = N.addTab("Items", "gift", "Rewards, quests, boosts and rerolls")
+	Tabs.Plot = N.addTab("Plot", "layout-grid", "Income, selling and every slot with its unit")
+	Tabs.Slots = Tabs.Plot
+	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Smart Spending, upgrade tree, rebirth and gear")
+	Tabs.Rewards = N.addTab("Rewards", "gift", "Daily, codes, quests and tickets")
+	Tabs.Items = N.addTab("Items", "backpack", "Boosts and trait or grade rerolls")
 	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and rates")
+	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts")
 	if Window.AddMiscTab then
 		pcall(function()
 			Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
@@ -32666,12 +32669,12 @@ do
 	end
 	Labels = {}
 	do
-		local QuickBox = Tabs.Roll:AddLeftGroupbox("Quick Farm", "sparkles")
+		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
 		N.FarmBestOn = { "SmartSpend", "AutoRoll", "AutoCollect", "AutoEquipBest", "AutoLevel", "AutoSell", "AutoEquipDice", "AutoBuyDice", "AutoUpgrade", "AutoRebirth", "AutoGear", "AutoDaily", "AutoGroup", "AutoOffline", "AutoCodes", "AutoQuests", "AutoTicketPasses", "AutoTower", "TowerEquipTeam", "AutoSpin", "AutoBoosts" }
 		-- Turning the quick farm off turns off everything it turned on (nothing keeps spending cash).
 		N.FarmBestOff = N.FarmBestOn
 		QuickBox:AddToggle("AutoFarmBest", {
-			Text = "Auto Farm Best",
+			Text = "Auto Farm Everything",
 			Default = false,
 			Tooltip = "Turns on everything: fast rolls, plot income, Smart Spending (levels, dice, upgrades and rebirths ranked by payback time), smart selling, rewards, quests and towers",
 			Callback = function(value)
@@ -32689,13 +32692,14 @@ do
 			Text = '<font transparency="0.35">One switch for the whole farm. Everything below still works if you want to fine tune it.</font>',
 			DoesWrap = true,
 		})
-		local RollBox = Tabs.Roll:AddLeftGroupbox("Rolling", "dice-5")
+		local RollBox = QuickBox
 		RollBox:AddToggle("AutoRoll", {
 			Text = "Auto Roll (Fast)",
 			Default = false,
 			Tooltip = "Rolls again the moment the server allows it, without waiting for the roll animation. Turns the game's own slower auto roll off",
 		})
-		RollBox:AddToggle("AutoSpin", {
+		RollBox = Tabs.Roll:AddLeftGroupbox("Spins", "dice-5")
+			RollBox:AddToggle("AutoSpin", {
 			Text = "Use Spins",
 			Default = false,
 			Tooltip = "Uses a Lucky Spin (100x) or Jackpot Spin (1000x) before a roll. Spins multiply your dice luck, so they are worth more with a better dice",
@@ -32705,7 +32709,7 @@ do
 		DiceBox:AddToggle("AutoBuyDice", { Text = "Auto Buy Best Dice", Default = false, Tooltip = "Buys the luckiest dice you can afford" })
 		DiceBox:AddToggle("AutoEquipDice", { Text = "Auto Equip Best Dice", Default = true })
 		Labels.Dice = DiceBox:AddLabel({ Text = "-", DoesWrap = true })
-		local StatusBox = Tabs.Roll:AddRightGroupbox("Status", "activity")
+		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 		Labels.Recent = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
@@ -32773,7 +32777,7 @@ do
 		-- Slots tab: a compact grid of tiles, one per slot (2 per row, slots 1-8 left, 9-16 right). Each tile shows
 		-- the unit's model, rarity, level and cash per second. The check mark decides if Auto Level may spend cash on
 		-- that slot, the arrow buys one level now. Models are static (no spinning or zoom) to keep the menu smooth.
-		local TopBox = Tabs.Slots:AddLeftGroupbox("Slot Upgrades", "chevrons-up")
+		local TopBox = Tabs.Plot:AddLeftGroupbox("Slot Upgrades", "chevrons-up")
 		TopBox:AddToggle("AutoLevel", {
 			Text = "Auto Level Up Slots",
 			Default = false,
@@ -32908,8 +32912,8 @@ do
 		end
 		local count = N.maxSlots()
 		local half = math.ceil(count / 2)
-		buildGrid(Tabs.Slots:AddLeftGroupbox("Slots 1-" .. half, "layout-grid"), 1, half)
-		buildGrid(Tabs.Slots:AddRightGroupbox("Slots " .. (half + 1) .. "-" .. count, "layout-grid"), half + 1, count)
+		buildGrid(Tabs.Plot:AddLeftGroupbox("Slots 1-" .. half, "layout-grid"), 1, half)
+		buildGrid(Tabs.Plot:AddRightGroupbox("Slots " .. (half + 1) .. "-" .. count, "layout-grid"), half + 1, count)
 	end
 	do
 		local SpendBox = Tabs.Upgrades:AddLeftGroupbox("Smart Spending", "calculator")
@@ -32985,13 +32989,13 @@ do
 		Labels.TowerOdds = OddsBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
-		local RewardBox = Tabs.Items:AddLeftGroupbox("Rewards", "gift")
+		local RewardBox = Tabs.Rewards:AddLeftGroupbox("Rewards", "gift")
 		RewardBox:AddToggle("AutoDaily", { Text = "Claim Daily Reward", Default = true })
 		RewardBox:AddToggle("AutoOffline", { Text = "Claim Offline Cash", Default = true })
 		RewardBox:AddToggle("AutoGroup", { Text = "Claim Group Reward", Default = true, Tooltip = "Works once you are in the game's group" })
 		RewardBox:AddToggle("AutoCodes", { Text = "Redeem All Codes", Default = true })
 		Labels.Rewards = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
-		local QuestBox = Tabs.Items:AddRightGroupbox("Quests", "scroll-text")
+		local QuestBox = Tabs.Rewards:AddRightGroupbox("Quests", "scroll-text")
 		QuestBox:AddToggle("AutoQuests", { Text = "Claim Quests", Default = true })
 		QuestBox:AddToggle("AutoTicketPasses", {
 			Text = "Buy Ticket Gamepasses",
@@ -33482,13 +33486,13 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		end)
 	end
 	pcall(function()
-		local holder = Tabs.Misc or Tabs.Roll
+		local holder = Tabs.Misc or Tabs.Main
 		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
 		Labels.Perf = PerfBox:AddLabel({ Text = "Measuring...", DoesWrap = true })
 	end)
-	if Tabs.Misc then
+	if Tabs.Webhook then
 		pcall(function()
-			local HookBox = Tabs.Misc:AddLeftGroupbox("Discord Webhook", "webhook")
+			local HookBox = Tabs.Webhook:AddLeftGroupbox("Discord Webhook", "webhook")
 				HookBox:AddToggle("WebhookOn", {
 					Text = "Post to Discord",
 					Default = false,
@@ -33603,7 +33607,7 @@ do
 			toggleCommand("upgrades", { "buy", "shop" }, { "SmartSpend", "AutoUpgrade", "AutoBuyDice" }, "Smart Spending, auto upgrades and dice")
 			toggleCommand("rebirth", {}, { "AutoRebirth" }, "Auto Rebirth")
 			toggleCommand("tower", { "towers" }, { "AutoTower" }, "Auto Tower")
-			toggleCommand("farmbest", { "all" }, { "AutoFarmBest" }, "Auto Farm Best")
+			toggleCommand("farmall", { "farmbest", "all", "farm" }, { "AutoFarmBest" }, "Auto Farm Everything")
 			Library:AddCommand({
 				Name = "stop",
 				Aliases = { "alloff" },
@@ -33653,7 +33657,7 @@ do
 	if Library.SetQuickBar then
 		pcall(function()
 			Library:SetQuickBar({
-				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm" },
+				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm All" },
 				{ Toggle = "AutoRoll", Icon = "dice-5", Label = "Roll" },
 				{ Toggle = "AutoSell", Icon = "badge-dollar-sign", Label = "Sell" },
 				{ Toggle = "AutoUpgrade", Icon = "arrow-big-up", Label = "Upgrades" },
@@ -33691,8 +33695,9 @@ do
 					Description = "Pick everything you want running. Tap again to unpick.",
 					Multi = true,
 					Required = true,
-					Default = { "roll", "plot", "upgrades", "rewards" },
+					Default = { "farm" },
 					Choices = {
+						{ Id = "farm", Title = "Auto Farm Everything", Description = "One switch: fast rolls, plot, Smart Spending, selling, rewards and towers, all picked by payback time", Icon = "sparkles", Color = "#60d696" },
 						{ Id = "roll", Title = "Roll fast", Description = "Rolls the moment the server allows, without the animation", Icon = "dice-5", Color = "#fab428" },
 						{ Id = "plot", Title = "Plot income", Description = "Collects cash, puts your best units on the plot and levels them", Icon = "house", Color = "#3ccf91" },
 						{ Id = "sell", Title = "Sell weak units", Description = "Keeps storage free, never sells your plot, team, mutated or rare units", Icon = "badge-dollar-sign", Color = "#5fb8ff" },
@@ -33713,9 +33718,10 @@ do
 					rewards = { "AutoDaily", "AutoOffline", "AutoGroup", "AutoCodes", "AutoQuests", "AutoTicketPasses" },
 				}
 				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] then "on" else "off" })
+					setToggles(names, { if chosen[id] and not chosen.farm then "on" else "off" })
 				end
 				N.markSetupDone()
+				setToggles({ "AutoFarmBest" }, { if chosen.farm then "on" else "off" })
 				notify("Quick setup done", "Change anything in the tabs any time", 5)
 			end,
 			Skipped = function()
@@ -33808,13 +33814,15 @@ if Window.AddInfoTab then
 	}
 	for _, tab in ipairs({
 		Tabs.Info,
+		Tabs.Main,
 		Tabs.Roll,
-		Tabs.Plot,
-		Tabs.Slots,
-		Tabs.Upgrades,
 		Tabs.Towers,
+		Tabs.Plot,
+		Tabs.Upgrades,
+		Tabs.Rewards,
 		Tabs.Items,
 		Tabs.Stats,
+		Tabs.Webhook,
 		Tabs.Misc,
 		Tabs.Settings,
 	}) do
@@ -34219,7 +34227,7 @@ do
 			group(UIQueue.flush)
 			if frame % 3 == 0 then
 				local I = N.InfoText
-				if shown(Tabs.Roll) then
+				if shown(Tabs.Main) or shown(Tabs.Roll) then
 					group(function()
 						Labels.Status:SetText(Status)
 						Labels.Info:SetText(I.info or "-")
@@ -34250,7 +34258,7 @@ do
 						Labels.TowerOdds:SetText(I.towerOdds or "-")
 					end)
 				end
-				if shown(Tabs.Items) then
+				if shown(Tabs.Items) or shown(Tabs.Rewards) then
 					group(function()
 						Labels.Rewards:SetText(I.rewards or "-")
 						Labels.Quests:SetText(I.quests or "-")
@@ -34314,7 +34322,7 @@ do
 		end
 	end)
 	pcall(function()
-		Tabs.Roll:Show()
+		Tabs.Main:Show()
 	end)
 	do
 		local key = "RightControl"
