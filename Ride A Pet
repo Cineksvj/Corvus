@@ -29821,6 +29821,49 @@ end
 skipEgg(info.id, 20, "no answer to pickup")
 return false, "no answer"
 end
+N.EP = { fails = 0, dead = false }
+local function tryRemotePickup(info)
+local EP = N.EP
+local root = rootPart()
+if EP.dead or not on("RemotePickup") or not root or serverNow() < info.dropEndsAt then
+return false
+end
+local cfg = N.eggConfig(info.name)
+if type(cfg) == "table" and cfg.RequiresVolcano == true then
+return false
+end
+local dist = flat(root.Position, info.pos)
+if dist < 12 then
+return false
+end
+N.watchBasket()
+Pickup.reply = nil
+local before = #N.basketItems()
+Farm.pending[info.name] = info
+Farm.pending[info.id] = info
+fire("Game/EggPickup", info.id)
+waitFor(function()
+return Pickup.reply ~= nil or #N.basketItems() > before
+end, 1)
+local reply = Pickup.reply
+local ok = #N.basketItems() > before or (reply ~= nil and reply.kind == "PickedUp")
+log(string.format("EGGPICKUP remote ok=%s dist=%.0f", tostring(ok), dist))
+if ok then
+EP.fails = 0
+Track.picked(info)
+log("PICKED", info.name, formatNumber(info.kg) .. " KG", info.rarity)
+return true
+end
+if reply and reply.kind == "BasketFull" then
+return false
+end
+EP.fails += 1
+if EP.fails >= 3 then
+EP.dead = true
+log("EGGPICKUP range unsupported")
+end
+return false
+end
 function N.holdStill(seconds, keepGoing)
 local root = rootPart()
 local spot = root and root.Position
@@ -30056,6 +30099,9 @@ keepGoing = keepGoing,
 })
 end
 local function grab(info, carry)
+if tryRemotePickup(info) then
+return true
+end
 if not goToEgg(info, carry) then
 if info.cfg.Parent == nil or eggClaimed(info.cfg, info.name) then
 log("TRIP egg gone before we got there", info.name)
@@ -30085,8 +30131,10 @@ Farm.lastTarget = first
 N.mount()
 local got = grab(first)
 if got then
-local limit = math.min(N.basketCapacity(), math.max(1, optionNumber("EggsPerTrip", 1)))
-while alive() and #N.basketItems() < limit and (on("AutoFarm") or N.manualRunning()) do
+local function planPaused()
+return on("PauseEggTimer") and N.Pause.verified and not N.Pause.dead and N.Pause.sent and N.pausedAny()
+end
+while alive() and #N.basketItems() < (if planPaused() then math.min(N.basketCapacity(), 20) else math.min(N.basketCapacity(), math.max(1, optionNumber("EggsPerTrip", 1)))) and (on("AutoFarm") or N.manualRunning()) do
 local root = rootPart()
 local home = homePos()
 local deadline = N.soonestBreak()
@@ -30099,12 +30147,29 @@ local nextEgg = targetList(root.Position, function(info)
 if mode == "Blatant" then
 return true
 end
+if planPaused() then
+-- the carried timers are frozen: only the frozen remainder must still cover the final stretch home
+local left = N.pauseRemaining()
+return left ~= nil and left > N.deliveryMargin() + 3
+end
 local arrive = travelSeconds(root.Position, info.pos, mode, carry) + optionNumber("PickupDelay", 0.2) + 0.5
 local back = travelSeconds(info.pos, home, "Safe", math.min(carry, N.carryMultiplier(info.weight, info.name)))
 return serverNow() + arrive + back <= deadline - N.deliveryMargin()
 end)[1]
 if not nextEgg then
 break
+end
+do
+local paused = planPaused()
+local value = nextEgg.luck * math.max(nextEgg.weight, 0.5)
+for _, child in ipairs(N.basketItems()) do
+local entry = Carry.items[child]
+local held = entry and entry.info
+if held then
+value += (held.luck or 1) * math.max(held.weight or 1, 0.5)
+end
+end
+log(string.format("DELIVERY plan eggs=%d paused=%s value=%s", #N.basketItems() + 1, tostring(paused), formatNumber(value)))
 end
 local _, why = grab(nextEgg, carry)
 if why == "full" then
@@ -30842,9 +30907,58 @@ function N.autoCollectOn()
 local value = N.playerAttr("AutoCollectCash")
 return value == nil or value == true
 end
+N.RC = { fails = 0, dead = false, replies = 0 }
+N.onEvent("Game/PetCollect", function(a)
+if type(a) == "table" and tonumber(a.Owner) == LocalPlayer.UserId then
+N.RC.replies += if type(a.PetKeys) == "table" then #a.PetKeys else 1
+end
+end, true)
+function N.remoteCollect(pets)
+local RC = N.RC
+local keys = {}
+for _, pet in ipairs(pets) do
+if pet.key then
+table.insert(keys, pet.key)
+end
+end
+if #keys == 0 then
+return false
+end
+local cash0, replies0 = N.cash(), RC.replies
+for _, key in ipairs(keys) do
+fire("Game/PetCollect", key)
+task.wait(0.03)
+end
+waitFor(function()
+return RC.replies > replies0
+end, 2)
+task.wait(0.3)
+local gained = N.cash() - cash0
+local ok = RC.replies > replies0 or gained > 0
+log(string.format("PETCOLLECT ok=%s pets=%d gained=%s", tostring(ok), #keys, formatNumber(gained)))
+if ok then
+RC.fails = 0
+else
+RC.fails += 1
+if RC.fails >= 3 then
+RC.dead = true
+log("PETCOLLECT unsupported")
+end
+end
+return ok
+end
 function N.collectCash()
 if N.autoCollectOn() then
 return 0
+end
+if on("RemoteCollect") and not N.RC.dead then
+local pets = N.plotPets()
+if N.remoteCollect(pets) then
+return #pets
+end
+if not N.RC.dead then
+return 0
+end
 end
 local visited = 0
 local base = N.baseplate()
@@ -32051,6 +32165,16 @@ FarmBox:AddToggle("PauseEggTimer", {
 Text = "Pause Egg Timer",
 Default = true,
 Tooltip = "Asks the server to pause the break timer of the eggs in your basket while you carry them away from your plot (the same call the game sends during cutscenes). Checks itself and stops if the server ignores it.",
+})
+FarmBox:AddToggle("RemoteCollect", {
+Text = "Remote Collect",
+Default = true,
+Tooltip = "Blatant: collects pet cash with the game's own PetCollect call without walking to every pet. Checks itself and goes back to walking after 3 failures.",
+})
+FarmBox:AddToggle("RemotePickup", {
+Text = "Remote Egg Pickup",
+Default = true,
+Tooltip = "Blatant: asks the server to pick up an egg from where you stand before walking to it. Checks itself and stops after 3 refusals.",
 })
 FarmBox:AddButton({
 Text = "Grab Best Egg",
