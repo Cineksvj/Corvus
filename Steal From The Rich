@@ -31156,6 +31156,18 @@ end
 function Plan.smart()
 return Plan.on("SmartSpend")
 end
+Plan.touched, Plan.setting = {}, 0
+function Plan.op()
+return Options.FarmMode ~= nil and Options.FarmMode.Value == "OP"
+end
+function Plan.touch(name)
+if Plan.setting == 0 then
+Plan.touched[name] = true
+end
+end
+function Plan.manual(name)
+return not Plan.op() and Plan.touched[name] == true
+end
 function Plan.mult()
 local best = tonumber(LocalPlayer:GetAttribute("TrailMultiplier")) or 1
 for _, trail in ipairs(Trails) do
@@ -31705,7 +31717,7 @@ cell = tonumber(cell) or 0
 return cell * six + (1 - cell) * (charged * three + (1 - charged))
 end
 function Plan.chargeSpend(points, config)
-if not Plan.smart() then
+if not Plan.smart() or Plan.manual("ChargeAmount") then
 return nil
 end
 local low = tonumber(config.MIN_SPEND) or 1000
@@ -31731,7 +31743,7 @@ return math.floor(bestSpend)
 end
 function Plan.orbsFirst()
 local manual = not (Options.OrbPriority and Options.OrbPriority.Value == "Crates first")
-if not (Plan.on("SmartSchedule") and Plan.on("AutoThunder") and Plan.ready and Plan.pointValue > 0) then
+if Plan.manual("OrbPriority") or not (Plan.on("SmartSchedule") and Plan.on("AutoThunder") and Plan.ready and Plan.pointValue > 0) then
 return manual
 end
 if Plan.orbSec < 20 then
@@ -32095,9 +32107,12 @@ Plan.farmNames = {
 Plan.farmSet = {}
 function Plan.farmAll(value)
 if value then
+local op = Plan.op()
+log("MODE", if op then "OP" else "Normal", "(farm all start)")
 for _, name in ipairs(Plan.farmNames) do
 local toggle = Toggles[name]
-if toggle and not toggle.Value then
+local skip = not op and (name == "AutoFuse" or (name == "SmartZones" and Plan.touched.StealZones))
+if toggle and not toggle.Value and not skip then
 Plan.farmSet[name] = true
 toggle:SetValue(true)
 end
@@ -32110,11 +32125,20 @@ end
 for _, name in ipairs(CrateRarities.list) do
 rarities[name] = true
 end
+Plan.setting += 1
+if op or not Plan.touched.StealZones then
 Options.StealZones:SetValue(zones)
+end
+if op or not Plan.touched.StealCrateRarities then
 Options.StealCrateRarities:SetValue(rarities)
+end
+if op then
 Options.StealPriority:SetValue("Best Value")
 Options.SellMode:SetValue("All")
+end
+Plan.setting -= 1
 end)
+Plan.setting = 0
 local turned = {}
 for name in pairs(Plan.farmSet) do
 table.insert(turned, name)
@@ -32394,6 +32418,16 @@ Callback = function(value)
 task.spawn(Plan.farmAll, value)
 end,
 })
+FarmBox:AddDropdown("FarmMode", {
+Text = "Farm Mode",
+Values = { "Normal", "OP" },
+Default = "Normal",
+Tooltip = "Normal = automate everything within your own picks (zones, rarities, priority, sell mode, fuse, charge amount stay as you set them). OP = the planner overrides every choice for max profit",
+Callback = function(value)
+log("MODE", tostring(value))
+end,
+})
+log("MODE", tostring(Options.FarmMode and Options.FarmMode.Value or "Normal"), "(start)")
 FarmBox:AddLabel({
 Text = '<font transparency="0.35">One switch for the whole farm. Everything below still works if you want to fine tune it.</font>',
 DoesWrap = true,
@@ -32411,6 +32445,9 @@ Default = { ZoneLabels[1] },
 Multi = true,
 Searchable = true,
 Tooltip = "Which zones to steal from",
+Callback = function()
+Plan.touch("StealZones")
+end,
 })
 StealBox:AddDropdown("StealCrateRarities", {
 Text = "Rarity Filter",
@@ -32419,6 +32456,9 @@ Default = CrateRarities.list,
 Multi = true,
 Searchable = true,
 Tooltip = "Which crate rarities to steal",
+Callback = function()
+Plan.touch("StealCrateRarities")
+end,
 })
 StealBox:AddDropdown("StealPriority", {
 Text = "Priority",
@@ -32724,6 +32764,9 @@ Text = "During the storm",
 Values = { "Orbs first", "Crates first" },
 Default = "Orbs first",
 Tooltip = "Crates first only collects orbs when no crate matches your filters",
+Callback = function()
+Plan.touch("OrbPriority")
+end,
 })
 StormLabel = OrbBox:AddLabel({ Text = "Storm: -", DoesWrap = true })
 local ThunderBox = Tabs.Storm:AddRightGroupbox("Thunder Machine", "cloud-lightning")
@@ -32737,6 +32780,9 @@ Text = "Charge With",
 Values = { "1,000 points", "1,500 points" },
 Default = "1,000 points",
 Tooltip = "1,000 already makes a crate Supercharged for sure. 1,500 doubles the small Supercell chance but charges fewer crates.",
+Callback = function()
+Plan.touch("ChargeAmount")
+end,
 })
 ThunderBox:AddButton({
 Text = "Go To Thunder Machine",
