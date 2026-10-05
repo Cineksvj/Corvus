@@ -30016,6 +30016,9 @@ local BootOk, BootError = xpcall(function()
 			or selected(Options.LockSizes, SizeNames[info.size] or info.size)
 		end
 		function lockProtected()
+			if on("AutoFarmAll") then
+				return 0
+			end
 			local data = Data()
 			if not data then
 				return 0
@@ -30065,8 +30068,9 @@ local BootOk, BootError = xpcall(function()
 				local smart = {}
 				for key, entry in pairs(data and data.Inventory or {}) do
 					local info = entryInfo(entry)
-					if info and entry.innerEntity.locked ~= true and not info.special and not isProtected(info) then
-						table.insert(smart, { key = key, info = info, kind = entry.itemType })
+					local locked = entry.innerEntity.locked == true
+					if info and not info.special and (not locked or isProtected(info)) then
+						table.insert(smart, { key = key, info = info, kind = entry.itemType, locked = locked })
 					end
 				end
 				table.sort(smart, function(a, b)
@@ -30143,6 +30147,18 @@ local BootOk, BootError = xpcall(function()
 					for i = 1, #keep, 40 do
 						call("InventoryService", "SetItemsLocked", table.move(keep, i, math.min(i + 39, #keep), 1, {}), state)
 					end
+				end
+				local relock = {}
+				for _, item in ipairs(list) do
+					if item.locked then
+						table.insert(relock, item.key)
+					end
+				end
+				for i = 1, #relock, 40 do
+					call("InventoryService", "SetItemsLocked", table.move(relock, i, math.min(i + 39, #relock), 1, {}), false)
+				end
+				if #relock > 0 then
+					task.wait(0.4)
 				end
 				if #list > 6 then
 					lockKeep(true)
@@ -31041,7 +31057,7 @@ local BootOk, BootError = xpcall(function()
 			local FarmAllSet = {
 				"AutoSea", "AutoSell", "AutoEquipBest", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff",
 				"AutoEquipStaff", "AutoBuyDumbbell", "AutoEquipDumbbell", "AutoTrain", "AutoBonus", "AutoRebirth",
-				"AutoPotions", "SmartPotions", "AutoLock", "AutoOffline", "SkipEmpty", "EquipBeforeSell", "SaveForRebirth",
+				"AutoPotions", "SmartPotions", "AutoOffline", "SkipEmpty", "EquipBeforeSell", "SaveForRebirth",
 				"AutoPlaytime", "AutoDaily", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoCodes", "AutoStars",
 			}
 			local FarmAllMain = { "AutoSea", "AutoSell", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff", "AutoBuyDumbbell", "AutoTrain", "AutoRebirth", "AutoPotions" }
@@ -31061,6 +31077,9 @@ local BootOk, BootError = xpcall(function()
 						if option then
 							pcall(option.SetValue, option, value2)
 						end
+					end
+					if Toggles.AutoLock then
+						Toggles.AutoLock:SetValue(false)
 					end
 					log("FARM ALL on, turned on", #FarmAllTurned, "toggles")
 				else
