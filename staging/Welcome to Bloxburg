@@ -32231,14 +32231,20 @@ do
 			return false
 		end
 		N.Job.youngWarned = false
+		if N.Job.startPauseJob == name and os.clock() < (N.Job.startPauseUntil or 0) then
+			setStatus(string.format("%s did not start 3 times, trying again in %d min", name, math.ceil((N.Job.startPauseUntil - os.clock()) / 60)))
+			task.wait(1)
+			return false
+		end
 		if os.clock() - N.Job.lastShiftTry < 8 then
 			return false
 		end
 		N.Job.lastShiftTry = os.clock()
 		if N.currentJob() ~= "" then
-			setStatus("Ending the " .. N.currentJob() .. " shift")
-			callJob(5, "StopWorking")
-			task.wait(1)
+			-- another job's shift: end it for real first (the game refuses StartShift while one is ongoing)
+			if not N.endShift("switch to " .. name) then
+				return false
+			end
 		end
 		setStatus("Going to work: " .. name)
 		callJob(45, "GoToWork", name)
@@ -32248,17 +32254,99 @@ do
 			return N.currentJob() == name
 		end, 5) then
 			Session.shifts += 1
+			N.Job.startFails = 0
 			log("SHIFT started", name, "money", N.money())
 			return true
 		end
-		log("SHIFT did not start", name, tostring(started))
+		log("SHIFT did not start", name, tostring(started), "clocked in:", N.currentJob())
 		setStatus("The shift did not start, trying again")
+		N.Job.startFails = (N.Job.startFails or 0) + 1
+		if N.Job.startFails >= 3 then
+			N.Job.startFails = 0
+			N.Job.startPauseUntil, N.Job.startPauseJob = os.clock() + 300, name
+			log("SHIFT start paused 5 min", name, "3 failures in a row")
+			logProblem(name .. " shift did not start 3 times, paused 5 min")
+		end
 		return false
 	end
-	function N.endShift()
+	-- True while you stand inside the current job's AreaBlock: the game's End Shift button (RequestStopWorking) refuses
+	-- there with "E_LeaveWork" (dump JobHandler line 1192).
+	local function insideWorkArea()
+		local jh = N.jobHandler()
+		local root = N.root()
+		local result = isolated(function()
+			local module = jh:GetCurJobModule()
+			local block = module and module.AreaBlock
+			if not (block and root) then
+				return false
+			end
+			local rel = block.CFrame:Inverse() * root.CFrame
+			local size = block.Size
+			return math.abs(rel.X) - 5 < size.X * 0.5 and math.abs(rel.Y) - 5 < size.Y * 0.5 and math.abs(rel.Z) - 5 < size.Z * 0.5
+		end)
+		return result == true
+	end
+	-- The Job stat must stay empty: StopWorking clears it on the client at once, the server puts it back when it
+	-- refuses the EndShift (log 2026-10-05: 30 "Ending the HighSchoolTeacher shift" in a row, still clocked in).
+	local function endedAfter(seconds)
+		waitFor(function()
+			return N.currentJob() == ""
+		end, seconds)
 		if N.currentJob() ~= "" then
-			callJob(5, "StopWorking")
+			return false
 		end
+		task.wait(1.5)
+		return N.currentJob() == ""
+	end
+	-- Ends the shift through the client's own paths and checks it really ended:
+	-- 1. outside the work area: the End Shift button (JobHandler.RequestStopWorking);
+	-- 2. inside it (or refused): the game's ToPlot teleport home, the client's own shift-area check then clocks you
+	--    out (JobHandler startedWorking: left ShiftArea/ShiftRadius -> StopWorking), then the button once more.
+	-- After 3 failures in a row it stops trying for 5 minutes (no endless retry loop).
+	function N.endShift(why)
+		local job = N.currentJob()
+		if job == "" then
+			return true
+		end
+		local J = N.Job
+		if os.clock() < (J.endPauseUntil or 0) then
+			setStatus(string.format("Cannot end the %s shift, trying again in %d min (End Shift button in the game works too)", job, math.ceil((J.endPauseUntil - os.clock()) / 60)))
+			task.wait(1)
+			return false
+		end
+		setStatus("Ending the " .. job .. " shift")
+		local ok, reason = false, "server kept the shift"
+		if not insideWorkArea() then
+			callJob(5, "RequestStopWorking")
+			if endedAfter(3) then
+				ok, reason = true, "end shift button"
+			end
+		end
+		if not ok and N.goHome then
+			setStatus("Ending the " .. job .. " shift: leaving the workplace")
+			N.goHome(true)
+			if endedAfter(6) then
+				ok, reason = true, "left the workplace"
+			elseif N.currentJob() ~= "" and not insideWorkArea() then
+				callJob(5, "RequestStopWorking")
+				if endedAfter(3) then
+					ok, reason = true, "end shift button after leaving"
+				end
+			end
+		end
+		log("SHIFT end", job, "ok=" .. tostring(ok), "reason=" .. reason, "why=" .. tostring(why or "-"))
+		if ok then
+			J.endFails = 0
+			return true
+		end
+		J.endFails = (J.endFails or 0) + 1
+		if J.endFails >= 3 then
+			J.endFails = 0
+			J.endPauseUntil = os.clock() + 300
+			log("SHIFT end paused 5 min", job, "3 failures in a row")
+			logProblem("Could not end the " .. job .. " shift 3 times, paused 5 min")
+		end
+		return false
 	end
 	-- Delay between actions: Blatant is as fast as the game takes, Legit looks like a fast player.
 	function N.actionDelay()
@@ -37412,10 +37500,16 @@ do
 		end)
 		return id
 	end
-	-- returns food {name, price, id}, list size, and whether it is the daily objective's meal
+	-- returns food {name, price, id, quality}, list size, and whether it is the daily objective's meal.
+	-- Hunger comes from the item's Stats.Quality (dump ItemData: Apple 1, Pear 3, Grilled Cheese 3, Avocado Toast 4;
+	-- Water / Fruit Infused Water / Baby Bottle have none and barely move Hunger: log 2026-10-05 Water 30 s for +5%).
+	-- Best quality first, then the cheaper one, only what money above the reserve pays; foods measured below +3%
+	-- Hunger this session (Q.foodBad) are skipped.
+	Q.foodBad = Q.foodBad or {}
 	local function quickFood()
 		local jh = N.jobHandler()
 		local wantId = N.dailyFoodId()
+		local budget = N.money() - N.reserve()
 		local pick, count = nil, 0
 		isolated(function()
 			local list = {}
@@ -37423,15 +37517,10 @@ do
 				local okHidden, hidden = pcall(item.IsHidden, item, LocalPlayer)
 				local okLocked, locked = pcall(item.IsLocked, item, LocalPlayer)
 				if okHidden and okLocked and not hidden and not locked and not item.PortionItem and not item.PortionItems and not item.CookECPrice then
-					table.insert(list, { name = tostring(item.Name), price = tonumber(item.CookPrice) or 0, skill = tonumber(item.CookSkill) or 0, id = tonumber(item.ID) or 0 })
+					local stats = type(item.Stats) == "table" and item.Stats or {}
+					table.insert(list, { name = tostring(item.Name), price = tonumber(item.CookPrice) or 0, skill = tonumber(item.CookSkill) or 0, id = tonumber(item.ID) or 0, quality = tonumber(stats.Quality) or 0 })
 				end
 			end
-			table.sort(list, function(a, b)
-				if a.skill ~= b.skill then
-					return a.skill < b.skill
-				end
-				return a.price < b.price
-			end)
 			count = #list
 			for _, f in ipairs(list) do
 				if wantId > 0 and f.id == wantId and Q.objQuickFoodOpen then
@@ -37439,7 +37528,19 @@ do
 					return
 				end
 			end
-			pick = list[1]
+			local good = {}
+			for _, f in ipairs(list) do
+				if f.quality > 0 and not Q.foodBad[f.name] and f.price <= budget then
+					table.insert(good, f)
+				end
+			end
+			table.sort(good, function(a, b)
+				if a.quality ~= b.quality then
+					return a.quality > b.quality
+				end
+				return a.price < b.price
+			end)
+			pick = good[1]
 		end)
 		return pick, count, pick ~= nil and wantId > 0 and pick.id == wantId
 	end
@@ -37481,64 +37582,105 @@ do
 		end
 		local started = os.clock()
 		if need == "Hunger" then
-			local food, count, daily = quickFood()
-			if Q.objMeal and not daily then
-				log("OBJ meal", "the daily quick meal (id " .. tostring(N.dailyFoodId()) .. ") is not on your fridge list, skipped for today")
-				Q.objMealSkip = N.dailyFoodId()
+			-- up to 5 quick meals in a row until Hunger reaches the target; each meal's real gain is measured
+			local anyRise = false
+			for meal = 1, 5 do
+				local mealBefore = (N.moods() or {})[need] or before
+				if meal > 1 then
+					if mealBefore >= TARGET - 3 or not keep() or os.clock() > deadline then
+						break
+					end
+					-- the fridge menu again for the next meal
+					if not interact(object.object, Keys[need]) then
+						break
+					end
+				end
+				local food, count, daily = quickFood()
+				if Q.objMeal and not daily then
+					log("OBJ meal", "the daily quick meal (id " .. tostring(N.dailyFoodId()) .. ") is not on your fridge list, skipped for today")
+					Q.objMealSkip = N.dailyFoodId()
+					N.detach()
+					return false
+				end
+				if not food then
+					log("NEEDS no quick food", "list", tostring(count), "money above reserve", N.money() - N.reserve())
+					N.detach()
+					break
+				end
+				local price = food.price
+				if not N.spendOk(price) then
+					log("NEEDS cannot afford", food.name, "$" .. price, "money", N.money(), "reserve", N.reserve())
+					N.detach()
+					break
+				end
+				task.wait(0.6)
+				N.needsFire({ Type = "TakeQuickFood", Name = food.name })
+				local held = waitFor(function()
+					return N.heldName() ~= ""
+				end, 6)
+				if not held then
+					log("NEEDS food", food.name, "$" .. price, "nothing equipped")
+				end
+				task.wait(0.8)
 				N.detach()
-				return false
+				task.wait(0.4)
+				N.needsFire({ Type = "EatEquipped", IsQuick = true })
+				local rising = waitFor(function()
+					local v = N.moods()
+					return v ~= nil and v[need] > mealBefore + 0.5
+				end, 10)
+				if daily then
+					log("OBJ meal", "ate the daily quick meal", food.name)
+					Q.objMealDone = os.clock()
+					task.delay(3, N.objectivesLog, "meal")
+					if Q.objMeal then
+						return true
+					end
+				end
+				-- the gain lands over a few seconds: wait until it stops rising (or 25 s)
+				local last, lastAt = mealBefore, os.clock()
+				waitFor(function()
+					local v = N.moods()
+					local now = v and v[need] or last
+					if now > last + 0.2 then
+						last, lastAt = now, os.clock()
+					end
+					return now >= TARGET or os.clock() - lastAt > 4
+				end, 25)
+				local gain = ((N.moods() or {})[need] or mealBefore) - mealBefore
+				log("NEEDS food", food.name, "hunger +" .. string.format("%.1f", gain), "quality", food.quality, "$" .. price)
+				if gain < 3 then
+					Q.foodBad[food.name] = true
+					log("NEEDS food skipped from now", food.name, "gave only +" .. string.format("%.1f", gain) .. "% Hunger")
+				end
+				anyRise = anyRise or rising or gain >= 1
 			end
-			if not food then
-				log("NEEDS no quick food", "list", tostring(count))
-				N.detach()
-				return false
-			end
-			local price = food.price
-			if not N.spendOk(price) then
-				log("NEEDS cannot afford", food.name, "$" .. price, "money", N.money(), "reserve", N.reserve())
-				N.detach()
-				return false
-			end
-			task.wait(0.6)
-			N.needsFire({ Type = "TakeQuickFood", Name = food.name })
-			local held = waitFor(function()
-				return N.heldName() ~= ""
-			end, 6)
-			log("NEEDS food", food.name, "$" .. price, "held", tostring(N.heldName()), if held then "" else "(nothing equipped)")
-			task.wait(0.8)
-			N.detach()
-			task.wait(0.4)
-			N.needsFire({ Type = "EatEquipped", IsQuick = true })
-			local rising = waitFor(function()
-				local v = N.moods()
-				return v ~= nil and v[need] > before + 0.5
-			end, 10)
-			if not rising and not (Q.objMeal and before >= 90) then
-				log("NEEDS unsupported", object.name, need, "did not rise in 10 s after eating", food.name)
+			if not anyRise and not (Q.objMeal and before >= 90) then
+				log("NEEDS unsupported", object.name, need, "did not rise after eating")
 				return false, "unsupported"
 			end
-			if daily then
-				log("OBJ meal", "ate the daily quick meal", food.name)
-				Q.objMealDone = os.clock()
-				task.delay(3, N.objectivesLog, "meal")
-				if Q.objMeal then
-					return true
-				end
-			end
-			waitFor(function()
-				local v = N.moods()
-				return v ~= nil and v[need] >= math.min(TARGET, before + 15)
-			end, 25)
 			task.wait(1)
 		else
 			local attached = waitFor(function()
 				return N.attachWeld() ~= nil
 			end, 5)
+			-- watching TV does not seat you (log 2026-10-05: Fun 0 -> 30% while "not attached after button I_Watch"):
+			-- without a seat the need's own rise is the proof of use
+			local standing = false
 			if not attached then
-				log("NEEDS unsupported", object.name, need, "not attached after button", tostring(title))
-				N.detach()
-				return false, "unsupported"
+				if waitFor(function()
+					local v0, r0 = N.moods()
+					return v0 ~= nil and ((r0 and (r0[need] or 0) > 0) or (v0[need] or 0) > before + 0.5)
+				end, 4) then
+					standing = true
+					log("NEEDS using", object.name, need, "without a seat, rising")
+				else
+					log("NEEDS unsupported", object.name, need, "not attached after button", tostring(title))
+					N.detach()
+					return false, "unsupported"
+				end
 			end
+			local lastV, lastRiseAt = before, os.clock()
 			-- the need must start rising within 10 s (the game's Rate turns positive, or the value goes up)
 			local rising = waitFor(function()
 				local v, r = N.moods()
@@ -37561,7 +37703,15 @@ do
 					log("NEEDS time cap", need, "at", math.floor(v), "% after", math.floor(os.clock() - started), "s")
 					break
 				end
-				if N.attachWeld() == nil and os.clock() - started > 8 then
+				if v > lastV + 0.2 then
+					lastV, lastRiseAt = v, os.clock()
+				end
+				if standing then
+					if os.clock() - lastRiseAt > 12 then
+						log("NEEDS stopped rising", need, "at", math.floor(v), "%")
+						break
+					end
+				elseif N.attachWeld() == nil and os.clock() - started > 8 then
 					log("NEEDS detached early", need, "at", math.floor(v), "%")
 					break
 				end
@@ -38409,6 +38559,10 @@ do
 			parts.job = "Work " .. objective .. " for daily task 1"
 			return
 		end
+		if N.jobAuto and not N.jobAuto() then
+			parts.job = "Work " .. optionText("JobPick", "Hairdresser") .. " (your choice)"
+			return
+		end
 		if P.lastPick and P.pickRate then
 			local measuring = P.text and string.find(P.text, "measuring", 1, true) ~= nil
 			parts.job = string.format("Work %s, %s/h over 24 h%s", P.lastPick, money(P.pickRate), if measuring then " (measuring)" else "")
@@ -38605,14 +38759,14 @@ do
 	local JobBox = Tabs.Jobs:AddLeftGroupbox("Job Farm", "briefcase")
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Hairdresser", "BloxBurgers Cashier", "BloxBurgers Line Cook (beta)", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Fisherman (beta)", "Woodcutter (beta)", "Taxi (beta)" },
-		Default = "Hairdresser",
-		Tooltip = "The job Auto Work does. With Best Pay on, Corvus picks the job itself",
+		Values = { "Auto (best pay)", "Hairdresser", "BloxBurgers Cashier", "BloxBurgers Line Cook (beta)", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Fisherman (beta)", "Woodcutter (beta)", "Taxi (beta)" },
+		Default = "Auto (best pay)",
+		Tooltip = "The job Auto Work does. Auto (best pay) = Corvus picks the job worth the most. A job you pick here always wins, also over Smart Planner and Best Pay",
 	})
 	JobBox:AddToggle("BestPay", {
 		Text = "Best Pay",
 		Default = false,
-		Tooltip = "Measures every job's real pay and level rewards and switches to the one worth the most over the next 24 h. Off = always the job above",
+		Tooltip = "Measures every job's real pay and level rewards and with Job on Auto (best pay) switches to the one worth the most over the next 24 h. A job you pick above always wins",
 	})
 	JobBox:AddDropdown("JobSpeed", {
 		Text = "Speed",
@@ -38628,7 +38782,7 @@ do
 	JobBox:AddButton({
 		Text = "End Shift",
 		Func = function()
-			task.spawn(N.endShift)
+			task.spawn(N.endShift, "End Shift button")
 		end,
 	})
 	local ObjBox = Tabs.Jobs:AddLeftGroupbox("Daily Objectives", "target")
@@ -39470,9 +39624,21 @@ do
 	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep, ["Pizza Delivery"] = N.deliveryStep, Miner = N.minerStep, ["BloxBurgers Cashier"] = N.bbCashierStep, ["BloxBurgers Line Cook (beta)"] = N.cookStep, Teacher = N.teacherStep, ["Taxi (beta)"] = N.taxiStep, ["Fisherman (beta)"] = N.fishStep, ["Woodcutter (beta)"] = N.woodStep }
 	local wasWorking, lastPick, lastWhy = false, nil, nil
 	-- which job Auto Work does: the open daily objective job task first, then Best Pay, then the dropdown
+	local respectLogged = nil
+	function N.jobAuto()
+		local pick = optionText("JobPick", "Auto (best pay)")
+		return pick == "Auto (best pay)" or pick == "Best Pay (auto)" or JobSteps[pick] == nil
+	end
+	-- The player's Job dropdown always wins (owner 2026-10-05: "Hairdresser selected, it picks Teacher"). Smart
+	-- Planner and Best Pay choose only while it is on "Auto (best pay)"; the daily objective detour too, unless the
+	-- player switched Daily Objectives on himself.
 	function N.workPick()
+		local auto = N.jobAuto()
 		local objective = N.objectiveJob()
 		if objective and N.planOn() and N.smartObjectiveWorth and not N.smartObjectiveWorth(objective) then
+			objective = nil
+		end
+		if objective and not auto and not on("Objectives") then
 			objective = nil
 		end
 		if objective then
@@ -39482,9 +39648,14 @@ do
 			end
 			return objective, "objective"
 		end
-		local pick = optionText("JobPick", "Hairdresser")
-		if N.bestOn() or pick == "Best Pay (auto)" then
+		if auto then
+			respectLogged = nil
 			return N.bestJobPick(), "best pay"
+		end
+		local pick = optionText("JobPick", "Hairdresser")
+		if N.bestOn() and respectLogged ~= pick then
+			respectLogged = pick
+			log("PLAN job respects player choice", pick)
 		end
 		return pick, "job pick"
 	end
@@ -39528,11 +39699,12 @@ do
 		if working then
 			wasWorking = true
 			local pick, why = N.workPick()
-			if why ~= lastWhy then
-				log("WORK pick", tostring(pick), "by", tostring(why))
+			if why ~= lastWhy or pick ~= lastPick then
+				log("WORK pick", tostring(pick), "by", tostring(why), "clocked in:", N.currentJob())
 				lastWhy = why
 			end
 			if lastPick and pick ~= lastPick then
+				log("WORK switch", tostring(lastPick), "->", tostring(pick))
 				-- switching jobs: leave the old one cleanly (taxi controls, till)
 				N.taxiRelease()
 				N.bbLeave()
@@ -39666,7 +39838,7 @@ do
 			local objective = N.objectiveJob()
 			if objective then
 				table.insert(lines, "Work " .. objective .. " for the daily objective")
-			elseif N.bestOn() then
+			elseif N.jobAuto() then
 				local P = N.Plan
 				if P.lastPick and P.pickRate and P.pickRate > 0 then
 					table.insert(lines, string.format("Work %s (best pay $%s/h)", P.lastPick, formatNumber(math.floor(P.pickRate))))
