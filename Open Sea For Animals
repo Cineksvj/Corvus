@@ -27944,6 +27944,12 @@ local BootOk, BootError = xpcall(function()
 			if info.rarity ~= "?" and not allows(Options[prefix .. "Rarities"], info.rarity) then
 				return false
 			end
+			if prefix == "Catch" and info.kind ~= "Egg" then
+				local pick = Options.CatchAnimals and Options.CatchAnimals.Value
+				if type(pick) == "table" and next(pick) ~= nil and pick[info.name] ~= true then
+					return false
+				end
+			end
 			if not allows(Options[prefix .. "Mutations"], MutationNames[info.mutation] or info.mutation) then
 				return false
 			end
@@ -31964,7 +31970,7 @@ local BootOk, BootError = xpcall(function()
 					end
 					for _, pair in ipairs({
 						{ "CatchRarities", all }, { "EggRarities", all }, { "CatchKinds", { Animals = true, Eggs = true } },
-						{ "CatchMinValue", "" }, { "EggOrder", "Smart" }, { "SeaPriority", "Best Value" },
+						{ "CatchMinValue", "" }, { "CatchAnimals", {} }, { "EggOrder", "Smart" }, { "SeaPriority", "Best Value" },
 					}) do
 						local option = Options[pair[1]]
 						if option then
@@ -32115,6 +32121,43 @@ local BootOk, BootError = xpcall(function()
 				"CatchRarities",
 				{ Text = "Rarities", Values = RarityList, Default = RarityList, Multi = true, AllowNull = true, Searchable = true }
 			)
+			do
+				local animalNames, seenName = {}, {}
+				for _, cfg in pairs(Brainrots) do
+					if type(cfg) == "table" then
+						local name = tostring(cfg.name or "")
+						if name ~= "" and not seenName[name] then
+							seenName[name] = true
+							table.insert(animalNames, { name = name, rank = RarityRank[cfg.rarity] or 0 })
+						end
+					end
+				end
+				table.sort(animalNames, function(a, b)
+					if a.rank ~= b.rank then
+						return a.rank < b.rank
+					end
+					return a.name < b.name
+				end)
+				local animalValues = {}
+				for _, item in ipairs(animalNames) do
+					table.insert(animalValues, item.name)
+				end
+				FilterBox:AddDropdown("CatchAnimals", {
+					Text = "Animals",
+					Values = animalValues,
+					Default = {},
+					Multi = true,
+					AllowNull = true,
+					Searchable = true,
+					Tooltip = "Catch only these animals. Leave empty (or select all) to catch every animal",
+				})
+				FilterBox:AddButton({
+					Text = "Clear Animals",
+					Func = function()
+						Options.CatchAnimals:SetValue({})
+					end,
+				})
+			end
 			FilterBox:AddDropdown(
 				"CatchMutations",
 				{ Text = "Mutations", Values = MutationLabels, Default = MutationLabels, Multi = true, AllowNull = true }
