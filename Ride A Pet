@@ -31250,6 +31250,26 @@ Options.FarmRarities:SetValue(N.rarityPick("Common"))
 end,
 })
 local MoveBox = Tabs.Main:AddRightGroupbox("Movement", "wind")
+MoveBox:AddButton({
+Text = "Recommended Settings",
+Tooltip = "Safe riding, terrain path and a bigger return margin: the server never sends you back or fails a delivery",
+Func = function()
+for name, value in pairs({ MoveMode = "Safe", SafePercent = 90, TravelPath = "Over terrain", ReturnMargin = 3, PickupDelay = 0.3, MaxDistance = 0, FarmPriority = "Best Value" }) do
+local option = Options[name]
+if option then
+pcall(option.SetValue, option, value)
+end
+end
+for name, value in pairs({ RidePet = true, WaitOnPlot = true, TeleportIfFar = false }) do
+local toggle = Toggles[name]
+if toggle then
+pcall(toggle.SetValue, toggle, value)
+end
+end
+log("SETTINGS recommended applied")
+notify("Corvus", "Recommended settings on: Safe riding, terrain path, 3s return margin", 5)
+end,
+})
 MoveBox:AddDropdown("MoveMode", {
 Text = "Mode",
 Values = { "Safe", "Fast", "Blatant" },
@@ -33767,7 +33787,28 @@ if on("WaitOnPlot") then
 N.goHome("Heading home to wait for eggs")
 end
 local left = Farm.cycleLeft
-setStatus("Waiting for eggs" .. (if left then ", new ones in " .. clockText(left) else ""))
+local matching, tooFar, best = 0, 0, nil
+local root = rootPart()
+if root then
+for _, info in ipairs(N.worldEggs()) do
+if not N.skipped(info.id) and N.eggWanted(info) then
+matching += 1
+local ok, _, back = N.reachInfo(info, root.Position)
+if not ok then
+tooFar += 1
+if not best or back < best.back then
+best = { back = back, limit = info.breakSeconds, name = info.name }
+end
+end
+end
+end
+end
+if matching > 0 and tooFar == matching and best then
+-- every egg you want is too heavy or too far to carry home on time at riding speed
+setStatus(string.format("%d egg(s) match but none can reach your plot before breaking (best: %s needs %ds, breaks in %ds). Lower Min KG, pick lighter eggs or use Fast", matching, best.name, math.ceil(best.back), math.floor(best.limit)))
+else
+setStatus("Waiting for eggs" .. (if left then ", new ones in " .. clockText(left) else "") .. (if matching > 0 then string.format(" (%d match, %d too far)", matching, tooFar) else ""))
+end
 task.wait(0.8)
 return
 end
@@ -34331,6 +34372,7 @@ Boot.CorvusBooting = nil
 if not BootOk then
 local report = "[Corvus] Ride A Pet failed to start:\n" .. tostring(BootError)
 warn(report)
+Boot.CorvusLastError = report
 local copied = pcall(setclipboard, report)
 pcall(function()
 game:GetService("StarterGui"):SetCore("SendNotification", {
