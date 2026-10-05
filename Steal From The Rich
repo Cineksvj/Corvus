@@ -29091,7 +29091,8 @@ if not (folder and root) then
 return nil
 end
 local best, bestScore
-local priority = Options.StealPriority and Options.StealPriority.Value or "Best Rarity"
+local priority = Options.StealPriority and Options.StealPriority.Value or "Best Value"
+local safe = safeSpot()
 for _, crate in ipairs(folder:GetChildren()) do
 local failedUntil = FailedCrates[crate.Name]
 if failedUntil and failedUntil < os.clock() then
@@ -29108,8 +29109,14 @@ local score
 if priority == "Nearest" then
 score = -distance
 else
+if priority == "Best Value" and Plan.crateScore then
+local ok, value = pcall(Plan.crateScore, crate, area, rarity, root, safe)
+score = ok and value or nil
+end
+if not score then
 local rank = (AreaById[area] and AreaById[area].Order or 0) * 100 + (CrateRarities.rank[rarity] or 0)
 score = rank * 100000 - distance
+end
 end
 if not bestScore or score > bestScore then
 best, bestScore = { crate = crate, prompt = prompt, area = area, rarity = rarity }, score
@@ -29197,6 +29204,9 @@ if LastStealRarity then
 Session.rarities[LastStealRarity] = (Session.rarities[LastStealRarity] or 0) + 1
 end
 Track.stolen(LastStealRarity, LastStealArea, StealStartedAt and os.clock() - StealStartedAt)
+if Plan.endTrip then
+Plan.endTrip(StealStartedAt and os.clock() - StealStartedAt)
+end
 log(
 "STEAL ok",
 LastStealRarity,
@@ -29283,6 +29293,9 @@ setStatus(
 "Stealing " .. target.rarity .. " crate in " .. (AreaById[target.area] and AreaById[target.area].DisplayName or target.area)
 )
 StealStartedAt = os.clock()
+if Plan.startTrip then
+Plan.startTrip(target)
+end
 local position = promptPosition(target.prompt) or target.crate:GetPivot().Position
 local spot = position
 local function crateStillThere()
@@ -29817,12 +29830,23 @@ return
 end
 local cash = money()
 local pick
-for _, candidate in ipairs(Plan.candidates()) do
-if candidate.kind == "trail" then
-pick = candidate
+if Plan.smart() and Plan.ready then
+for _, option in ipairs(Plan.list) do
+if option.kind == "trail" and option.cost <= cash and Plan.check(option.cost, option.gain) then
+pick = option
+break
 end
 end
-if pick and pick.cost <= cash and Plan.allow("trail", pick.cost) then
+else
+local mult = Plan.mult()
+for _, trail in ipairs(Trails) do
+if not TrailState.Owned[trail.Id] and (trail.Multiplier or 0) > mult then
+pick = { name = trail.Name or trail.Id, id = trail.Id, cost = trail.Cost or math.huge }
+break
+end
+end
+end
+if pick and pick.cost <= cash then
 log("BUY trail", pick.name, "for $" .. formatNumber(pick.cost))
 fire("TRAIL_BUY", pick.id)
 task.wait(0.5)
@@ -30057,7 +30081,7 @@ local points = tonumber(state.points) or 0
 local best
 for _, crate in ipairs(type(state.crates) == "table" and state.crates or {}) do
 if type(crate) == "table" and crate.Uid and crate.Charge == nil and crate.InMachine ~= true and crate.Blocked ~= true then
-if not best or tierRank(crate.Tier) > tierRank(best.Tier) then
+if not best or Plan.rowScore(crate, tierRank(crate.Tier)) > Plan.rowScore(best, tierRank(best.Tier)) then
 best = crate
 end
 end
@@ -30067,7 +30091,7 @@ ThunderNext = os.clock() + 60
 setStatus("Thunder Machine: no crate left to charge")
 return true
 end
-local spend = math.floor(math.min(points, chargeTarget(config), config.MAX_CHARGE or 1500))
+local spend = Plan.chargeSpend(points, config) or math.floor(math.min(points, chargeTarget(config), config.MAX_CHARGE or 1500))
 if spend < (config.MIN_SPEND or 1000) then
 ThunderNext = os.clock() + 30
 setStatus("Thunder Machine: not enough storm points yet")
@@ -30099,6 +30123,7 @@ local Bless = { next = 0, points = nil, min = nil, max = nil, open = nil, result
 do
 task.spawn(onNet, "BLESSING_POINTS", function(gain, total)
 Bless.points = tonumber(total) or Bless.points
+Bless.gained = (Bless.gained or 0) + math.max(tonumber(gain) or 0, 0)
 Bless.next = math.min(Bless.next, os.clock() + 5)
 log("BLESS points", tostring(gain), "total", tostring(total))
 end)
@@ -30138,7 +30163,7 @@ if type(row) == "table" then
 local uid = row.Uid or row.uid
 if uid ~= nil and row.Blocked ~= true then
 local tier = row.Tier or crateTierOf(uid)
-local score = blessRank(tier) * 1e6 + (tonumber(row.kg or row.Kg) or 0)
+local score = Plan.rowScore(row, blessRank(tier) * 1e6 + (tonumber(row.kg or row.Kg) or 0))
 if not bestScore or score > bestScore then
 bestUid, bestTier, bestScore = uid, tier, score
 end
@@ -30202,7 +30227,7 @@ Bless.next = now + 1200
 logEvery("blessunknown", 3600, "BLESS points unknown, waiting for the first BLESSING_POINTS event")
 return false
 end
-if Bless.points < (Bless.min or 30) then
+if Bless.points < (Bless.min or (ItemData and type(ItemData.Blessing) == "table" and tonumber(ItemData.Blessing.MinPoints)) or 30) then
 Bless.next = now + 600
 return false
 end
@@ -30222,7 +30247,8 @@ Bless.next = now + 600
 log("BLESS no crate to bless")
 return true
 end
-local spend = math.floor(math.min(Bless.points, Bless.max or 90))
+local blessMin = Bless.min or (ItemData and type(ItemData.Blessing) == "table" and tonumber(ItemData.Blessing.MinPoints)) or 30
+local spend = blessMin + Plan.blessExtra(Bless.points, blessMin, (Bless.max or Bless.points) - blessMin)
 log("BLESS try (remote)", tostring(tier), "spend", spend)
 local result = invokeWithTimeout(rf, 10, "bless", uid, spend)
 if type(result) == "table" and result.ok then
@@ -30278,7 +30304,7 @@ if points < base then
 log("BLESS not enough points", tostring(points), "need", tostring(base))
 return true
 end
-local extra = math.max(0, math.floor(math.min(tonumber(open.maximumextra) or 0, points - base)))
+local extra = Plan.blessExtra(points, base, tonumber(open.maximumextra) or 0)
 if extra > 0 then
 task.wait(5.3)
 local better = ask("quote", "mutation", uid, extra)
@@ -30377,11 +30403,18 @@ if os.clock() < FuseNext then
 return false
 end
 local cash = money()
-local job
+local job, jobRatio
 for _, candidate in ipairs(fuseCandidates()) do
-if candidate.fee <= cash and (not Plan.smart() or candidate.fee * 4 <= cash) then
+if candidate.fee <= cash then
+if not Plan.smart() then
 job = candidate
 break
+end
+local gain = Plan.fuseGain(candidate.tools)
+if gain and Plan.check(candidate.fee, gain) and (not jobRatio or gain / math.max(candidate.fee, 1) > jobRatio) then
+job, jobRatio = candidate, gain / math.max(candidate.fee, 1)
+candidate.gain = gain
+end
 end
 end
 if not job then
@@ -30396,7 +30429,7 @@ for _, tool in ipairs(job.tools) do
 table.insert(uids, tool:GetAttribute("ItemUid"))
 end
 local before = #toolsWith("ItemUid")
-log("FUSE", job.name, "fee $" .. formatNumber(job.fee))
+log("FUSE", job.name, "fee $" .. formatNumber(job.fee), job.gain and ("expected gain $" .. formatNumber(job.gain)) or "")
 fire("FUSE_ITEMS", uids)
 if waitFor(function()
 return #toolsWith("ItemUid") < before
@@ -30416,6 +30449,12 @@ return true
 end
 end
 do
+local HORIZON = 86400
+local SellSeconds = ItemData and type(ItemData.Sell) == "table" and tonumber(ItemData.Sell.ItemSeconds) or 1200
+local V = { dists = {}, values = {}, present = {}, plot = { free = 1, min = 0, used = 0 }, calib = 1, calibN = 0, zones = {}, pos = nil, pending = nil }
+Plan.V = V
+Plan.list, Plan.best, Plan.time, Plan.ready = {}, nil, nil, false
+Plan.orbSec, Plan.orbPts, Plan.pointValue, Plan.planKey = 0, 0, 0, nil
 function Plan.on(name)
 local toggle = Toggles[name]
 return toggle ~= nil and toggle.Value == true
@@ -30424,7 +30463,7 @@ function Plan.smart()
 return Plan.on("SmartSpend")
 end
 function Plan.mult()
-local best = 1
+local best = tonumber(LocalPlayer:GetAttribute("TrailMultiplier")) or 1
 for _, trail in ipairs(Trails) do
 if TrailState.Owned[trail.Id] and (trail.Multiplier or 0) > best then
 best = trail.Multiplier
@@ -30444,60 +30483,752 @@ function Plan.speedRate()
 local current = Plan.treadmill()
 return (current and tonumber(current.GainPerSecond) or 5) * Plan.mult()
 end
-function Plan.candidates()
-local list = {}
-local current, nextTier = Plan.treadmill()
-if current and nextTier and tonumber(nextTier.Cost) then
-table.insert(list, {
-kind = "treadmill",
-name = nextTier.Name or "next treadmill",
-cost = nextTier.Cost,
-rel = (tonumber(nextTier.GainPerSecond) or 0) / math.max(tonumber(current.GainPerSecond) or 1, 1) - 1,
+function Plan.horizon()
+return HORIZON
+end
+local function canonicalArea(id)
+if id == nil then
+return nil
+end
+if AreaData and type(AreaData.LEGACY_IDS) == "table" and AreaData.LEGACY_IDS[id] then
+return AreaData.LEGACY_IDS[id]
+end
+return id
+end
+local function parseMoney(text)
+local clean = string.gsub(tostring(text or ""), "[,%$%s]", "")
+local number, suffix = string.match(clean, "^([%d%.]+)(%a*)$")
+number = tonumber(number)
+if not number then
+return nil
+end
+if suffix == "" then
+return number
+end
+for index, name in ipairs(Suffixes) do
+if name ~= "" and string.lower(name) == string.lower(suffix) then
+return number * 1000 ^ (index - 1)
+end
+end
+return nil
+end
+local function itemArea(id)
+if not (ItemData and type(ItemData.Areas) == "table") then
+return nil
+end
+for _, area in ipairs(ItemData.Areas) do
+if area.Id == id then
+return area
+end
+end
+return nil
+end
+function V.dist(areaId, tier, size)
+local key = tostring(areaId) .. "|" .. tostring(tier) .. "|" .. tostring(size)
+local cached = V.dists[key]
+if cached ~= nil then
+return cached or nil
+end
+local list = false
+pcall(function()
+local id = canonicalArea(areaId)
+local area = itemArea(id)
+if not (area and type(area.Items) == "table" and #area.Items > 0) then
+return
+end
+local weights = {}
+local isRarity = false
+if type(ItemData.IsRarityCrate) == "function" then
+local ok, result = pcall(ItemData.IsRarityCrate, ItemData, id, tier)
+isRarity = ok and result == true
+end
+if isRarity then
+local wanted, index = string.upper(tostring(tier)), nil
+for i, info in ipairs(ItemData.Tiers or {}) do
+if string.upper(tostring(info.Id)) == wanted or string.upper(tostring(info.Name)) == wanted then
+index = i
+end
+end
+local same = {}
+for _, item in ipairs(area.Items) do
+if item.Tier == index then
+table.insert(same, item)
+end
+end
+table.sort(same, function(a, b)
+return a.Income < b.Income
+end)
+local top = tonumber(ItemData.RARITY_PAIR_TOP_SHARE) or 0.35
+for i, item in ipairs(same) do
+weights[item] = if #same == 1 then 1 elseif i == #same then top else (1 - top) / (#same - 1)
+end
+else
+local crateTierId = "RARE"
+if type(ItemData.ResolveCrateTier) == "function" then
+local ok, result = pcall(ItemData.ResolveCrateTier, ItemData, id, tier)
+if ok and result then
+crateTierId = result
+end
+end
+local crateTier
+for _, info in ipairs(ItemData.CrateTiers or {}) do
+if info.Id == crateTierId then
+crateTier = info
+end
+end
+if not (crateTier and type(crateTier.Weights) == "table") then
+return
+end
+for i, item in ipairs(area.Items) do
+local weight = crateTier.Weights[item.Slot or i] or 0
+if weight > 0 then
+weights[item] = weight
+end
+end
+end
+local total = 0
+for _, weight in pairs(weights) do
+total += weight
+end
+if total <= 0 then
+return
+end
+local sizeInfo
+for _, info in ipairs(ItemData.CrateSizes or {}) do
+if info.Id == size then
+sizeInfo = info
+end
+end
+local sizes, sizeTotal = {}, 0
+for i, info in ipairs(ItemData.Sizes or {}) do
+local weight = (sizeInfo and type(sizeInfo.SizeWeights) == "table" and sizeInfo.SizeWeights[i]) or info.Weight or 0
+sizeTotal += weight
+table.insert(sizes, {
+w = weight,
+mult = ((info.MultMin or info.Mult or 1) + (info.MultMax or info.Mult or 1)) / 2,
+time = info.TimeMult or 1,
 })
 end
-if TrailState.known then
+if sizeTotal <= 0 then
+sizes, sizeTotal = { { w = 1, mult = 1, time = 1 } }, 1
+end
+local conds, condTotal = {}, 0
+for _, info in ipairs(ItemData.Conditions or {}) do
+condTotal += info.Weight or 0
+table.insert(conds, { w = info.Weight or 0, mult = info.Mult or 1, time = info.TimeMult or 1 })
+end
+if condTotal <= 0 then
+conds, condTotal = { { w = 1, mult = 1, time = 1 } }, 1
+end
+local tierTime = type(ItemData.TierTime) == "table" and ItemData.TierTime or {}
+local maxTime = tonumber(ItemData.MAX_APPRAISAL) or HORIZON
+local out = {}
+for item, weight in pairs(weights) do
+for _, s in ipairs(sizes) do
+for _, c in ipairs(conds) do
+local p = (weight / total) * (s.w / sizeTotal) * (c.w / condTotal)
+if p > 0 then
+table.insert(out, {
+p = p,
+income = (tonumber(item.Income) or 0) * s.mult * c.mult,
+time = math.min((tierTime[item.Tier] or 0) * s.time * c.time, maxTime),
+})
+end
+end
+end
+end
+list = out
+end)
+V.dists[key] = list
+return list or nil
+end
+function V.plotState()
+local floor = myFloor()
+local incomes, used = {}, 0
+for _, child in ipairs(floor and floor:GetChildren() or {}) do
+if child.Name == "ItemStand" then
+used += 1
+local income = tonumber(child:GetAttribute("IncomePerSecond"))
+if income then
+table.insert(incomes, income)
+end
+elseif child.Name == "AppraisingCrate" then
+used += 1
+end
+end
+table.sort(incomes)
+local cap = tonumber(LocalPlayer:GetAttribute("UnlockedPlotSlots"))
+local free
+if os.clock() < PlotFullUntil then
+free = 0
+elseif cap then
+free = math.max(cap - used, 0)
+else
+free = 1
+end
+return { free = free, min = incomes[1] or 0, used = used, cap = cap }
+end
+function V.item(income, appraise)
+local plot = V.plot
+local left = math.max(Plan.horizon() - (appraise or 0), 0)
+local sell = income * SellSeconds
+local keep = 0
+if plot.free > 0 then
+keep = income * left
+elseif income > plot.min then
+keep = (income - plot.min) * left + plot.min * SellSeconds
+end
+return math.max(sell, keep)
+end
+function V.crate(areaId, tier, size)
+local key = tostring(areaId) .. "|" .. tostring(tier) .. "|" .. tostring(size)
+local hit = V.values[key]
+if hit then
+return hit[1], hit[2]
+end
+local list = V.dist(areaId, tier, size)
+if not list then
+return nil, nil
+end
+local value, income = 0, 0
+for _, entry in ipairs(list) do
+value += entry.p * V.item(entry.income, entry.time)
+income += entry.p * entry.income
+end
+V.values[key] = { value, income }
+return value, income
+end
+function V.walk(level)
+local speed
+if SpeedData and type(SpeedData.GetSpeedFromLevel) == "function" then
+local ok, result = pcall(SpeedData.GetSpeedFromLevel, SpeedData, math.floor(tonumber(level) or 0))
+if ok then
+speed = tonumber(result)
+end
+end
+if not speed then
+local hum = humanoid()
+speed = hum and hum.WalkSpeed or 16
+end
+local cap = SpeedData and tonumber(SpeedData.MAX_WALK_SPEED)
+if cap then
+speed = math.min(speed, cap)
+end
+return math.max(speed, 1)
+end
+function V.carry(size)
+local carrying = SpeedData and type(SpeedData.Modifiers) == "table" and tonumber(SpeedData.Modifiers.Carrying) or 1
+local mult = 1
+for _, info in ipairs(ItemData and ItemData.CrateSizes or {}) do
+if info.Id == size then
+mult = tonumber(info.CarryMult) or 1
+end
+end
+return math.max(carrying * mult, 0.05)
+end
+function V.raw(outDist, backDist, size, level)
+local speed = V.walk(level)
+return outDist / speed + backDist / (speed * V.carry(size))
+end
+function V.trip(raw)
+return V.calib * raw + 1
+end
+function V.zoneDist(areaId)
+if not V.pos then
+local sums = {}
+for _, part in ipairs(Nav.arenaParts()) do
+local id = canonicalArea(part:GetAttribute("AreaId"))
+if id then
+local sum = sums[id] or { x = 0, z = 0, n = 0 }
+sum.x += part.Position.X
+sum.z += part.Position.Z
+sum.n += 1
+sums[id] = sum
+end
+end
+if next(sums) ~= nil then
+V.pos = {}
+for id, sum in pairs(sums) do
+V.pos[id] = Vector3.new(sum.x / sum.n, 0, sum.z / sum.n)
+end
+end
+end
+local pos = V.pos and V.pos[areaId]
+if not pos then
+return nil
+end
+local safe = safeSpot()
+return (Vector3.new(pos.X, safe.Y, pos.Z) - safe).Magnitude
+end
+function V.scanCrates()
+V.present = {}
+local folder = workspace:FindFirstChild("Crates")
+local safe = safeSpot()
+for _, crate in ipairs(folder and folder:GetChildren() or {}) do
+if crate:IsA("Model") and crate:GetAttribute("IsCrate") ~= false then
+local area, tier = crateInfo(crate)
+if area and tier then
+local size = crate:GetAttribute("CrateSize") or "STANDARD"
+local value, income = V.crate(area, tier, size)
+if value then
+local entry = V.present[area] or { n = 0, value = 0, income = 0, dist = 0 }
+entry.n += 1
+entry.value += value
+entry.income += income
+entry.dist += (crate:GetPivot().Position - safe).Magnitude
+V.present[area] = entry
+end
+end
+end
+end
+end
+function V.zoneRate(area, level)
+local id = area.Id
+local present = V.present[id]
+local value, income, dist
+if present and present.n > 0 then
+value, income, dist = present.value / present.n, present.income / present.n, present.dist / present.n
+else
+local sum, incomeSum, count = 0, 0, 0
+for _, tier in ipairs(type(area.CrateTiers) == "table" and area.CrateTiers or {}) do
+local v, i = V.crate(id, tier, "STANDARD")
+if v then
+sum += v
+incomeSum += i
+count += 1
+end
+end
+if count == 0 then
+return nil, nil
+end
+value, income, dist = sum / count, incomeSum / count, V.zoneDist(id)
+end
+local trip
+local measured = V.zones[id]
+if measured then
+trip = measured.dist / V.walk(level)
+elseif dist then
+trip = V.trip(V.raw(dist, dist, "STANDARD", level))
+else
+return nil, nil
+end
+return value / math.max(trip, 0.5), income
+end
+function Plan.zoneWanted(id)
+if not (Options.StealZones and type(Options.StealZones.Value) == "table") then
+return true
+end
+for label, zoneId in pairs(ZoneByLabel) do
+if zoneId == id then
+return selected(Options.StealZones, label)
+end
+end
+return false
+end
+function Plan.crateScore(crate, area, rarity, root, safe)
+local size = crate:GetAttribute("CrateSize") or "STANDARD"
+local value = V.crate(area, rarity, size)
+if not value then
+return nil
+end
+local pos = crate:GetPivot().Position
+local level = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
+return value / V.trip(V.raw((pos - root.Position).Magnitude, (pos - safe).Magnitude, size, level))
+end
+function Plan.startTrip(target)
+V.pending = nil
+pcall(function()
+local root = rootPart()
+local pos = target.crate:GetPivot().Position
+local size = target.crate:GetAttribute("CrateSize") or "STANDARD"
+local level = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
+V.pending = {
+area = target.area,
+level = level,
+raw = V.raw(root and (pos - root.Position).Magnitude or 0, (pos - safeSpot()).Magnitude, size, level),
+value = V.crate(target.area, target.rarity, size) or 0,
+}
+end)
+end
+function Plan.endTrip(seconds)
+local trip = V.pending
+V.pending = nil
+if not (trip and seconds and seconds > 0) then
+return
+end
+if trip.raw > 0.5 then
+local ratio = math.max(seconds - 1, 0.1) / trip.raw
+V.calib = (V.calib * V.calibN + ratio) / (V.calibN + 1)
+V.calibN = math.min(V.calibN + 1, 19)
+end
+local zone = V.zones[trip.area] or { dist = seconds * V.walk(trip.level), value = trip.value, n = 0 }
+local weight = 1 / math.min(zone.n + 1, 10)
+zone.dist += (seconds * V.walk(trip.level) - zone.dist) * weight
+zone.value += (trip.value - zone.value) * weight
+zone.n += 1
+zone.rate = zone.value / math.max(zone.dist / V.walk(trip.level), 0.5)
+V.zones[trip.area] = zone
+end
+function Plan.orbSample(seconds, points)
+if seconds > 0 and seconds < 30 then
+Plan.orbSec = Plan.orbSec * 0.995 + seconds
+Plan.orbPts = Plan.orbPts * 0.995 + math.max(points or 0, 0)
+end
+end
+function Plan.stormMult(points)
+local config = Storm and Storm.config
+if not (type(config) == "table" and type(config.chances) == "function") then
+return nil
+end
+local ok, charged, cell = pcall(config.chances, points)
+if not ok or not charged then
+return nil
+end
+local mults = ItemData and type(ItemData.StormMutations) == "table" and ItemData.StormMutations or {}
+local three, six = tonumber(mults.Supercharged) or 3, tonumber(mults.Supercell) or 6
+cell = tonumber(cell) or 0
+return cell * six + (1 - cell) * (charged * three + (1 - charged))
+end
+function Plan.chargeSpend(points, config)
+if not Plan.smart() then
+return nil
+end
+local low = tonumber(config.MIN_SPEND) or 1000
+local high = math.min(points, tonumber(config.MAX_CHARGE) or low)
+local base = Plan.stormMult(low)
+if not base or points < low then
+return nil
+end
+local orbRate = if Plan.orbSec > 0 then Plan.orbPts / Plan.orbSec else 0
+local stormShare = 300 / 1200
+local perPoint = (base - 1) / low
+local bestSpend, bestValue = low, nil
+for spend = low, high, 50 do
+local mult = Plan.stormMult(spend) or base
+local left = points - spend
+local future = if left + orbRate * Plan.horizon() * stormShare >= low then left * perPoint else 0
+local value = mult - 1 + future
+if not bestValue or value > bestValue then
+bestSpend, bestValue = spend, value
+end
+end
+return math.floor(bestSpend)
+end
+function Plan.orbsFirst()
+local manual = not (Options.OrbPriority and Options.OrbPriority.Value == "Crates first")
+if not (Plan.on("SmartSchedule") and Plan.on("AutoThunder") and Plan.ready and Plan.pointValue > 0) then
+return manual
+end
+if Plan.orbSec < 20 then
+return true
+end
+return Plan.orbPts / Plan.orbSec * Plan.pointValue > (Plan.time and Plan.time.nowRate or 0)
+end
+function Plan.blessExtra(points, base, maxExtra)
+local all = math.max(0, math.floor(math.min(maxExtra, points - base)))
+if not Plan.smart() then
+return all
+end
+local rate = (Bless.gained or 0) / math.max(os.clock() - Session.started, 1)
+if points - base + rate * Plan.horizon() >= base then
+return 0
+end
+return all
+end
+function Plan.rowScore(row, fallback)
+local area = canonicalArea(row.AreaId or row.CrateAreaId or row.Area)
+local tier = row.Tier or row.CrateTier
+if area and tier then
+local _, income = V.crate(area, tier, row.Size or row.CrateSize or "STANDARD")
+if income then
+return income
+end
+end
+return fallback
+end
+function Plan.fuseIncome(incomes, area)
+local outcomes = ItemData and type(ItemData.Fuse) == "table" and ItemData.Fuse.Outcomes
+if type(outcomes) ~= "table" or #incomes == 0 then
+return nil
+end
+local sum = 0
+for _, income in ipairs(incomes) do
+sum += income
+end
+local total, expected = 0, 0
+for _, outcome in ipairs(outcomes) do
+local mid = ((outcome.Min or 1) + (outcome.Max or outcome.Min or 1)) / 2
+local basis = if outcome.Basis == "Average" then sum / #incomes else sum
+expected += (outcome.Chance or 0) * mid * basis
+total += outcome.Chance or 0
+end
+if total <= 0 then
+return nil
+end
+local factor = 1
+if area and type(ItemData.GetFuseAreaFactor) == "function" then
+local ok, result = pcall(ItemData.GetFuseAreaFactor, ItemData, area)
+factor = ok and tonumber(result) or 1
+end
+return expected / total * factor
+end
+function Plan.fuseGain(tools)
+local incomes, area = {}, nil
+for _, tool in ipairs(tools) do
+table.insert(incomes, tonumber(tool:GetAttribute("ItemIncome")) or 0)
+area = area or tool:GetAttribute("ItemAreaId") or tool:GetAttribute("AreaId")
+end
+local fused = Plan.fuseIncome(incomes, area)
+if not fused then
+return nil
+end
+local before = 0
+for _, income in ipairs(incomes) do
+before += V.item(income, 0)
+end
+return V.item(fused, 0) - before
+end
+function Plan.plotPrice(floor)
+local board = floor and signOf(floor, "UpgradeSignBoard")
+if not board then
+return nil
+end
+local pill = board:FindFirstChild("PricePill", true)
+if pill then
+local texts = pill:GetDescendants()
+table.insert(texts, pill)
+for _, d in ipairs(texts) do
+if d:IsA("TextLabel") or d:IsA("TextButton") then
+local value = parseMoney(d.Text)
+if value and value > 0 then
+return value
+end
+end
+end
+end
+if canAfford(board) then
+return money()
+end
+return nil
+end
+function Plan.check(cost, gain, income)
+if gain <= cost then
+return false
+end
+local top = Plan.best
+if not top then
+return true
+end
+if gain / math.max(cost, 1) >= top.ratio then
+return true
+end
+return income ~= nil and income > 0 and cost / income <= top.eta
+end
+function Plan.find(kind, id)
+for _, option in ipairs(Plan.list) do
+if option.kind == kind and (id == nil or option.id == id) then
+return option
+end
+end
+return nil
+end
+function Plan.allow(kind, _cost, id)
+if not (Plan.smart() and Plan.ready) then
+return true
+end
+local option = Plan.find(kind, id)
+if not option then
+return true
+end
+return Plan.check(option.cost, option.gain, option.income)
+end
+function Plan.compute()
+local H = Plan.horizon()
+V.values = {}
+V.plot = V.plotState()
+V.scanCrates()
+local level = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
+local cash = money()
+local formula = Plan.speedRate()
+local G = if Sched.trainTime >= 20 and Sched.trainSpeed > 0 then formula * Sched.trainSpeed / Sched.trainTime else formula
+if adminTreadmill() then
+local system = ReplicatedStorage:FindFirstChild("AdminSystem")
+G *= math.max(tonumber(system and system:GetAttribute("AdminTreadmillMultiplier")) or 1, 1)
+end
+G = math.max(G, 1e-6)
+local spent = Sched.trainTime + Sched.otherTime
+local cashRate = if spent >= 30 then (Sched.trainMoney + Sched.otherMoney) / spent else tonumber(LocalPlayer:GetAttribute("IncomePerSecond")) or 0
+cashRate = math.max(cashRate, 1e-6)
+local nowRate, nowArea, nowIncome = 0, nil, 0
+for _, area in ipairs(Areas) do
+if Plan.zoneWanted(area.Id) and (area.RecommendedSpeed or 0) <= level then
+local rate, income = V.zoneRate(area, level)
+if rate and rate > nowRate then
+nowRate, nowArea, nowIncome = rate, area, income
+end
+end
+end
+local function zonePlan(gain, delay)
+local best
+for _, area in ipairs(Areas) do
+if Plan.zoneWanted(area.Id) then
+local need = math.max((area.RecommendedSpeed or 0) - level, 0)
+local train = need / gain
+if delay + train < H then
+local rate = V.zoneRate(area, math.max(level, area.RecommendedSpeed or 0))
+if rate then
+local value = rate * (H - delay - train)
+if not best or value > best.value then
+best = { value = value, area = area, train = train, rate = rate }
+end
+end
+end
+end
+end
+return best
+end
+local base = zonePlan(G, 0)
+local options = {}
+local function etaOf(cost)
+return math.max(cost - cash, 0) / cashRate
+end
+local function add(option)
+option.eta = etaOf(option.cost)
+option.ratio = option.gain / math.max(option.cost, 1)
+table.insert(options, option)
+end
+local function speedOption(kind, name, id, cost, factor)
+local eta = etaOf(cost)
+local gain, plan = 0, nil
+if base and eta < H then
+plan = zonePlan(G * factor, eta)
+if plan then
+gain = math.max(nowRate * eta + plan.value - base.value, 0)
+end
+end
+add({ kind = kind, name = name, id = id, cost = cost, gain = gain, plan = plan })
+end
+if Plan.on("AutoUpgradeTreadmill") then
+local current, nextTier = Plan.treadmill()
+if current and nextTier and tonumber(nextTier.Cost) then
+local factor = (tonumber(nextTier.GainPerSecond) or 0) / math.max(tonumber(current.GainPerSecond) or 1, 1e-9)
+speedOption("treadmill", tostring(nextTier.Name or "next treadmill"), nil, tonumber(nextTier.Cost), factor)
+end
+end
+if Plan.on("AutoTrails") and TrailState.known then
 local mult = Plan.mult()
 for _, trail in ipairs(Trails) do
-if not TrailState.Owned[trail.Id] and (trail.Multiplier or 0) > mult then
-table.insert(list, {
-kind = "trail",
-name = trail.Name or trail.Id,
-id = trail.Id,
-cost = trail.Cost or math.huge,
-rel = trail.Multiplier / mult - 1,
-})
+if not TrailState.Owned[trail.Id] and (trail.Multiplier or 0) > mult and tonumber(trail.Cost) then
+speedOption("trail", tostring(trail.Name or trail.Id), trail.Id, tonumber(trail.Cost), trail.Multiplier / mult)
+end
+end
+end
+local spare = 0
+for _, tool in ipairs(toolsWith("ItemUid")) do
+spare = math.max(spare, tonumber(tool:GetAttribute("ItemIncome")) or 0)
+end
+local slotIncome = if V.plot.free > 0 then 0 else math.max(spare, math.min(nowIncome, V.plot.min))
+if Plan.on("AutoBuySlot") and type(SlotPrices) == "table" then
+local index = (tonumber(LocalPlayer:GetAttribute("AddedSlots")) or 0) + 1
+local price = tonumber(SlotPrices[index])
+if price then
+add({ kind = "slot", name = "slot " .. index, cost = price, income = slotIncome, gain = slotIncome * math.max(H - etaOf(price), 0) })
+end
+end
+if Plan.on("AutoUpgradePlot") then
+local price = Plan.plotPrice(myFloor())
+if price then
+add({ kind = "plot", name = "plot upgrade", cost = price, income = slotIncome, gain = slotIncome * math.max(H - etaOf(price), 0) })
+end
+end
+table.sort(options, function(a, b)
+return a.ratio > b.ratio
+end)
+Plan.list = options
+Plan.best = nil
+for _, option in ipairs(options) do
+if option.gain > option.cost then
+Plan.best = option
 break
 end
 end
+Plan.target = Plan.best
+local low = Storm and type(Storm.config) == "table" and tonumber(Storm.config.MIN_SPEND) or 1000
+local stormMult = Plan.stormMult(low)
+Plan.pointValue = if stormMult and nowIncome > 0 then (V.item(nowIncome * stormMult, 0) - V.item(nowIncome, 0)) / low else 0
+local train, why = false, "nothing to unlock, steal"
+local speedBest, speedValue = nil, base and base.value or 0
+for _, option in ipairs(options) do
+if option.plan and option.gain > option.cost then
+local value = nowRate * option.eta + option.plan.value - option.cost
+if value > speedValue then
+speedBest, speedValue = option, value
 end
-return list
+end
+end
+if speedBest and speedBest.eta > 0 then
+why = string.format("steal for %s:%s first (%ds), then train to %s", speedBest.kind, speedBest.name, math.floor(speedBest.eta), speedBest.plan.area.Id)
+elseif speedBest then
+train = speedBest.plan.train > 0
+why = string.format("buy %s:%s, then %s %s", speedBest.kind, speedBest.name, if train then "train to" else "steal in", speedBest.plan.area.Id)
+elseif base and base.train > 0 then
+train = true
+why = string.format("train to %s for %ds", base.area.Id, math.floor(base.train))
+elseif base then
+why = "steal in " .. base.area.Id
+end
+Plan.time = { train = train, why = why, nowRate = nowRate, zone = nowArea and nowArea.Id or "none", G = G, cashRate = cashRate }
+Plan.ready = true
+local function describe(option)
+return string.format("%s:%s %.3g", option.kind, option.name, option.ratio)
+end
+local alt = {}
+for _, option in ipairs(options) do
+if option ~= Plan.best and #alt < 2 then
+table.insert(alt, describe(option))
+end
+end
+local best = Plan.best
+Sched.info = string.format(
+"time=%s | steal now %s $%s/s | speed +%s/s on treadmill | cash $%s/s | trip calib x%.2f | H=%dh",
+why,
+Plan.time.zone,
+formatNumber(nowRate),
+formatNumber(G),
+formatNumber(cashRate),
+V.calib,
+H // 3600
+)
+local text = string.format(
+"best=%s gain/$=%s eta=%s alt=%s | %s",
+if best then best.kind .. ":" .. best.name .. " $" .. formatNumber(best.cost) else "none (save cash)",
+if best then string.format("%.3g", best.ratio) else "-",
+if best then math.floor(best.eta) .. "s" else "-",
+if #alt > 0 then table.concat(alt, ", ") else "none",
+Sched.info
+)
+local key = (if best then best.kind .. best.name else "none") .. tostring(train)
+if key ~= Plan.planKey then
+Plan.planKey = key
+log("PLAN", text)
+else
+logEvery("plan", 120, "PLAN", text)
+end
+local zones = {}
+for id, zone in pairs(V.zones) do
+table.insert(zones, string.format("%s $%s/s trip %.0fs n%d", id, formatNumber(zone.rate or 0), zone.dist / V.walk(level), zone.n))
+end
+if #zones > 0 then
+table.sort(zones)
+logEvery("zones", 300, "ZONES measured:", table.concat(zones, " | "))
+end
 end
 function Plan.refresh()
-local best, bestScore
-for _, candidate in ipairs(Plan.candidates()) do
-local score = candidate.rel / math.max(candidate.cost, 1)
-if not bestScore or score > bestScore then
-best, bestScore = candidate, score
+local ok, err = pcall(Plan.compute)
+if not ok then
+Plan.ready = false
+logEvery("planerr", 120, "PLAN error", err)
 end
-end
-local old = Plan.target
-Plan.target = best
-if best and (not old or old.kind ~= best.kind or old.name ~= best.name) then
-log("PLAN speed target", best.kind, best.name, "cost $" .. formatNumber(best.cost), "speed gain +" .. math.floor(best.rel * 100) .. "%")
-end
-end
-function Plan.allow(kind, cost)
-if not Plan.smart() then
-return true
-end
-local target = Plan.target
-if not target or target.kind == kind then
-return true
-end
-if money() >= target.cost + cost or cost * 8 <= target.cost then
-return true
-end
-return false
 end
 function Plan.treadmillOk()
 local _, nextTier = Plan.treadmill()
@@ -30506,40 +31237,15 @@ return SpeedData == nil
 end
 return Plan.allow("treadmill", tonumber(nextTier.Cost) or 0)
 end
-function Plan.bestSurplus()
-local top = 0
-for _, tool in ipairs(toolsWith("ItemUid")) do
-top = math.max(top, tonumber(tool:GetAttribute("ItemIncome")) or 0)
-end
-if top <= 0 and os.clock() - Plan.surplusAt < 1200 then
-top = Plan.surplus or 0
-end
-return top
-end
 function Plan.slotOk()
 if type(SlotPrices) ~= "table" then
 return true
 end
 local price = SlotPrices[(tonumber(LocalPlayer:GetAttribute("AddedSlots")) or 0) + 1]
-if not price then
+if not price or money() < price then
 return false
 end
-local cash = money()
-if cash < price then
-return false
-end
-if not Plan.smart() then
-return true
-end
-local income = Plan.bestSurplus()
-if income <= 0 then
-return price * 10 <= cash
-end
-if price / income <= 10800 then
-return true
-end
-local target = Plan.target
-return cash >= price + (target and target.cost or 0)
+return Plan.allow("slot", price)
 end
 Plan.farmNames = {
 "AutoSteal",
@@ -30556,6 +31262,7 @@ Plan.farmNames = {
 "AutoOrbs",
 "AutoThunder",
 "AutoBlessing",
+"AutoFuse",
 "SmartZones",
 "SmartSpend",
 "SmartSchedule",
@@ -30580,7 +31287,7 @@ rarities[name] = true
 end
 Options.StealZones:SetValue(zones)
 Options.StealCrateRarities:SetValue(rarities)
-Options.StealPriority:SetValue("Best Rarity")
+Options.StealPriority:SetValue("Best Value")
 Options.SellMode:SetValue("All")
 end)
 local turned = {}
@@ -30605,8 +31312,10 @@ if step <= 0 or step > 5 then
 return
 end
 if onTreadmill() then
+if not adminTreadmill() then
 Sched.trainTime = Sched.trainTime * 0.9995 + step
-Sched.trainSpeed = Sched.trainSpeed * 0.9995 + speedGain
+Sched.trainSpeed = Sched.trainSpeed * 0.9995 + speedGain / math.max(Plan.speedRate(), 1e-6)
+end
 Sched.trainMoney = Sched.trainMoney * 0.9995 + moneyGain
 else
 Sched.otherTime = Sched.otherTime * 0.9995 + step
@@ -30620,47 +31329,6 @@ return
 end
 Sched.updatedAt = now
 Plan.refresh()
-local level = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
-local nextZone
-for _, area in ipairs(Areas) do
-if (area.RecommendedSpeed or 0) > level then
-nextZone = area
-break
-end
-end
-local rate = if Sched.trainTime >= 20 and Sched.trainSpeed > 0 then Sched.trainSpeed / Sched.trainTime else Plan.speedRate()
-rate = math.max(rate, 0.01)
-local need = if nextZone then (nextZone.RecommendedSpeed - level) else 0
-local moneySteal = if Sched.otherTime >= 30 then Sched.otherMoney / Sched.otherTime else nil
-local moneyTrain = if Sched.trainTime >= 30 then Sched.trainMoney / Sched.trainTime else 0
-local deficit = 0
-local target = Plan.target
-if target then
-deficit = math.max(target.cost - money(), 0)
-end
-local f, why
-if need <= 0 then
-f, why = 0.15, "no higher zone to unlock"
-elseif target and deficit <= 0 then
-f, why = 0.85, "next speed upgrade is already affordable"
-elseif not moneySteal or moneySteal <= 0 then
-f, why = 0.5, "no money rate measured yet"
-else
-local denominator = deficit * rate + need * (moneySteal - math.min(moneyTrain, moneySteal))
-f = need * moneySteal / math.max(denominator, 1e-9)
-why = "both goals finish together"
-end
-Sched.f = math.clamp(f, 0.15, 0.85)
-Sched.info = string.format(
-"train share %.0f%% (%s), speed %s/s, next zone %s needs %s more, money while stealing $%s/s, upgrade deficit $%s",
-Sched.f * 100,
-why,
-formatNumber(rate),
-nextZone and nextZone.Id or "none",
-formatNumber(need),
-formatNumber(moneySteal or 0),
-formatNumber(deficit)
-)
 logEvery("sched", 120, "SCHED", Sched.info)
 end
 function Sched.trainNow()
@@ -30668,16 +31336,14 @@ if not (Plan.on("SmartSchedule") and Plan.on("AutoTreadmill") and Plan.on("AutoS
 return false
 end
 local train
-if adminTreadmill() then
-train = true
-elseif os.clock() < Sched.failUntil then
+if os.clock() < Sched.failUntil then
 train = false
 else
-train = (os.clock() - Sched.cycleStart) % Sched.period < Sched.f * Sched.period
+train = Plan.time ~= nil and Plan.time.train == true
 end
 if train ~= Sched.training then
 Sched.training = train
-log("SCHED switch to", if train then "TRAINING on the treadmill" else "STEALING", string.format("(train share %.0f%%)", Sched.f * 100))
+log("SCHED switch to", if train then "TRAINING on the treadmill" else "STEALING", "(" .. tostring(Plan.time and Plan.time.why or "no plan yet") .. ")")
 end
 return train
 end
@@ -30928,9 +31594,9 @@ Tooltip = "Which crate rarities to steal",
 })
 StealBox:AddDropdown("StealPriority", {
 Text = "Priority",
-Values = { "Best Rarity", "Nearest" },
-Default = "Best Rarity",
-Tooltip = "Best Rarity goes for the most valuable crate first",
+Values = { "Best Value", "Best Rarity", "Nearest" },
+Default = "Best Value",
+Tooltip = "Best Value takes the crate with the most expected money per second of trip (real item odds, your speed, distance). Best Rarity goes for the rarest crate first",
 })
 StealBox:AddToggle("SmartZones", {
 Text = "Only Zones I Can Escape",
@@ -31020,7 +31686,7 @@ local FuseBox = Tabs.Items:AddRightGroupbox("Fuse Machine", "combine")
 FuseBox:AddToggle("AutoFuse", {
 Text = "Auto Fuse",
 Default = false,
-Tooltip = "Fuses 3 copies of the same item into one stronger item when you can afford the fee. Runs before selling. Not part of Auto Farm Everything: the fee can cost more than the stronger item earns.",
+Tooltip = "Fuses 3 copies of the same item into one stronger item. With Smart Spending it only fuses when the expected fused item (real outcome odds) is worth more than the 3 items plus the fee. Runs before selling.",
 })
 FuseBox:AddDropdown("FuseTiers", {
 Text = "Fuse Rarities",
@@ -31046,7 +31712,7 @@ local SpendBox = Tabs.Upgrades:AddLeftGroupbox("Smart Spending", "coins")
 SpendBox:AddToggle("SmartSpend", {
 Text = "Smart Spending",
 Default = true,
-Tooltip = "Buys the upgrade with the best payback first: slots by the income of your spare items, trails and treadmill tiers by speed gain per dollar. Cheap buys never starve the better one.",
+Tooltip = "Puts every buy on one scale: expected extra money in the next 24 hours per dollar spent (slots from your plot and the real crate odds, treadmill tiers and trails from how much sooner they unlock the next zone). Buys the best one, cheaper ones only when they pay back before it.",
 })
 SpendBox:AddToggle("AutoBuySlot", { Text = "Auto Buy +1 Equip", Default = false, Tooltip = "Buys extra item slots with cash" })
 SpendBox:AddToggle("AutoUpgradePlot", { Text = "Auto Upgrade Plot", Default = false })
@@ -31070,7 +31736,7 @@ TreadBox:AddToggle("AutoUpgradeTreadmill", { Text = "Auto Upgrade Treadmill", De
 TreadBox:AddToggle("SmartSchedule", {
 Text = "Balance Steal and Train",
 Default = true,
-Tooltip = "With Auto Steal and Auto Treadmill on, switches between stealing and training so the next zone unlock and the next speed upgrade arrive at the same time. An active Admin Treadmill event always gets the training time.",
+Tooltip = "With Auto Steal and Auto Treadmill on, compares the money per second of stealing now with training to a better zone (or stealing first for a speed upgrade) over the next 24 hours and does the one that ends with more money.",
 })
 TreadBox:AddToggle("UseAdminTreadmill", {
 Text = "Use Admin Treadmill In Events",
@@ -32544,7 +33210,7 @@ end
 return count
 end)()
 )
-add("speed target: " .. (if Plan.target then string.format("%s %s for $%s (+%d%% speed gain)", Plan.target.kind, Plan.target.name, formatNumber(Plan.target.cost), math.floor(Plan.target.rel * 100)) else "none"))
+add("best buy: " .. (if Plan.target then string.format("%s %s for $%s (gain/$ %.3g, eta %ds)", Plan.target.kind, Plan.target.name, formatNumber(Plan.target.cost), Plan.target.ratio, math.floor(Plan.target.eta)) else "none, saving"))
 add("schedule: " .. Sched.info .. " | now " .. (if Sched.training then "training" else "stealing"))
 add("storm: " .. (if stormActive() then "ON" else "off") .. " | storm points " .. formatNumber(tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0))
 add(string.rep("-", 70))
@@ -32612,9 +33278,11 @@ openCrates()
 return
 end
 end
-local orbsFirst = not (Options.OrbPriority and Options.OrbPriority.Value == "Crates first")
+local orbsFirst = Plan.orbsFirst()
 if on("AutoOrbs") and stormActive() and (orbsFirst or not on("AutoSteal")) then
+local orbStart, orbPoints = os.clock(), Storm.points
 if collectOrbs() then
+Plan.orbSample(os.clock() - orbStart, Storm.points - orbPoints)
 return
 end
 end
@@ -32763,6 +33431,7 @@ on("AutoUpgradePlot")
 and now > last.plot
 and Remotes.re_PLOT_UPGRADE
 and canAfford(signOf(floor, "UpgradeSignBoard"))
+and Plan.allow("plot", 0)
 then
 local board = signOf(floor, "UpgradeSignBoard")
 tryUpgrade("plot", function()
