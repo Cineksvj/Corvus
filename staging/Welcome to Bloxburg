@@ -26096,15 +26096,12 @@ end)
             local SupportedGames = Info.SupportedGames or {
                 { Name = "+1 Stone Skipping", PlaceId = 111543903102439 },
                 { Name = "Anime Dice", PlaceId = 113290951185459 },
-                { Name = "Bizarre", PlaceId = 135621866300031 },
                 { Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
                 { Name = "Loot To Forge", PlaceId = 118805555015549 },
                 { Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
                 { Name = "Pets Universe", PlaceId = 74629631798007 },
                 { Name = "Ride A Pet", PlaceId = 124216119978534 },
-                { Name = "Steal An Egg", PlaceId = 107778070777162 },
                 { Name = "Steal From The Rich", PlaceId = 120475074479690 },
-                { Name = "Voltline Electric Scooters", PlaceId = 118315378611589 },
                 { Name = "Welcome to Bloxburg", PlaceId = 185655149 },
             }
             local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
@@ -37162,13 +37159,7 @@ do
 		-- objectives) and a one-time build of the saved plot, minus whatever the player excluded.
 		local S = { turned = {}, saved = {} }
 		N.Farm = { built = false, confirmed = false, building = false }
-		-- design v4: no Remember switch, the master toggle always starts off (an old "1" state file is cleared)
-		pcall(function()
-			if isfile and isfile("Corvus/WTB_farm_state.txt") then
-				writefile("Corvus/WTB_farm_state.txt", "0")
-			end
-		end)
-		local function writeState(_on: boolean?) end
+		-- design v4: no Remember switch, the master toggle always starts off and is never saved
 		local function turnOn(name)
 			local t = Toggles[name]
 			if t and not t.Value then
@@ -37295,13 +37286,11 @@ do
 				task.defer(function()
 					if not value then
 						N.farmStop()
-						writeState(false)
 						return
 					end
 					if N.Farm.confirmed then
 						N.Farm.confirmed = false
 						N.farmStart()
-						writeState(true)
 						return
 					end
 					-- not confirmed yet: back to off, ask first
@@ -37947,7 +37936,7 @@ do
 	end
 	if Library.AddCommand then
 		pcall(function()
-			toggleCommand("farmall", { "farmbest", "all", "farm", "work", "job" }, { "AutoFarmBest" }, "Auto Farm Everything")
+			toggleCommand("farmall", { "farmbest", "all", "farm" }, { "AutoFarmBest" }, "Auto Farm Everything")
 			Library:AddCommand({
 				Name = "stop",
 				Aliases = { "alloff" },
@@ -38094,6 +38083,12 @@ else
 		SaveManager:LoadAutoloadConfig()
 	end)
 end
+pcall(function()
+	SaveManager:SetIgnoreIndexes({ "AutoFarmBest" })
+	if type(SaveManager.Ignore) == "table" then
+		SaveManager.Ignore["AutoFarmBest"] = true
+	end
+end)
 if Window.AddInfoTab then
 	local DonateMethods = {
 		{
