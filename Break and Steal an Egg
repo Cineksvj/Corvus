@@ -32377,10 +32377,18 @@ do
 		log("BANKED event", ...)
 	end)
 	-- Farm Everything uses Fast (0.36-0.4 s, just above the server's HitCooldown) unless the player picked Blatant
+	function N.farmMode()
+		return optionText("FarmMode", "Normal")
+	end
 	function N.hitSpeedPick()
 		local pick = optionText("HitSpeed", "Normal")
-		if on("AutoFarmBest") and pick ~= "Blatant (HIGH RISK OF BAN)" then
-			return "Fast"
+		if on("AutoFarmBest") then
+			-- OP: Fast unless Blatant. Normal: Fast only when the player left Hit Speed at the Normal default
+			if N.farmMode() == "OP" and pick ~= "Blatant (HIGH RISK OF BAN)" then
+				return "Fast"
+			elseif pick == "Normal" then
+				return "Fast"
+			end
 		end
 		return pick
 	end
@@ -34409,19 +34417,27 @@ do
 		N.FarmBestOn = { "AutoFarm", "GrabOwnHatch", "StealPickups", "OnlyBetter", "TitanicFirst", "AvoidGuards", "AutoPlace", "AutoTrain", "AutoMergeEggs", "AutoSellSurplus", "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill", "AutoSatchel", "AutoDemonShop", "AutoIndex", "AutoOffline", "AutoFriend", "AutoGroup" }
 		-- Turning the quick farm off turns off everything it turned on (nothing keeps spending cash).
 		N.FarmBestOff = N.FarmBestOn
+		N.PlayerOff = {}
+		N.TogDefault = {}
 		QuickBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Everything",
 			Default = false,
 			Tooltip = "Turns on everything for you: breaks eggs in the best zone (Titanic first), steals better animals, trains, places the best ones, sells surplus animals, buys upgrades and potions, claims rewards. Walks safely",
 			Callback = function(value)
 				task.defer(function()
+					local op = N.farmMode() == "OP"
+					N.farmSetting = true
 					for _, name in ipairs(if value then N.FarmBestOn else N.FarmBestOff) do
 						local toggle = Toggles[name]
-						if toggle and toggle.Value ~= value then
+						-- Normal: a toggle the player switched off themselves stays off
+						if toggle and toggle.Value ~= value and not (value and not op and N.PlayerOff[name]) then
 							toggle:SetValue(value)
 						end
 					end
-					if value then
+					N.farmSetting = false
+					if value and not op then
+						log("FARM Normal: player picks kept")
+					elseif value then
 						if Options.ZoneMode then
 							Options.ZoneMode:SetValue("Best zone")
 						end
@@ -34437,6 +34453,15 @@ do
 						end
 					end
 				end)
+			end,
+		})
+		QuickBox:AddDropdown("FarmMode", {
+			Text = "Farm Mode",
+			Values = { "Normal", "OP" },
+			Default = "Normal",
+			Tooltip = "Normal = automate everything within your own picks. OP = the planner overrides every choice for max profit",
+			Callback = function(value)
+				log("MODE", tostring(value))
 			end,
 		})
 		QuickBox:AddLabel({
@@ -34870,6 +34895,25 @@ do
 		EspStyle:AddToggle("ESPDistanceText", { Text = "Show Distance", Default = true })
 		EspStyle:AddSlider("ESPDistance", { Text = "Max Distance", Default = 1500, Min = 100, Max = 10000, Rounding = 0, Suffix = " studs" })
 		EspStyle:AddSlider("ESPTextSize", { Text = "Text Size", Default = 13, Min = 9, Max = 22, Rounding = 0 })
+	end
+end
+-- Normal mode (Farm Mode): remember toggles the player switched off by hand so Farm Everything leaves them off
+for _, name in ipairs(N.FarmBestOn) do
+	local toggle = Toggles[name]
+	if toggle and toggle.OnChanged then
+		N.TogDefault[name] = toggle.Value == true
+		pcall(function()
+			toggle:OnChanged(function(value)
+				if N.farmSetting then
+					return
+				end
+				if value then
+					N.PlayerOff[name] = nil
+				elseif N.TogDefault[name] or (Toggles.AutoFarmBest and Toggles.AutoFarmBest.Value) then
+					N.PlayerOff[name] = true
+				end
+			end)
+		end)
 	end
 end
 do
@@ -35741,6 +35785,7 @@ pcall(function()
 		end
 	end
 end)
+log("MODE", N.farmMode())
 if Window.AddInfoTab then
 	local DonateMethods = {
 		{
