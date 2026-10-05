@@ -37687,11 +37687,15 @@ do
 	end
 	-- Remember Auto Farm Everything: only then does a saved "on" come back after a restart
 	task.delay(3, function()
-		if not alive() or not on("RememberFarm") or on("AutoFarmBest") then
+		if not alive() or on("AutoFarmBest") then
 			return
 		end
+		-- the file holds "1" only while Remember was on and the farm was running, so it works without a saved config
 		local ok, state = pcall(readfile, "Corvus/WTB_farm_state.txt")
 		if ok and state == "1" then
+			if Toggles.RememberFarm and not Toggles.RememberFarm.Value then
+				Toggles.RememberFarm:SetValue(true)
+			end
 			log("FARM remembered", "starting again")
 			N.Farm.confirmed = true
 			Toggles.AutoFarmBest:SetValue(true)
