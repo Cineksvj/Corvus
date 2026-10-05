@@ -33227,6 +33227,7 @@ do
 			"AutoWorldBoss",
 			"AutoOnline",
 			"AutoOffline",
+			"AutoFriend",
 			"AutoIndex",
 			"AutoSeason",
 			"AutoSeasonLuck",
@@ -33472,6 +33473,100 @@ do
 	do
 		local RewardBox = Tabs.Rewards:AddLeftGroupbox("Rewards", "gift")
 		RewardBox:AddToggle("AutoOnline", { Text = "Claim Online Gifts", Default = true })
+		do
+			local FPlayers = game:GetService("Players")
+			local FTeleport = game:GetService("TeleportService")
+			local F = { on = true, asked = {}, friend = {}, sent = 0, lastSend = -1e9, lastLog = "", lastLogAt = -1e9 }
+			local function friendBoost()
+				local v = LocalPlayer:GetAttribute("FriendNumber")
+				if type(v) == "number" then return "+" .. math.floor(v * 10 + 0.5) .. "%" end
+				return "?"
+			end
+			local function isFriend(p)
+				if F.friend[p.UserId] then return true, true end
+				local ok, res = pcall(function() return LocalPlayer:IsFriendsWith(p.UserId) end)
+				if ok and res then F.friend[p.UserId] = true end
+				return ok and res, ok
+			end
+			local function friendPump()
+				if not F.on then return end
+				for _, p in ipairs(FPlayers:GetPlayers()) do
+					if p ~= LocalPlayer and not F.asked[p.UserId] and not F.friend[p.UserId] then
+						local yes, ok = isFriend(p)
+						if ok and not yes then
+							if os.clock() - F.lastSend < 10 then return end
+							F.asked[p.UserId] = true
+							F.lastSend = os.clock()
+							if pcall(function() LocalPlayer:RequestFriendship(p) end) then F.sent += 1 end
+							return
+						end
+					end
+				end
+			end
+			local function friendLog()
+				local n = 0
+				for _, p in ipairs(FPlayers:GetPlayers()) do
+					if p ~= LocalPlayer and isFriend(p) then n += 1 end
+				end
+				local boost = friendBoost()
+				local key = F.sent .. "/" .. n .. "/" .. tostring(boost)
+				if key ~= F.lastLog and os.clock() - F.lastLogAt >= 60 then
+					F.lastLog = key
+					F.lastLogAt = os.clock()
+					log("FRIEND sent=" .. F.sent .. " friends=" .. n .. " boost=" .. tostring(boost))
+				end
+			end
+			pcall(function()
+				Library:GiveSignal(FPlayers.PlayerAdded:Connect(function()
+					task.delay(2, function() pcall(friendPump) end)
+				end))
+			end)
+			task.spawn(function()
+				local beat = 0
+				while alive() do
+					task.wait(10)
+					beat += 1
+					pcall(friendPump)
+					if beat % 6 == 0 then pcall(friendLog) end
+				end
+			end)
+			local function joinFriend()
+				local ok, list = pcall(function() return LocalPlayer:GetFriendsOnline(200) end)
+				if not ok or type(list) ~= "table" then
+					log("FRIEND join unsupported")
+					notify("Friends", "Joining a friend is not supported by this executor", 4)
+					return
+				end
+				for _, f in ipairs(list) do
+					local place, job = f.PlaceId, f.GameId
+					if place and job and job ~= game.JobId and (place == game.PlaceId or f.UniverseId == game.GameId) then
+						log("FRIEND join " .. tostring(f.UserName or f.DisplayName or f.VisitorId))
+						notify("Friends", "Joining " .. tostring(f.UserName or "a friend"), 4)
+						if not pcall(function() FTeleport:TeleportToPlaceInstance(place, job, LocalPlayer) end) then
+							log("FRIEND join unsupported")
+						end
+						return
+					end
+				end
+				log("FRIEND join none")
+				notify("Friends", "No friend is online in this game's other servers", 4)
+			end
+			local FriendBox = Tabs.Rewards:AddRightGroupbox("Friends", "users")
+			FriendBox:AddToggle("AutoFriend", {
+				Text = "Auto Friend",
+				Tooltip = "Every friend in the server gives +10%. Sends one friend request per 10 s to everyone in the server, once each",
+				Default = true,
+				Callback = function(v)
+					F.on = v == true
+				end,
+			})
+			FriendBox:AddButton({
+				Text = "Join friend's server",
+				Func = function()
+					task.spawn(joinFriend)
+				end,
+			})
+		end
 		RewardBox:AddToggle("AutoOffline", { Text = "Claim Offline Reward", Default = true })
 		RewardBox:AddToggle("AutoIndex", { Text = "Claim Index EXP And Levels", Default = true })
 		RewardBox:AddToggle("AutoSeason", { Text = "Claim Season Rewards", Default = true, Tooltip = "Season pass rewards you reached and the daily season ticket" })
