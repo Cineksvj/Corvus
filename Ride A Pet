@@ -29835,8 +29835,16 @@ end
 Farm.skip[id] = nil
 return false
 end
+-- Farm Mode: Normal keeps the player's own picks authoritative, OP lets the planner override every choice.
+function N.farmOP()
+return optionText("FarmMode", "Normal") == "OP"
+end
+function N.nothingPicked(option)
+local v = option and option.Value
+return type(v) ~= "table" or next(v) == nil
+end
 function N.eggWanted(info)
-if on("FarmAll") and N.weatherEggMult and N.weatherEggMult(info) and not (on("SkipMazeEggs") and info.maze) then
+if on("FarmAll") and N.farmOP() and N.weatherEggMult and N.weatherEggMult(info) and not (on("SkipMazeEggs") and info.maze) then
 return true
 end
 if not allows(Options.FarmRarities, info.rarity) then
@@ -29880,6 +29888,9 @@ return sum
 end
 function N.eggScore(info, from)
 local weatherScore = N.weatherEggScore and N.weatherEggScore(info)
+if weatherScore and not N.farmOP() and not (N.nothingPicked(Options.TargetPets) and optionText("FarmPriority", "Best Value") == "Best Value") then
+weatherScore = nil
+end
 if
 weatherScore
 and not (on("AdminFirst") and (info.admin or info.spotlight))
@@ -31577,7 +31588,7 @@ return list
 end
 for _, item in ipairs(N.ShopItems) do
 local modeled = shopKind(item) ~= "shop"
-if selected(Options.ShopItems, item.name) or (not manual and modeled and on("FarmAll")) then
+if selected(Options.ShopItems, item.name) or (not manual and modeled and on("FarmAll") and (N.farmOP() or N.nothingPicked(Options.ShopItems))) then
 local amount = N.stockOf(item.category, item.name)
 if amount > 0 and shopOk(item, manual) then
 table.insert(list, item)
@@ -31906,7 +31917,7 @@ local queued = #N.lanternTools()
 for _, it in ipairs(N.ShopItems) do
 local lantern = N.LanternData[it.name]
 local food = it.category == "Food" and N.FoodData[it.name]
-if (selected(Options.ShopItems, it.name) or on("FarmAll")) and N.stockOf(it.category, it.name) > 0 then
+if (selected(Options.ShopItems, it.name) or (on("FarmAll") and (N.farmOP() or N.nothingPicked(Options.ShopItems)))) and N.stockOf(it.category, it.name) > 0 then
 if type(food) == "table" and target and allows(Options.FeedFoods, it.name) then
 -- walk the XP through the age levels (PetAging.RequirementFor grows with age)
 local xp, age = tonumber(food.XP) or 0, target.age
@@ -32385,6 +32396,25 @@ task.spawn(N.farmAll, value)
 end
 end,
 })
+FarmBox:AddDropdown("FarmMode", {
+Text = "Farm Mode",
+Values = { "Normal", "OP" },
+Default = "Normal",
+Tooltip = "Normal = automate everything within your own filters and picks. OP = the planner overrides every choice for max profit.",
+Callback = function(value)
+if N.lastFarmMode ~= value then
+N.lastFarmMode = value
+log("MODE", tostring(value))
+end
+end,
+})
+task.defer(function()
+local mode = optionText("FarmMode", "Normal")
+if N.lastFarmMode ~= mode then
+N.lastFarmMode = mode
+log("MODE", mode)
+end
+end)
 FarmBox:AddToggle("AutoFarm", {
 Text = "Auto Farm Eggs",
 Default = false,
