@@ -32793,7 +32793,7 @@ do
 		return worst or 0, worstInfo
 	end
 end
-N.Moves = { snaps = 0, pushes = 0, blocked = 0, last = nil, slowUntil = 0, slowFactor = 1, hold = nil, flungUntil = 0, rescues = 0, rescueAt = -1e9 }
+N.Moves = { snaps = 0, pushes = 0, blocked = 0, last = nil, slowUntil = 0, slowFactor = 1, hold = nil, flungUntil = 0, rescues = 0, rescueAt = -1e9, ladder = { chosen = nil, current = nil, retryAt = 0, snaps = {} } }
 local Noclip = { travel = false, saved = setmetatable({}, { __mode = "k" }), active = false }
 do
 	-- A guard catch flings the character with real physics. While that runs the hub must not move it or turn
@@ -32957,9 +32957,32 @@ do
 	function N.holdAt(position, slack)
 		N.Moves.hold = if position then { position = position, slack = slack or 3 } else nil
 	end
+	-- Movement ladder (slow -> fast). The server only pulls you back (SPEED/TELEPORT check, no kick), so the picked mode
+	-- runs until 2 snapbacks land within 60 s, then Corvus steps down one mode and tries the faster one again after 10 min.
+	local ModeOrder = { "Walk", "Fast", "Teleport" }
+	local ModeRank = { Walk = 1, Fast = 2, Teleport = 3 }
+	N.ModeOrder = ModeOrder
+	function N.chosenMoveMode()
+		local v = optionText("MoveMode", "Fast")
+		return if v == "Walk" or v == "Teleport" then v else "Fast"
+	end
 	function N.moveMode()
-		local v = optionText("MoveMode", "Walk")
-		return if v == "Fast" or v == "Teleport" then v else "Walk"
+		local L = N.Moves.ladder
+		local chosen = N.chosenMoveMode()
+		if L.chosen ~= chosen then
+			L.chosen, L.current, L.retryAt, L.snaps = chosen, chosen, 0, {}
+		end
+		if L.current ~= chosen and os.clock() >= L.retryAt then
+			local up = ModeOrder[math.min(ModeRank[L.current] + 1, ModeRank[chosen])]
+			log("MOVE retry", L.current, "->", up)
+			L.current, L.snaps = up, {}
+			L.retryAt = if up ~= chosen then os.clock() + 600 else 0
+		end
+		return L.current
+	end
+	function N.moveFallback()
+		local L = N.Moves.ladder
+		return L.current ~= nil and L.current ~= L.chosen, math.max(L.retryAt - os.clock(), 0)
 	end
 	function N.walkSpeed()
 		local hum = humanoid()
@@ -32970,7 +32993,8 @@ do
 		mode = mode or N.moveMode()
 		local factor = if os.clock() < N.Moves.slowUntil then N.Moves.slowFactor else 1
 		if mode == "Fast" then
-			return math.max(optionNumber("FastSpeed", 150), 20) * factor
+			-- Fast = your server WalkSpeed plus a margin the lag forgiveness covers; snapbacks step it down to Walk.
+			return math.max(N.walkSpeed() * math.clamp(optionNumber("FastBoost", 110), 100, 300) / 100, 18) * factor
 		elseif mode == "Teleport" then
 			return math.huge
 		end
@@ -32982,10 +33006,22 @@ do
 		N.Moves.slowUntil = os.clock() + 45
 		N.Moves.slowFactor = math.max((N.Moves.slowFactor or 1) * 0.8, 0.4)
 		log("MOVE snapback", math.floor(distance) .. " studs, slowing down to", math.floor(N.Moves.slowFactor * 100) .. "%")
+		local current = N.moveMode()
+		local L, now = N.Moves.ladder, os.clock()
+		table.insert(L.snaps, now)
+		while L.snaps[1] and now - L.snaps[1] > 60 do
+			table.remove(L.snaps, 1)
+		end
+		if #L.snaps >= 2 and ModeRank[current] > 1 then
+			local down = ModeOrder[ModeRank[current] - 1]
+			log("MOVE fallback", current, "->", down, "(" .. #L.snaps .. " snapbacks in 60 s, retry in 10 min)")
+			L.current, L.retryAt, L.snaps = down, now + 600, {}
+		end
 		if on("SnapNotify") then
 			notify("Movement", "The server pulled you back, Corvus slows down for a bit", 4)
 		end
 	end
+	N.noteSnap = noteSnap
 	local function glideTo(target, speedFn, keepGoing)
 		local last = os.clock()
 		local expected
@@ -33124,16 +33160,28 @@ do
 		end
 		N.holdAt(nil)
 		local mode = opts.mode or N.moveMode()
+		N.Moves.trip = (N.Moves.trip or 0) + 1
 		if mode == "Teleport" or (target - root.Position).Magnitude < 0.5 then
+			local far = (target - root.Position).Magnitude > 20
 			Noclip.travel = true
 			local ok = placeRoot(target, opts.look)
 			task.wait(0.05)
 			Noclip.travel = false
+			if far and mode == "Teleport" then
+				-- The server pulls a teleport back a moment later: count it like a snapback so the ladder can step down.
+				local trip = N.Moves.trip
+				task.delay(0.6, function()
+					local now = rootPart()
+					if now and N.Moves.trip == trip and not N.flung() and (now.Position - target).Magnitude > 12 then
+						noteSnap((now.Position - target).Magnitude)
+					end
+				end)
+			end
 			return ok
 		end
 		-- Humanoid:MoveTo runs far below your speed in this game, so Walk glides along the ground at your own WalkSpeed.
 		local speedFn = function()
-			return N.modeSpeed(mode)
+			return N.modeSpeed(opts.mode or N.moveMode())
 		end
 		local startPos, startAt = root.Position, os.clock()
 		Noclip.travel = mode == "Walk" or on("TravelNoclip")
@@ -33197,10 +33245,25 @@ N.Manual = { running = false }
 N.Farm = { failedEggs = setmetatable({}, { __mode = "k" }), failedPickups = setmetatable({}, { __mode = "k" }), rejects = 0, hatches = {}, target = nil, placeAt = -1e9, placeWanted = false, lastEquipBest = -1e9 }
 do
 	local F = N.Farm
+	-- Hit ladder: Blatant goes under the server floor, the server only drops those hits (EggHitRejected, no kick code
+	-- exists for hits). 3 rejections within 60 s step Blatant down to Fast; Blatant is tried again after 10 min.
+	N.HitLadder = { rejects = {}, fallbackUntil = 0 }
+	N.BlatantHit = "Blatant (rejected hits)"
 	N.onRemote("EggHitRejected", function(part)
 		F.rejects += 1
 		Session.rejects += 1
 		F.backoffUntil = os.clock() + 0.4
+		local H, now = N.HitLadder, os.clock()
+		if N.hitSpeedPick() == N.BlatantHit then
+			table.insert(H.rejects, now)
+			while H.rejects[1] and now - H.rejects[1] > 60 do
+				table.remove(H.rejects, 1)
+			end
+			if #H.rejects >= 3 then
+				H.rejects, H.fallbackUntil, H.fellBack = {}, now + 600, true
+				log("HIT fallback Blatant -> Fast (3 rejected hits in 60 s, retry in 10 min)")
+			end
+		end
 		if typeof(part) == "Instance" and F.target and F.target.part == part then
 			F.targetRejects = (F.targetRejects or 0) + 1
 			if (F.targetHits or 0) <= 1 then
@@ -33253,16 +33316,33 @@ do
 	end
 	-- Hit Speed: the server takes one hit per 0.92 x the swing gap (EggConfig.HitCooldownFactor, PickaxeConfig
 	-- SwingCooldown 0.5 = 0.46 s at base, burst 2). Fast sits just above that floor (0.94-0.98 x gap = 0.47-0.49 s), so
-	-- no hit is rejected; Normal is the game's own swing. The player picks it.
+	-- no hit is rejected; Normal is the game's own swing. The player picks it (default Fast).
+	function N.chosenHitSpeed()
+		local v = optionText("HitSpeed", "Fast")
+		return if string.sub(v, 1, 7) == "Blatant" then N.BlatantHit else v
+	end
 	function N.hitSpeedPick()
-		return optionText("HitSpeed", "Normal")
+		local v = N.chosenHitSpeed()
+		local H = N.HitLadder
+		if v ~= N.BlatantHit then
+			H.rejects, H.fallbackUntil, H.fellBack = {}, 0, false
+			return v
+		end
+		if os.clock() < H.fallbackUntil then
+			return "Fast"
+		end
+		if H.fellBack then
+			H.fellBack = false
+			log("HIT retry Fast -> Blatant")
+		end
+		return v
 	end
 	function N.hitRange()
 		local base = N.swingGap()
 		local range = ({
 			Slow = { base + 0.15, base + 0.3 },
 			Fast = { base * 0.94, base * 0.98 },
-			["Blatant (HIGH RISK OF BAN)"] = { 0.1, 0.14 },
+			[N.BlatantHit] = { 0.1, 0.14 },
 		})[N.hitSpeedPick()] or { base, base + 0.06 }
 		return range[1], range[2]
 	end
@@ -35590,7 +35670,7 @@ do
 			table.insert(N.EggNames, egg.name)
 		end
 	end
-	N.HitSpeeds = { "Slow", "Normal", "Fast", "Blatant (HIGH RISK OF BAN)" }
+	N.HitSpeeds = { "Slow", "Normal", "Fast", "Blatant (rejected hits)" }
 	do
 		-- One switch for people who do not want to set anything: the safe, best settings for a full farm.
 		-- Quick Start (CLAUDE.md "Main = Quick Start"): Smart Planner plus the main loop toggles mirrored from their tabs
@@ -35665,8 +35745,8 @@ do
 		EggBox:AddDropdown("HitSpeed", {
 			Text = "Hit Speed",
 			Values = N.HitSpeeds,
-			Default = "Normal",
-			Tooltip = "Normal hits as fast as the game's own swing. Fast hits at the server limit. Blatant goes past it and can get you banned",
+			Default = "Fast",
+			Tooltip = "Fast hits right at the server limit (default). Normal is the game's own swing. Blatant goes past the limit, the server drops those hits and Corvus switches to Fast after 3 rejections",
 		})
 		EggBox:AddToggle("AvoidPlayers", {
 			Text = "Skip Eggs Other Players Hit",
@@ -35722,7 +35802,7 @@ do
 		})
 		GuardBox:AddSlider("GuardDistance", { Text = "Guard Distance", Default = 40, Min = 10, Max = 150, Rounding = 0, Suffix = " studs" })
 		GuardBox:AddToggle("IgnoreGuards", {
-			Text = "Ignore Guards (risky)",
+			Text = "Ignore Guards",
 			Default = false,
 			Tooltip = "Goes for zones and animals above your speed, the guard will often catch you and you drop the animal",
 		})
@@ -35972,15 +36052,15 @@ do
 		MoveBox:AddDropdown("MoveMode", {
 			Text = "Movement Type",
 			Values = { "Walk", "Fast", "Teleport" },
-			Default = "Walk",
-			Tooltip = "Walk really runs with your own speed and is safe from the game's anticheat. Fast and Teleport get pulled back or exploded by it now",
+			Default = "Fast",
+			Tooltip = "Fast glides a bit above your own speed (default). Walk runs at your own speed. Teleport is instant, the game blocks banking right after one. If the server pulls you back twice in a minute Corvus steps down one mode and tries again after 10 minutes",
 		})
 		MoveBox:AddToggle("TeleportSpeedCheck", {
 			Text = "Speed Check With Teleport",
 			Default = false,
 			Tooltip = "Also keeps to zones your speed can escape while teleporting. Off = farms the highest zone you can break eggs in",
 		})
-		MoveBox:AddSlider("FastSpeed", { Text = "Fast Speed", Default = 150, Min = 20, Max = 400, Rounding = 0, Suffix = " studs/s" })
+		MoveBox:AddSlider("FastBoost", { Text = "Fast Speed", Default = 110, Min = 100, Max = 300, Rounding = 0, Suffix = "% of your speed" })
 		MoveBox:AddToggle("TravelNoclip", { Text = "Noclip While Travelling", Default = true, Tooltip = "Fast mode only. Walk always passes through walls" })
 		MoveBox:AddToggle("LeaveHell", {
 			Text = "Leave Hell Event",
@@ -36804,13 +36884,13 @@ do
 					Id = "move",
 					Title = "How should Corvus travel?",
 					Description = "You can change this later in the Player tab.",
-					Default = "Walk",
+					Default = "Fast",
 					SingleColumn = true,
 					ChoiceHeight = 54,
 					Choices = {
-						{ Id = "Walk", Title = "Walk (safe)", Description = "Really runs with your own speed, the game's anticheat has nothing to catch", Icon = "shield", Color = "#60d696" },
-						{ Id = "Fast", Title = "Fast (risky)", Description = "Moves at 150 studs/s, the anticheat pulls you back", Icon = "wind", Color = "#5fb8ff" },
-						{ Id = "Teleport", Title = "Teleport (risky)", Description = "Instant, but the anticheat now pulls you back and blocks banking", Icon = "zap", Color = "#ff5d8f" },
+						{ Id = "Fast", Title = "Fast", Description = "Glides a bit above your own speed, steps down to Walk if the server pulls you back", Icon = "wind", Color = "#5fb8ff" },
+						{ Id = "Walk", Title = "Walk", Description = "Runs with your own speed", Icon = "footprints", Color = "#60d696" },
+						{ Id = "Teleport", Title = "Teleport", Description = "Instant, the game blocks banking right after a teleport", Icon = "zap", Color = "#ff5d8f" },
 					},
 				},
 			},
@@ -36869,17 +36949,6 @@ else
 		SaveManager:LoadAutoloadConfig()
 	end)
 end
--- The game added a server anticheat for teleport, speed and fly. Configs saved before that keep Teleport,
--- so they are moved to Walk once (the player can still pick another mode afterwards).
-pcall(function()
-	if Library.GetSetting and not Library:GetSetting("BSE_AntiCheatWalk", false) then
-		Library:SetSetting("BSE_AntiCheatWalk", true)
-		if N.moveMode() ~= "Walk" then
-			Options.MoveMode:SetValue("Walk")
-			notify("Movement", "The game added an anticheat, Corvus now walks instead of teleporting", 6)
-		end
-	end
-end)
 if Window.AddInfoTab then
 	local DonateMethods = {
 		{
@@ -37249,9 +37318,13 @@ do
 				end
 				I.merge = string.format("<b>%d</b> merge eggs on your plot, <b>%d</b> ready\nPlaced <b>%d</b>  \u{00B7}  hatched <b>%d</b>", growing, ready, N.Merge.placed, N.Merge.hatched)
 				I.move = string.format(
-					"Speed now <b>%s</b> studs/s%s\nSnapbacks <b>%d</b>  \u{00B7}  blocked <b>%d</b>",
+					"Speed now <b>%s</b> studs/s%s%s\nSnapbacks <b>%d</b>  \u{00B7}  blocked <b>%d</b>",
 					if N.moveMode() == "Teleport" then "\u{221E}" else formatNumber(math.floor(N.modeSpeed())),
 					if os.clock() < N.Moves.slowUntil then '  <font color="#fab428">(slowed after a snapback)</font>' else "",
+				(function()
+					local fell, wait = N.moveFallback()
+					return if fell then string.format("\n%s after snapbacks, %s again in %dm", N.moveMode(), N.chosenMoveMode(), math.ceil(wait / 60)) else ""
+				end)(),
 					N.Moves.snaps,
 					N.Moves.blocked
 				)
