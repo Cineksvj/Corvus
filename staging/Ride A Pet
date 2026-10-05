@@ -9078,7 +9078,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
     
             local function RefreshFooterInfo()
                 FooterInfoLabel.Text = string.format(
-                    "#%s • %d, %d, %d",
+                    "#%s â€¢ %d, %d, %d",
                     ColorPicker.Value:ToHex(),
                     math.floor(ColorPicker.Value.R * 255),
                     math.floor(ColorPicker.Value.G * 255),
@@ -31829,6 +31829,8 @@ local Allowed = {
 ["Game/ClaimEventReward"] = true,
 ["Game/PlayerActivity"] = true,
 ["Game/EggTimerPause"] = true,
+["Game/SellItems"] = true,
+["Game/EggArrivalClaim"] = true,
 ["Plot/Nests"] = true,
 ["Plot/Upgrades"] = true,
 ["Net/VolcanoDip"] = true,
@@ -33266,6 +33268,9 @@ return MoveByRank[math.max(1, MoveRank[base] - S.level)]
 end
 function N.noteSnapback(kind)
 local S = N.Snap
+if N.basketItems and #N.basketItems() > 0 and N.carryBoost() > 1 then
+N.carryResult(false, N.carryBoost(), #N.basketItems(), "snapback")
+end
 local from = N.moveMode()
 if from == "Safe" then
 return
@@ -33311,7 +33316,45 @@ return math.huge
 end
 return N.safeSpeed()
 end
+function N.stormActive()
+for _, w in ipairs(N.weatherState and N.weatherState() or {}) do
+if w.mutation then
+return true
+end
+end
+return false
+end
+-- Storm: a held/ridden pet can be struck (LightningStrike Kind "Ridden", HeldRiggedStrikeChanceBonus). Ride the best
+-- un-mutated backpack pet that would not earn on the plot anyway (weaker than the weakest placed pet).
+function N.stormRidePet()
+if not on("StormRideBest") or not N.stormActive() then
+return nil
+end
+local placed = N.plotPets()
+if #placed < N.maxPets() then
+return nil
+end
+local w = math.huge
+for _, pet in ipairs(placed) do
+w = math.min(w, pet.income)
+end
+local best
+for _, info in ipairs(N.petTools()) do
+if not info.mutation and info.income <= w and (not best or info.income > best.income) then
+best = info
+end
+end
+if best and N.StormRideKey ~= best.key then
+N.StormRideKey = best.key
+log("STORM ride", best.name, "rarity=" .. tostring(best.rarity))
+end
+return best
+end
 function N.ridePetChoice()
+local storm = N.stormRidePet()
+if storm then
+return storm
+end
 local wanted = optionText("RidePet", "Fastest")
 local best, bestSpeed
 for _, info in ipairs(N.petTools()) do
@@ -33458,6 +33501,51 @@ return 0.2
 end
 return pathLength(from, to) / math.max(plannedSpeed(mode) * (carry or 1), 1)
 end
+-- Carry ladder: with ONLY cheap eggs in the basket (below Legendary, no mutation) the ride home goes 1.15x..1.5x the
+-- safe speed. No client speed check exists (EggDeliveryRules.ClaimDeadline only checks claim times); the worst case is
+-- a lost cheap egg. 3 clean deliveries step up, a refused delivery or a snapback steps down and locks that rung.
+N.CarryBoost = { rungs = { 1, 1.15, 1.3, 1.5 }, level = 2, wins = 0, top = 4 }
+function N.carryCheap()
+local items = N.basketItems()
+if #items == 0 then
+return false
+end
+local legendary = N.RarityRank.Legendary or 5
+for _, child in ipairs(items) do
+local name = tostring(child:GetAttribute("Egg") or child.Name)
+local m, sm = child:GetAttribute("Mutation"), child:GetAttribute("SpawnMutation")
+if (N.RarityRank[N.eggRarity(name)] or 99) >= legendary or (type(m) == "string" and m ~= "") or (type(sm) == "string" and sm ~= "") then
+return false
+end
+end
+return true
+end
+function N.carryBoost()
+if not N.carryCheap() then
+return 1
+end
+return N.CarryBoost.rungs[N.CarryBoost.level] or 1
+end
+function N.carryResult(ok, speed, eggs, why)
+local C = N.CarryBoost
+log(string.format("CARRY speed=%.2f eggs=%d ok=%s%s", speed, eggs, tostring(ok), if why then " " .. why else ""))
+if speed <= 1 then
+return
+end
+if ok then
+C.wins += 1
+if C.wins >= 3 and C.level < C.top then
+C.level += 1
+C.wins = 0
+log(string.format("CARRY step up to %.2f", C.rungs[C.level]))
+end
+else
+C.wins = 0
+C.top = math.max(1, C.level - 1)
+C.level = C.top
+log(string.format("CARRY fallback to %.2f, locked for this session", C.rungs[C.level]))
+end
+end
 function N.travelTo(target, opts)
 opts = opts or {}
 local root = rootPart()
@@ -33477,9 +33565,10 @@ task.wait(0.05)
 Noclip.travel = false
 return ok
 end
+local boost = if mode == "Safe" and #N.basketItems() > 0 then N.carryBoost() else 1
 local speedFn = if mode == "Safe"
 then function()
-return N.safeSpeed() * (opts.carry or 1)
+return N.safeSpeed() * (opts.carry or 1) * boost
 end
 else function()
 return N.modeSpeed(mode)
@@ -33755,10 +33844,16 @@ end
 function N.plannerOn()
 return on("AutoSmartPlan")
 end
--- a spend switch runs when its own toggle or the Smart Planner is on (Auto Sell and Auto Feed never follow the planner)
+-- a switch's job runs when its own toggle or the Smart Planner is on
 function N.planOn(name)
 return on(name) or on("AutoSmartPlan")
 end
+-- the egg farm runs for Auto Farm Eggs and for the Smart Planner (the planner plays the whole loop itself)
+function N.farmOn()
+return on("AutoFarm") or on("AutoSmartPlan")
+end
+-- EggPickup: the server refuses when you stand over 90 studs from the egg's spawn point ("too far from its spawn point (3160 studs, limit 90)")
+N.PICKUP_RANGE = 80
 function N.nothingPicked(option)
 local v = option and option.Value
 return type(v) ~= "table" or next(v) == nil
@@ -33832,6 +33927,11 @@ return 1e30 - distance
 end
 if on("AdminFirst") and (info.admin or info.spotlight) then
 return 1e29 + value
+end
+if N.plannerOn() and N.Plan and N.Plan.eggValue then
+-- Smart Planner: expected $ of the hatch (sell worth + income over your weakest placed pet) per second of the trip
+local v = N.Plan.eggValue(info)
+return v / ((info.toEgg or 0) + (info.back or 0) + (info.waitDrop or 0) + 2)
 end
 if pick == "Rarest" then
 return info.rank * 1e18 + value
@@ -34009,6 +34109,21 @@ end
 end)
 local function pickUp(info)
 N.watchBasket()
+-- arrival check: fire only inside the server's pickup range
+local function gap()
+local r = rootPart()
+return if r then (r.Position - info.pos).Magnitude else math.huge
+end
+if gap() > N.PICKUP_RANGE then
+waitFor(function()
+return gap() <= N.PICKUP_RANGE
+end, 2)
+if gap() > N.PICKUP_RANGE then
+log(string.format("PICKUP not fired, still %.0f studs away (limit 90)", gap()))
+skipEgg(info.id, 8, "not in pickup range")
+return false, "range"
+end
+end
 Pickup.reply = nil
 local before = #N.basketItems()
 Farm.pending[info.name] = info
@@ -34044,8 +34159,8 @@ local cfg = N.eggConfig(info.name)
 if type(cfg) == "table" and cfg.RequiresVolcano == true then
 return false
 end
-local dist = flat(root.Position, info.pos)
-if dist < 12 then
+local dist = (root.Position - info.pos).Magnitude
+if dist < 12 or dist > N.PICKUP_RANGE then
 return false
 end
 N.watchBasket()
@@ -34117,6 +34232,7 @@ local names = {}
 for _, child in ipairs(N.basketItems()) do
 table.insert(names, tostring(child:GetAttribute("Egg") or child.Name))
 end
+local carrySpeed, carryEggs, failsBefore = N.carryBoost(), #N.basketItems(), N.Moves.deliveryFails or 0
 setStatus("Bringing " .. table.concat(names, ", ") .. " home")
 if mode ~= "Blatant" and N.playerAttr("InVolcano") == true then
 N.leaveVolcano()
@@ -34135,9 +34251,26 @@ end
 N.holdStill(0.6, function()
 return #N.basketItems() > 0
 end)
+-- early arrival claim (only when Pause Egg Timer does not work): the server accepts a claim time up to ~0.5 s back
+local rootNow = rootPart()
+if N.Pause and N.Pause.dead and rootNow and N.onPlot(rootNow.Position, -2) then
+local claim, soon = {}, false
+for _, child in ipairs(N.basketItems()) do
+local at = tonumber(child:GetAttribute("BreakAt"))
+if at and child:GetAttribute("Delivering") ~= true then
+table.insert(claim, child.Name)
+soon = soon or at - serverNow() < 1.5
+end
+end
+if soon and #claim > 0 then
+fire("Game/EggArrivalClaim", serverNow() - 0.4, rootNow.Position, claim)
+log(string.format("ARRIVAL early eggs=%d", #claim))
+end
+end
 local done = waitFor(function()
 return #N.basketItems() == 0
 end, 5)
+N.carryResult(done and (N.Moves.deliveryFails or 0) == failsBefore, carrySpeed, carryEggs)
 if not done and #N.basketItems() > 0 then
 local child = N.basketItems()[1]
 local at = tonumber(child:GetAttribute("BreakAt"))
@@ -34294,7 +34427,7 @@ end
 local function goToEgg(info, carry)
 local target = info.pos + Vector3.new(0, N.hrpOffset() + 0.5, 0)
 local function keepGoing()
-return info.cfg.Parent ~= nil and not eggClaimed(info.cfg, info.name) and (on("AutoFarm") or N.manualRunning())
+return info.cfg.Parent ~= nil and not eggClaimed(info.cfg, info.name) and (N.farmOn() or N.manualRunning())
 end
 local cfg = N.eggConfig(info.name)
 if type(cfg) == "table" and cfg.RequiresVolcano == true then
@@ -34346,7 +34479,7 @@ if got then
 local function planPaused()
 return on("PauseEggTimer") and N.Pause.verified and not N.Pause.dead and N.Pause.sent and N.pausedAny()
 end
-while alive() and #N.basketItems() < (if planPaused() then math.min(N.basketCapacity(), 20) else math.min(N.basketCapacity(), math.max(1, optionNumber("EggsPerTrip", 1)))) and (on("AutoFarm") or N.manualRunning()) do
+while alive() and #N.basketItems() < (if planPaused() then math.min(N.basketCapacity(), 20) else math.min(N.basketCapacity(), math.max(1, optionNumber("EggsPerTrip", 1)))) and (N.farmOn() or N.manualRunning()) do
 local root = rootPart()
 local home = homePos()
 local deadline = N.soonestBreak()
@@ -34399,6 +34532,30 @@ N.deliverBasket()
 end
 return got
 end
+-- Night (DayNight: 120 s of every 420 s, growth x10): when an egg on the plot finishes inside the coming night and you
+-- have eggs to refill, the Smart Planner stays home so the nest is refilled at once.
+function N.nightHold()
+local D = N.DayNight
+local cycle = tonumber(D.SteppedCycleSeconds) or 420
+local beginsAt = tonumber(D.NightBeginsAt) or 298.5
+local len = tonumber(D.NightPhaseSeconds) or 120
+local rate = tonumber(D.NightGrowthRate) or 10
+local v = serverNow() % cycle
+local untilNight = if v >= beginsAt and v < beginsAt + len then 0 elseif v < beginsAt then beginsAt - v else cycle - v + beginsAt
+if untilNight > 20 or #N.eggTools() == 0 then
+return false, 0, 0
+end
+local nightLeft = if untilNight == 0 then beginsAt + len - v else len
+local nests, ready = 0, 0
+for _, model in ipairs(N.plotEggModels()) do
+nests += 1
+local left = N.eggGrowth(model)
+if left and left > 0 and left <= untilNight + nightLeft * rate then
+ready += 1
+end
+end
+return ready > 0, nests, ready
+end
 function N.farmStep()
 N.watchBasket()
 if #N.basketItems() > 0 then
@@ -34409,6 +34566,16 @@ local root = rootPart()
 if not root then
 return false
 end
+if N.plannerOn() then
+local hold, nests, ready = N.nightHold()
+if hold then
+N.Plan.say("night", "hold", string.format("NIGHT hold nests=%d eggs ready=%d", nests, ready), true)
+Farm.idleReason = "Night hold"
+N.goHome("Night: eggs grow 10x, staying home to refill nests")
+task.wait(1)
+return true
+end
+end
 local list = targetList(root.Position)
 local first = list[1]
 if not first then
@@ -34416,6 +34583,10 @@ Farm.idleReason = "No eggs match right now"
 return false
 end
 Farm.idleReason = nil
+if N.plannerOn() and N.Plan and N.Plan.eggValue then
+local v, beat = N.Plan.eggValue(first)
+N.Plan.say("trip", first.id, string.format("trip %s (%s KG, %s) worth $%s, %.1f%% to beat your weakest pet, about %ds", first.name, formatNumber(first.kg), first.rarity, formatNumber(v), beat * 100, math.floor((first.toEgg or 0) + (first.back or 0))))
+end
 runTrip(first)
 return true
 end
@@ -35607,6 +35778,11 @@ function P.noteEgg(info)
 if type(info) ~= "table" or not N.eggConfig(info.name) then
 return
 end
+if P.seeded then
+-- real deliveries replace the map eggs used as a first guess
+P.seeded = false
+table.clear(P.mix)
+end
 local w = tonumber(info.weight) or 1
 table.insert(P.mix, { name = info.name, w = w, f = w * N.mutationFactor(info.mutation) * N.mutationFactor(info.spawnMutation) })
 if #P.mix > 40 then
@@ -35729,6 +35905,19 @@ end
 if noNest then
 nests = 10
 end
+if #P.mix == 0 then
+-- nothing delivered yet: value luck and nests with the eggs you would farm right now
+for _, info in ipairs(N.worldEggs()) do
+if #P.mix >= 40 then
+break
+end
+if N.eggWanted(info) and N.eggConfig(info.name) then
+local wt = tonumber(info.weight) or 1
+table.insert(P.mix, { name = info.name, w = wt, f = wt * N.mutationFactor(info.mutation) * N.mutationFactor(info.spawnMutation) })
+P.seeded = true
+end
+end
+end
 local grow, gn = 0, 0
 for _, e in ipairs(P.mix) do
 grow += N.growthSeconds(e.name, e.w)
@@ -35740,6 +35929,7 @@ local r = if #t >= 3 then #t / math.max(os.clock() - t[1], 60) elseif grow > 0 t
 local L0 = N.luckMultiplier()
 local g0, s0, p0, fAvg, rar0 = dropStats(L0, w)
 local gap0 = if p0 > 0 then math.max(K * s0 / p0 - raw, 0) else 0
+P.w, P.m, P.K = w, m, K
 local opts = {}
 local function add(o)
 o.ratio = if o.C > 0 then o.dI / o.C else math.huge
@@ -35811,7 +36001,7 @@ end
 -- Shop: food = pet age (income x(1 + 0.01 per age), XP per age from PetAging), lanterns = bigger hatches
 if N.planOn("AutoShop") and N.Shop.stock then
 local target
-if on("AutoFeed") then
+if N.planOn("AutoFeed") then
 local A = N.PetAging
 local maxAge = tonumber(A.MaxAge) or 100
 local per = tonumber(A.GrowthPerAge) or 0.01
@@ -35848,7 +36038,7 @@ age += part
 xp -= part * need
 end
 add({ kind = "food", key = it.name, label = it.name, cash = it.price, C = it.price, dI = (age - target.age) * target.perAge * m })
-elseif type(lantern) == "table" and on("AutoLanterns") then
+elseif type(lantern) == "table" and N.planOn("AutoLanterns") then
 local eggs = #N.plotEggModels()
 add({ kind = "lantern", key = it.name, label = it.name, cash = it.price, C = it.price, dI = eggs * s0 * (tonumber(lantern.SizeBonus) or 0) / math.max(fAvg, 0.1) * m / (1 + queued) })
 end
@@ -35906,6 +36096,30 @@ else
 log("PLAN best=none (no option pays back within " .. secs(H) .. ") alt=" .. (if #alt > 0 then table.concat(alt, ", ") else "-"))
 end
 end
+if N.plannerOn() and os.clock() - (P.eggsAt or -1e9) > 60 then
+P.eggsAt = os.clock()
+local byName = {}
+for _, info in ipairs(N.worldEggs()) do
+local v, beat = P.eggValue(info)
+local b = byName[info.name]
+if not b or v > b.v then
+byName[info.name] = { v = v, beat = beat, name = info.name, wanted = N.eggWanted(info) }
+end
+end
+local arr = {}
+for _, b in pairs(byName) do
+table.insert(arr, b)
+end
+table.sort(arr, function(a, b)
+return a.v > b.v
+end)
+local parts = {}
+for i = 1, math.min(4, #arr) do
+local b = arr[i]
+table.insert(parts, string.format("%s $%s (%.1f%% beats weakest)%s", b.name, formatNumber(b.v), b.beat * 100, if b.wanted then "" else " filtered out"))
+end
+log("PLAN eggs " .. (if #parts > 0 then table.concat(parts, "; ") else "none on the map right now"))
+end
 if os.clock() - P.rateAt > 60 then
 P.rateAt = os.clock()
 local seen, want = {}, {}
@@ -35941,6 +36155,35 @@ return lines
 end
 function P.nextText()
 return P.upNext()[1] or "nothing to buy right now"
+end
+-- Expected $ of one egg: every pet it can hatch (game odds at your luck) is worth its sell price (SellValue:
+-- income x SellIncomeMultiplier 600) and, when it beats your weakest placed pet, the extra income over 6 h.
+P.SELL_MULT, P.PLACE_SECONDS = 600, 21600
+function P.eggValue(info)
+local w = P.w or 0
+local m = P.m or N.incomeMultiplier()
+local f = math.max(tonumber(info.weight) or 1, 0.05) * N.mutationFactor(info.mutation) * N.mutationFactor(info.spawnMutation)
+local value, beat = 0, 0
+for _, e in ipairs(N.eggOdds(info.name) or {}) do
+local cfg = N.PetsData[e.name]
+local inc = (if type(cfg) == "table" then tonumber(cfg.Income) or 0 else 0) * f
+value += e.chance * (P.SELL_MULT * inc + math.max(0, inc - w) * m * P.PLACE_SECONDS)
+if inc > w then
+beat += e.chance
+end
+end
+return value, beat
+end
+-- PLAN lines in plain words: a decision is logged when it changes, the same one again after 60 s
+P.said = {}
+function P.say(key, sig, text, raw)
+local now = os.clock()
+local last = P.said[key]
+if last and last.sig == sig and now - last.at < 60 then
+return
+end
+P.said[key] = { sig = sig, at = now }
+log(if raw then text else "PLAN " .. text)
 end
 function P.approve(kind, cost, key)
 if ((P.dirty and os.clock() - P.at > 1) or os.clock() - P.at > 5) and (on("AutoSmartPlan") or on("AutoBuyNests") or on("AutoLuck") or on("AutoRebirth") or on("AutoShop") or on("AutoFeed") or on("AutoLanterns")) then
@@ -35980,6 +36223,10 @@ local pick = tools[1]
 if not pick then
 return false
 end
+local here = rootPart()
+if here and not N.onPlot(here.Position, 0) and #N.basketItems() == 0 then
+N.goHome("Going home to use the radar (its egg spawns near you)")
+end
 if N.isRiding() then
 N.dismount()
 end
@@ -35991,7 +36238,7 @@ task.wait(0.6)
 fire("Game/RadarState")
 waitFor(radarActive, 2)
 N.unequipTools()
-log("RADAR used", pick.Name, if radarActive() then "target found" else "no target yet")
+log("RADAR used", pick.Name, if radarActive() then "target found" else "no target yet", "onPlot=" .. tostring(rootPart() ~= nil and N.onPlot(rootPart().Position, 2)))
 return radarActive()
 end
 local Rewards = { meatAt = -1e9 }
@@ -36083,111 +36330,125 @@ end
 log("CONFIRM", message, "->", tostring(choice or "Yes"))
 fire("Game/ConfirmRequest", id, true, choice or "Yes")
 end)
-local function sellOption(list)
-for _, text in ipairs(list) do
-local lower = string.lower(text)
-if
-string.find(lower, "sell", 1, true)
-and not string.find(lower, "all", 1, true)
-and not string.find(lower, "every", 1, true)
-and not string.find(lower, "pet", 1, true)
-then
-return text
+-- Selling: the game sells PETS only (SellValue.EggSellingEnabled = false). The Sell menu at Richie fires
+-- Game/SellItems({Pets = {PetKey...}, Eggs = {}}) and the server refuses beyond Richie's range (Reason "TooFar").
+-- Only pets weaker than your weakest placed pet are sold, never favorites, the tutorial snail or the rebirth pet.
+function N.sellablePets()
+local placed = N.plotPets()
+if #placed < N.maxPets() then
+return {}, 0
+end
+local w = math.huge
+for _, pet in ipairs(placed) do
+w = math.min(w, pet.income)
+end
+-- every pet a coming rebirth still asks for (General.RebirthRequirements) is kept
+local need = {}
+local reqs = N.GeneralData.RebirthRequirements
+if type(reqs) == "table" then
+for i = N.rebirths() + 1, #reqs do
+need[tostring(reqs[i])] = true
 end
 end
-return nil
-end
-local function sellableEggs()
 local list = {}
-for _, info in ipairs(N.eggTools()) do
+for _, pet in ipairs(N.petTools()) do
 if
-selected(Options.SellRarities, info.rarity)
-and not (on("SellKeepMutated") and (info.mutation or info.spawnMutation))
-and info.kg < N.optionAmount("SellBelowKG", math.huge)
+type(pet.key) == "string"
+and pet.key ~= "TUTORIAL_Snail"
+and not pet.favorited
+and pet.income < w
+and not need[pet.name]
+and selected(Options.SellRarities, pet.rarity)
+and not (on("SellKeepMutated") and (pet.mutation or pet.spawnMutation))
+and pet.weight < N.optionAmount("SellBelowKG", math.huge)
 then
-table.insert(list, info)
+table.insert(list, pet)
 end
 end
-return list
+table.sort(list, function(a, b)
+return a.income < b.income
+end)
+return list, w
 end
-local Sell = { blockedUntil = 0 }
+local Sell = { blockedUntil = 0, reply = nil }
+N.onEvent("Game/SellItems", function(data)
+Sell.reply = if type(data) == "table" then data else { Reason = tostring(data) }
+end, true)
 function N.sellEggs(manual)
-local eggs = sellableEggs()
-if #eggs == 0 then
+local pets, weakest = N.sellablePets()
+if #pets == 0 then
 if manual then
-notify("Sell", "No eggs match your sell filters", 3)
+notify("Sell", "No pets to sell: only pets weaker than your weakest placed pet that match Sell Rarities are sold", 5)
 end
-return 0
-end
-if type(fireproximityprompt) ~= "function" then
-if manual then
-notify("Sell", "Your executor cannot press prompts, selling is off", 4)
-end
-Sell.blockedUntil = os.clock() + 600
 return 0
 end
 local stalls = workspace:FindFirstChild("Stalls")
 local stall = stalls and stalls:FindFirstChild("Sell")
 local npc = stall and stall:FindFirstChild("Richie")
-local rootOfNpc = npc and npc:FindFirstChild("HumanoidRootPart")
-local prompt = rootOfNpc and rootOfNpc:FindFirstChildOfClass("ProximityPrompt")
-if not prompt then
+local part = npc and (npc.PrimaryPart or npc:FindFirstChild("HumanoidRootPart"))
+if not part then
 Sell.blockedUntil = os.clock() + 300
-log("SELL could not find Richie")
+log("SELL skipped reason=Richie not found")
 return 0
 end
-N.dismount()
-setStatus("Selling eggs to Richie")
-N.travelTo((rootOfNpc.CFrame * CFrame.new(0, 0, -6)).Position)
-local sold = 0
-for i, info in ipairs(eggs) do
-if i > 12 or not alive() or not info.item.Parent then
+local keys, worth = {}, 0
+for i, pet in ipairs(pets) do
+if i > 50 then
 break
 end
-if not N.equipTool(info.item) then
+table.insert(keys, pet.key)
+worth += pet.income * 600
+end
+if N.plannerOn() then
+log(string.format("PLAN sell %d pet(s) weaker than your weakest placed pet ($%s/s raw) for about $%s", #keys, formatNumber(weakest), formatNumber(worth)))
+end
+setStatus("Selling " .. #keys .. " pet(s) to Richie")
+N.travelTo((part.CFrame * CFrame.new(0, 0, -6)).Position)
+local root = rootPart()
+local dist = if root then (root.Position - part.Position).Magnitude else math.huge
+if dist > 25 then
+log(string.format("SELL skipped reason=not next to Richie (%.0f studs)", dist))
+Sell.blockedUntil = os.clock() + 60
+return 0
+end
+local cashBefore = N.cash()
+local reply, sold = nil, 0
+for attempt = 1, 2 do
+Sell.reply = nil
+fire("Game/SellItems", { Pets = keys, Eggs = {} })
+waitFor(function()
+return Sell.reply ~= nil
+end, 3)
+reply = Sell.reply
+sold = if reply then tonumber(reply.Sold) or 0 else 0
+if sold > 0 or attempt == 2 or not reply then
 break
 end
-Dialog.data = nil
-pcall(fireproximityprompt, prompt)
-local got = waitFor(function()
-return Dialog.data ~= nil and #dialogOptions(Dialog.data) > 0
-end, 4)
-if not got then
-log("SELL Richie did not answer")
-Sell.blockedUntil = os.clock() + 300
-break
-end
-local option = sellOption(dialogOptions(Dialog.data))
-if not option then
-log("SELL no single-sell option found", table.concat(dialogOptions(Dialog.data), " | "))
-Sell.blockedUntil = os.clock() + 900
-if manual then
-notify("Sell", "Richie has no sell option for this item", 5)
-end
-break
-end
-Dialog.confirmUntil = os.clock() + 5
-fire("Dialogue/DialogueSelect", Dialog.data.Model, option)
-local gone = waitFor(function()
-return N.toolGone(info.item)
-end, 4)
-Dialog.confirmUntil = 0
-if gone then
-sold += 1
-Session.sold += 1
+if reply.Reason == "TooFar" then
+N.travelTo((part.CFrame * CFrame.new(0, 0, -4)).Position)
+elseif reply.Reason == "Busy" then
+task.wait(2)
 else
-log("SELL item still here after choosing", option)
 break
 end
 end
-N.unequipTools()
-if sold > 0 then
-Track.event("Sell", "Sold " .. sold .. " egg(s)", "to Richie", "banknote", "#60d696")
+if sold <= 0 then
+local why = tostring(reply and reply.Reason or "no answer")
+log("SELL skipped reason=" .. why .. " pets=" .. #keys)
+Sell.blockedUntil = os.clock() + 300
+if manual then
+notify("Sell", "Richie did not buy: " .. why, 5)
 end
+return 0
+end
+task.wait(0.5)
+log(string.format("SELL pets n=%d cash=$%s (expected $%s)", sold, formatNumber(math.max(N.cash() - cashBefore, 0)), formatNumber(worth)))
+Session.sold += sold
+Track.event("Sell", "Sold " .. sold .. " pet(s)", "to Richie", "banknote", "#60d696")
 return sold
 end
 function N.sellDue()
-return os.clock() >= Sell.blockedUntil and #sellableEggs() >= math.max(1, math.floor(optionNumber("SellAt", 5)))
+return os.clock() >= Sell.blockedUntil and #N.sellablePets() >= math.max(1, math.floor(optionNumber("SellAt", 5)))
 end
 local function activeWeathers()
 local serverData = ReplicatedStorage:FindFirstChild("ServerData")
@@ -36321,7 +36582,7 @@ N.EverythingBox = OPBox
 OPBox:AddToggle("AutoSmartPlan", {
 Text = "Smart Planner (best value)",
 Default = false,
-Tooltip = "Runs its own loop: buys luck, nests, rebirth and shop items by profit payback with the real game odds, without turning other switches on. Keeps your Keep Cash. It never sells or feeds: Auto Sell and Auto Feed stay on their own switches.",
+Tooltip = "Plays the whole loop by profit with the real game odds: rides to the eggs worth most for your pets, places and hatches them, places the best pets, feeds, sells pets weaker than your weakest placed one (Sell Rarities, never favorites), buys luck, nests, rebirth and shop items by 24 h payback and claims free rewards. Other switches stay as they are. Keeps your Keep Cash and egg filters.",
 })
 N.QuickStartStop = {
 Text = "Stop Everything",
@@ -36396,6 +36657,11 @@ FarmBox:AddToggle("StormEggsFirst", {
 Text = "Storm Eggs First",
 Default = true,
 Tooltip = "During a weather with a mutation, eggs with the storm mutation (x2 to x12.5 income) are grabbed first. Your egg filters still apply.",
+})
+FarmBox:AddToggle("StormRideBest", {
+Text = "Storm: Ride Best Spare Pet",
+Default = true,
+Tooltip = "During a mutation storm you ride your best un-mutated backpack pet (one that earns nothing on the plot), the ridden pet can be struck and mutated",
 })
 FarmBox:AddToggle("WaitOnPlot", { Text = "Wait On Plot Between Spawns", Default = true })
 FarmBox:AddToggle("PauseEggTimer", {
@@ -36774,20 +37040,20 @@ Func = function()
 task.spawn(N.runManual, N.shopTick, true)
 end,
 })
-local SellBox = Tabs.Upgrades:AddRightGroupbox("Sell Eggs", "banknote")
+local SellBox = Tabs.Upgrades:AddRightGroupbox("Sell Pets", "banknote")
 SellBox:AddToggle(
 "AutoSell",
-{ Text = "Auto Sell Eggs", Default = false, Tooltip = "Sells the eggs you do not want to Richie" }
+{ Text = "Auto Sell Weak Pets", Default = false, Tooltip = "Sells backpack pets weaker than your weakest placed pet to Richie (the game pays 600x their income). Never favorites. The Smart Planner uses the same filters" }
 )
 SellBox:AddDropdown(
 "SellRarities",
-{ Text = "Sell Rarities", Values = N.EggRarities, Default = { "Common" }, Multi = true, AllowNull = true }
+{ Text = "Sell Rarities", Values = N.RarityList, Default = { "Common" }, Multi = true, AllowNull = true }
 )
-SellBox:AddToggle("SellKeepMutated", { Text = "Keep Mutated Eggs", Default = true })
+SellBox:AddToggle("SellKeepMutated", { Text = "Keep Mutated Pets", Default = true })
 SellBox:AddInput("SellBelowKG", { Text = "Only Below KG", Placeholder = "empty = any weight", Default = "", Finished = true })
 SellBox:AddSlider(
 "SellAt",
-{ Text = "Sell When I Have", Default = 5, Min = 1, Max = 50, Rounding = 0, Suffix = " eggs", HideMax = true }
+{ Text = "Sell When I Have", Default = 5, Min = 1, Max = 50, Rounding = 0, Suffix = " pets", HideMax = true }
 )
 SellBox:AddButton({
 Text = "Sell Now",
@@ -38737,12 +39003,12 @@ Perf.frames, Perf.time, Perf.worst, Perf.hitches, Perf.freezes = 0, 0, 0, 0, 0
 table.clear(Perf.work)
 flushLog(false)
 end
-local farming = on("AutoFarm") or on("AutoPlaceEggs") or on("AutoPlacePets") or on("AutoFeed")
+local farming = N.farmOn() or on("AutoPlaceEggs") or on("AutoPlacePets") or on("AutoFeed")
 if farming and Log.statusAt and os.clock() - Log.statusAt > 600 and Log.stuckAt ~= Log.statusAt then
 Log.stuckAt = Log.statusAt
 logProblem("Stuck for 10 minutes on: " .. tostring(Status))
 end
-if on("AutoFarm") and Farm.idleReason == nil then
+if N.farmOn() and Farm.idleReason == nil then
 if not farmSince or Session.delivered ~= lastDelivered then
 farmSince = os.clock()
 lastDelivered = Session.delivered
@@ -38991,23 +39257,23 @@ end
 return false
 end
 local function runChores()
-if on("AutoPlaceEggs") and choreDue("place", 8) and N.placeEggsDue() then
+if N.planOn("AutoPlaceEggs") and choreDue("place", 8) and N.placeEggsDue() then
 N.placeEggs()
 return true
 end
-if on("AutoPlacePets") and choreDue("pets", 12) and N.placePetsDue() then
+if N.planOn("AutoPlacePets") and choreDue("pets", 12) and N.placePetsDue() then
 N.placePets()
 return true
 end
-if on("AutoFeed") and choreDue("feed", 45) and N.feedDue() then
+if N.planOn("AutoFeed") and choreDue("feed", 45) and N.feedDue() then
 N.feedPets()
 return true
 end
-if on("AutoLanterns") and choreDue("lantern", 20) and N.lanternDue() then
+if N.planOn("AutoLanterns") and choreDue("lantern", 20) and N.lanternDue() then
 N.placeLantern()
 return true
 end
-if on("AutoRadar") and choreDue("radar", 15) and N.radarDue() then
+if N.planOn("AutoRadar") and choreDue("radar", 15) and N.radarDue() then
 N.useRadar()
 return true
 end
@@ -39015,15 +39281,15 @@ if N.planOn("AutoShop") and choreDue("shop", 20) and N.shopDue() then
 N.shopTick(false)
 return true
 end
-if on("AutoSell") and choreDue("sell", 60) and N.sellDue() then
+if N.planOn("AutoSell") and choreDue("sell", 60) and N.sellDue() then
 N.sellEggs(false)
 return true
 end
-if on("AutoGroupMeat") and choreDue("meat", 60) and N.meatDue() then
+if N.planOn("AutoGroupMeat") and choreDue("meat", 60) and N.meatDue() then
 N.claimMeat()
 return true
 end
-if on("AutoCollect") and choreDue("collect", 30) and not N.autoCollectOn() and #N.plotPets() > 0 then
+if N.planOn("AutoCollect") and choreDue("collect", 30) and not N.autoCollectOn() and #N.plotPets() > 0 then
 N.collectCash()
 return true
 end
@@ -39048,14 +39314,14 @@ setStatus("Looking for your plot")
 return
 end
 N.watchBasket()
-if on("AutoFarm") and #N.basketItems() > 0 then
+if N.farmOn() and #N.basketItems() > 0 then
 N.deliverBasket()
 return
 end
 if runChores() then
 return
 end
-if on("AutoFarm") then
+if N.farmOn() then
 if N.farmStep() then
 return
 end
@@ -39084,6 +39350,10 @@ if matching > 0 and tooFar == matching and best then
 setStatus(string.format("%d egg(s) match but none can reach your plot before breaking (best: %s needs %ds, breaks in %ds). Lower Min KG, pick lighter eggs or use Fast", matching, best.name, math.ceil(best.back), math.floor(best.limit)))
 else
 setStatus("Waiting for eggs" .. (if left then ", new ones in " .. clockText(left) else "") .. (if matching > 0 then string.format(" (%d match, %d too far)", matching, tooFar) else ""))
+end
+if N.plannerOn() then
+local why = if matching == 0 then "no egg on the map passes your egg filters" elseif tooFar == matching then "every matching egg would break before reaching your plot" else "waiting for eggs"
+N.Plan.say("idle", why, "idle reason=" .. why .. (if left then ", new eggs in " .. clockText(left) else "") .. ", next buy: " .. N.Plan.nextText())
 end
 task.wait(0.8)
 return
@@ -39266,14 +39536,14 @@ end
 return false
 end
 local Jobs = {
-{ "AutoHatch", "hatch", 3, N.hatchEggs },
-{ "AutoFusionCollect", "fusion", 5, N.fusionTick },
+{ "AutoHatch", "hatch", 3, N.hatchEggs, false, true },
+{ "AutoFusionCollect", "fusion", 5, N.fusionTick, false, true },
 { "AutoBuyNests", "nests", 8, N.buyNests, true, true },
 { "AutoLuck", "luck", 5, N.upgradeLuck, true, true },
 { "AutoRebirth", "rebirth", 5, N.rebirthTick, false, true },
-{ "AutoIndex", "index", 20, N.indexTick },
-{ "AutoOffline", "offline", 10, N.offlineTick },
-{ "AutoEventBoost", "event", 30, N.eventTick },
+{ "AutoIndex", "index", 20, N.indexTick, false, true },
+{ "AutoOffline", "offline", 10, N.offlineTick, false, true },
+{ "AutoEventBoost", "event", 30, N.eventTick, false, true },
 { "AutoFavorite", "favorite", 10, N.favoriteTick },
 }
 while alive() do
@@ -39296,7 +39566,7 @@ while alive() do
 local now = N.plannerOn()
 if now ~= was then
 was = now
-log(if now then "PLAN on (luck, nests, rebirth, shop by payback)" else "PLAN off")
+log(if now then "PLAN on (egg trips by value, place, hatch, best pets, feed, sell weak pets, luck, nests, rebirth, shop, free rewards)" else "PLAN off")
 end
 if now and N.myPlot() and not N.tutorialActive() then
 local ok, err = pcall(N.Plan.compute)
@@ -39308,6 +39578,11 @@ task.wait(5)
 end
 end)
 N.Weather = { list = {}, at = -1e9, seen = {} }
+N.onEvent("Game/LightningStrike", function(data)
+if type(data) == "table" and tonumber(data.Owner) == LocalPlayer.UserId then
+log("STORM struck", tostring(data.Kind), tostring(data.PetKey or ""), "->", tostring(data.Mutation or "-"))
+end
+end, true)
 function N.weatherState()
 local W = N.Weather
 local clock = os.clock()
@@ -39365,8 +39640,12 @@ active[w.name] = true
 if not W.seen[w.name] then
 W.seen[w.name] = true
 if N.anyAuto() then log("WEATHER", w.name, string.format("mult=%.4g until=%ds", w.mult, math.floor(w.left))) end
-if w.mutation and on("AutoFarm") and on("StormEggsFirst") then
+if w.mutation and N.farmOn() and on("StormEggsFirst") then
 log("WEATHER prioritise eggs")
+end
+if w.mutation and on("StormRideBest") and N.isRiding() and #N.basketItems() == 0 and not N.manualRunning() then
+-- get off so the next mount takes the storm pet
+N.dismount()
 end
 end
 end
@@ -39421,7 +39700,7 @@ return false
 end
 function N.pauseTick()
 local P = N.Pause
-local active = not P.dead and on("PauseEggTimer") and on("AutoFarm")
+local active = not P.dead and on("PauseEggTimer") and N.farmOn()
 local root = rootPart()
 local home = root ~= nil and N.onPlot(root.Position, 4)
 local want = active and #N.basketItems() > 0 and not home
@@ -39472,7 +39751,7 @@ end
 end)
 task.spawn(function()
 while alive() do
-local wanted = on("EggESP") or on("AutoFarm") or shown(Tabs.Main) or shown(Tabs.Eggs)
+local wanted = on("EggESP") or N.farmOn() or shown(Tabs.Main) or shown(Tabs.Eggs)
 if wanted then
 local started = os.clock()
 local ok, err = xpcall(N.scanEggs, debug.traceback)
