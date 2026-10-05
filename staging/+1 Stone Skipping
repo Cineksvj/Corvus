@@ -23442,14 +23442,10 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                 }
     
                 local ResizeTween
+                local ResizeTarget
                 local CollapseArrowTween
-    
+
                 function Groupbox:Resize()
-                    if ResizeTween then
-                        StopTween(ResizeTween, true)
-                        ResizeTween = nil
-                    end
-    
                     local TopSize = (GroupboxTop.AbsoluteSize.Y / Library.DPIScale)
                     local ContainerSize = (GroupboxList.AbsoluteContentSize.Y / Library.DPIScale) + 14
                     if Groupbox.PoppedOut then
@@ -23459,7 +23455,19 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                     local TargetSize = UDim2.new(1, 0, 0, if Groupbox.Collapsed then TopSize else (TopSize + 1 + ContainerSize))
                     GroupboxContainer.Size = UDim2.new(1, 0, 0, ContainerSize)
                     GroupboxLine.Visible = not Groupbox.Collapsed
-    
+
+                    -- live labels fire AbsoluteContentSize often: keep a running tween to the same size, skip a resize to the current size
+                    if ResizeTween then
+                        if ResizeTarget == TargetSize then
+                            return
+                        end
+                        StopTween(ResizeTween, true)
+                        ResizeTween = nil
+                    elseif GroupboxHolder.Size == TargetSize then
+                        return
+                    end
+                    ResizeTarget = TargetSize
+
                     if Library.Animations and Library.Animations.Groupbox then
                         local TweenInfo = Library.GroupboxTweenInfo or TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
                         local Tween = TweenService:Create(GroupboxHolder, TweenInfo, { Size = TargetSize })
@@ -27677,7 +27685,7 @@ end
                 if Info.AutoLoad ~= false then
                     task.defer(function()
                         pcall(SaveManager.LoadAutoloadConfig, SaveManager)
-                        if Library.OnAutoload then pcall(Library.OnAutoload) end
+                        Library:FireAutoload()
                     end)
                 end
             end
@@ -31424,6 +31432,147 @@ end
 			return Result
 		end
 	end
+	-- CORVUS-STARTLOG: standard owner log lines for every hub. The hub sets Library.LoadLogger (its log function);
+	-- BOOT comes from the hub, START + AUTOLOAD + CLICK come from here unless the hub set its own OnAutoload/OnUserToggle.
+	-- A hub that logs these itself opts out with Library.OnAutoload = false / Library.OnUserToggle = nil.
+	function Library:CorvusLog(Line: string)
+		if typeof(Library.LoadLogger) == "function" then
+			pcall(Library.LoadLogger, tostring(Line))
+		end
+	end
+	local function TogglesOn(): { string }
+		local Names = {}
+		for Name, Toggle in Library.Toggles do
+			if typeof(Name) == "string" and typeof(Toggle) == "table" and Toggle.Value == true then
+				table.insert(Names, Name)
+			end
+		end
+		table.sort(Names)
+		return Names
+	end
+	function Library:LogStart()
+		if Library.StartLogged then
+			return
+		end
+		Library.StartLogged = true
+		local Total, On = 0, #TogglesOn()
+		for Name in Library.Toggles do
+			if typeof(Name) == "string" then
+				Total += 1
+			end
+		end
+		local Shown = CorvusLoadTimes.shown
+		Library:CorvusLog(string.format(
+			"START hub loaded | place %s | toggles %d on of %d | window %ss",
+			tostring(game.PlaceId), On, Total, if Shown then string.format("%.1f", Shown - CorvusLoadT0) else "-"
+		))
+	end
+	function Library:FireAutoload()
+		if Library.AutoloadFired then
+			return
+		end
+		Library.AutoloadFired = true
+		Library:LogStart()
+		local Hook = Library.OnAutoload
+		if Hook == false then
+			return
+		end
+		if typeof(Hook) == "function" then
+			pcall(Hook)
+			return
+		end
+		local Names = TogglesOn()
+		Library:CorvusLog("AUTOLOAD toggles=" .. (if #Names > 0 then table.concat(Names, ",") else "-"))
+	end
+	Library.OnUserToggle = function(Name, Value)
+		Library:CorvusLog("CLICK " .. tostring(Name) .. "=" .. tostring(Value))
+	end
+	do
+		local BaseCreateWindowLog = Library.CreateWindow
+		function Library:CreateWindow(...)
+			local Window = BaseCreateWindowLog(self, ...)
+			if not Library.StartFallback then
+				Library.StartFallback = true
+				task.delay(20, function()
+					if not Library.Unloaded then
+						Library:LogStart()
+					end
+				end)
+			end
+			return Window
+		end
+	end
+	-- Quick Start rule: a second control for an existing toggle in another groupbox. Both stay in sync both ways,
+	-- the original keeps the only callback and the only config key (the mirror is not in Library.Toggles).
+	function Library:MirrorToggle(Idx: string, Box: any, Opts: any?)
+		Opts = if typeof(Opts) == "table" then Opts else {}
+		local Original = Library.Toggles[Idx]
+		if typeof(Original) ~= "table" or typeof(Box) ~= "table" or typeof(Box.AddToggle) ~= "function" then
+			return nil
+		end
+		local Key = {}
+		local Mirror = Box:AddToggle(Key, {
+			Text = Opts.Text or Original.Text,
+			Description = Opts.Description,
+			Tooltip = Opts.Tooltip or Original.Tooltip,
+			DisabledTooltip = Original.DisabledTooltip,
+			Risky = Original.Risky,
+			Default = Original.Value == true,
+		})
+		Library.Toggles[Key] = nil
+		if not Mirror then
+			return nil
+		end
+		Mirror.MirrorOf = Idx
+		local ShowValue = Mirror.SetValue
+		local Syncing = false
+		local function Sync()
+			if Syncing or Mirror.Destroyed then
+				return
+			end
+			Syncing = true
+			if Mirror.Value ~= Original.Value then
+				pcall(ShowValue, Mirror, Original.Value)
+			end
+			Syncing = false
+		end
+		local BaseSet = Original.SetValue
+		Original.SetValue = function(Self, Value)
+			BaseSet(Self, Value)
+			Sync()
+		end
+		local BaseDisabled = Original.SetDisabled
+		if typeof(BaseDisabled) == "function" then
+			Original.SetDisabled = function(Self, Disabled)
+				BaseDisabled(Self, Disabled)
+				if not Mirror.Destroyed then
+					pcall(Mirror.SetDisabled, Mirror, Disabled)
+				end
+			end
+			if Original.Disabled then
+				pcall(Mirror.SetDisabled, Mirror, true)
+			end
+		end
+		-- the mirror's own switch (click, quick bar) drives the original; Sync then repaints the mirror
+		Mirror.SetValue = function(_, Value)
+			Original:SetValue(Value)
+		end
+		local Holder = Mirror.Holder
+		if typeof(Holder) == "Instance" and Holder:IsA("GuiButton") then
+			table.insert(Mirror.Connections, Holder.MouseButton1Click:Connect(function()
+				-- deferred so the value is the one after the click, whatever order the connections fire in
+				task.defer(function()
+					if not Original.Disabled and Library.OnUserToggle then
+						pcall(Library.OnUserToggle, Idx, Original.Value)
+					end
+				end)
+			end))
+			table.insert(Mirror.Connections, Holder.MouseButton2Click:Connect(function()
+				Library:StartQuickBind("Toggle", Idx, tostring(Original.Text))
+			end))
+		end
+		return Mirror
+	end
 	getgenv().CorvusLibrary = Library
     return Library
     end)()
@@ -31863,16 +32012,14 @@ do
 		local value = option and option.Value
 		return if type(value) == "string" and value ~= "" then value else default
 	end
-	function N.farmMode()
+	-- Throw Speed and Movement in two words (debug header, Main info).
+	function N.paceText()
 		return (if optionText("ThrowSpeed", "Max (Blatant)") == "Max (Blatant)" then "Max" else "Legit") .. ", " .. (if optionText("MoveMode", "Teleport (Fast)") == "Teleport (Fast)" then "Teleport" else "Walk")
 	end
-	-- Kept for the shared pet code: there is no full automatic mode any more, so nothing takes over the player's filters.
-	function N.opActive()
-		return false
-	end
-	N.OPSkipped = { count = 0, last = "" }
-	function N.opExcluded(_key)
-		return false
+	-- Smart Planner (one toggle, default off): the profit engine owns the throw/train split, the purchases and the
+	-- rebirth timing. Off = every toggle does its plain job.
+	function N.planner()
+		return on("SmartPlanner")
 	end
 	-- Max throw rate: no pause between throws beyond the game's own cooldown (the Throw button comes back after it), with
 	-- a back-off when the server refuses a throw. Default Max.
@@ -32442,6 +32589,67 @@ function N.throwBlocker()
 	end
 	return "unknown (button off with everything clear)"
 end
+-- The hatch reveal (EggHatch module) waits for a click on "continue" after a fusion claim (and after a hatch the player
+-- started himself); until then SkippingHUD.HatchActive keeps the Throw button off. Owner log 2026-10-05: ClaimFusion at
+-- 649 s, the Throw button stayed off for 3+ minutes (only 30 throws in 14 min). Hiding the game's EggHatchFX ScreenGui
+-- makes the module's own Step run Reset (HatchActive false, the same cleanup as a respawn); a click on the screen (the
+-- module's InputBegan "continue") is the fallback. The hub's own HatchEgg never opens the reveal.
+N.HatchFX = { since = nil, closedAt = nil, clickAt = -1e9, skips = 0, problem = false }
+function N.hatchRevealOpen()
+	local gui = LocalPlayer:FindFirstChild("PlayerGui")
+	local hud = gui and gui:FindFirstChild("SkippingHUD")
+	local open = false
+	pcall(function()
+		open = hud ~= nil and hud:GetAttribute("HatchActive") == true
+	end)
+	return open
+end
+-- Closes a hatch reveal that has been open for minOpen seconds. Returns true while one is open.
+function N.hatchRevealStep(minOpen)
+	local H = N.HatchFX
+	local now = os.clock()
+	if not N.hatchRevealOpen() then
+		if H.closedAt and H.skips <= 20 then
+			log("HATCH reveal closed in", string.format("%.1fs", now - H.closedAt))
+		end
+		H.since, H.closedAt = nil, nil
+		return false
+	end
+	H.since = H.since or now
+	if now - H.since < (minOpen or 1) then
+		return true
+	end
+	if not H.closedAt then
+		H.closedAt = now
+		H.skips += 1
+		pcall(function()
+			local fx = LocalPlayer.PlayerGui:FindFirstChild("EggHatchFX")
+			if fx and fx:IsA("ScreenGui") then
+				fx.Enabled = false
+			end
+		end)
+		if H.skips <= 20 then
+			log("HATCH reveal skipped after", string.format("%.1fs", now - H.since), "(it waits for a click)")
+		end
+	elseif now - H.closedAt > 1.5 and now - H.clickAt > 2 then
+		H.clickAt = now
+		pcall(function()
+			local vim = game:GetService("VirtualInputManager")
+			local size = workspace.CurrentCamera.ViewportSize
+			vim:SendMouseButtonEvent(size.X / 2, size.Y * 0.6, 0, true, game, 0)
+			task.wait(0.05)
+			vim:SendMouseButtonEvent(size.X / 2, size.Y * 0.6, 0, false, game, 0)
+		end)
+		if H.skips <= 20 then
+			log("HATCH reveal click")
+		end
+		if now - H.closedAt > 10 and not H.problem then
+			H.problem = true
+			logProblem("Hatch reveal stays open: hiding it and clicking did not close it")
+		end
+	end
+	return true
+end
 function N.throwButton()
 	local cached = N.Throw.button
 	if cached and cached.Parent then
@@ -32572,11 +32780,14 @@ function N.throwStep()
 		end
 		-- A game page left open (Notice, shop, rebirth page...) keeps the button off for good: close it like the page's
 		-- own close button would (the Hud tracks Frames children by Visible).
-		if page and on("AutoThrow") then
+		if page and (on("AutoThrow") or N.planner()) then
 			pcall(function()
 				page.Visible = false
 			end)
 			log("THROW closed page", page.Name)
+		end
+		if reason == "the egg hatch animation is playing" then
+			N.hatchRevealStep(0.5)
 		end
 		setStatus("Waiting for the throw button (" .. reason .. ")")
 		task.wait(0.15)
@@ -32586,7 +32797,9 @@ function N.throwStep()
 		end
 		return false
 	end
+	T.pace = T.pace or { at = os.clock(), n = 0, gaps = 0, blocked = 0 }
 	if T.blockedReason then
+		T.pace.blocked += os.clock() - (T.blockedSince or os.clock())
 		if (T.blockLogs or 0) <= 40 then
 			log("THROW unblocked after", string.format("%.1fs", os.clock() - (T.blockedSince or os.clock())), "was", T.blockedReason)
 		end
@@ -32620,9 +32833,23 @@ function N.throwStep()
 		end
 		return false
 	end
+	-- The first throw has no previous one (finishedAt starts at -1e9).
+	local firstThrow = T.finishedAt < -1e8
 	T.gapLogs = (T.gapLogs or 0) + 1
 	if T.gapLogs <= 5 or T.gapLogs % 50 == 0 then
-		log("THROW gap=" .. string.format("%.2f", gap), "accepted=true")
+		log("THROW gap=" .. (if firstThrow then "first" else string.format("%.2f", gap)), "accepted=true")
+	end
+	-- Pace: throws per minute and the average gap between the end of a throw and the next press (blocks included).
+	local pace = T.pace
+	if not firstThrow then
+		pace.n += 1
+		pace.gaps += gap
+	end
+	if os.clock() - pace.at >= 60 then
+		if pace.n > 0 then
+			log("THROW pace", pace.n, "throws in", string.format("%.0fs", os.clock() - pace.at), "avg gap", string.format("%.2fs", pace.gaps / pace.n), "blocked", string.format("%.1fs", pace.blocked))
+		end
+		T.pace = { at = os.clock(), n = 0, gaps = 0, blocked = 0 }
 	end
 	if not T.method then
 		T.method = method
@@ -33291,12 +33518,12 @@ function N.fusionStep()
 			table.insert(groups[key], entry)
 		end
 	end
-	local forIndex = on("FuseForIndex") or N.opActive()
+	local forIndex = on("FuseForIndex")
 	local best, bestScore = nil, 0
 	for key, list in pairs(groups) do
 		local info = N.petInfo(list[1])
 		local variant = if info.variant == "Normal" then "Golden" elseif info.variant == "Golden" then "Diamond" else nil
-		if #list >= 3 and variant and fusions[variant] == nil and N.canFuse(info) and not N.opExcluded("Pets: " .. info.rarity) and not (info.variant == "Golden" and N.opExcluded("Golden pets")) then
+		if #list >= 3 and variant and fusions[variant] == nil and N.canFuse(info) then
 			local result = if variant == "Golden" then info.power * 1.5 else info.power / 1.5 * 2
 			local gain = result - weakest
 			local newId = string.lower(variant) .. "__" .. info.base
@@ -33325,24 +33552,11 @@ end
 -- Deletes spare pets the player does not need, through the game's own Delete Selected (PetEquipment DeleteSelected).
 -- Never: equipped pets, the best N by power, protected pets, Golden/Diamond (unless allowed), pets missing from the
 -- index, 3 copies kept for a fusion that still pays (Auto Fuse on). Normal: picked rarities (and weaker than the team
--- when "Only weaker than my team" is on). Full automatic: any rarity, always only weaker than the team. Never what is in
--- the Exclude list (Main tab).
+-- when "Only weaker than my team" is on).
 N.Del = { deleted = 0, last = "", refusedUntil = 0, fails = 0, discards = {}, discardFile = "Corvus/STONE_discard_" .. tostring(LocalPlayer.UserId) .. ".txt" }
 local function deleteRule(info, weakest)
-	if N.opExcluded("Pets: " .. info.rarity) then
-		return false
-	end
-	if info.variant == "Golden" and N.opExcluded("Golden pets") then
-		return false
-	end
-	if info.variant == "Diamond" and N.opExcluded("Diamond pets") then
-		return false
-	end
 	if selected(Options.ProtectPets, info.name) then
 		return false
-	end
-	if N.opActive() then
-		return info.power < weakest
 	end
 	if info.variant ~= "Normal" and on("KeepVariants") then
 		return false
@@ -33470,7 +33684,7 @@ local function saveDiscards()
 end
 function N.discardWanted()
 	local want = {}
-	if not (on("AutoDeletePets") and (on("DiscardOnHatch") or N.opActive())) then
+	if not (on("AutoDeletePets") and on("DiscardOnHatch")) then
 		return want
 	end
 	local _, weakest = N.petTotal()
@@ -33598,7 +33812,7 @@ function N.potionStep(mode)
 	local now = N.serverTime()
 	local want = { Skill = mode == "train" or mode == "throw", Win = mode == "throw", Luck = mode == "hatch" }
 	for id, yes in pairs(want) do
-		if yes and allows(Options.PotionKinds, id) and not N.opExcluded("Potion: " .. id) and (tonumber(potions[id]) or 0) > 0 and (tonumber(expires[id]) or 0) <= now then
+		if yes and allows(Options.PotionKinds, id) and (tonumber(potions[id]) or 0) > 0 and (tonumber(expires[id]) or 0) <= now then
 			send("UsePotion", id)
 			Session.potions += 1
 			log("POTION", id, "left", (tonumber(potions[id]) or 1) - 1)
@@ -33747,7 +33961,7 @@ function N.openInventoryEggs()
 		return false
 	end
 	for id, count in pairs(N.coll("Eggs")) do
-		if (tonumber(count) or 0) >= 1 and not N.opExcluded("Egg: " .. tostring(id)) and due("egg" .. tostring(id), 6) then
+		if (tonumber(count) or 0) >= 1 and due("egg" .. tostring(id), 6) then
 			send("HatchInventoryEgg", id)
 			Session.eggsOpened += 1
 			rewardNote("Opened a " .. tostring(id) .. " egg")
@@ -34045,7 +34259,7 @@ do
 			end
 		end
 		R.trainSkill, R.throwSkill = N.trainRateNow(), N.throwSkillNow()
-		if now - R.logAt >= 60 and (R.trainNorm or R.throwWins) then
+		if N.planner() and now - R.logAt >= 60 and (R.trainNorm or R.throwWins) then
 			R.logAt = now
 			log("RATE", "train skill/s", fmt(R.trainSkill), "throw skill/s", fmt(R.throwSkill), "throw wins/s", fmt(R.throwWins), "s/throw", fmt(R.secPerThrow), "f", fmt(P.f), "alpha", fmt(P.alpha), "scale", fmt(N.skillScale()))
 		end
@@ -34195,7 +34409,7 @@ do
 	-- first for the Wins it costs can open the next world sooner than training alone. Returns the best such stone.
 	-- tTrain = seconds of training to the unlock now, T / s = training / throwing skill per second.
 	function N.stoneFirst(tTrain, T, s, need)
-		if not on("AutoBuyStones") or not (R.throwWins and R.throwWins > 0) or not need then
+		if not N.planner() or not (R.throwWins and R.throwWins > 0) or not need then
 			return nil
 		end
 		local wins = N.wins()
@@ -34291,21 +34505,32 @@ do
 		local f = P.f
 		return (1 - f) * (N.trainRateNow() or 0) + f * (N.throwSkillNow() or 0)
 	end
-	-- Which activity now: blocks of 180 s, f of them throwing. Throw only (f = 1) and train only (f = 0) re-check every 60 s.
+	-- Which activity now. Smart Planner on: blocks of 180 s, f of them throwing (throw only f = 1 and train only f = 0
+	-- re-check every 60 s), whatever Auto Throw / Auto Train say. Planner off: Auto Throw and Auto Train do their plain
+	-- job; with both on the time is split by the Throw Share slider in 180 s blocks.
+	local Plain = { mode = "throw", ends = 0 }
 	function N.planMode()
-		local throwOn, trainOn = on("AutoThrow"), on("AutoTrain")
-		if throwOn and not trainOn then
-			return "throw"
-		elseif trainOn and not throwOn then
-			return "train"
-		elseif not throwOn and not trainOn then
-			return nil
-		end
-		local split = N.pickText("TimeSplit", "Auto (planner)")
-		if split == "Throw only" then
-			return "throw"
-		elseif split == "Train only" then
-			return "train"
+		if not N.planner() then
+			local throwOn, trainOn = on("AutoThrow"), on("AutoTrain")
+			if throwOn and not trainOn then
+				return "throw"
+			elseif trainOn and not throwOn then
+				return "train"
+			elseif not throwOn and not trainOn then
+				return nil
+			end
+			local share = math.clamp(optionNumber("ThrowShare", 50) / 100, 0, 1)
+			if share >= 1 then
+				return "throw"
+			elseif share <= 0 then
+				return "train"
+			end
+			local now = os.clock()
+			if now >= Plain.ends then
+				Plain.mode = if Plain.mode == "throw" then "train" else "throw"
+				Plain.ends = now + 180 * (if Plain.mode == "throw" then share else 1 - share)
+			end
+			return Plain.mode
 		end
 		local now = os.clock()
 		if now >= P.blockEnds then
@@ -34535,7 +34760,7 @@ do
 			log("PLAN", P.text)
 			log("PLAN decision", P.say)
 		end
-		if on("AutoRebirth") then
+		do
 			local worth = N.rebirthWorth()
 			local rkey = tostring(worth) .. (if P.chain then "chain" .. P.chain.k else "24h")
 			if rkey ~= P.rebirthKey or os.clock() - P.rebirthLogAt > 300 then
@@ -34550,7 +34775,7 @@ do
 		local list = {}
 		local W = math.max(N.winsValueRate(), 1e-9)
 		local alpha = P.alpha
-		if on("AutoBuyStones") then
+		do
 			local _, best = N.bestOwnedStone()
 			local owned = N.coll("OwnedStones")
 			for _, stone in ipairs(N.worldStones()) do
@@ -34560,7 +34785,7 @@ do
 				end
 			end
 		end
-		if on("AutoBuyTrails") then
+		do
 			local _, best = N.bestOwnedTrail()
 			local owned = N.coll("OwnedTrails")
 			for _, trail in ipairs(N.G.Balance.Trails or {}) do
@@ -34571,10 +34796,10 @@ do
 			end
 		end
 		-- Eggs only with room in the pet storage (Auto Delete frees it first).
-		if on("AutoHatch") and N.storageFree() >= N.hatchCount() then
+		if N.storageFree() >= N.hatchCount() then
 			local count = N.hatchCount()
 			for _, egg in ipairs(N.worldEggs()) do
-				if allows(Options.HatchEggs, egg.id) or N.opActive() then
+				if allows(Options.HatchEggs, egg.id) then
 					local e, total = N.eggGain(egg.id)
 					if e > 0 then
 						table.insert(list, { key = "egg:" .. egg.id, kind = "egg", item = egg, cost = egg.price * count, gain = alpha * e / total * count * W, count = count })
@@ -34652,13 +34877,62 @@ do
 		end
 		return pick
 	end
-	-- Buys what the planner picked (needs Idle, so the movement loop calls it between throws).
+	-- Planner off: each buy toggle does its plain job. Buy Stones = the strongest better stone you can afford, Buy Trails
+	-- = the strongest better Wins trail you can afford, Auto Hatch = the priciest picked egg you can afford (room in the
+	-- pet storage). Stones first, then trails, then eggs.
+	function N.plainPick()
+		local wins = N.wins()
+		local pick
+		if on("AutoBuyStones") then
+			local _, best = N.bestOwnedStone()
+			local owned = N.coll("OwnedStones")
+			for _, stone in ipairs(N.worldStones()) do
+				local mult, price = tonumber(stone.Multiplier) or 0, tonumber(stone.Price) or 0
+				if not owned[stone.Id] and mult > best and price > 0 and price <= wins and (N.Shop.refused[stone.Id] or 0) <= os.clock() and (not pick or mult > tonumber(pick.item.Multiplier)) then
+					pick = { key = "stone:" .. stone.Id, kind = "stone", item = stone, cost = price }
+				end
+			end
+			if pick then
+				return pick
+			end
+		end
+		if on("AutoBuyTrails") then
+			local _, best = N.bestOwnedTrail()
+			local owned = N.coll("OwnedTrails")
+			for _, trail in ipairs(N.G.Balance.Trails or {}) do
+				local mult, price = tonumber(trail.WinsMultiplier) or 1, tonumber(trail.Price) or 0
+				if price > 0 and price <= wins and not owned[trail.Id] and mult > best and (N.Shop.refused[trail.Id] or 0) <= os.clock() and (not pick or mult > (tonumber(pick.item.WinsMultiplier) or 1)) then
+					pick = { key = "trail:" .. trail.Id, kind = "trail", item = trail, cost = price }
+				end
+			end
+			if pick then
+				return pick
+			end
+		end
+		if on("AutoHatch") and N.storageFree() >= N.hatchCount() then
+			local count = N.hatchCount()
+			for _, egg in ipairs(N.worldEggs()) do
+				if allows(Options.HatchEggs, egg.id) and egg.price * count <= wins and (not pick or egg.price > pick.item.price) then
+					pick = { key = "egg:" .. egg.id, kind = "egg", item = egg, cost = egg.price * count, count = count }
+				end
+			end
+		end
+		return pick
+	end
+	-- What the next purchase is: the planner's pick (Smart Planner on) or the plain one.
+	function N.nextBuy()
+		if N.planner() then
+			return N.spendPick()
+		end
+		return N.plainPick()
+	end
+	-- Buys what the planner (or the plain rule) picked (needs Idle, so the movement loop calls it between throws).
 	function N.spendStep()
-		local pick = N.spendPick()
+		local pick = N.nextBuy()
 		if not pick then
 			return false
 		end
-		log("BUY", pick.key, "cost", brief(pick.cost), "gain/$", fmt(pick.perCoin), "wins", brief(N.wins()))
+		log("BUY", pick.key, "cost", brief(pick.cost), "gain/$", if pick.perCoin then fmt(pick.perCoin) else "plain", "wins", brief(N.wins()))
 		if pick.kind == "stone" then
 			if N.buyStone(pick.item) then
 				N.equipBestStone()
@@ -34703,24 +34977,35 @@ do
 		elseif mode == "throw" then
 			table.insert(lines, "Throw" .. (if left > 0 and P.f < 1 then " for ~" .. N.longTime(left) .. ", then train" else ""))
 		end
-		if P.say ~= "" and on("AutoThrow") and on("AutoTrain") then
-			table.insert(lines, P.say)
-		elseif on("AutoThrow") and not on("AutoTrain") then
+		local planner = N.planner()
+		if planner then
+			if P.say ~= "" then
+				table.insert(lines, P.say)
+			end
+		elseif on("AutoThrow") and on("AutoTrain") then
+			local share = math.floor(math.clamp(optionNumber("ThrowShare", 50), 0, 100) + 0.5)
+			table.insert(lines, string.format("Throwing %d%% / training %d%% (Throw Share). Smart Planner picks the best split", share, 100 - share))
+		elseif on("AutoThrow") then
 			table.insert(lines, "Only Auto Throw is on: Wins and some skill, no training")
-		elseif on("AutoTrain") and not on("AutoThrow") then
+		elseif on("AutoTrain") then
 			table.insert(lines, "Only Auto Train is on: skill, no Wins (nothing to spend)")
 		end
 		local nx = P.next
-		if nx and nx.option then
+		if not planner then
+			if on("AutoBuyStones") or on("AutoBuyTrails") or on("AutoHatch") then
+				local pick = N.plainPick()
+				table.insert(lines, if pick then optionWords(pick) .. " now" else "Buying the next stone, trail or egg as soon as Wins allow")
+			end
+		elseif nx and nx.option then
 			local o = nx.option
 			if nx.pick and nx.pick ~= o then
 				table.insert(lines, optionWords(nx.pick) .. " now")
 			end
 			table.insert(lines, optionWords(o) .. (if nx.eta == math.huge then " when Wins come in" elseif nx.eta > 1 then " in ~" .. N.longTime(nx.eta) else " now"))
-		elseif on("AutoBuyStones") or on("AutoHatch") or on("AutoBuyTrails") then
+		else
 			table.insert(lines, "Nothing to buy pays back within 24 h, saving Wins")
 		end
-		if on("AutoThrow") and N.nextWorldLocked() then
+		if (planner or on("AutoThrow")) and N.nextWorldLocked() then
 			local nextId = tostring(N.worldCfg().NextWorldId)
 			local eta = N.unlockEta()
 			if eta == 0 then
@@ -34733,10 +35018,12 @@ do
 				table.insert(lines, "Reach the end of the map to unlock " .. nextId)
 			end
 		end
-		if on("AutoRebirth") then
+		if planner or on("AutoRebirth") then
 			local need = tonumber(N.state().NextRebirthLevel)
 			if need and N.level() < need then
 				table.insert(lines, string.format("Rebirth at level %d (now %d)", need, N.level()))
+			elseif need and not planner then
+				table.insert(lines, "Rebirth now (Auto Rebirth, as soon as ready)")
 			elseif need then
 				N.rebirthWorth()
 				if P.rebirthSay ~= "" then
@@ -34751,7 +35038,7 @@ do
 		if not ok then
 			log("ERROR", "plan sample", tostring(err))
 		end
-		if os.clock() - P.at >= 5 then
+		if N.planner() and os.clock() - P.at >= 5 then
 			P.at = os.clock()
 			ok, err = pcall(refresh)
 			if not ok then
@@ -34775,7 +35062,6 @@ do
 		Icon = "corvus",
 		Footer = GameName,
 		FooterGame = true,
-		FooterLink = Discord,
 		NotifySide = "Right",
 		ShowCustomCursor = false,
 		ToggleKeybind = Enum.KeyCode.RightControl,
@@ -34803,10 +35089,12 @@ do
 			})
 		end)
 	end
-	Tabs.Main = N.addTab("Main", "house", "Throwing, training and what Corvus does next")
-	-- Throwing and training live on Main (packed tabs: the old Farm and Auto OP tabs were too small).
-	Tabs.Throw = Tabs.Main
-	Tabs.Train = Tabs.Main
+	Tabs.Main = N.addTab("Main", "house", "Quick Start and what Corvus does next")
+	-- Main = Quick Start (the core loop toggles, two-way bound to their own controls) + Status. Throwing, training and the
+	-- Smart Planner have their own tab.
+	Tabs.Farm = N.addTab("Farm", "target", "Throwing, training and the Smart Planner")
+	Tabs.Throw = Tabs.Farm
+	Tabs.Train = Tabs.Farm
 	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Stones, trails, rebirth and worlds")
 	Tabs.Rewards = N.addTab("Rewards", "gift", "Daily, gifts, offline, index, codes and friends")
 	Tabs.Items = N.addTab("Items", "backpack", "Eggs, pets, auto delete and potions")
@@ -34821,6 +35109,7 @@ do
 	-- Every automation toggle of this hub (Stop Everything, Status "Running", the stuck check). Each feature is its own
 	-- toggle: there is no master toggle that runs them all (owner decision 2026-10-05).
 	N.FarmToggles = {
+		{ "SmartPlanner", "Smart Planner" },
 		{ "AutoThrow", "Throw" },
 		{ "AutoTrain", "Train" },
 		{ "AutoEquipBest", "Equip best stone, trail, pets" },
@@ -34896,8 +35185,8 @@ do
 		})
 	end
 	do
-		-- Main: throwing and training first, then the Status box with "Up next" in plain words.
-		local ThrowBox = Tabs.Main:AddLeftGroupbox("Throw", "target")
+		-- Farm: Throw, Train and the Smart Planner.
+		local ThrowBox = Tabs.Farm:AddLeftGroupbox("Throw", "target")
 		ThrowBox:AddToggle("AutoThrow", { Text = "Auto Throw", Default = false, Tooltip = "Throws from the launch zone with the game's own Throw button" })
 		ThrowBox:AddDropdown("ThrowSpeed", {
 				Text = "Throw Speed",
@@ -34914,16 +35203,19 @@ do
 			ThrowBox:AddToggle("SkipAnimations", {
 			Text = "Skip Animations",
 			Default = true,
-			Tooltip = "Speeds up throw animation tracks and hides the secret throw overlay. The server still decides when a throw ends and when the next one may start, so this only hides the show",
+			Tooltip = "While Corvus throws: speeds up throw animation tracks and hides the secret throw overlay. The server still decides when a throw ends, so this only hides the show. A hatch reveal that blocks the Throw button is always closed",
 		})
 		Labels.Throw = ThrowBox:AddLabel({ Text = "-", DoesWrap = true })
-		local TrainBox = Tabs.Main:AddLeftGroupbox("Train", "dumbbell")
-		TrainBox:AddToggle("AutoTrain", { Text = "Auto Train", Default = false, Tooltip = "Stands in the best training zone you qualify for. With Auto Throw on too, the planner splits the time" })
-		TrainBox:AddDropdown("TimeSplit", {
-			Text = "Time Split",
-			Values = { "Auto (planner)", "Throw only", "Train only" },
-			Default = "Auto (planner)",
-			Tooltip = "With Auto Throw and Auto Train both on: Auto computes how much time to throw (Wins) and train (Skill, which makes throws longer and unlocks the next world)",
+		local TrainBox = Tabs.Farm:AddRightGroupbox("Train", "dumbbell")
+		TrainBox:AddToggle("AutoTrain", { Text = "Auto Train", Default = false, Tooltip = "Stands in the best training zone you qualify for" })
+		TrainBox:AddSlider("ThrowShare", {
+			Text = "Throw Share",
+			Default = 50,
+			Min = 0,
+			Max = 100,
+			Rounding = 0,
+			Suffix = "%",
+			Tooltip = "With Auto Throw and Auto Train both on and Smart Planner off: the share of time spent throwing (180 s blocks). Smart Planner computes the best split itself",
 		})
 		TrainBox:AddDropdown("TrainZone", {
 			Text = "Training Zone",
@@ -34932,39 +35224,32 @@ do
 			Tooltip = "Best open = the biggest bonus you qualify for (rebirth zones, owned passes and the free Hacker event zone)",
 		})
 		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
+		local PlanBox = Tabs.Farm:AddLeftGroupbox("Smart Planner", "brain")
+		PlanBox:AddToggle("SmartPlanner", {
+			Text = "Smart Planner",
+			Default = false,
+			Tooltip = "Runs the whole loop by profit math: splits throwing and training, buys stones, trails and eggs by Wins gained per Win (24 h payback), rebirths when it opens the next world sooner. Other toggles stay as you set them",
+		})
+		Labels.Planner = PlanBox:AddLabel({ Text = "-", DoesWrap = true })
+		-- Main: Quick Start (filled at the end of this part, once Auto Hatch exists in Items) + Status.
+		N.QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "zap")
 		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
-		StatusBox:AddButton({
-			Text = "Stop Everything",
-			Tooltip = "Turns every automation off",
-			Func = function()
-				N.stopAll()
-			end,
-		})
-		StatusBox:AddButton({
-			Text = "Reset Hub Options",
-			Tooltip = "Puts every toggle, dropdown, slider and input back to its default. Saved configs are not deleted",
-			Func = function()
-				N.askReset()
-			end,
-		})
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 		Labels.Plan = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 		Labels.Lines = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
-		local ShopBox = Tabs.Upgrades:AddLeftGroupbox("Smart Spending", "coins")
-		ShopBox:AddToggle("AutoBuyStones", { Text = "Buy Stones", Default = false, Tooltip = "Stones multiply Skill. Bought in the order of Wins gained per Win spent" })
-		ShopBox:AddToggle("AutoBuyTrails", { Text = "Buy Trails", Default = false, Tooltip = "Trails multiply Wins. Only the ones sold for Wins" })
+		local ShopBox = Tabs.Upgrades:AddLeftGroupbox("Shop", "coins")
+		ShopBox:AddToggle("AutoBuyStones", { Text = "Buy Stones", Default = false, Tooltip = "Stones multiply Skill. Buys the strongest better stone you can afford. With Smart Planner on, the planner buys by Wins gained per Win instead" })
+		ShopBox:AddToggle("AutoBuyTrails", { Text = "Buy Trails", Default = false, Tooltip = "Trails multiply Wins (only the ones sold for Wins). Buys the strongest better trail you can afford. With Smart Planner on, the planner decides" })
 		ShopBox:AddToggle("AutoEquipBest", { Text = "Equip Best Stone, Trail And Pets", Default = false })
 		Labels.Shop = ShopBox:AddLabel({ Text = "-", DoesWrap = true })
 		local RebirthBox = Tabs.Upgrades:AddRightGroupbox("Rebirth", "refresh-cw")
-		RebirthBox:AddToggle("AutoRebirth", { Text = "Auto Rebirth", Default = false, Tooltip = "Rebirth multiplies Skill and opens zones but resets your Skill" })
-		RebirthBox:AddDropdown("RebirthMode", {
-			Text = "When",
-			Values = { "Auto (planner)", "As soon as possible" },
-			Default = "Auto (planner)",
-			Tooltip = "Auto rebirths when the new multiplier earns back the reset within 24 h",
+		RebirthBox:AddToggle("AutoRebirth", {
+			Text = "Auto Rebirth",
+			Default = false,
+			Tooltip = "Rebirth multiplies Skill and opens zones but resets your Skill. Rebirths as soon as the level allows. With Smart Planner on, the planner times it (waits when training opens the next world sooner)",
 		})
 		Labels.Rebirth = RebirthBox:AddLabel({ Text = "-", DoesWrap = true })
 		local WorldBox = Tabs.Upgrades:AddRightGroupbox("Worlds", "globe")
@@ -35118,7 +35403,11 @@ do
 	end
 	do
 		local EggBox = Tabs.Items:AddLeftGroupbox("Eggs", "egg")
-		EggBox:AddToggle("AutoHatch", { Text = "Auto Hatch (smart)", Default = false, Tooltip = "Hatches the egg whose pets add the most Skill per Win, from the game's own odds and your luck. Needs Smart Spending to pick it over stones" })
+		EggBox:AddToggle("AutoHatch", {
+			Text = "Auto Hatch",
+			Default = false,
+			Tooltip = "Hatches the priciest picked egg you can afford (with room in the pet storage). With Smart Planner on, eggs compete with stones and trails by Skill per Win from the game's odds and your luck",
+		})
 		local eggs = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical", "SpaceDivine", "Ascended", "Eternal", "Celestial", "Transcendent", "Empyrean", "Primordial", "Titan", "Infinity" }
 		EggBox:AddDropdown("HatchEggs", { Text = "Eggs (none = all)", Values = eggs, Default = eggs, Multi = true, AllowNull = true })
 		EggBox:AddToggle("AutoOpenEggs", { Text = "Open Inventory Eggs", Default = false, Tooltip = "Eggs from gifts and the daily reward, free to open" })
@@ -35160,6 +35449,83 @@ do
 		local PotionBox = Tabs.Items:AddRightGroupbox("Potions", "flask-conical")
 		PotionBox:AddToggle("AutoPotions", { Text = "Auto Use Potions", Default = false, Tooltip = "Skill while training or throwing, Win while throwing, Luck right before a hatch" })
 		PotionBox:AddDropdown("PotionKinds", { Text = "Potion Kinds", Values = { "Skill", "Win", "Luck" }, Default = { "Skill", "Win", "Luck" }, Multi = true, AllowNull = true })
+	end
+	-- Quick Start: the core loop toggles, each the same control as in its own tab (two-way bound), then Stop Everything
+	-- and Reset Hub Options. The library's MirrorToggle keeps one config key and one callback; without it (older library,
+	-- test mock) a copy toggle "QS<name>" is kept in sync both ways and left out of configs.
+	do
+		local QuickBox = N.QuickBox
+		N.Mirrors = {}
+		local syncing = false
+		local function setQuiet(toggle, v)
+			syncing = true
+			local quiet = N.quiet
+			N.quiet = true
+			pcall(toggle.SetValue, toggle, v)
+			N.quiet = quiet
+			syncing = false
+		end
+		local function mirror(main, text, tooltip)
+			if Library.MirrorToggle then
+				local ok, made = pcall(Library.MirrorToggle, Library, main, QuickBox, { Text = text, Tooltip = tooltip })
+				if ok and made then
+					return made
+				end
+			end
+			local id = "QS" .. main
+			local copy = QuickBox:AddToggle(id, {
+				Text = text,
+				Default = false,
+				Tooltip = tooltip,
+				Callback = function(v)
+					local target = Toggles[main]
+					if syncing or not target or target.Value == v then
+						return
+					end
+					syncing = true
+					pcall(target.SetValue, target, v)
+					syncing = false
+				end,
+			})
+			table.insert(N.Mirrors, { main = main, copy = id })
+			local target = Toggles[main]
+			if target and target.OnChanged then
+				pcall(target.OnChanged, target, function(v)
+					local q = Toggles[id]
+					if not syncing and q and q.Value ~= v then
+						setQuiet(q, v)
+					end
+				end)
+			end
+			return copy
+		end
+		-- Main -> Quick Start copies for changes the OnChanged hook did not see (config load, mock library).
+		function N.syncMirrors()
+			for _, m in ipairs(N.Mirrors) do
+				local a, b = Toggles[m.main], Toggles[m.copy]
+				if a and b and a.Value ~= b.Value and not syncing then
+					setQuiet(b, a.Value)
+				end
+			end
+		end
+		mirror("AutoThrow", "Auto Throw", "Same as Farm > Auto Throw")
+		mirror("AutoTrain", "Auto Train", "Same as Farm > Auto Train")
+		mirror("SmartPlanner", "Smart Planner", "Same as Farm > Smart Planner: throw/train split, purchases and rebirths by profit math")
+		mirror("AutoHatch", "Auto Hatch", "Same as Items > Auto Hatch")
+		QuickBox:AddButton({
+			Text = "Stop Everything",
+			Tooltip = "Turns every automation off",
+			Func = function()
+				N.stopAll()
+			end,
+		})
+		QuickBox:AddButton({
+			Text = "Reset Hub Options",
+			Tooltip = "Puts every toggle, dropdown, slider and input back to its default. Saved configs are not deleted",
+			Func = function()
+				N.askReset()
+			end,
+		})
 	end
 end
 N.StatRows = {}
@@ -35290,7 +35656,7 @@ do
 				Session.claims,
 				Session.potions
 			),
-			"Status: " .. tostring(Status) .. "  |  mode " .. N.farmMode() .. "  |  throw method " .. tostring(N.Throw.method),
+			"Status: " .. tostring(Status) .. "  |  pace " .. N.paceText() .. "  |  planner " .. (if N.planner() then "on" else "off") .. "  |  throw method " .. tostring(N.Throw.method),
 			"Running: " .. table.concat(Debug.running(), ", "),
 			string.format(
 				"Game: world %s, skill %s, wins %s, level %s/%s, rebirths %d, activity %s, stone %s (x%s), trail %s (x%s), pets %d, friends +%s%%, packets %d",
@@ -35322,7 +35688,6 @@ N.AllAutoToggles = { "SpeedHack" }
 for _, row in ipairs(N.FarmToggles) do
 	table.insert(N.AllAutoToggles, row[1])
 end
-log("MODE", N.farmMode())
 do
 	function N.manualRunning()
 		return N.Manual.running
@@ -35724,9 +36089,9 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 	end
 	if Tabs.Info then
 		pcall(function()
-			local StartBox = Tabs.Info:AddLeftGroupbox("Quick Start", "wand-sparkles")
+			local StartBox = Tabs.Info:AddLeftGroupbox("Quick Setup", "wand-sparkles")
 			StartBox:AddLabel({
-				Text = '<font transparency="0.4">Tell Corvus what to do in a few taps. Everything can be changed later.</font>',
+				Text = '<font transparency="0.4">Tell Corvus what to do in a few taps. Nothing is picked for you, everything can be changed later.</font>',
 				DoesWrap = true,
 			})
 			StartBox:AddButton({
@@ -35784,6 +36149,7 @@ do
 	end
 	if Library.AddCommand then
 		pcall(function()
+			toggleCommand("planner", { "smart" }, { "SmartPlanner" }, "Smart Planner")
 			toggleCommand("throw", {}, { "AutoThrow" }, "Auto Throw")
 			toggleCommand("train", {}, { "AutoTrain" }, "Auto Train")
 			toggleCommand("rebirth", {}, { "AutoRebirth" }, "Auto Rebirth")
@@ -35841,9 +36207,9 @@ do
 			Library:SetQuickBar({
 				{ Toggle = "AutoThrow", Icon = "target", Label = "Throw" },
 				{ Toggle = "AutoTrain", Icon = "dumbbell", Label = "Train" },
-				{ Toggle = "AutoBuyStones", Icon = "coins", Label = "Stones" },
-				{ Toggle = "AutoRebirth", Icon = "refresh-cw", Label = "Rebirth" },
+				{ Toggle = "SmartPlanner", Icon = "brain", Label = "Planner" },
 				{ Toggle = "AutoHatch", Icon = "egg", Label = "Hatch" },
+				{ Toggle = "AutoRebirth", Icon = "refresh-cw", Label = "Rebirth" },
 			})
 		end)
 	end
@@ -35873,14 +36239,14 @@ do
 				{
 					Id = "tasks",
 					Title = "What should Corvus do for you?",
-					Description = "Pick everything you want running. Tap again to unpick.",
+					Description = "Nothing is picked for you: tap what you want running, tap again to unpick.",
 					Multi = true,
-					Required = true,
-					Default = { "throw", "train", "rewards" },
+					Required = false,
+					Default = {},
 					Choices = {
 						{ Id = "throw", Title = "Throw", Description = "Throws for Wins at the max rate", Icon = "target", Color = "#fab428" },
 						{ Id = "train", Title = "Train", Description = "Trains Skill in the best open zone", Icon = "dumbbell", Color = "#3ccf91" },
-						{ Id = "spend", Title = "Smart Spending", Description = "Stones, trails and eggs by Wins gained per Win", Icon = "coins", Color = "#5fb8ff" },
+						{ Id = "planner", Title = "Smart Planner", Description = "Throw/train split, stones, trails, eggs and rebirths by profit math", Icon = "brain", Color = "#5fb8ff" },
 						{ Id = "rewards", Title = "Claim rewards", Description = "Daily, gifts, offline, group, index and inventory eggs", Icon = "gift", Color = "#ff5d8f" },
 						{ Id = "codes", Title = "Redeem codes", Description = "Every known code once on this account", Icon = "ticket", Color = "#b18cff" },
 						{ Id = "pets", Title = "Pet care", Description = "Equip best, fuse spare pets for index, delete Common and Uncommon pets weaker than your team", Icon = "paw-print", Color = "#f0b90b" },
@@ -35892,17 +36258,25 @@ do
 				local groups = {
 					throw = { "AutoThrow" },
 					train = { "AutoTrain" },
-					spend = { "AutoBuyStones", "AutoBuyTrails", "AutoHatch", "AutoEquipBest" },
+					planner = { "SmartPlanner" },
 					rewards = { "AutoDaily", "AutoGifts", "AutoOffline", "AutoGroupReward", "AutoIndex", "AutoOpenEggs" },
 					codes = { "AutoCodes" },
+					pets = { "AutoEquipBest", "AutoFuse", "AutoDeletePets" },
 				}
-				-- Pet care works next to the farm too (it only keeps the team strong and the storage free).
-				setToggles({ "AutoEquipBest", "AutoFuse", "AutoDeletePets" }, { if chosen.pets then "on" else "off" })
-				if chosen.pets then
-					pcall(Options.DeleteRarities.SetValue, Options.DeleteRarities, { Common = true, Uncommon = true })
+				-- Only what the player picked is switched on; nothing is switched off and nothing else changes.
+				local want = {}
+				for _, id in ipairs(chosen) do
+					want[id] = true
+				end
+				for id, yes in pairs(chosen) do
+					if yes == true then
+						want[id] = true
+					end
 				end
 				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] then "on" else "off" })
+					if want[id] then
+						setToggles(names, { "on" })
+					end
 				end
 				N.markSetupDone()
 				notify("Quick setup done", "Change anything in the tabs any time", 5)
@@ -35923,6 +36297,14 @@ if Window.AddSettingsTab then
 	})
 	if ok and tab then
 		Tabs.Settings = tab
+		-- Quick Start copies mirror real toggles: only the real ones are saved.
+		pcall(function()
+			local ids = {}
+			for _, m in ipairs(N.Mirrors or {}) do
+				table.insert(ids, m.copy)
+			end
+			SaveManager:SetIgnoreIndexes(ids)
+		end)
 	else
 		Tabs.Settings = N.addTab("Settings", "settings", "Menu and configs")
 	end
@@ -36021,6 +36403,9 @@ pcall(function()
 		return string.format("wins %s  \u{00B7}  rebirth %d", formatNumber(N.wins()), N.rebirths())
 	end
 end)
+-- this hub logs AUTOLOAD and CLICK itself (below), so the library's standard lines are off
+Library.OnAutoload = false
+Library.OnUserToggle = nil
 -- Autoload report and click log. The library applies the autoload config a moment after the Settings tab is built, so the
 -- report and the CLICK hooks wait for it; changes made by the hub itself (Stop Everything, Reset Hub Options) stay quiet.
 task.delay(3, function()
@@ -36037,7 +36422,7 @@ task.delay(3, function()
 	end
 	local restored = {}
 	for name, toggle in pairs(Toggles) do
-		if toggle.Value == true and not toggle.Default then
+		if toggle.Value == true and not toggle.Default and string.sub(name, 1, 2) ~= "QS" then
 			table.insert(restored, name)
 		end
 	end
@@ -36129,7 +36514,7 @@ do
 		if choreDue("discard", 20) then
 			N.discardStep()
 		end
-		if (on("AutoBuyStones") or on("AutoBuyTrails") or on("AutoHatch")) and choreDue("spend", 3) then
+		if (N.planner() or on("AutoBuyStones") or on("AutoBuyTrails") or on("AutoHatch")) and choreDue("spend", 3) then
 			if N.spendStep() then
 				return true
 			end
@@ -36158,11 +36543,17 @@ do
 			return
 		end
 		local act = N.activity()
-		if (act == "Idle" or act == "Practice") and on("AutoRebirth") and N.rebirthReady() and choreDue("rebirth", 2) then
-			local asap = N.pickText("RebirthMode", "Auto (planner)") == "As soon as possible"
+		-- Rebirth: Smart Planner times it (rebirth vs world unlock, 24 h payback); without it Auto Rebirth rebirths as soon as
+		-- the level allows.
+		if (act == "Idle" or act == "Practice") and (N.planner() or on("AutoRebirth")) and N.rebirthReady() and choreDue("rebirth", 2) then
+			if not N.planner() then
+				log("REBIRTH plain (Auto Rebirth, as soon as ready)")
+				N.rebirth()
+				return
+			end
 			local worth, gain, lost, reason = N.rebirthWorth()
-			if asap or worth then
-				log("PLAN rebirth", "gain", brief(gain), "lost", brief(lost), "asap", tostring(asap), "|", N.Plan.rebirthSay or "")
+			if worth then
+				log("PLAN rebirth", "gain", brief(gain), "lost", brief(lost), "|", N.Plan.rebirthSay or "")
 				N.rebirth()
 				return
 			elseif choreDue("rebirthLog", 300) then
@@ -36173,7 +36564,7 @@ do
 			return
 		end
 		-- Training never passes through Idle: leave it now and then when the planner wants to buy something.
-		if act == "Practice" and (on("AutoBuyStones") or on("AutoBuyTrails") or on("AutoHatch")) and choreDue("trainSpend", 30) and N.spendPick() then
+		if act == "Practice" and (N.planner() or on("AutoBuyStones") or on("AutoBuyTrails") or on("AutoHatch")) and choreDue("trainSpend", 30) and N.nextBuy() then
 			send("StopPractice", nil)
 			waitFor(function()
 				return N.activity() ~= "Practice"
@@ -36202,10 +36593,6 @@ do
 		if N.Manual.running then
 			task.wait(0.3)
 			return
-		end
-		-- The planner only samples while an automation runs or the menu is open (it feeds Status and Up next).
-		if anyAutoOn() or Library.Toggled ~= false then
-			N.planTick()
 		end
 		if N.S.data then
 			N.rewardStep()
@@ -36237,13 +36624,26 @@ do
 		end
 		task.wait(1)
 	end)
+	-- Smart Planner: its own loop. It measures the training / throwing rates while throwing or training runs (time on the
+	-- Stats tab) and decides and logs (PLAN, RATE) only while the Smart Planner toggle is on; silent otherwise.
+	loop("planner", function()
+		if N.Manual.running then
+			task.wait(0.3)
+			return
+		end
+		if N.planner() or on("AutoThrow") or on("AutoTrain") then
+			N.planTick()
+		end
+		task.wait(1)
+	end)
 	-- Skip Animations: only cosmetic. The throw itself (ThrowStarted -> ThrowFinished) is simulated by the server and the
 	-- hub already throws again the moment ThrowFinished arrives, so animations never delay a throw. Throw poses are
 	-- procedural (ThrowPose), so this speeds up any Action AnimationTrack and hides the secret throw overlay.
 	loop("skipanim", function()
 		local gui = LocalPlayer:FindFirstChild("PlayerGui")
 		local fx = gui and gui:FindFirstChild("SecretThrowFX")
-		if not on("SkipAnimations") then
+		-- Only while Corvus throws (nothing changes the game's look when no automation runs).
+		if not (on("SkipAnimations") and (on("AutoThrow") or N.planner())) then
 			if fx and N.fxHidden then
 				pcall(function()
 					fx.Enabled = true
@@ -36286,21 +36686,22 @@ do
 				local I = N.InfoText
 				local s = N.state()
 				I.info = string.format(
-					"Wins <b>%s</b>  \u{00B7}  skill <b>%s</b>\nLevel <b>%d</b>  \u{00B7}  rebirth <b>%d</b>  \u{00B7}  %s\nThrows <b>%d</b>  \u{00B7}  mode %s",
+					"Wins <b>%s</b>  \u{00B7}  skill <b>%s</b>\nLevel <b>%d</b>  \u{00B7}  rebirth <b>%d</b>  \u{00B7}  %s\nThrows <b>%d</b>  \u{00B7}  %s  \u{00B7}  Smart Planner %s",
 					formatNumber(N.wins()),
 					formatNumber(N.skill()),
 					N.level(),
 					N.rebirths(),
 					N.worldId(),
 					Session.throws,
-					N.farmMode()
+					N.paceText(),
+					if N.planner() then "on" else "off"
 				)
 				local P = N.Plan
 				local upNext = N.upNext()
 				I.plan = if #upNext > 0 then "<b>Up next</b>\n" .. '<font transparency="0.2">\u{2022} ' .. table.concat(upNext, "\n\u{2022} ") .. "</font>" else "Up next: nothing running"
 				local base, dist = N.baseWins(N.skill())
 				I.throw = string.format(
-					"Distance now ~<b>%d</b> studs, zone pays <b>%s</b> wins (x%s trail)\nLast: %s\nThrows <b>%d</b>, secret <b>%d</b>, refused <b>%d</b>\nThrowing %d%% of the time (%s)",
+					"Distance now ~<b>%d</b> studs, zone pays <b>%s</b> wins (x%s trail)\nLast: %s\nThrows <b>%d</b>, secret <b>%d</b>, refused <b>%d</b>\n%s",
 					math.floor(dist or 0),
 					formatNumber(base or 0),
 					formatNumber(N.trailMult()),
@@ -36308,9 +36709,11 @@ do
 					Session.throws,
 					Session.secret + Session.colossus,
 					Session.rejected,
-					math.floor(P.f * 100),
-					P.why
+					if N.planner() then string.format("Smart Planner: throwing %d%% of the time (%s)", math.floor(P.f * 100), P.why) else "Throw Share " .. math.floor(optionNumber("ThrowShare", 50)) .. "% when Auto Train is on too"
 				)
+				I.planner = if N.planner()
+					then string.format("<b>On</b>\n%s\n%s\nNext buy: %s", if P.say ~= "" then P.say else "Measuring...", if P.rebirthSay ~= "" then P.rebirthSay else "-", if P.spendText ~= "" then P.spendText else "-")
+					else "Off. Turn it on to let Corvus split throwing and training, buy stones, trails and eggs by payback and time rebirths around world unlocks. Your other toggles stay as they are"
 				local zone = N.bestZone()
 				I.train = string.format(
 					"%s\nTraining rate %s skill/s (game says %s)\nTrained %s this session",
@@ -36325,12 +36728,22 @@ do
 					"Stone x<b>%s</b>  \u{00B7}  trail x<b>%s</b>\n%s\nBought %d stones, %d trails",
 					formatNumber(stoneBest),
 					formatNumber(trailBest),
-					if N.Plan.spendText ~= "" then N.Plan.spendText else "-",
+					if not N.planner() then "Plain buying (strongest you can afford). Smart Planner buys by payback" elseif N.Plan.spendText ~= "" then N.Plan.spendText else "-",
 					Session.stones,
 					Session.trails
 				)
 				local worth, gain, lost = N.rebirthWorth()
-				I.rebirth = string.format(
+				I.rebirth = if not N.planner()
+					then string.format(
+						"Rebirth <b>%d</b>  \u{00B7}  level %d / %s\nx%s now, x%s next\nAuto Rebirth: as soon as the level allows (Smart Planner times it instead)%s",
+						N.rebirths(),
+						N.level(),
+						tostring(s.NextRebirthLevel or "?"),
+						formatNumber(tonumber(s.RebirthMultiplier) or 0),
+						formatNumber(tonumber(s.NextRebirthMultiplier) or 0),
+						if N.Reb.last ~= "" then "\n" .. N.Reb.last else ""
+					)
+					else string.format(
 					"Rebirth <b>%d</b>  \u{00B7}  level %d / %s\nx%s now, x%s next\n24 h gain %s skill vs reset %s (%s)\n%s%s",
 					N.rebirths(),
 					N.level(),
@@ -36439,9 +36852,17 @@ do
 						Labels.Info:SetText(I.info or "-")
 						Labels.Lines:SetText(I.lines or "-")
 						Labels.Plan:SetText(I.plan or "-")
+					end)
+				end
+				if shown(Tabs.Farm) then
+					group(function()
 						Labels.Throw:SetText(I.throw or "-")
 						Labels.Train:SetText(I.train or "-")
+						Labels.Planner:SetText(I.planner or "-")
 					end)
+				end
+				if frame % 6 == 0 and N.syncMirrors then
+					group(N.syncMirrors)
 				end
 				if shown(Tabs.Upgrades) then
 					group(function()
@@ -36522,17 +36943,7 @@ do
 		end)
 		notify("Corvus", if Library.IsMobile then "Loaded and ready. The round Corvus button opens and closes the hub." else "Loaded. Press " .. key .. " to hide or show the menu.", 5)
 	end
-	if Library.ShowWizard and not N.setupDone() then
-		task.delay(1.5, function()
-			if on("AutoThrow") or on("AutoTrain") then
-				N.markSetupDone()
-				return
-			end
-			if alive() then
-				pcall(N.openWizard)
-			end
-		end)
-	end
+	-- The Quick Setup wizard never opens by itself (Info > Quick Setup opens it).
 end
 end, debug.traceback)
 Boot.CorvusBooting = nil
