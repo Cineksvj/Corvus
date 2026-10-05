@@ -36,6 +36,7 @@ local BootOk, BootError = xpcall(function()
 local HubRepo = "https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/"
 local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/"
 local Library = (function()
+local CorvusLoadT0, CorvusLoadTimes = os.clock(), {}
 local cloneref = (cloneref or clonereference or function(instance: any)
 return instance
 end)
@@ -1945,16 +1946,51 @@ MinusIcon = Library:GetIcon("minus")
 PlusIcon = Library:GetIcon("plus")
 TrashIcon = Library:GetIcon("trash-2")
 end
-local OnlineFetchIcons, OnlineIcons = pcall(function()
-return (
-loadstring(
-game:HttpGet("https://raw.githubusercontent.com/mstudio45/lucide-roblox-direct/refs/heads/main/source.lua")
-) :: () -> IconModule
-)()
-end)
-if OnlineFetchIcons and OnlineIcons then
-Library:SetIconModule(OnlineIcons)
-end
+-- Lucide icons: a cached copy loads from disk at once, the download only refreshes the cache in the background
+	-- (a synchronous download here held the whole start on slow executors)
+	do
+		local LucideUrl = "https://raw.githubusercontent.com/mstudio45/lucide-roblox-direct/refs/heads/main/source.lua"
+		local LucideFile = "Corvus/lucide.lua"
+		local IconsT0 = os.clock()
+		local function ApplyIcons(Source)
+			if typeof(Source) ~= "string" or #Source < 1000 then
+				return false
+			end
+			local Ok, Module = pcall(function()
+				return (loadstring(Source) :: any)()
+			end)
+			if Ok and Module then
+				Library:SetIconModule(Module)
+				return true
+			end
+			return false
+		end
+		local Cached = nil
+		pcall(function()
+			if isfile and readfile and isfile(LucideFile) then
+				Cached = readfile(LucideFile)
+			end
+		end)
+		local UsedCache = ApplyIcons(Cached)
+		CorvusLoadTimes.icons = os.clock() - IconsT0
+		task.spawn(function()
+			local Ok, Source = pcall(game.HttpGet, game, LucideUrl)
+			if not Ok or typeof(Source) ~= "string" or #Source < 1000 or Source == Cached then
+				return
+			end
+			pcall(function()
+				if isfolder and makefolder and not isfolder("Corvus") then
+					makefolder("Corvus")
+				end
+				if writefile then
+					writefile(LucideFile, Source)
+				end
+			end)
+			if not UsedCache and not Library.Unloaded then
+				ApplyIcons(Source)
+			end
+		end)
+	end
 Library.Cursor = {}
 function Library.Cursor:ResetCross()
 for _, Inner in InnerCross do
@@ -15680,7 +15716,9 @@ return
 end
 CommunityState.Fetching = true
 task.spawn(function()
+local CommunityT0 = os.clock()
 local Data = HttpRequestJSON(string.format("https://discord.com/api/v10/invites/%s?with_counts=true", Code))
+CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - CommunityT0)
 CommunityState.Fetching = false
 if typeof(Data) ~= "table" or Library.Unloaded then
 return
@@ -28132,14 +28170,108 @@ do
 end
 -- CORVUS-DIAG-END
 getgenv().Library = Library
-getgenv().CorvusLibrary = Library
+-- CORVUS-LOAD: start timing. Every phase gets a time; the hub logs the line through Library.LoadLogger and the
+	-- owner loader waits for getgenv().CorvusLoaded (set once the window exists).
+	Library.LoadTimes = CorvusLoadTimes
+	CorvusLoadTimes.lib = os.clock() - CorvusLoadT0
+	CorvusLoadTimes.libDone = os.clock()
+	-- Obsidian addons: the cached copy is used at once and refreshed in the background (Network = true forces a download)
+	function Library.FetchAddon(BaseUrl: string, Name: string, Network: boolean?): string
+		local T0 = os.clock()
+		local File = "Corvus/addons/" .. Name
+		local Source = nil
+		if not Network then
+			pcall(function()
+				if isfile and readfile and isfile(File) then
+					Source = readfile(File)
+				end
+			end)
+		end
+		if typeof(Source) == "string" and #Source > 500 then
+			task.spawn(function()
+				local Ok, Fresh = pcall(game.HttpGet, game, BaseUrl .. Name)
+				if Ok and typeof(Fresh) == "string" and #Fresh > 500 and Fresh ~= Source and writefile then
+					pcall(writefile, File, Fresh)
+				end
+			end)
+		else
+			Source = game:HttpGet(BaseUrl .. Name)
+			if typeof(Source) == "string" and #Source > 500 then
+				pcall(function()
+					if isfolder and makefolder then
+						if not isfolder("Corvus") then
+							makefolder("Corvus")
+						end
+						if not isfolder("Corvus/addons") then
+							makefolder("Corvus/addons")
+						end
+					end
+					if writefile then
+						writefile(File, Source)
+					end
+				end)
+			end
+		end
+		CorvusLoadTimes.addons = (CorvusLoadTimes.addons or 0) + (os.clock() - T0)
+		return Source
+	end
+	function Library:LoadReport(): string
+		local T = CorvusLoadTimes
+		local Loader = getgenv().CorvusLoaderTimes
+		Loader = if typeof(Loader) == "table" then Loader else {}
+		local function F(Value)
+			return if typeof(Value) == "number" then string.format("%.1f", Value) else "-"
+		end
+		local GameTime = if T.shown and T.libDone then math.max(0, T.shown - T.libDone - (T.ui or 0) - (T.addons or 0)) else nil
+		local BootTime = if typeof(Loader.run) == "number" then math.max(0, CorvusLoadT0 - Loader.run) else nil
+		local Total = if T.shown and typeof(Loader.begin) == "number" then T.shown - Loader.begin elseif T.shown then T.shown - CorvusLoadT0 else nil
+		return string.format(
+			"LOAD fetch=%s compile=%s boot=%s lib=%s icons=%s ui=%s addons=%s community=%s discord=%s game=%s total=%s",
+			F(Loader.fetch), F(Loader.compile), F(BootTime), F(T.lib), F(T.icons), F(T.ui), F(T.addons), F(T.community), F(T.discord), F(GameTime), F(Total)
+		)
+	end
+	do
+		local BaseCreateWindow = Library.CreateWindow
+		function Library:CreateWindow(...)
+			local T0 = os.clock()
+			local Window = BaseCreateWindow(self, ...)
+			if CorvusLoadTimes.shown == nil then
+				CorvusLoadTimes.ui = os.clock() - T0
+				CorvusLoadTimes.shown = os.clock()
+				getgenv().CorvusLoaded = os.clock()
+				-- reported a bit later so the background phases (community, discord) have their times too
+				task.delay(12, function()
+					local Ok, Line = pcall(Library.LoadReport, Library)
+					if not Ok then
+						return
+					end
+					getgenv().CorvusLoadLine = Line
+					print("[Corvus] " .. Line)
+					if typeof(Library.LoadLogger) == "function" then
+						pcall(Library.LoadLogger, Line)
+					end
+				end)
+			end
+			return Window
+		end
+		local BaseOpenDiscordInvite = Library.OpenDiscordInvite
+		function Library:OpenDiscordInvite(...)
+			local T0 = os.clock()
+			local Result = BaseOpenDiscordInvite(self, ...)
+			if CorvusLoadTimes.discord == nil then
+				CorvusLoadTimes.discord = os.clock() - T0
+			end
+			return Result
+		end
+	end
+	getgenv().CorvusLibrary = Library
 return Library
 end)()
 local function loadAddon(name)
 local lastError
 for attempt = 1, 3 do
 local ok, addon = pcall(function()
-return loadstring(game:HttpGet(AddonsUrl .. name))()
+return loadstring(Library.FetchAddon(AddonsUrl, name, attempt > 1))()
 end)
 if ok and type(addon) == "table" then
 return addon
@@ -28214,6 +28346,9 @@ lines[i] = nil
 end
 end
 end
+Library.LoadLogger = function(line)
+	pcall(log, line)
+end
 local function logEvery(key, seconds, ...)
 local now = os.clock()
 if (Log.once[key] or -1e9) + seconds <= now then
@@ -28263,10 +28398,12 @@ return pcall(function()
 NetFolder:WaitForChild("rev_" .. name, 5):FireServer(table.unpack(args, 1, args.n))
 end)
 end
+-- in the background: the game creates some rev_ remotes only when they are first used, waiting here held the
+-- whole start (the window showed after 76 s)
 local function onNet(name, fn)
-pcall(function()
-local remote = NetFolder and NetFolder:WaitForChild("rev_" .. name, 10)
-if remote then
+task.spawn(pcall, function()
+local remote = NetFolder and NetFolder:WaitForChild("rev_" .. name, 120)
+if remote and alive() then
 remote.OnClientEvent:Connect(fn)
 end
 end)
@@ -28304,6 +28441,7 @@ return nil
 end
 local function safeRequire(path)
 local result, done = nil, false
+local startedAt = os.clock()
 task.spawn(function()
 local ok, value = pcall(function()
 local node = ReplicatedStorage
@@ -28318,6 +28456,9 @@ end)
 local waited = 0
 while not done and waited < 10 do
 waited += task.wait(0.05) or 0.05
+end
+if os.clock() - startedAt > 1 then
+log("LOAD slow require", path, string.format("%.1fs", os.clock() - startedAt), if result ~= nil then "ok" else "none")
 end
 return result
 end
@@ -29874,7 +30015,7 @@ if not Nav.ready then
 local waited = 0
 while not Nav.ready and waited < 12 and alive() do
 if waited > 1 then
-setStatus("Mapping the level, one moment")
+setStatus("Mapping the map...")
 end
 waited += task.wait(0.2) or 0.2
 end
