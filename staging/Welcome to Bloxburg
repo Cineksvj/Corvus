@@ -36080,6 +36080,46 @@ do
 		end
 		return best
 	end
+	-- every object for a need, best first, without the ones that failed in the last 15 min (Q.bad)
+	Q.bad = setmetatable({}, { __mode = "k" })
+	local function candidates(objects, need)
+		local list = {}
+		for _, o in ipairs(objects) do
+			if o.need == need and o.pos and os.clock() - (Q.bad[o.object] or -1e9) > 900 then
+				table.insert(list, o)
+			end
+		end
+		table.sort(list, function(a, b)
+			if a.stat ~= b.stat then
+				return a.stat > b.stat
+			end
+			return a.dist < b.dist
+		end)
+		return list
+	end
+	-- trip order: the need the game's efficiency reason (or the mood name, e.g. "Starving") names goes first, then
+	-- the quick ones (a meal ~30 s, shower, TV) before the slow sleep, so the job resumes with most moods up early
+	local NeedWords = {
+		Hunger = { "hungry", "hunger", "starving", "food", "eat" },
+		Energy = { "tired", "energy", "sleep", "exhausted", "sleepy" },
+		Hygiene = { "hygiene", "stinky", "smell", "dirty", "shower" },
+		Fun = { "fun", "bored" },
+	}
+	local function needOrder(effWhy, moodName)
+		local order = { "Hunger", "Hygiene", "Fun", "Energy" }
+		for _, text in ipairs({ string.lower(tostring(effWhy or "")), string.lower(tostring(moodName or "")) }) do
+			for i, name in ipairs(order) do
+				for _, word in ipairs(NeedWords[name]) do
+					if string.find(text, word, 1, true) then
+						table.remove(order, i)
+						table.insert(order, 1, name)
+						return order, name
+					end
+				end
+			end
+		end
+		return order, nil
+	end
 
 	-- What a missing need costs to fix: the cheapest money item of that type (dump ReplicatedStorage.Items: "Old
 	-- Television" $220 Fun 3 (same Fun as "NYX VintageView TV" $400), "Standard Single Bed" $200 Comfort 5 (sleeps
@@ -36193,45 +36233,217 @@ do
 		return N.needsFire({ Type = "Interact", Target = target, Path = tostring(index) }), title
 	end
 
-	-- Walks with the game's pathfinding (plots have walls), then the plain walk for the last studs.
-	function N.pathWalk(pos, near, timeout)
-		local root = N.root()
-		if not root then
-			return false
+	-- Walking inside a plot (walls, doors, fences, trees). The old walk aimed at the object's own centre, which is
+	-- inside its collision box, so PathfindingService answered NoPath and the straight fallback ran into walls
+	-- (log 2026-10-05: "NEEDS walk failed Hygiene Basic Shower dist 41"). Now: approach points beside the object,
+	-- a person-sized agent (radius 1.25, then 0.6 for narrow doors; the game's own quest path uses 0.15), local
+	-- PathfindingModifier PassThrough on your plot's doors and gates (they swing open for you, the navmesh sees them
+	-- closed), jump waypoints, re-path when no progress for 2 s or the path reports Blocked, and after 3 failed paths
+	-- the game's own ToPlot teleport once and again. Arrival = within 6 studs of the object's box. The game's menu
+	-- works from 10 studs (InteractionData.INTERACTION_DISTANCE), the server allows 30 (MAX_INTERACTION_DISTANCE).
+	local PFS = game:GetService("PathfindingService")
+	local Passed = setmetatable({}, { __mode = "k" })
+	local passAt, passPlot = -1e9, nil
+	local function passDoors()
+		local plot = N.myPlot()
+		if not plot or (plot == passPlot and os.clock() - passAt < 60) then
+			return
 		end
-		local deadline = os.clock() + (timeout or 40)
-		local ok, path = pcall(function()
-			local p = game:GetService("PathfindingService"):CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })
-			p:ComputeAsync(root.Position, pos)
-			return p
-		end)
-		if ok and path and path.Status == Enum.PathStatus.Success then
-			local points = path:GetWaypoints()
-			for i = 2, #points do
-				local wp = points[i]
-				if os.clock() > deadline or not alive() then
-					return false
-				end
-				if wp.Action == Enum.PathWaypointAction.Jump then
-					local hum = N.humanoid()
-					if hum then
-						hum.Jump = true
+		passPlot, passAt = plot, os.clock()
+		local house = plot:FindFirstChild("House")
+		if not house then
+			return
+		end
+		local added = 0
+		pcall(function()
+			for _, d in ipairs(house:GetDescendants()) do
+				if (d:IsA("BasePart") or d:IsA("Model")) and not Passed[d] then
+					local name = string.lower(d.Name)
+					if string.find(name, "door", 1, true) or string.find(name, "gate", 1, true) then
+						for _, p in ipairs(d:IsA("BasePart") and { d } or d:GetDescendants()) do
+							if p:IsA("BasePart") and not Passed[p] then
+								local m = Instance.new("PathfindingModifier")
+								m.Name = "CorvusPass"
+								m.PassThrough = true
+								m.Parent = p
+								Passed[p] = m
+								table.insert(N.Unhooks, function()
+									m:Destroy()
+								end)
+								added += 1
+							end
+						end
+						Passed[d] = true
 					end
 				end
-				N.walkTo(wp.Position, 2.5, 6)
+			end
+		end)
+		if added > 0 then
+			log("WALK doors", "pass-through for", added, "door/gate parts on your plot")
+		end
+	end
+	local function posText(p)
+		return string.format("(%d,%d,%d)", p.X, p.Y, p.Z)
+	end
+	-- distance from a point to the object's box (0 inside), else to its position
+	local function boxDist(object, pos, p)
+		if typeof(object) == "Instance" and object:IsA("BasePart") then
+			local lp = object.CFrame:PointToObjectSpace(p)
+			local h = object.Size / 2
+			local c = Vector3.new(math.clamp(lp.X, -h.X, h.X), math.clamp(lp.Y, -h.Y, h.Y), math.clamp(lp.Z, -h.Z, h.Z))
+			return (lp - c).Magnitude
+		end
+		return (p - pos).Magnitude
+	end
+	N.boxDist = boxDist
+	-- standing points beside the object (front, back, sides), nearest first, the raw position last
+	local function approachPoints(object, pos, from)
+		local list = {}
+		if typeof(object) == "Instance" and object:IsA("BasePart") then
+			local cf, size = object.CFrame, object.Size
+			local y = cf.Position.Y - size.Y / 2 + 3
+			for _, v in ipairs({ { cf.LookVector, size.Z }, { -cf.LookVector, size.Z }, { cf.RightVector, size.X }, { -cf.RightVector, size.X } }) do
+				local flat = Vector3.new(v[1].X, 0, v[1].Z)
+				if flat.Magnitude > 0.1 then
+					local p = cf.Position + flat.Unit * (v[2] / 2 + 2.5)
+					table.insert(list, Vector3.new(p.X, y, p.Z))
+				end
+			end
+			table.sort(list, function(a, b)
+				return (a - from).Magnitude < (b - from).Magnitude
+			end)
+		end
+		table.insert(list, pos)
+		return list
+	end
+	local function computePath(from, to)
+		local last = "?"
+		for _, radius in ipairs({ 1.25, 0.6 }) do
+			local path = PFS:CreatePath({ AgentRadius = radius, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = false, WaypointSpacing = 4, Costs = { Water = 20 } })
+			local ok = pcall(path.ComputeAsync, path, from, to)
+			if ok and path.Status == Enum.PathStatus.Success then
+				return path, "Success"
+			end
+			last = if ok then path.Status.Name else "error"
+		end
+		return nil, last
+	end
+	-- follows the waypoints; false + reason when stuck 2 s, blocked or out of time
+	local function followPath(path, deadline)
+		local points = path:GetWaypoints()
+		local blocked = false
+		local conn = path.Blocked:Connect(function()
+			blocked = true
+		end)
+		local function done(ok, why)
+			conn:Disconnect()
+			return ok, why
+		end
+		for i = 2, #points do
+			local wp = points[i]
+			local hum = N.humanoid()
+			if not hum then
+				return done(false, "no character")
+			end
+			if wp.Action == Enum.PathWaypointAction.Jump then
+				hum.Jump = true
+			end
+			pcall(hum.MoveTo, hum, wp.Position)
+			local issued, best, bestAt, hopped = os.clock(), math.huge, os.clock(), false
+			while true do
+				local root
+				root, hum = N.root(), N.humanoid()
+				if not (root and hum) or hum.Health <= 0 or not alive() then
+					return done(false, "no character")
+				end
+				if os.clock() > deadline then
+					return done(false, "timeout")
+				end
+				if blocked then
+					log("WALK blocked at", posText(root.Position), "(path blocked)")
+					return done(false, "blocked")
+				end
+				local flat = Vector3.new(wp.Position.X - root.Position.X, 0, wp.Position.Z - root.Position.Z).Magnitude
+				if flat <= (if i == #points then 1.5 else 2) then
+					break
+				end
+				if flat < best - 0.25 then
+					best, bestAt, hopped = flat, os.clock(), false
+				elseif os.clock() - bestAt > 2 then
+					log("WALK blocked at", posText(root.Position), "waypoint", i .. "/" .. #points, "dist", string.format("%.1f", flat))
+					return done(false, "stuck")
+				elseif os.clock() - bestAt > 1 and not hopped then
+					hopped = true
+					hum.Jump = true
+				end
+				if os.clock() - issued > 1 then
+					issued = os.clock()
+					pcall(hum.MoveTo, hum, wp.Position)
+				end
+				task.wait(0.05)
 			end
 		end
-		return N.walkTo(pos, near or 4, math.max(5, deadline - os.clock()))
+		return done(true)
 	end
-	-- The game's own "go to my plot" teleport (HouseHandler:ToPlot = InvokeServer ToPlot).
-	function N.goHome()
+	function N.pathWalk(pos, near, timeout, object)
+		near = near or 6
+		local deadline = os.clock() + (timeout or 45)
+		local function arrived()
+			local root = N.root()
+			return root ~= nil and boxDist(object, pos, root.Position) < near
+		end
+		passDoors()
+		local fails, teleported = 0, false
+		while alive() and os.clock() < deadline do
+			local root = N.root()
+			if not root then
+				return false
+			end
+			if arrived() then
+				return true
+			end
+			local path, status, goal
+			for _, g in ipairs(approachPoints(object, pos, root.Position)) do
+				path, status = computePath(root.Position, g)
+				if path then
+					goal = g
+					break
+				end
+			end
+			if path then
+				log("WALK path", "waypoints=" .. #path:GetWaypoints(), "status=" .. status, "to", posText(goal), "dist", math.floor(boxDist(object, pos, root.Position)))
+				if followPath(path, deadline) then
+					N.walkTo(goal, 1.5, 3)
+					if arrived() then
+						return true
+					end
+				end
+			else
+				log("WALK path", "waypoints=0", "status=" .. tostring(status), "from", posText(root.Position), "to", posText(pos))
+			end
+			fails += 1
+			if fails >= 3 then
+				if teleported then
+					break
+				end
+				teleported, fails = true, 0
+				log("WALK fallback", "3 failed paths, the game's ToPlot teleport and again")
+				N.goHome(true)
+			end
+			task.wait(0.3)
+		end
+		return arrived()
+	end
+	-- The game's own "go to my plot" teleport (HouseHandler:ToPlot = InvokeServer ToPlot). force = also when you
+	-- already stand on your plot (the walk's fallback: it puts you back at the plot's spawn).
+	function N.goHome(force)
 		local root = N.root()
 		local plot = N.myPlot()
 		if not (root and plot) then
 			log("NEEDS no plot", "Plot_" .. LocalPlayer.Name, "not found")
 			return false
 		end
-		if N.plotAt(root.Position) == plot then
+		if not force and N.plotAt(root.Position) == plot then
 			return true
 		end
 		local jh = N.jobHandler()
@@ -36240,6 +36452,9 @@ do
 		local called = N.callModule(25, jh and jh.Modules.HouseHandler, "ToPlot")
 		if called == nil then
 			N.needsInvoke({ Type = "ToPlot" }, 25)
+		end
+		if force then
+			task.wait(1.5)
 		end
 		local there = waitFor(function()
 			local r = N.root()
@@ -36291,9 +36506,16 @@ do
 		local values = N.moods()
 		local before = values and values[need] or 0
 		setStatus(string.format("Needs: %s at %s (%d%%)", need, object.name, before))
-		if not N.pathWalk(object.pos, 4, 45) then
-			log("NEEDS walk failed", need, object.name, "dist", math.floor(object.dist))
-			return false
+		N.detach()
+		if not N.pathWalk(object.pos, 6, 60, object.object) then
+			local root = N.root()
+			local d = root and N.boxDist(object.object, object.pos, root.Position) or 1e9
+			-- the server takes interactions from up to 30 studs: still try from close enough, the checks below verify it
+			if d > 25 then
+				log("NEEDS walk failed", need, object.name, "dist", math.floor(d))
+				return false, "walk"
+			end
+			log("NEEDS walk short", need, object.name, "dist", math.floor(d), "trying the interaction from here")
 		end
 		task.wait(0.3)
 		local ok, title
@@ -36310,7 +36532,8 @@ do
 		end
 		ok, title = interact(object.object, Keys[need])
 		if not ok then
-			return false
+			log("NEEDS unsupported", object.name, need, "no usable button")
+			return false, "unsupported"
 		end
 		local started = os.clock()
 		if need == "Hunger" then
@@ -36336,6 +36559,14 @@ do
 			N.detach()
 			task.wait(0.4)
 			N.needsFire({ Type = "EatEquipped", IsQuick = true })
+			local rising = waitFor(function()
+				local v = N.moods()
+				return v ~= nil and v[need] > before + 0.5
+			end, 10)
+			if not rising then
+				log("NEEDS unsupported", object.name, need, "did not rise in 10 s after eating", food.name)
+				return false, "unsupported"
+			end
 			waitFor(function()
 				local v = N.moods()
 				return v ~= nil and v[need] >= math.min(TARGET, before + 15)
@@ -36346,9 +36577,21 @@ do
 				return N.attachWeld() ~= nil
 			end, 5)
 			if not attached then
-				log("NEEDS not attached", need, object.name, "button", tostring(title))
-				return false
+				log("NEEDS unsupported", object.name, need, "not attached after button", tostring(title))
+				N.detach()
+				return false, "unsupported"
 			end
+			-- the need must start rising within 10 s (the game's Rate turns positive, or the value goes up)
+			local rising = waitFor(function()
+				local v, r = N.moods()
+				return v ~= nil and ((r and (r[need] or 0) > 0) or (v[need] or 0) > before + 0.5)
+			end, 10)
+			if not rising then
+				log("NEEDS unsupported", object.name, need, "did not rise in 10 s (" .. tostring(title) .. ")")
+				N.detach()
+				return false, "unsupported"
+			end
+			log("NEEDS using", object.name, need, "button", tostring(title), "rising from", math.floor(before) .. "%")
 			local lastLog = os.clock()
 			while alive() and on("AutoJob") do
 				values = N.moods()
@@ -36595,6 +36838,8 @@ do
 			log("BREAK start", "after", math.floor(Q.workSeconds / 60), "min of work, break", math.floor(breakSeconds / 60), "min")
 		end
 		setStatus("Needs: leaving the job (" .. tostring(reason) .. ")")
+		-- the efficiency reason is only readable while still clocked in
+		local effWhy = N.effReason(select(2, N.efficiency()))
 		N.taxiRelease()
 		N.bbLeave()
 		N.cookLeave()
@@ -36616,8 +36861,10 @@ do
 				table.sort(names)
 				return table.concat(names, ", ")
 			end)())
-			local values = N.moods() or {}
-			local order = { "Hunger", "Hygiene", "Fun", "Energy" }
+			local values, _, moodName = N.moods()
+			values = values or {}
+			local order, firstBy = needOrder(effWhy, moodName)
+			log("NEEDS order", table.concat(order, ">"), "| reason '" .. tostring(effWhy) .. "' mood '" .. tostring(moodName) .. "'", if firstBy then "-> " .. firstBy .. " first" else "")
 			local limit = if isBreak then 90 else REFILL
 			for _, need in ipairs(order) do
 				local v = values[need]
@@ -36653,7 +36900,21 @@ do
 						end
 					end
 					if object then
-						local ok = restoreNeed(need, object, deadline)
+						-- the best object first; one that cannot be reached or used is skipped for 15 min, then the next
+						local ok = false
+						for _, o in ipairs(candidates(objects, need)) do
+							local why
+							ok, why = restoreNeed(need, o, deadline)
+							if ok or not alive() or not on("AutoJob") or os.clock() > deadline then
+								break
+							end
+							if why == "unsupported" or why == "walk" then
+								Q.bad[o.object] = os.clock()
+								log("NEEDS next option", need, "after", o.name, "(" .. why .. ")")
+							else
+								break
+							end
+						end
 						if ok then
 							Q.fails[need] = 0
 						else
@@ -36782,18 +37043,13 @@ do
 		-- objectives) and a one-time build of the saved plot, minus whatever the player excluded.
 		local S = { turned = {}, saved = {} }
 		N.Farm = { built = false, confirmed = false, building = false }
-		local StateFile = "Corvus/WTB_farm_state.txt"
-		local function writeState(v)
-			if not on("RememberFarm") then
-				return
+		-- design v4: no Remember switch, the master toggle always starts off (an old "1" state file is cleared)
+		pcall(function()
+			if isfile and isfile("Corvus/WTB_farm_state.txt") then
+				writefile("Corvus/WTB_farm_state.txt", "0")
 			end
-			pcall(function()
-				if makefolder and isfolder and not isfolder("Corvus") then
-					makefolder("Corvus")
-				end
-				writefile(StateFile, if v then "1" else "0")
-			end)
-		end
+		end)
+		local function writeState(_on: boolean?) end
 		local function turnOn(name)
 			local t = Toggles[name]
 			if t and not t.Value then
@@ -36961,22 +37217,12 @@ do
 				end)
 			end,
 		})
-		QuickBox:AddToggle("RememberFarm", {
-			Text = "Remember Auto Farm Everything",
-			Default = false,
-			Tooltip = "Starts Auto Farm Everything again by itself the next time you run Corvus, if it was on when you left. Off = it always starts switched off",
-			Callback = function(value)
-				if value then
-					-- a config restoring this switch must not overwrite the remembered "on" before the start reads it
-					if on("AutoFarmBest") then
-						writeState(true)
-					end
-				else
-					pcall(function()
-						writefile(StateFile, "0")
-					end)
-				end
-			end,
+		-- design v4: Mode under the master switch; Bloxburg has no per-loop filters, so only "Best value" (no Run list)
+		QuickBox:AddDropdown("FarmMode", {
+			Text = "Mode",
+			Values = { "Best value" },
+			Default = "Best value",
+			Tooltip = "Best value: Corvus decides everything (best paying job, needs, meals, breaks, one-time build) within the Exclude list below",
 		})
 		QuickBox:AddDropdown("FarmExclude", {
 			Text = "Exclude",
@@ -37703,7 +37949,7 @@ do
 		})
 	end
 end
--- Auto Farm Everything is never restored by a saved config (only by Remember Auto Farm Everything)
+-- Auto Farm Everything is never restored by a saved config (design v4: it always starts off)
 pcall(function()
 	SaveManager:SetIgnoreIndexes({ "AutoFarmBest" })
 end)
@@ -37963,7 +38209,8 @@ do
 				end
 				N.InfoText.needs = N.needsStatus()
 				N.InfoText.pay = N.payText()
-				N.InfoText.next = N.upNextText()
+				-- the first pass runs inside task.spawn before N.upNextText below is defined (ERROR info: attempt to call a nil value)
+				N.InfoText.next = if N.upNextText then N.upNextText() else N.InfoText.next
 				local job = N.currentJob()
 				N.InfoText.job = if job == "" then "not working" else job
 				N.InfoText.jobText = string.format(
@@ -38029,23 +38276,6 @@ do
 		end
 		return table.concat(lines, "\n")
 	end
-	-- Remember Auto Farm Everything: only then does a saved "on" come back after a restart
-	task.delay(3, function()
-		if not alive() or on("AutoFarmBest") then
-			return
-		end
-		-- the file holds "1" only while Remember was on and the farm was running, so it works without a saved config
-		local ok, state = pcall(readfile, "Corvus/WTB_farm_state.txt")
-		if ok and state == "1" then
-			if Toggles.RememberFarm and not Toggles.RememberFarm.Value then
-				Toggles.RememberFarm:SetValue(true)
-			end
-			log("FARM remembered", "starting again")
-			N.Farm.confirmed = true
-			Toggles.AutoFarmBest:SetValue(true)
-			notify("Corvus", "Auto Farm Everything started again (Remember is on)", 5)
-		end
-	end)
 	local function shown(tab)
 		if tab == nil or Library.Toggled == false then
 			return false
