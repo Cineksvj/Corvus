@@ -26101,15 +26101,12 @@ end)
             local SupportedGames = Info.SupportedGames or {
                 { Name = "+1 Stone Skipping", PlaceId = 111543903102439 },
                 { Name = "Anime Dice", PlaceId = 113290951185459 },
-                { Name = "Bizarre", PlaceId = 135621866300031 },
                 { Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
                 { Name = "Loot To Forge", PlaceId = 118805555015549 },
                 { Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
                 { Name = "Pets Universe", PlaceId = 74629631798007 },
                 { Name = "Ride A Pet", PlaceId = 124216119978534 },
-                { Name = "Steal An Egg", PlaceId = 107778070777162 },
                 { Name = "Steal From The Rich", PlaceId = 120475074479690 },
-                { Name = "Voltline Electric Scooters", PlaceId = 118315378611589 },
                 { Name = "Welcome to Bloxburg", PlaceId = 185655149 },
             }
             local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
@@ -32801,13 +32798,20 @@ do
 		log("BANKED event", ...)
 	end)
 	-- Farm Everything uses Fast (0.36-0.4 s, just above the server's HitCooldown) unless the player picked Blatant
+	function N.bestValueOn()
+		return on("AutoFarmBest") and optionText("FarmMode", "Best value") ~= "My filters"
+	end
+	-- My filters: only the loops picked in Run, with the player's own filters. No planner, never sells, never spends.
+	function N.filtersOn()
+		return on("AutoFarmBest") and optionText("FarmMode", "Best value") == "My filters"
+	end
 	function N.farmMode()
-		return if on("AutoFarmBest") then "Auto" else "Manual"
+		return if N.bestValueOn() then "Auto" elseif N.filtersOn() then "Filters" else "Manual"
 	end
 	-- Exclude (Main tab): things Auto Farm Everything never sells, places over, spends on or speeds up. Only checked while it runs.
 	N.OPExcludeAt = {}
 	function N.opExcluded(label)
-		if not on("AutoFarmBest") then
+		if not N.bestValueOn() then
 			return false
 		end
 		local value = Options.OPExclude and Options.OPExclude.Value
@@ -32836,7 +32840,7 @@ do
 	function N.hitSpeedPick()
 		local pick = optionText("HitSpeed", "Normal")
 		-- Auto Farm Everything overrides Hit Speed (Fast unless Blatant), unless Hit Speed Fast is excluded.
-		if on("AutoFarmBest") and pick ~= "Blatant (HIGH RISK OF BAN)" and not N.opExcluded("Hit Speed Fast") then
+		if N.bestValueOn() and pick ~= "Blatant (HIGH RISK OF BAN)" and not N.opExcluded("Hit Speed Fast") then
 			return "Fast"
 		end
 		return pick
@@ -33351,7 +33355,7 @@ do
 			return false
 		end
 		-- Auto Farm Everything never places over an animal the player excluded (Equip Best would swap it out)
-		if not force and on("AutoFarmBest") then
+		if not force and N.bestValueOn() then
 			for _, placed in ipairs(N.placedAnimals()) do
 				if N.opProtects(placed) then
 					return false
@@ -33359,7 +33363,7 @@ do
 			end
 		end
 		-- Auto Farm Everything never places over an animal the player excluded (Equip Best would swap it out)
-		if not force and on("AutoFarmBest") then
+		if not force and N.bestValueOn() then
 			for _, placed in ipairs(N.placedAnimals()) do
 				if N.opProtects(placed) then
 					return false
@@ -33367,7 +33371,7 @@ do
 			end
 		end
 		-- Auto Farm Everything never places over an animal the player excluded (Equip Best would swap it out)
-		if not force and on("AutoFarmBest") then
+		if not force and N.bestValueOn() then
 			for _, placed in ipairs(N.placedAnimals()) do
 				if N.opProtects(placed) then
 					return false
@@ -33454,6 +33458,10 @@ do
 		return list
 	end
 	function N.sellStep(force)
+		-- My filters never sells on its own
+		if not force and N.filtersOn() then
+			return false
+		end
 		if not (force or on("AutoSell") or on("AutoSellSurplus")) then
 			return false
 		end
@@ -34525,6 +34533,9 @@ do
 		return true
 	end
 	function N.shopStep()
+		if N.filtersOn() then
+			return false
+		end
 		pcall(N.Plan.update, false)
 		if N.tutorial() or N.carrying() then
 			return false
@@ -34908,20 +34919,56 @@ do
 				notify("Auto Farm Everything", "Could not show the confirmation, it stays off", 5)
 			end
 		end
+		-- My filters: the loops the player picks in Run. Only things that never sell and never spend.
+		N.FarmRunMap = {
+			["Auto Farm (eggs)"] = { "AutoFarm" },
+			["Auto Steal"] = { "StealPickups" },
+			["Auto Place"] = { "AutoPlace" },
+			["Auto Train"] = { "AutoTrain" },
+			["Index rewards"] = { "AutoIndex" },
+			["Offline cash"] = { "AutoOffline" },
+			["Group rewards"] = { "AutoGroup" },
+			["Auto Friend"] = { "AutoFriend" },
+		}
+		N.FarmRunValues = { "Auto Farm (eggs)", "Auto Steal", "Auto Place", "Auto Train", "Index rewards", "Offline cash", "Group rewards", "Auto Friend" }
+		N.farmApplied = nil
+		function N.applyFilters()
+			local picked = Options.FarmRun and Options.FarmRun.Value
+			picked = if type(picked) == "table" then picked else {}
+			N.farmApplied = "filters"
+			local names = {}
+			for _, label in ipairs(N.FarmRunValues) do
+				if picked[label] == true then
+					table.insert(names, label)
+				end
+				for _, name in ipairs(N.FarmRunMap[label]) do
+					local toggle = Toggles[name]
+					local want = picked[label] == true
+					if toggle and toggle.Value ~= want then
+						toggle:SetValue(want)
+					end
+				end
+			end
+			log("FILTERS run", table.concat(names, ", "))
+		end
 		QuickBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "Full automatic: farms eggs, steals animals, trains, places the best, sells surplus, buys the upgrades with the best payback, claims rewards and uses potions. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
+			Tooltip = "Best value: full automatic, the planner farms, steals, trains, places, sells surplus, buys the best upgrades and uses potions. My filters: only the loops you pick in Run, with your own filters, never sells or spends. Never saved, always off after a restart. Best value uses the game's remotes faster than a normal player, use at your own risk, preferably on an alt.",
 			Callback = function(value)
 				if N.opRevert then
 					return
 				end
-				-- A saved config or a share code never turns it on at start: only the player (card) or Remember Auto Farm Everything does
+				-- A saved config or a share code never turns it on at start: only the player does
 				if value and not N.opOK and os.clock() - N.uiStart < 10 then
 					N.opRevert = true
 					Toggles.AutoFarmBest:SetValue(false)
 					N.opRevert = false
-					log("Auto Farm Everything not restored from config (Remember Auto Farm Everything is the only way)")
+					log("Auto Farm Everything not restored from config")
+					return
+				end
+				if value and optionText("FarmMode", "Best value") == "My filters" then
+					task.defer(N.applyFilters)
 					return
 				end
 				if value and not N.opOK then
@@ -34939,15 +34986,27 @@ do
 					end)
 					return
 				end
-				pcall(function()
-					Library:SetSetting("BSE_FarmWas", value == true)
-				end)
 				task.defer(function()
-					for _, name in ipairs(N.FarmBestOn) do
+					if value then
+						N.farmApplied = "best"
+					end
+					local names = N.FarmBestOn
+					if not value and N.farmApplied == "filters" then
+						names = {}
+						for _, list in pairs(N.FarmRunMap) do
+							for _, name in ipairs(list) do
+								table.insert(names, name)
+							end
+						end
+					end
+					for _, name in ipairs(names) do
 						local toggle = Toggles[name]
 						if toggle and toggle.Value ~= value then
 							toggle:SetValue(value)
 						end
+					end
+					if not value then
+						N.farmApplied = nil
 					end
 					if value then
 						N.applyRecommended()
@@ -34955,6 +35014,44 @@ do
 				end)
 			end,
 		})
+		QuickBox:AddDropdown("FarmMode", {
+			Text = "Mode",
+			Values = { "Best value", "My filters" },
+			Default = "Best value",
+			Tooltip = "Best value: the planner decides everything for the most profit (farms, upgrades, potions, sells surplus). My filters: no planner, no selling, no spending, only the loops you pick in Run and your own filters",
+			Callback = function(value)
+				pcall(function()
+					local run = Options.FarmRun
+					if run and run.SetVisible then
+						run:SetVisible(value == "My filters")
+					end
+				end)
+				-- changing the mode while it runs turns it off, so Best value always asks first
+				if Toggles.AutoFarmBest and Toggles.AutoFarmBest.Value then
+					Toggles.AutoFarmBest:SetValue(false)
+					notify("Auto Farm Everything", "Mode changed, it is off. Turn it on again.", 4)
+				end
+			end,
+		})
+		QuickBox:AddDropdown("FarmRun", {
+			Text = "Run",
+			Values = N.FarmRunValues,
+			Default = { "Auto Farm (eggs)", "Auto Steal", "Auto Place", "Auto Train", "Index rewards", "Offline cash", "Group rewards" },
+			Multi = true,
+			AllowNull = true,
+			Visible = false,
+			Tooltip = "The loops My filters runs. Auto Farm uses your zone and egg filters. Hit Speed stays as you set it. Never sells, never spends",
+			Callback = function()
+				if N.filtersOn() then
+					N.applyFilters()
+				end
+			end,
+		})
+		pcall(function()
+			if Options.FarmRun and Options.FarmRun.SetVisible then
+				Options.FarmRun:SetVisible(optionText("FarmMode", "Best value") == "My filters")
+			end
+		end)
 		-- Recommended settings: the planner picks the egg, the zone and farm vs train, walking is the safe movement.
 		function N.applyRecommended()
 			if Options.ZoneMode then
@@ -34972,15 +35069,6 @@ do
 		end
 		QuickBox:AddLabel({
 			Text = '<font color="rgb(255,140,60)">Full automatic. Uses the game\'s remotes faster than a normal player: the game\'s anticheat MAY BAN this account. Use at your own risk, preferably on an alt.</font>',
-			DoesWrap = true,
-		})
-		QuickBox:AddToggle("RememberFarm", {
-			Text = "Remember Auto Farm Everything",
-			Default = false,
-			Tooltip = "Off: Auto Farm Everything is always off after a restart, whatever the config says. On: it comes back on by itself 5 s after start, without asking. The game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
-		})
-		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">Remember starts it again after every restart without asking. Same ban risk, use an alt.</font>',
 			DoesWrap = true,
 		})
 		QuickBox:AddButton({
@@ -36274,7 +36362,7 @@ do
 		})
 	end
 end
--- Configs never restore Auto Farm Everything on their own (Remember Auto Farm Everything does it by itself, see below)
+-- The master toggle is never saved or restored: a config or a restart always starts it off
 pcall(function()
 	SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoFarmBest" })
 end)
@@ -36323,15 +36411,7 @@ end)
 pcall(function()
 	if Library.GetSetting and not Library:GetSetting("BSE_FarmSplitToast", false) then
 		Library:SetSetting("BSE_FarmSplitToast", true)
-		notify("Auto Farm Everything", "Auto Farm Everything is now on Main. Normal = your toggles, OP = full automatic.", 8)
-	end
-end)
-task.delay(5, function()
-	if alive() and Toggles.RememberFarm and Toggles.RememberFarm.Value and Toggles.AutoFarmBest and not Toggles.AutoFarmBest.Value and Library.GetSetting and Library:GetSetting("BSE_FarmWas", false) then
-		N.opOK = true
-		Toggles.AutoFarmBest:SetValue(true)
-		N.opOK = false
-		log("OP restored (Remember Auto Farm Everything)")
+		notify("Auto Farm Everything", "Auto Farm Everything is now on Main. Pick Best value (full automatic) or My filters (only your loops).", 8)
 	end
 end)
 log("MODE", N.farmMode())
@@ -36470,10 +36550,10 @@ do
 				if choreDue("place", 2) then
 					N.placeStep(false)
 				end
-				if (on("AutoSell") or on("AutoSellSurplus")) and choreDue("sell", 10) and N.sellStep(false) then
+				if not N.filtersOn() and (on("AutoSell") or on("AutoSellSurplus")) and choreDue("sell", 10) and N.sellStep(false) then
 					return
 				end
-				if choreDue("shop", 4) and N.shopStep() then
+				if not N.filtersOn() and choreDue("shop", 4) and N.shopStep() then
 					return
 				end
 				if choreDue("merge", 3) and N.mergeStep() then
@@ -36566,7 +36646,7 @@ do
 	-- Up next in plain words (the raw planner line only goes to the log)
 	local P = N.Plan
 	local lines = {}
-	if on("AutoFarmBest") then
+	if N.bestValueOn() then
 		table.insert(lines, if P.activity == "train" then string.format("Now: training speed to %s", formatNumber(P.trainTarget or 0)) else "Now: farming eggs")
 	end
 	for i = 1, math.min(#(P.valid or {}), 4) do
