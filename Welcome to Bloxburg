@@ -36068,12 +36068,12 @@ do
 		QuickBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "One switch: Auto Work on Best Pay (auto). It measures what every job really pays you plus its level rewards, tests a new job only while that can pay off, and keeps the best one. Turning it off clocks you out and gives your own job pick back",
+			Tooltip = "One switch for Auto Work. Farm Mode Normal keeps your own picks (job, speed, needs, breaks); OP switches to Best Pay (auto), which measures every job's real pay plus level rewards and keeps the best one. Turning it off clocks you out and gives your own job pick back",
 			Callback = function(value)
 				task.defer(function()
 					if value then
 						local pick = Options.JobPick
-						if pick and pick.Value ~= "Best Pay (auto)" then
+						if optionText("FarmMode", "Normal") == "OP" and pick and pick.Value ~= "Best Pay (auto)" then
 							N.FarmPrevPick = pick.Value
 							pcall(function()
 								pick:SetValue("Best Pay (auto)")
@@ -36093,6 +36093,30 @@ do
 						end
 					end
 				end)
+			end,
+		})
+		QuickBox:AddDropdown("FarmMode", {
+			Text = "Farm Mode",
+			Values = { "Normal", "OP" },
+			Default = "Normal",
+			Tooltip = "Normal = automate everything within your own picks. OP = the planner overrides every choice for max profit",
+			Callback = function(value)
+				log("MODE", tostring(value))
+				if value == "OP" and on("AutoFarmBest") then
+					local pick = Options.JobPick
+					if pick and pick.Value ~= "Best Pay (auto)" then
+						N.FarmPrevPick = pick.Value
+						pcall(function()
+							pick:SetValue("Best Pay (auto)")
+						end)
+					end
+				elseif value == "Normal" and N.FarmPrevPick and Options.JobPick then
+					local prev = N.FarmPrevPick
+					N.FarmPrevPick = nil
+					pcall(function()
+						Options.JobPick:SetValue(prev)
+					end)
+				end
 			end,
 		})
 		QuickBox:AddLabel({
@@ -37110,6 +37134,7 @@ do
 	pcall(function()
 		Tabs.Main:Show()
 	end)
+	log("MODE", optionText("FarmMode", "Normal"))
 	notify("Corvus", if Library.IsMobile then "Loaded and ready. The round Corvus button opens and closes the hub." else "Loaded. Press RightControl to hide or show the menu.", 5)
 	if Library.ShowWizard and not N.setupDone() then
 		task.delay(1.5, function()
