@@ -30496,8 +30496,35 @@ do
 		return found
 	end
 	-- Only the job actions a worker sends. Never purchases, trading, admin or anything for other players.
-	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true, TakeOil = true, TakeWheel = true, TakePainter = true, FixBike = true, DeliverPizza = true }
-	local AllowedJobInvoke = { CleanSchoolJanitorObject = true, TakePizzaBox = true, MineBlock = true }
+	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true, TakeOil = true, TakeWheel = true, TakePainter = true, FixBike = true, DeliverPizza = true, ExitWorkstation = true }
+	local AllowedJobInvoke = { CleanSchoolJanitorObject = true, TakePizzaBox = true, MineBlock = true, TeacherJob_TaskComplete = true, TeacherJob_GetHallPass = true, TeacherJob_StartLectureStudent = true, TeacherJob_UseBoard = true, RequestCashierRole = true, ConfirmOrderCashier = true }
+	-- Build mode on YOUR OWN plot only, paid with your own money (the normal build packets the game's build menu sends).
+	local AllowedBuild = { EnterBuild = true, PlaceObject = true, PlaceWall = true, PlaceFloor = true, PlacePath = true }
+	function N.buildInvoke(packet)
+		local jh = N.jobHandler()
+		if not (jh and AllowedBuild[packet.Type]) then
+			log("BLOCKED build", tostring(packet.Type))
+			return false, nil
+		end
+		local box = { done = false }
+		task.spawn(function()
+			box.ok, box.result, box.result2 = pcall(function()
+				return jh.net:InvokeServer(packet)
+			end)
+			box.done = true
+		end)
+		local started = os.clock()
+		while not box.done and os.clock() - started < 10 do
+			task.wait(0.03)
+		end
+		return box.done and box.ok, box.result, box.result2
+	end
+	function N.buildExit()
+		local jh = N.jobHandler()
+		pcall(function()
+			jh.net:FireServer({ Type = "ExitBuild" })
+		end)
+	end
 	function N.jobFire(packet)
 		local jh = N.jobHandler()
 		if not (jh and AllowedJob[packet.Type]) then
@@ -31371,9 +31398,431 @@ do
 		end)
 		local lines = {}
 		for i, row in ipairs(rows) do
-			table.insert(lines, string.format("%s%s  <b>$%s/h</b>  <font transparency=\"0.4\">(%d min)</font>", if i == 1 then "\u{2605} " else "", row.job, formatNumber(math.floor(row.rate)), math.floor(row.minutes)))
+			local level = N.Levels and N.Levels[row.job]
+			table.insert(lines, string.format("%s%s  <b>$%s/h</b>  <font transparency=\"0.4\">(%d min%s)</font>", if i == 1 then "\u{2605} " else "", row.job, formatNumber(math.floor(row.rate)), math.floor(row.minutes), if level and level > 0 then ", lvl " .. level else ""))
 		end
 		return if #lines > 0 then table.concat(lines, "\n") else '<font transparency="0.4">Work a few minutes in each job to see what it really pays you</font>'
+	end
+end
+-- Plot copy. "Save" reads what a plot shows in the world (floors: FloorModel.PointData Point_N in plot space; walls:
+-- Wall.FPole / BPole -> PoleValue world points at mid height; paths: Path.FPole / BPole -> Pole parts; objects: the
+-- named root parts in House.Objects / Counters and in every ItemHolder, with their CFrame) relative to the plot's
+-- _groundCFrame, and saves it to Corvus/WTB_layouts/<name>.json. "Build" places the same things on YOUR plot with the
+-- normal build packets (EnterBuild, PlaceFloor {Points}, PlaceWall {From, To}, PlacePath {From, To}, PlaceObject
+-- {Name, Pos, Rot, TargetModel}), paid with your own money. Blockbux and event currency items are never bought.
+-- Roofs and paint are not copied yet (their packets need more data). BETA: not tested in game yet.
+N.Build = { running = false, stop = false, dir = "Corvus/WTB_layouts", index = "Corvus/WTB_layouts/index.json", status = "Stand on a plot, type a name and save its layout.", names = {} }
+do
+	local WALL_HALF = 6
+	local function groundOf(plot)
+		local v = plot:FindFirstChild("_groundCFrame")
+		if v and typeof(v.Value) == "CFrame" then
+			return v.Value, v:GetAttribute("Size") or plot:GetAttribute("GroundSize")
+		end
+		return plot:GetAttribute("GroundPosition"), plot:GetAttribute("GroundSize")
+	end
+	function N.plotAt(pos)
+		local plots = workspace:FindFirstChild("Plots")
+		for _, plot in ipairs(plots and plots:GetChildren() or {}) do
+			local cf, size = groundOf(plot)
+			if typeof(cf) == "CFrame" then
+				size = if typeof(size) == "Vector3" then size else Vector3.new(250, 0, 250)
+				local rel = cf:PointToObjectSpace(pos)
+				if math.abs(rel.X) <= size.X / 2 + 4 and math.abs(rel.Z) <= size.Z / 2 + 4 and math.abs(rel.Y) < 200 then
+					return plot, cf
+				end
+			end
+		end
+		return nil
+	end
+	function N.myPlot()
+		local plots = workspace:FindFirstChild("Plots")
+		local plot = plots and plots:FindFirstChild("Plot_" .. LocalPlayer.Name)
+		if plot then
+			return plot, (groundOf(plot))
+		end
+		return nil
+	end
+	local function ensureDir()
+		pcall(function()
+			if makefolder and isfolder then
+				if not isfolder("Corvus") then
+					makefolder("Corvus")
+				end
+				if not isfolder(N.Build.dir) then
+					makefolder(N.Build.dir)
+				end
+			end
+		end)
+	end
+	local function loadIndex()
+		local names = {}
+		pcall(function()
+			if isfile(N.Build.index) then
+				local data = HttpService:JSONDecode(readfile(N.Build.index))
+				if type(data) == "table" then
+					names = data
+				end
+			end
+		end)
+		N.Build.names = names
+		return names
+	end
+	loadIndex()
+	function N.layoutNames()
+		local list = {}
+		for _, name in ipairs(N.Build.names) do
+			table.insert(list, name)
+		end
+		return list
+	end
+	local function safeName(name)
+		name = string.gsub(tostring(name or ""), "[^%w%s%-_]", "")
+		name = string.gsub(name, "^%s+", "")
+		name = string.gsub(name, "%s+$", "")
+		return if name == "" then "layout" else string.sub(name, 1, 40)
+	end
+	local function vec(t)
+		return Vector3.new(t[1], t[2], t[3])
+	end
+	local function arr(v)
+		return { math.floor(v.X * 1000 + 0.5) / 1000, math.floor(v.Y * 1000 + 0.5) / 1000, math.floor(v.Z * 1000 + 0.5) / 1000 }
+	end
+	local function cframeOf(instance)
+		if instance:IsA("BasePart") then
+			return instance.CFrame
+		end
+		local ok, pivot = pcall(instance.GetPivot, instance)
+		return if ok then pivot else nil
+	end
+	local function poleOf(owner, name)
+		local link = owner:FindFirstChild(name)
+		local target = link and link:IsA("ObjectValue") and link.Value
+		local pole = target and target.Parent
+		if pole and pole:IsA("Vector3Value") then
+			return pole.Value
+		elseif pole and pole:IsA("BasePart") then
+			return pole.Position
+		elseif target and target:IsA("BasePart") then
+			return target.Position
+		end
+		return nil
+	end
+	local function itemData(object)
+		local jh = N.jobHandler()
+		local item = isolated(function()
+			return jh.Items:GetItemFromObject(object)
+		end)
+		return if type(item) == "table" then item else nil
+	end
+	function N.saveLayout(name)
+		name = safeName(name)
+		local root = N.root()
+		if not root then
+			return false, "No character"
+		end
+		local plot, ground = N.plotAt(root.Position)
+		if not plot then
+			return false, "Stand on the plot you want to copy first"
+		end
+		local house = plot:FindFirstChild("House")
+		if not house then
+			return false, "That house has not loaded yet: walk onto the plot and wait a moment"
+		end
+		local data = { version = 1, source = plot.Name, saved = os.time(), floors = {}, walls = {}, paths = {}, objects = {}, cost = 0, skipped = 0, roofs = 0 }
+		local floor = house:FindFirstChild("Floor")
+		for _, model in ipairs(floor and floor:GetChildren() or {}) do
+			local pd = model:FindFirstChild("PointData")
+			if pd then
+				local points = {}
+				for i = 1, tonumber(pd.Value) or 0 do
+					local p = pd:FindFirstChild("Point_" .. i)
+					if p and typeof(p.Value) == "Vector3" then
+						table.insert(points, arr(p.Value))
+					end
+				end
+				if #points >= 3 then
+					table.insert(data.floors, points)
+					if #data.floors == 1 then
+						-- check the "points are in plot space" reading against the floor model's own position
+						local sum = Vector3.zero
+						for _, p in ipairs(points) do
+							sum += ground:PointToWorldSpace(vec(p))
+						end
+						local center = sum / #points
+						local pivot = cframeOf(model)
+						log("BUILD floor check", "points center", brief(center), "model", brief(pivot and pivot.Position))
+					end
+				end
+			end
+		end
+		local function addObject(object, on, link)
+			if not object:IsA("BasePart") or object.Name == "ItemHolder" then
+				return
+			end
+			local item = itemData(object)
+			if item and (item.BSPrice or item.ECPrice) then
+				data.skipped += 1
+				return
+			end
+			local cf = cframeOf(object)
+			if not cf then
+				return
+			end
+			local entry = { name = object.Name, cf = { ground:ToObjectSpace(cf):GetComponents() }, on = on, link = link, price = item and tonumber(item.Price) or 0 }
+			table.insert(data.objects, entry)
+			data.cost += entry.price
+			local index = #data.objects
+			local holder = object:FindFirstChild("ItemHolder")
+			for _, child in ipairs(holder and holder:GetChildren() or {}) do
+				addObject(child, "object", index)
+			end
+		end
+		local walls = house:FindFirstChild("Walls")
+		for _, wall in ipairs(walls and walls:GetChildren() or {}) do
+			local a, b = poleOf(wall, "FPole"), poleOf(wall, "BPole")
+			if a and b then
+				local down = Vector3.new(0, WALL_HALF, 0)
+				table.insert(data.walls, { arr(ground:PointToObjectSpace(a - down)), arr(ground:PointToObjectSpace(b - down)) })
+				local index = #data.walls
+				local holder = wall:FindFirstChild("ItemHolder")
+				for _, child in ipairs(holder and holder:GetChildren() or {}) do
+					addObject(child, "wall", index)
+				end
+			end
+		end
+		local paths = house:FindFirstChild("Paths")
+		for _, path in ipairs(paths and paths:GetChildren() or {}) do
+			local a, b = poleOf(path, "FPole"), poleOf(path, "BPole")
+			if a and b then
+				table.insert(data.paths, { arr(ground:PointToObjectSpace(a)), arr(ground:PointToObjectSpace(b)) })
+			end
+		end
+		for _, folderName in ipairs({ "Objects", "Counters" }) do
+			local folder = house:FindFirstChild(folderName)
+			for _, object in ipairs(folder and folder:GetChildren() or {}) do
+				addObject(object, "ground", nil)
+			end
+		end
+		local roof = house:FindFirstChild("Roof")
+		data.roofs = roof and #roof:GetChildren() or 0
+		if #data.floors + #data.walls + #data.objects == 0 then
+			return false, "Nothing to copy found on " .. plot.Name .. " (walk closer so the house loads)"
+		end
+		ensureDir()
+		local ok, err = pcall(function()
+			writefile(N.Build.dir .. "/" .. name .. ".json", HttpService:JSONEncode(data))
+		end)
+		if not ok then
+			return false, "Could not write the file: " .. tostring(err)
+		end
+		if N.layoutInfoReset then
+			N.layoutInfoReset(name)
+		end
+		if not table.find(N.Build.names, name) then
+			table.insert(N.Build.names, name)
+			pcall(function()
+				writefile(N.Build.index, HttpService:JSONEncode(N.Build.names))
+			end)
+		end
+		log("BUILD saved", name, "from", plot.Name, "floors", #data.floors, "walls", #data.walls, "paths", #data.paths, "objects", #data.objects, "cost", data.cost, "skipped", data.skipped, "roofs", data.roofs)
+		return true, string.format("Saved '%s': %d floors, %d walls, %d paths, %d items ($%s for items, walls and floors extra). %d Blockbux items left out, roofs (%d) are not copied yet.", name, #data.floors, #data.walls, #data.paths, #data.objects, formatNumber(data.cost), data.skipped, data.roofs)
+	end
+	local function loadLayout(name)
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(readfile(N.Build.dir .. "/" .. safeName(name) .. ".json"))
+		end)
+		return if ok and type(data) == "table" then data else nil
+	end
+	local InfoCache = {}
+	function N.layoutInfo(name)
+		if InfoCache[name] then
+			return InfoCache[name]
+		end
+		local data = name and loadLayout(name)
+		if not data then
+			return "No layout picked"
+		end
+		InfoCache[name] = string.format("%s: %d floors, %d walls, %d paths, %d items, items $%s (from %s)", name, #(data.floors or {}), #(data.walls or {}), #(data.paths or {}), #(data.objects or {}), formatNumber(data.cost or 0), tostring(data.source))
+		return InfoCache[name]
+	end
+	function N.layoutInfoReset(name)
+		InfoCache[safeName(name)] = nil
+	end
+	local function rotOf(cf)
+		local look = cf.LookVector
+		return (-math.atan2(look.Z, look.X) - math.pi / 2) % (2 * math.pi)
+	end
+	local function placeDelay()
+		return if optionText("JobSpeed", "Fast") == "Blatant" then 0.15 else 0.35 + math.random() * 0.25
+	end
+	-- the model a floor object stands on: the floor model under it, else the plot ground
+	local function surfaceAt(plot, house, pos)
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Include
+		params.FilterDescendantsInstances = { plot }
+		local hit = workspace:Raycast(pos + Vector3.new(0, 1.5, 0), Vector3.new(0, -4, 0), params)
+		local part = hit and hit.Instance
+		if not part then
+			return nil
+		end
+		local floor = house and house:FindFirstChild("Floor")
+		local node = part
+		while node and node ~= plot do
+			if floor and node.Parent == floor then
+				return node
+			end
+			if node.Parent and (node.Parent.Name == "Objects" or node.Parent.Name == "Counters") and node.Parent.Parent == house then
+				return node
+			end
+			node = node.Parent
+		end
+		return part
+	end
+	local function wallNear(house, pos)
+		local walls = house and house:FindFirstChild("Walls")
+		local best, bestDist
+		for _, wall in ipairs(walls and walls:GetChildren() or {}) do
+			local a, b = poleOf(wall, "FPole"), poleOf(wall, "BPole")
+			if a and b then
+				local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+				local ap = Vector3.new(pos.X - a.X, 0, pos.Z - a.Z)
+				local t = math.clamp(ap:Dot(ab) / math.max(ab:Dot(ab), 1e-6), 0, 1)
+				local d = (ap - ab * t).Magnitude + math.abs(pos.Y - a.Y) * 0.1
+				if not bestDist or d < bestDist then
+					best, bestDist = wall, d
+				end
+			end
+		end
+		return if bestDist and bestDist < 2 then best else nil
+	end
+	local function objectNear(house, name, pos)
+		local best, bestDist
+		local function scan(folder)
+			for _, obj in ipairs(folder and folder:GetChildren() or {}) do
+				if obj.Name == name and obj:IsA("BasePart") then
+					local d = (obj.Position - pos).Magnitude
+					if not bestDist or d < bestDist then
+						best, bestDist = obj, d
+					end
+				end
+				local holder = obj:FindFirstChild("ItemHolder")
+				if holder then
+					scan(holder)
+				end
+			end
+		end
+		scan(house and house:FindFirstChild("Objects"))
+		scan(house and house:FindFirstChild("Counters"))
+		local walls = house and house:FindFirstChild("Walls")
+		for _, wall in ipairs(walls and walls:GetChildren() or {}) do
+			scan(wall:FindFirstChild("ItemHolder"))
+		end
+		return if bestDist and bestDist < 2 then best else nil
+	end
+	function N.buildLayout(name, parts)
+		local data = loadLayout(name)
+		if not data then
+			N.Build.status = "Pick a saved layout first"
+			return
+		end
+		local plot, ground = N.myPlot()
+		local root = N.root()
+		if not (plot and ground and root) then
+			N.Build.status = "Your plot was not found"
+			return
+		end
+		if N.plotAt(root.Position) ~= plot then
+			N.Build.status = "Go to your own plot first, then press Build"
+			notify("Corvus", "Walk onto your own plot first, then press Build", 5)
+			return
+		end
+		N.Build.running, N.Build.stop = true, false
+		N.taxiRelease()
+		N.bbLeave()
+		N.endShift()
+		task.wait(0.5)
+		local entered, enterResult = N.buildInvoke({ Type = "EnterBuild", Plot = plot })
+		log("BUILD enter", tostring(entered), brief(enterResult))
+		task.wait(1)
+		local house = plot:FindFirstChild("House")
+		local done, failed, logged = 0, 0, 0
+		local total = (if parts.shell then #(data.floors or {}) + #(data.walls or {}) + #(data.paths or {}) else 0) + (if parts.items then #(data.objects or {}) else 0)
+		local function place(packet, what)
+			if N.Build.stop or not alive() then
+				return false
+			end
+			local ok, result, extra = N.buildInvoke(packet)
+			if ok and result then
+				done += 1
+			else
+				failed += 1
+				if logged < 8 then
+					logged += 1
+					log("BUILD failed", what, brief(packet), "answer", brief(result), brief(extra))
+				end
+			end
+			N.Build.status = string.format("Building %s: %d / %d placed, %d failed", name, done, total, failed)
+			task.wait(placeDelay())
+			return ok and result
+		end
+		if parts.shell then
+			for _, points in ipairs(data.floors or {}) do
+				local world = {}
+				for _, p in ipairs(points) do
+					table.insert(world, ground:PointToWorldSpace(Vector3.new(p[1], 0, p[3])) + Vector3.new(0, 0.05 + p[2], 0))
+				end
+				place({ Type = "PlaceFloor", Points = world }, "floor")
+			end
+			for _, w in ipairs(data.walls or {}) do
+				place({ Type = "PlaceWall", From = ground:PointToWorldSpace(vec(w[1])), To = ground:PointToWorldSpace(vec(w[2])) }, "wall")
+			end
+			for _, p in ipairs(data.paths or {}) do
+				place({ Type = "PlacePath", From = ground:PointToWorldSpace(vec(p[1])), To = ground:PointToWorldSpace(vec(p[2])) }, "path")
+			end
+			task.wait(1)
+		end
+		if parts.items then
+			house = plot:FindFirstChild("House")
+			-- ground items first, then wall items, then items standing on other items
+			for _, pass in ipairs({ "ground", "wall", "object" }) do
+				for _, entry in ipairs(data.objects or {}) do
+					if N.Build.stop or not alive() then
+						break
+					end
+					if entry.on == pass then
+						if (entry.price or 0) > 0 and N.money() < entry.price then
+							N.Build.status = string.format("Out of money at %d / %d (next item %s costs $%s)", done, total, entry.name, formatNumber(entry.price))
+							N.Build.stop = true
+							break
+						end
+						local cf = ground * CFrame.new(table.unpack(entry.cf))
+						local target
+						if pass == "ground" then
+							target = surfaceAt(plot, house, cf.Position)
+						elseif pass == "wall" then
+							target = wallNear(house, cf.Position)
+						else
+							local parent = data.objects[entry.link]
+							if parent then
+								target = objectNear(house, parent.name, (ground * CFrame.new(table.unpack(parent.cf))).Position)
+							end
+						end
+						place({ Type = "PlaceObject", Name = entry.name, Pos = cf.Position, Rot = rotOf(cf), TargetModel = target }, entry.name .. " on " .. tostring(target))
+					end
+				end
+				task.wait(0.5)
+			end
+		end
+		N.buildExit()
+		N.Build.running = false
+		local stopped = N.Build.stop
+		N.Build.stop = false
+		if not string.find(N.Build.status, "Out of money", 1, true) then
+			N.Build.status = string.format("%s %s: %d placed, %d failed%s", if stopped then "Stopped" else "Finished", name, done, failed, if data.roofs and data.roofs > 0 then ". Add the roof yourself (" .. data.roofs .. ")" else "")
+		end
+		log("BUILD done", name, "placed", done, "failed", failed, "stopped", tostring(stopped))
+		notify("Corvus", N.Build.status, 6)
 	end
 end
 -- Ben's Ice Cream: TakeIceCreamCup at Interior.TableObjects.IceCreamCups, AddIceCreamScoop {Taste, Ball = cup.Ball1 /
@@ -32108,6 +32557,890 @@ do
 		end
 	end
 end
+-- Shared helpers for the newer jobs.
+do
+	function N.posOf(instance)
+		if not instance then
+			return nil
+		end
+		if instance:IsA("BasePart") then
+			return instance.Position
+		end
+		local ok, pivot = pcall(instance.GetPivot, instance)
+		return if ok then pivot.Position else nil
+	end
+	function N.heldName()
+		local jh = N.jobHandler()
+		local item = isolated(function()
+			return jh.Shared.EquipmentService:GetEquipped(LocalPlayer)
+		end)
+		return item and tostring(item) or ""
+	end
+	function N.attachWeld()
+		local jh = N.jobHandler()
+		return isolated(function()
+			return jh.Shared.AttachService:GetAttachWeld(LocalPlayer.Character)
+		end)
+	end
+	-- The game's own "get up" (used by its build mode and go to work).
+	function N.detach()
+		local jh = N.jobHandler()
+		isolated(function()
+			jh.Modules.CharacterHandler:Detach()
+		end)
+	end
+	-- Calls a method of any game object in its own thread with a timeout.
+	function N.callModule(timeout, object, method, ...)
+		if not (type(object) == "table" and type(object[method]) == "function") then
+			return nil
+		end
+		local args = table.pack(...)
+		local box = { done = false }
+		task.spawn(function()
+			box.result = table.pack(pcall(object[method], object, table.unpack(args, 1, args.n)))
+			box.done = true
+		end)
+		local started = os.clock()
+		while not box.done and os.clock() - started < timeout do
+			task.wait(0.05)
+		end
+		if not box.done then
+			log("MODCALL", method, "timed out")
+			return nil
+		end
+		if not box.result[1] then
+			log("MODCALL", method, "error", tostring(box.result[2]))
+			return nil
+		end
+		return box.result[2]
+	end
+	-- Job level (1-10) the game keeps in ClientStats "Job/Jobs/<job>".
+	function N.jobLevel(job)
+		local jh = N.jobHandler()
+		return tonumber(isolated(function()
+			return jh.Modules.ClientStats:Get("Job/Jobs/" .. job)
+		end)) or 0
+	end
+	-- The shift's efficiency (0-1) and the game's reason index for it.
+	function N.efficiency()
+		local jh = N.jobHandler()
+		local value, tip = isolated(function()
+			local eff = jh.Modules.ClientStats:GetStat("Job"):FindFirstChild("Efficiency")
+			return eff.Value, eff:GetAttribute("ToolTipIndex")
+		end)
+		return tonumber(value), tip
+	end
+end
+
+-- High School Teacher. Desks in School.Interior.Floor2.Teacher1.Interior.Gameplay.Desks carry ID and TaskID (set by the
+-- game when the server sends TeacherJob_NewTask): 1 = scold (TeacherJob_TaskComplete at the desk), 2 = hall pass
+-- (TeacherJob_GetHallPass {StationID} at a "Hall Pass Stations" child, then TaskComplete at the desk), 3 = lecture
+-- (stand within ~9 studs of the student so StartLectureStudent runs, TeacherJob_UseBoard at the Board, the board
+-- minigame, then TaskComplete). Every call is an InvokeServer answered true when it counted.
+N.Teacher = { skip = setmetatable({}, { __mode = "k" }), last = "" }
+do
+	local DISCIPLINE, HALL_PASS, LECTURE = 1, 2, 3
+	local function gameplay()
+		local node = workspace:FindFirstChild("Environment")
+		for _, name in ipairs({ "Locations", "SchoolArea", "School", "Interior", "Floor2", "Teacher1", "Interior", "Gameplay" }) do
+			node = node and node:FindFirstChild(name)
+		end
+		return node
+	end
+	local function boardTime()
+		local mode = optionText("JobSpeed", "Fast")
+		if mode == "Blatant" then
+			return 1.2
+		elseif mode == "Legit" then
+			return 6 + math.random() * 3
+		end
+		return 3.5 + math.random() * 1.5
+	end
+	local function complete(item)
+		item.desk:SetAttribute("TaskID", 0)
+		local ok, result = N.jobInvoke({ Type = "TeacherJob_TaskComplete", DeskID = item.id, TaskID = item.task })
+		if ok and result then
+			item.desk:SetAttribute("TaskID", -1)
+			Session.done += 1
+			Session.correct += 1
+			N.Teacher.last = "task " .. item.task .. " done"
+			return true
+		end
+		if item.desk:GetAttribute("TaskID") == 0 then
+			item.desk:SetAttribute("TaskID", item.task)
+		end
+		N.Teacher.skip[item.desk] = os.clock() + 4
+		N.Teacher.last = "task " .. item.task .. " refused"
+		return false
+	end
+	function N.teacherStep()
+		if not N.ensureShift("HighSchoolTeacher") then
+			return
+		end
+		if N.attachWeld() then
+			N.detach()
+			task.wait(0.3)
+		end
+		local area, root = gameplay(), N.root()
+		local desks = area and area:FindFirstChild("Desks")
+		if not (desks and root) then
+			setStatus("Teacher: waiting for the classroom to load")
+			task.wait(1)
+			return
+		end
+		local holding = N.heldName() == "Hall Pass"
+		local best, bestScore
+		local now = os.clock()
+		for _, desk in ipairs(desks:GetChildren()) do
+			local taskId, id = desk:GetAttribute("TaskID"), desk:GetAttribute("ID")
+			if id and (taskId == DISCIPLINE or taskId == HALL_PASS or taskId == LECTURE) and (N.Teacher.skip[desk] or 0) <= now then
+				local pos = N.posOf(desk:FindFirstChild("NPC") or desk)
+				if pos then
+					local score = (pos - root.Position).Magnitude
+					if taskId == HALL_PASS and holding then
+						score -= 1000
+					elseif taskId == LECTURE then
+						score += 40
+					end
+					if not bestScore or score < bestScore then
+						best, bestScore = { desk = desk, id = id, task = taskId, pos = pos }, score
+					end
+				end
+			end
+		end
+		if not best then
+			setStatus(string.format("Teacher: waiting for students (%d tasks done)", Session.done))
+			task.wait(0.3)
+			return
+		end
+		if best.task == DISCIPLINE then
+			setStatus("Teacher: calming a student down")
+			N.walkTo(best.pos, 5, 10)
+			task.wait(N.actionDelay())
+			complete(best)
+		elseif best.task == HALL_PASS then
+			if not holding then
+				local stations = area:FindFirstChild("Hall Pass Stations")
+				local station, stationDist
+				for _, st in ipairs(stations and stations:GetChildren() or {}) do
+					local pos = N.posOf(st)
+					if pos and st:GetAttribute("ID") then
+						local d = (pos - root.Position).Magnitude
+						if not stationDist or d < stationDist then
+							station, stationDist = st, d
+						end
+					end
+				end
+				if not station then
+					setStatus("Teacher: no hall pass station found")
+					N.Teacher.skip[best.desk] = os.clock() + 10
+					return
+				end
+				setStatus("Teacher: taking a hall pass")
+				N.walkTo(N.posOf(station), 4, 12)
+				task.wait(N.actionDelay())
+				N.jobInvoke({ Type = "TeacherJob_GetHallPass", StationID = station:GetAttribute("ID") })
+				if not waitFor(function()
+					return N.heldName() == "Hall Pass"
+				end, 2) then
+					N.Teacher.skip[best.desk] = os.clock() + 4
+					return
+				end
+			end
+			setStatus("Teacher: giving the hall pass")
+			N.walkTo(best.pos, 5, 12)
+			task.wait(N.actionDelay())
+			complete(best)
+		else
+			setStatus("Teacher: helping a student at the board")
+			local npc = best.desk:FindFirstChild("NPC")
+			N.walkTo(best.pos, 4, 12)
+			local started = waitFor(function()
+				return npc ~= nil and npc:GetAttribute("DontAutoHideThoughtBubble") == true
+			end, 2.5)
+			if not started then
+				local ok, result = N.jobInvoke({ Type = "TeacherJob_StartLectureStudent", DeskID = best.id, TaskID = LECTURE })
+				if not (ok and result) then
+					N.Teacher.skip[best.desk] = os.clock() + 5
+					return
+				end
+			end
+			local board = area:FindFirstChild("Board")
+			local boardPos = N.posOf(board)
+			if not boardPos then
+				N.Teacher.skip[best.desk] = os.clock() + 10
+				return
+			end
+			N.walkTo(boardPos, 5, 12)
+			task.wait(N.actionDelay())
+			local ok, result = N.jobInvoke({ Type = "TeacherJob_UseBoard", DeskID = best.id, TaskID = LECTURE })
+			if ok and result then
+				task.wait(boardTime())
+				complete(best)
+			else
+				N.Teacher.skip[best.desk] = os.clock() + 5
+			end
+			if N.attachWeld() then
+				N.detach()
+			end
+		end
+		log("TEACHER", "task", best.task, N.Teacher.last)
+	end
+end
+
+-- BloxBurgers Cashier. RequestCashierRole {StationName = "Cashier", StationIndexName = "Cashier_0N"} (InvokeServer)
+-- puts you behind the till. The customer (Occupied of the station model) carries its order as children "1" (burger,
+-- attribute HasDrink), "2" (side) and "3" (drink). The game answers ConfirmOrderCashier {Order = {burger, side, drink}}
+-- with true/false. burger = {patty code (meat 1 / plant 2 times 10 plus count), cheese, lettuce, tomato, onion, buns},
+-- side / drink = tonumber(index .. sizeIndex) from the lists below (no drink = nil).
+N.BB = { station = nil, served = setmetatable({}, { __mode = "k" }), dumped = 0, wrongLogged = 0, imageMap = nil, firstSeen = setmetatable({}, { __mode = "k" }) }
+do
+	local Sides = { "Fries", "Mozarella Sticks", "Onion Rings" }
+	local Drinks = { "Fountain Drink", "FruityFruit Juice", "Vanilla Milkshake" }
+	local Sizes = { "Small", "Medium", "Large" }
+	local Ingredient = { Cheese = 2, Lettuce = 3, Tomato = 4, Onion = 5 }
+	local function stationsFolder()
+		local node = workspace:FindFirstChild("Environment")
+		for _, name in ipairs({ "Locations", "City", "BloxBurgers", "Interior", "ScriptableObjects", "Cashier", "Workstations" }) do
+			node = node and node:FindFirstChild(name)
+		end
+		return node
+	end
+	-- the game's burgerModelToTable
+	local function burgerFromModel(model)
+		local t = { 0, 0, 0, 0, 0, 0 }
+		local first
+		for _, child in ipairs(model:GetChildren()) do
+			local name = child.Name
+			if string.find(name, "Bun") then
+				t[6] += 1
+			elseif string.find(name, "Patty") then
+				local kind = if string.find(name, "Meat") then 1 else 2
+				if not first then
+					t[1] = kind * 10
+					first = kind
+				end
+				if kind == first then
+					t[1] += 1
+				else
+					t[1] = t[1] * -1
+				end
+			else
+				local base = string.match(name, "^(.-) %[(.+)%]$")
+				local i = base and Ingredient[base]
+				if i then
+					t[i] += 1
+				end
+			end
+		end
+		return t
+	end
+	-- image id -> button name, from the game's own cashier screen template
+	local function imageMap()
+		if N.BB.imageMap then
+			return N.BB.imageMap
+		end
+		local map = {}
+		pcall(function()
+			local module = LocalPlayer.PlayerScripts.Modules.JobHandler.BloxBurgersEmployee.BloxBurgersCashier
+			local frame = module:FindFirstChild("CashierFrame")
+			for _, d in ipairs(frame and frame:GetDescendants() or {}) do
+				if (d:IsA("ImageLabel") or d:IsA("ImageButton")) and d.Image ~= "" then
+					local node = d
+					while node and node ~= frame do
+						local n = node.Name
+						if string.find(n, "%[") or table.find(Sides, n) or table.find(Drinks, n) or table.find(Sizes, n) then
+							map[d.Image .. "|" .. tostring(d.ImageRectOffset)] = n
+							map[d.Image] = map[d.Image] or n
+							break
+						end
+						node = node.Parent
+					end
+				end
+			end
+		end)
+		N.BB.imageMap = map
+		return map
+	end
+	-- every name a frame shows: instance names, texts, attributes and icons the cashier screen uses
+	local function frameWords(frame)
+		local words = {}
+		local map = imageMap()
+		local function add(text, count)
+			if type(text) == "string" and text ~= "" then
+				table.insert(words, { text = text, count = count or 1 })
+			end
+		end
+		for _, d in ipairs(frame:GetDescendants()) do
+			local count = 1
+			local label = d:FindFirstChildWhichIsA("TextLabel")
+			local n = label and tonumber(string.match(label.Text, "(%d+)"))
+			if n and n > 0 and n < 10 then
+				count = n
+			end
+			add(d.Name, count)
+			if d:IsA("TextLabel") then
+				add(d.Text)
+			end
+			if d:IsA("ImageLabel") or d:IsA("ImageButton") then
+				add(map[d.Image .. "|" .. tostring(d.ImageRectOffset)] or map[d.Image], count)
+			end
+			for key, value in pairs(d:GetAttributes()) do
+				add(tostring(value))
+				add(key)
+			end
+		end
+		return words
+	end
+	local function findModel(frame, test)
+		local best, bestScore = nil, 0
+		for _, d in ipairs(frame:GetDescendants()) do
+			if d:IsA("Model") then
+				local score = test(d)
+				if score > bestScore then
+					best, bestScore = d, score
+				end
+			end
+		end
+		return best
+	end
+	local function sizeOf(frame, model)
+		local size = model and model:GetAttribute("Size")
+		if size and table.find(Sizes, size) then
+			return table.find(Sizes, size)
+		end
+		for _, w in ipairs(frameWords(frame)) do
+			for i, s in ipairs(Sizes) do
+				if w.text == s or string.find(w.text, s, 1, true) then
+					return i
+				end
+			end
+		end
+		return nil
+	end
+	local function itemOf(frame, list)
+		local model = findModel(frame, function(m)
+			local base = string.match(m.Name, "^(.-) %[") or m.Name
+			return if table.find(list, base) then 1 else 0
+		end)
+		local index
+		if model then
+			index = table.find(list, string.match(model.Name, "^(.-) %[") or model.Name)
+		else
+			for _, w in ipairs(frameWords(frame)) do
+				for i, name in ipairs(list) do
+					if w.text == name or string.find(w.text, name, 1, true) then
+						index = i
+						break
+					end
+				end
+				if index then
+					break
+				end
+			end
+		end
+		local size = sizeOf(frame, model)
+		if index and size then
+			return tonumber(tostring(index) .. tostring(size))
+		end
+		return nil
+	end
+	local function burgerOf(frame)
+		local model = findModel(frame, function(m)
+			local score = 0
+			for _, c in ipairs(m:GetChildren()) do
+				if string.find(c.Name, "Bun") or string.find(c.Name, "Patty") or string.find(c.Name, "%[") then
+					score += 1
+				end
+			end
+			return score
+		end)
+		if model then
+			return burgerFromModel(model)
+		end
+		-- no 3D model: count the ingredient names the frame shows
+		local t = { 0, 0, 0, 0, 0, 2 }
+		local meat, plant = 0, 0
+		for _, w in ipairs(frameWords(frame)) do
+			local text = w.text
+			if string.find(text, "Meat Patty") then
+				meat += w.count
+			elseif string.find(text, "Plantbased Patty") then
+				plant += w.count
+			elseif not string.find(text, "Rings") then
+				for name, i in pairs(Ingredient) do
+					if text == name or string.find(text, name .. " %[") then
+						t[i] += w.count
+					end
+				end
+			end
+		end
+		if meat + plant == 0 then
+			return nil
+		end
+		if meat > 0 and plant > 0 then
+			t[1] = -(10 + meat)
+		elseif meat > 0 then
+			t[1] = 10 + meat
+		else
+			t[1] = 20 + plant
+		end
+		return t
+	end
+	-- Compact tree of the order frames for the log (so the parser can be fixed from one game log).
+	local function describe(root, limit)
+		local parts = {}
+		local function walk(inst, depth)
+			if #parts >= limit then
+				return
+			end
+			local text = string.rep(".", depth) .. inst.ClassName .. ":" .. inst.Name
+			if inst:IsA("TextLabel") then
+				text ..= "='" .. inst.Text .. "'"
+			elseif inst:IsA("ImageLabel") or inst:IsA("ImageButton") then
+				text ..= "=" .. inst.Image .. "@" .. tostring(inst.ImageRectOffset)
+			end
+			local attrs = {}
+			for k, v in pairs(inst:GetAttributes()) do
+				table.insert(attrs, k .. "=" .. tostring(v))
+			end
+			if #attrs > 0 then
+				text ..= "{" .. table.concat(attrs, ",") .. "}"
+			end
+			table.insert(parts, text)
+			for _, child in ipairs(inst:GetChildren()) do
+				walk(child, depth + 1)
+			end
+		end
+		walk(root, 0)
+		return table.concat(parts, " ")
+	end
+	N.bbDescribe = describe
+	function N.bbOrder(customer)
+		local f1 = customer:FindFirstChild("1")
+		local f2 = customer:FindFirstChild("2")
+		if not (f1 and f2) then
+			return nil, "frames not there yet"
+		end
+		local hasDrink = f1:GetAttribute("HasDrink")
+		local f3 = customer:FindFirstChild("3")
+		if hasDrink and not f3 then
+			return nil, "drink frame not there yet"
+		end
+		local burger = burgerOf(f1)
+		local side = itemOf(f2, Sides)
+		local drink = if hasDrink then itemOf(f3, Drinks) else nil
+		if not burger or not side or (hasDrink and not drink) then
+			return nil, string.format("burger %s side %s drink %s", brief(burger), tostring(side), tostring(drink))
+		end
+		return if hasDrink then { burger, side, drink } else { burger, side }
+	end
+	local function thinkTime()
+		local mode = optionText("JobSpeed", "Fast")
+		if mode == "Blatant" then
+			return 0.4
+		elseif mode == "Legit" then
+			return 4 + math.random() * 2
+		end
+		return 2 + math.random()
+	end
+	local function claim()
+		local folder = stationsFolder()
+		if not folder then
+			setStatus("BloxBurgers: waiting for the restaurant to load")
+			task.wait(1)
+			return false
+		end
+		for i = 1, 4 do
+			local name = "Cashier_0" .. i
+			local model = folder:FindFirstChild(name)
+			local inUse = model and model:FindFirstChild("InUse")
+			if model and not (inUse and inUse.Value and inUse.Value ~= LocalPlayer) then
+				local point = model:FindFirstChild("InteractionPoint") or model:FindFirstChild("StationPart")
+				setStatus("BloxBurgers: going to till " .. i)
+				N.walkTo(N.posOf(point) or N.posOf(model), 4, 12)
+				task.wait(N.actionDelay())
+				local ok, result = N.jobInvoke({ Type = "RequestCashierRole", StationName = "Cashier", StationIndexName = name })
+				if ok and result then
+					N.BB.station = model
+					waitFor(function()
+						return N.attachWeld() ~= nil
+					end, 3)
+					log("BBCASHIER claimed", name)
+					return true
+				end
+			end
+		end
+		setStatus("BloxBurgers: every till is taken, waiting")
+		task.wait(3)
+		return false
+	end
+	function N.bbCashierStep()
+		if not N.ensureShift("BloxBurgersEmployee") then
+			return
+		end
+		local station = N.BB.station
+		if not (station and station.Parent and N.attachWeld()) then
+			N.BB.station = nil
+			claim()
+			return
+		end
+		local occ = station:FindFirstChild("Occupied")
+		local customer = occ and occ.Value
+		if not customer or N.BB.served[customer] then
+			setStatus(string.format("BloxBurgers: waiting for customers (%d served, %d correct)", Session.done, Session.correct))
+			task.wait(0.3)
+			return
+		end
+		N.BB.firstSeen[customer] = N.BB.firstSeen[customer] or os.clock()
+		local order, why = N.bbOrder(customer)
+		if not order then
+			if os.clock() - N.BB.firstSeen[customer] < 8 then
+				task.wait(0.3)
+				return
+			end
+			if N.BB.dumped < 3 then
+				N.BB.dumped += 1
+				local f1, f2, f3 = customer:FindFirstChild("1"), customer:FindFirstChild("2"), customer:FindFirstChild("3")
+				log("BBCASHIER unreadable", tostring(why), "| 1:", f1 and describe(f1, 40) or "-", "| 2:", f2 and describe(f2, 25) or "-", "| 3:", f3 and describe(f3, 25) or "-")
+			end
+			-- serve the most common order so the line keeps moving; the log above shows what to fix
+			order = { { 11, 0, 0, 0, 0, 2 }, 11, 11 }
+		end
+		if N.BB.dumped == 0 then
+			N.BB.dumped = 1
+			local f1 = customer:FindFirstChild("1")
+			log("BBCASHIER first order", brief(order), "| 1:", f1 and describe(f1, 40) or "-")
+		end
+		setStatus("BloxBurgers: taking an order")
+		task.wait(thinkTime())
+		local ok, result = N.jobInvoke({ Type = "ConfirmOrderCashier", Order = order })
+		N.BB.served[customer] = true
+		Session.done += 1
+		if ok and result then
+			Session.correct += 1
+		else
+			Session.wrong += 1
+			if N.BB.wrongLogged < 5 then
+				N.BB.wrongLogged += 1
+				local f1, f2 = customer:FindFirstChild("1"), customer:FindFirstChild("2")
+				logProblem("BloxBurgers order judged wrong: " .. brief(order))
+				log("BBCASHIER wrong", brief(order), "| 1:", f1 and describe(f1, 40) or "-", "| 2:", f2 and describe(f2, 20) or "-")
+			end
+		end
+		log("BBCASHIER", brief(order), if ok and result then "correct" else "WRONG")
+	end
+	function N.bbLeave()
+		if N.BB.station then
+			N.BB.station = nil
+			N.jobFire({ Type = "ExitWorkstation" })
+		end
+	end
+end
+
+-- Taxi driver. Sit in a TruFleet taxi at a TaxiStands stand (the game's TaxiJob:UseTaxi starts the shift). The server
+-- sends TaxiJobPathTask {Path, SpotCF, PickupSpot, IsPickup}; you drive into the yellow zone to pick up and then to the
+-- drop off. The hub drives with the game's own vehicle controls (it answers the vehicle's GetMoveVector), never
+-- teleports the car. BETA: needs a game log to tune steering.
+N.Taxi = { task = nil, tasks = 0, hook = nil, controls = nil, move = Vector3.zero, steer = 1, stuckSince = nil, reverseUntil = 0, waypoint = 1 }
+do
+	local function controls()
+		if N.Taxi.controls then
+			return N.Taxi.controls
+		end
+		local c = isolated(function()
+			return require(LocalPlayer.PlayerScripts:WaitForChild("PlayerModule", 5)):GetControls()
+		end)
+		N.Taxi.controls = c
+		return c
+	end
+	local function setMove(vec)
+		N.Taxi.move = vec
+		local c = controls()
+		if type(c) == "table" and not N.Taxi.driving then
+			N.Taxi.driving = true
+			pcall(function()
+				rawset(c, "GetMoveVector", function()
+					return N.Taxi.move
+				end)
+			end)
+		end
+	end
+	function N.taxiRelease()
+		local c = N.Taxi.controls
+		if N.Taxi.driving and type(c) == "table" then
+			pcall(function()
+				rawset(c, "GetMoveVector", nil)
+			end)
+		end
+		N.Taxi.driving = false
+		N.Taxi.move = Vector3.zero
+	end
+	local function toVector(p)
+		local kind = typeof(p)
+		if kind == "Vector3" then
+			return p
+		elseif kind == "CFrame" then
+			return p.Position
+		elseif kind == "Instance" then
+			return N.posOf(p)
+		elseif kind == "table" and tonumber(p.X or p[1]) then
+			return Vector3.new(tonumber(p.X or p[1]), tonumber(p.Y or p[2]) or 0, tonumber(p.Z or p[3]) or 0)
+		end
+		return nil
+	end
+	local function hook()
+		if N.Taxi.hook then
+			return
+		end
+		local jh = N.jobHandler()
+		local ok, unhook = pcall(function()
+			return jh.net:HookEvent("TaxiJobPathTask", function(data)
+				if type(data) ~= "table" then
+					return
+				end
+				local points = {}
+				if type(data.Path) == "table" then
+					for _, p in ipairs(data.Path) do
+						local v = toVector(p)
+						if v then
+							table.insert(points, v)
+						end
+					end
+				end
+				local spot = toVector(data.SpotCF) or toVector(data.PickupSpot)
+				if N.Taxi.task and data.IsPickup then
+					Session.done += 1
+					Session.correct += 1
+				end
+				N.Taxi.task = { pickup = data.IsPickup == true, spot = spot, path = points, at = os.clock() }
+				N.Taxi.waypoint = 1
+				N.Taxi.tasks += 1
+				log("TAXI task", if data.IsPickup then "pickup" else "dropoff", "spot", brief(spot), "path", #points, "first", brief(type(data.Path) == "table" and data.Path[1]), "type", typeof(type(data.Path) == "table" and data.Path[1]))
+			end)
+		end)
+		if ok and type(unhook) == "function" then
+			N.Taxi.hook = unhook
+		else
+			log("TAXI could not hook the path event", tostring(unhook))
+		end
+	end
+	local function vehicle()
+		local weld = N.attachWeld()
+		local part = weld and weld.Part1
+		local model = part and part.Parent
+		if model and model:IsA("Model") and model.PrimaryPart then
+			return model
+		end
+		return nil
+	end
+	local function startTaxi()
+		local root = N.root()
+		local env = workspace:FindFirstChild("Environment")
+		local stands = env and env:FindFirstChild("TaxiStands")
+		local best, bestDist
+		for _, stand in ipairs(stands and stands:GetChildren() or {}) do
+			local car = stand:FindFirstChild("TaxiJobCar")
+			local static = car and car:FindFirstChild("StaticVehicleObject")
+			if static and static.Value and static.Value:IsDescendantOf(workspace) and root then
+				local d = (car.Position - root.Position).Magnitude
+				if not bestDist or d < bestDist then
+					best, bestDist = car, d
+				end
+			end
+		end
+		if not best then
+			setStatus("Taxi: no free taxi at the stand, waiting")
+			task.wait(2)
+			return false
+		end
+		setStatus("Taxi: getting into a taxi")
+		N.walkTo(best.Position, 6, 15)
+		task.wait(N.actionDelay())
+		local jh = N.jobHandler()
+		local module = isolated(function()
+			return jh:GetJobModule("TaxiJob")
+		end)
+		N.callModule(30, module, "UseTaxi", best, best:FindFirstChild("StaticVehicleObject"))
+		return waitFor(function()
+			return N.currentJob() == "TaxiJob"
+		end, 10)
+	end
+	function N.taxiStep()
+		hook()
+		if N.currentJob() ~= "TaxiJob" or not vehicle() then
+			N.taxiRelease()
+			if N.currentJob() ~= "" and N.currentJob() ~= "TaxiJob" then
+				N.endShift()
+				task.wait(1)
+			end
+			if N.tooYoung("TaxiJob") then
+				setStatus("Your character is too young for jobs: change your age at a wardrobe or dresser")
+				task.wait(3)
+				return
+			end
+			if os.clock() - N.Job.lastShiftTry < 8 then
+				task.wait(0.5)
+				return
+			end
+			N.Job.lastShiftTry = os.clock()
+			if not vehicle() then
+				local root = N.root()
+				local env = workspace:FindFirstChild("Environment")
+				local stands = env and env:FindFirstChild("TaxiStands")
+				local near = false
+				for _, stand in ipairs(stands and stands:GetChildren() or {}) do
+					if root and (stand:GetPivot().Position - root.Position).Magnitude < 60 then
+						near = true
+					end
+				end
+				if not near then
+					setStatus("Going to work: Taxi")
+					N.callJob(45, "GoToWork", "TaxiJob")
+					task.wait(1.5)
+				end
+			end
+			if startTaxi() then
+				Session.shifts += 1
+				log("SHIFT started", "TaxiJob", "money", N.money())
+			end
+			return
+		end
+		local car = vehicle()
+		local T = N.Taxi.task
+		if not (T and T.spot) then
+			setMove(Vector3.zero)
+			setStatus("Taxi: waiting for a customer call")
+			task.wait(0.3)
+			return
+		end
+		local mode = optionText("JobSpeed", "Fast")
+		local topSpeed = if mode == "Legit" then 0.75 else 1
+		local deadline = os.clock() + 1
+		while alive() and on("AutoJob") and os.clock() < deadline and N.Taxi.task == T do
+			local cf = car.PrimaryPart.CFrame
+			local target = T.spot
+			while T.path[N.Taxi.waypoint] do
+				local wp = T.path[N.Taxi.waypoint]
+				if Vector3.new(wp.X - cf.X, 0, wp.Z - cf.Z).Magnitude < 14 then
+					N.Taxi.waypoint += 1
+				else
+					target = wp
+					break
+				end
+			end
+			local flat = Vector3.new(T.spot.X - cf.X, 0, T.spot.Z - cf.Z).Magnitude
+			local rel = cf:PointToObjectSpace(target)
+			local angle = math.atan2(rel.X, -rel.Z)
+			local steer = math.clamp(angle * 1.6, -1, 1) * N.Taxi.steer
+			local speed = car.PrimaryPart.AssemblyLinearVelocity.Magnitude
+			local throttle = topSpeed
+			if flat < 9 then
+				throttle = if speed > 6 then -0.5 else 0
+				steer = 0
+			elseif flat < 40 then
+				throttle = math.min(topSpeed, 0.55)
+			end
+			if math.abs(angle) > 1.2 then
+				throttle = math.min(throttle, 0.5)
+			end
+			-- stuck: back up with the wheels turned the other way
+			if throttle > 0 and speed < 1.5 then
+				N.Taxi.stuckSince = N.Taxi.stuckSince or os.clock()
+				if os.clock() - N.Taxi.stuckSince > 2.5 then
+					N.Taxi.reverseUntil = os.clock() + 1.5
+					N.Taxi.stuckSince = nil
+					log("TAXI stuck, backing up", "dist", math.floor(flat))
+				end
+			else
+				N.Taxi.stuckSince = nil
+			end
+			if os.clock() < N.Taxi.reverseUntil then
+				setMove(Vector3.new(-steer, 0, 0.8))
+			else
+				setMove(Vector3.new(steer, 0, -throttle))
+			end
+			-- steering sign check: turning the wrong way makes the angle grow while driving
+			if throttle > 0.3 and speed > 8 and math.abs(angle) > 0.6 then
+				N.Taxi.angleLog = N.Taxi.angleLog or {}
+				table.insert(N.Taxi.angleLog, math.abs(angle))
+				if #N.Taxi.angleLog >= 25 then
+					local grew = N.Taxi.angleLog[#N.Taxi.angleLog] - N.Taxi.angleLog[1]
+					if grew > 0.5 then
+						N.Taxi.steer = -N.Taxi.steer
+						log("TAXI steering flipped", N.Taxi.steer)
+					end
+					N.Taxi.angleLog = {}
+				end
+			else
+				N.Taxi.angleLog = nil
+			end
+			setStatus(string.format("Taxi: driving to the %s (%d studs, %d rides)", if T.pickup then "customer" else "drop off", math.floor(flat), Session.done))
+			task.wait(0.05)
+		end
+	end
+end
+
+-- Best Pay (auto): tries every job a few minutes (the Pay box keeps its real $/h), then works the one that pays you
+-- the most and checks again every 15 minutes. Jobs that cannot start or earn nothing fall to the bottom by themselves.
+N.Best = { current = nil, since = 0, tried = {} }
+N.JobKeys = {
+	Hairdresser = "StylezHairdresser",
+	Janitor = "SchoolJanitor",
+	Stocker = "SupermarketStocker",
+	["Ice Cream"] = "BensIceCreamSeller",
+	["Supermarket Cashier"] = "SupermarketCashier",
+	["Pizza Baker"] = "PizzaPlanetBaker",
+	Mechanic = "MikesMechanic",
+	["Pizza Delivery"] = "PizzaPlanetDelivery",
+	Miner = "CaveMiner",
+	["BloxBurgers Cashier"] = "BloxBurgersEmployee",
+	Teacher = "HighSchoolTeacher",
+	["Taxi (beta)"] = "TaxiJob",
+}
+do
+	local Explore = { "Hairdresser", "BloxBurgers Cashier", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery" }
+	local function rate(name)
+		local entry = N.Pay.jobs[N.JobKeys[name]]
+		if entry and entry.seconds >= 300 then
+			return entry.money / entry.seconds * 3600
+		end
+		return nil
+	end
+	function N.bestJobPick()
+		local now = os.clock()
+		local cur = N.Best.current
+		if cur then
+			N.Best.tried[cur] = (N.Best.tried[cur] or 0) + (now - (N.Best.tick or now))
+		end
+		N.Best.tick = now
+		if cur and now - N.Best.since < (if rate(cur) then 900 else 480) then
+			return cur
+		end
+		local pick
+		-- explore: a job with no real pay data yet that this session has not already given 8 minutes
+		for _, name in ipairs(Explore) do
+			if not rate(name) and (N.Best.tried[name] or 0) < 480 then
+				pick = name
+				break
+			end
+		end
+		if not pick then
+			local bestRate = -1
+			for _, name in ipairs(Explore) do
+				local r = rate(name) or 0
+				if r > bestRate then
+					pick, bestRate = name, r
+				end
+			end
+		end
+		if pick ~= cur then
+			log("BEST job", tostring(cur), "->", tostring(pick), "rate", rate(pick) and math.floor(rate(pick)) or "measuring")
+		end
+		N.Best.current, N.Best.since = pick, now
+		return pick
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -32149,6 +33482,7 @@ do
 		end)
 	end
 	Tabs.Jobs = N.addTab("Jobs", "briefcase", "Job farms: work shifts on their own")
+	Tabs.Build = N.addTab("Build", "hammer", "Copy a plot's house onto your own plot")
 	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and pay")
 	if Window.AddMiscTab then
 		pcall(function()
@@ -32164,9 +33498,9 @@ do
 	})
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream", "Supermarket Cashier", "Pizza Baker", "Mechanic", "Pizza Delivery", "Miner" },
+		Values = { "Best Pay (auto)", "Hairdresser", "BloxBurgers Cashier", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Taxi (beta)" },
 		Default = "Hairdresser",
-		Tooltip = "The Pay box shows what every job really paid you per hour",
+		Tooltip = "Best Pay (auto) tries each job a few minutes, then keeps working the one that really paid you the most per hour",
 	})
 	JobBox:AddDropdown("JobSpeed", {
 		Text = "Speed",
@@ -32189,6 +33523,63 @@ do
 	Labels.Job = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 	local PayBox = Tabs.Jobs:AddRightGroupbox("Pay Per Job", "coins")
 	Labels.Pay = PayBox:AddLabel({ Text = "-", DoesWrap = true })
+
+	local CopyBox = Tabs.Build:AddLeftGroupbox("Copy a Plot", "copy")
+	CopyBox:AddLabel({
+		Text = '<font transparency="0.35">Stand on any plot (yours or another player\'s), name the layout and save it. Then go to your own plot and build it there with your own money. Blockbux items are never bought. Roofs and paint are not copied yet.</font>',
+		DoesWrap = true,
+	})
+	CopyBox:AddInput("LayoutName", {
+		Text = "Layout name",
+		Default = "My house",
+		Placeholder = "name",
+		Finished = true,
+	})
+	CopyBox:AddButton({
+		Text = "Save the plot I'm standing on",
+		Func = function()
+			task.spawn(function()
+				local ok, text = N.saveLayout(optionText("LayoutName", "My house"))
+				N.Build.status = text
+				notify("Corvus", text, 6)
+				if ok and Options.LayoutPick then
+					pcall(function()
+						Options.LayoutPick:SetValues(N.layoutNames())
+					end)
+				end
+			end)
+		end,
+	})
+	local BuildBox = Tabs.Build:AddRightGroupbox("Build On My Plot", "hammer")
+	BuildBox:AddDropdown("LayoutPick", {
+		Text = "Saved layout",
+		Values = N.layoutNames(),
+		AllowNull = true,
+	})
+	BuildBox:AddToggle("BuildShell", { Text = "Floors, walls and paths", Default = true })
+	BuildBox:AddToggle("BuildItems", { Text = "Furniture and items", Default = true })
+	BuildBox:AddButton({
+		Text = "Build it on my plot",
+		Func = function()
+			if N.Build.running then
+				notify("Corvus", "Already building", 3)
+				return
+			end
+			local name = optionText("LayoutPick", "")
+			if name == "" then
+				notify("Corvus", "Pick a saved layout first", 4)
+				return
+			end
+			task.spawn(N.runManual, N.buildLayout, name, { shell = on("BuildShell"), items = on("BuildItems") })
+		end,
+	})
+	BuildBox:AddButton({
+		Text = "Stop building",
+		Func = function()
+			N.Build.stop = true
+		end,
+	})
+	Labels.Build = BuildBox:AddLabel({ Text = "-", DoesWrap = true })
 end
 N.StatRows = {}
 do
@@ -32659,6 +34050,12 @@ do
 	if Library.OnUnload then
 		Library:OnUnload(function()
 			INSTANCE.stop = true
+			pcall(N.taxiRelease)
+			pcall(function()
+				if N.Taxi.hook then
+					N.Taxi.hook()
+				end
+			end)
 			log("UNLOAD")
 			flushLog(true)
 		end)
@@ -32869,21 +34266,37 @@ do
 	if not N.jobHandler() then
 		logProblem("The game's JobHandler was not found, job farms cannot start")
 	end
-	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep, ["Pizza Delivery"] = N.deliveryStep, Miner = N.minerStep }
-	local wasWorking = false
+	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep, ["Pizza Delivery"] = N.deliveryStep, Miner = N.minerStep, ["BloxBurgers Cashier"] = N.bbCashierStep, Teacher = N.teacherStep, ["Taxi (beta)"] = N.taxiStep }
+	local wasWorking, lastPick = false, nil
+	local function leaveJob()
+		N.taxiRelease()
+		N.bbLeave()
+		N.endShift()
+	end
 	loop("main loop", function()
 		if N.manualRunning() then
 			task.wait(0.3)
 			return
 		end
 		if N.dead() then
+			N.taxiRelease()
 			setStatus("Waiting for your character")
 			task.wait(0.5)
 			return
 		end
 		if on("AutoJob") then
 			wasWorking = true
-			local step = JobSteps[optionText("JobPick", "Hairdresser")]
+			local pick = optionText("JobPick", "Hairdresser")
+			if pick == "Best Pay (auto)" then
+				pick = N.bestJobPick()
+			end
+			if lastPick and pick ~= lastPick then
+				-- switching jobs: leave the old one cleanly (taxi controls, till)
+				N.taxiRelease()
+				N.bbLeave()
+			end
+			lastPick = pick
+			local step = JobSteps[pick]
 			if step then
 				step()
 			end
@@ -32893,7 +34306,7 @@ do
 		if wasWorking then
 			-- Auto Work was turned off: clock out so nothing keeps running
 			wasWorking = false
-			N.endShift()
+			leaveJob()
 		end
 		setStatus("Idle")
 		task.wait(0.5)
@@ -32922,6 +34335,15 @@ do
 				if os.clock() - (N.Pay.savedAt or 0) > 60 then
 					N.Pay.savedAt = os.clock()
 					N.paySave()
+					-- job levels for the Pay box, and the shift's efficiency (the game's pay factor) for the log
+					N.Levels = N.Levels or {}
+					for _, key in pairs(N.JobKeys) do
+						N.Levels[key] = N.jobLevel(key)
+					end
+					if N.currentJob() ~= "" then
+						local eff, tip = N.efficiency()
+						log("EFF", N.currentJob(), "efficiency", eff, "reason", tostring(tip), "level", N.Levels[N.currentJob()], "shift pay", N.shiftEarnings())
+					end
 				end
 				N.InfoText.pay = N.payText()
 				local job = N.currentJob()
@@ -32966,6 +34388,12 @@ do
 					Labels.Status:SetText(Status)
 					Labels.Job:SetText(N.InfoText.jobText or "-")
 					Labels.Pay:SetText(N.InfoText.pay or "-")
+				end)
+			end
+			if Labels.Build and shown(Tabs.Build) then
+				group(function()
+					local pick = optionText("LayoutPick", "")
+					Labels.Build:SetText(N.Build.status .. (if pick ~= "" and not N.Build.running then "\n" .. N.layoutInfo(pick) else ""))
 				end)
 			end
 			if shown(Tabs.Stats) then
