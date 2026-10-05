@@ -30979,14 +30979,20 @@ do
 	local R = N.R
 	-- Rolling: the server only allows one roll per "Roll Duration" (2.5 s base, less with Roll Speed). The game's
 	-- own auto roll waits for the whole animation on top of that; Corvus asks again the moment the server allows it.
-	N.Roll = { autoOffAt = -1e9, nextAt = 0, fullSince = nil }
+	N.Roll = { autoOffAt = -1e9, nextAt = 0, fullSince = nil, margin = 0.04, clean = 0, rejectStreak = 0, lastAt = -1e9, lastCount = 0 }
 	function N.rollDuration()
 		return math.max(N.buff("Roll Duration", 2.5) or 2.5, 0.2)
 	end
 	function N.inventoryFull()
 		N.units()
 		local rolls = math.max(N.buff("Rolls", 1) or 1, 1)
-		return N.UnitCache.count + (rolls - 1) >= N.storage()
+		-- The server hands out the units of a roll 1.33 roll durations after the call, so the last roll is still on
+		-- its way and needs room too (otherwise its units could arrive in a full storage).
+		local pending = 0
+		if os.clock() - N.Roll.lastAt < N.rollDuration() * 1.4 + 0.3 then
+			pending = N.Roll.lastCount
+		end
+		return N.UnitCache.count + pending + (rolls - 1) >= N.storage()
 	end
 	function N.noteRoll(name, mutation)
 		local cfg = N.entry(name)
@@ -31051,6 +31057,9 @@ do
 		local wait = Roll.nextAt - os.clock()
 		if wait > 0 then
 			task.wait(wait)
+			if not on("AutoRoll") or N.manualRunning() then
+				return
+			end
 		end
 		local started = os.clock()
 		Session.rollCalls += 1
@@ -31062,11 +31071,25 @@ do
 					N.noteRoll(result.result, result.mutation)
 				end
 			end
-			Roll.nextAt = started + N.rollDuration() + 0.04
+			Roll.nextAt = started + N.rollDuration() + Roll.margin
+			Roll.lastAt, Roll.lastCount = started, #results
+			Roll.rejectStreak = 0
+			Roll.clean += 1
+			if Roll.clean >= 60 then
+				Roll.clean = 0
+				Roll.margin = math.max(0.04, Roll.margin - 0.01)
+			end
 			setStatus(string.format("Rolling  \u{00B7}  %s rolls this session", formatNumber(Session.rolls)))
 		else
 			Session.rejected += 1
-			Roll.nextAt = os.clock() + 0.25
+			-- Refused: the server timer was not over yet (ping jitter). Wait a little longer next time, and back
+			-- off when it keeps refusing so no calls are wasted.
+			Roll.clean = 0
+			Roll.rejectStreak += 1
+			if Roll.rejectStreak == 1 then
+				Roll.margin = math.min(Roll.margin + 0.03, 0.3)
+			end
+			Roll.nextAt = os.clock() + math.min(0.1 * 2 ^ (Roll.rejectStreak - 1), 3)
 		end
 	end
 	-- Plot: the server pays out a slot's balance on request from anywhere, no walking needed.
@@ -31230,7 +31253,7 @@ do
 	function N.levelGain(info)
 		return info.income / (1 + 0.25 * (info.level - 1)) * 0.25 * (N.buff("Money Multiplier", 1) or 1)
 	end
-	function N.levelOptions()
+	function N.levelOptions(strategyOverride)
 		local list = {}
 		for _, info in ipairs(N.units()) do
 			if info.slot and N.slotLevelAllowed(info.slot) then
@@ -31241,7 +31264,7 @@ do
 				end
 			end
 		end
-		local strategy = optionText("LevelStrategy", "Fastest payback")
+		local strategy = strategyOverride or optionText("LevelStrategy", "Fastest payback")
 		table.sort(list, function(a, b)
 			if strategy == "Cheapest first" then
 				return a.price < b.price
@@ -31323,9 +31346,12 @@ do
 	-- With high luck the game stops rolling plain low units but still rolls their Silver/Gold versions, so nearly
 	-- every roll is "mutated". Only the mutations picked in Keep Mutations are protected, the rest is judged by value.
 	N.MutationNames = { "Silver", "Gold", "Emerald", "Diamond", "Ruby", "Rainbow" }
-	function N.sellPlan()
+	-- relax 1 (storage full and nothing to sell for a while): the extra best units are not kept any more.
+	-- relax 2: mutations picked in Keep Mutations may go too. Plot, team, locked and rare units are never sold.
+	function N.sellPlan(relax)
+		relax = relax or 0
 		local list = N.units()
-		local keepTop = #N.unlockedSlots() + math.floor(optionNumber("KeepExtra", 4))
+		local keepTop = #N.unlockedSlots() + (if relax >= 1 then 0 else math.floor(optionNumber("KeepExtra", 4)))
 		local keepRank = N.rarityRank(optionText("KeepRarity", "Celestial"))
 		local plan = {}
 		local why = { best = 0, plot = 0, team = 0, locked = 0, mutation = 0, rarity = 0 }
@@ -31335,7 +31361,7 @@ do
 				elseif info.slot ~= nil then "plot"
 				elseif info.team then "team"
 				elseif info.locked then "locked"
-				elseif info.mutation and selected(Options.KeepMutations, info.mutation) then "mutation"
+				elseif relax < 2 and info.mutation and selected(Options.KeepMutations, info.mutation) then "mutation"
 				elseif keepRank > 0 and N.rarityRank(info.rarity) >= keepRank then "rarity"
 				else nil
 			if reason then
@@ -31344,7 +31370,9 @@ do
 				table.insert(plan, info)
 			end
 		end
-		N.Sell.why = why
+		if relax == 0 then
+			N.Sell.why = why
+		end
 		return plan
 	end
 	function N.sellStep(force)
@@ -31356,7 +31384,15 @@ do
 			return false
 		end
 		N.Sell.at = os.clock()
-		local plan = N.sellPlan()
+		local relax = 0
+		if N.Roll.fullSince then
+			local stuck = os.clock() - N.Roll.fullSince
+			relax = if stuck > 120 then 2 elseif stuck > 45 then 1 else 0
+		end
+		local plan = N.sellPlan(relax)
+		if relax > 0 and #plan > 0 then
+			log("SELL storage stuck, selling kept units too (relax " .. relax .. ")", #plan)
+		end
 		if #plan == 0 then
 			local why = N.Sell.why or {}
 			local text = string.format(
@@ -31374,6 +31410,9 @@ do
 			local keys = {}
 			for i = first, math.min(first + 99, #plan) do
 				table.insert(keys, plan[i].key)
+			end
+			if not on("AutoSell") then
+				break
 			end
 			local ok, price = invoke(R.sell, 10, keys)
 			if ok then
@@ -31498,13 +31537,41 @@ do
 		return string.match(name, "^(.-)%s+[IVXL]+$") or name
 	end
 	N.UpgradeCategories = { "Money", "Luck", "Fortune", "Roll Speed", "Unit Storage", "Sell", "Damage", "Health", "Walkspeed", "Grade Luck", "Trait Luck" }
+	-- The tree never changes, so each parent is looked up once (the game's GetParent scans the whole tree).
+	N.Tree = { parents = {}, children = nil }
+	function N.treeParent(name)
+		local cached = N.Tree.parents[name]
+		if cached == nil then
+			local ok, parent = pcall(N.G.Tree.GetParent, name)
+			cached = if ok and parent ~= nil then parent else false
+			N.Tree.parents[name] = cached
+		end
+		return if cached then cached else nil
+	end
+	function N.treeChildren(name)
+		local T = N.Tree
+		if not T.children then
+			local map = {}
+			for upgrade in pairs(N.G.Upgrades) do
+				local parent = N.treeParent(upgrade)
+				if parent then
+					map[parent] = map[parent] or {}
+					table.insert(map[parent], upgrade)
+				end
+			end
+			for _, children in pairs(map) do
+				table.sort(children)
+			end
+			T.children = map
+		end
+		return T.children[name] or {}
+	end
 	function N.upgradeAvailable()
 		local owned = N.field("Upgrades", {}) or {}
 		local list = {}
 		for name, data in pairs(N.G.Upgrades) do
 			if name ~= "Start" and type(data) == "table" and not owned[name] then
-				local okParent, parent = pcall(N.G.Tree.GetParent, name)
-				parent = if okParent then parent else nil
+				local parent = N.treeParent(name)
 				if parent == nil or parent == "Start" or owned[parent] then
 					table.insert(list, { name = name, price = tonumber(data.price) or math.huge, category = N.upgradeCategory(name) })
 				end
@@ -31571,7 +31638,7 @@ do
 end
 do
 	local R = N.R
-	N.Reward = { at = {}, codesTried = {}, groupChecked = nil, log = {} }
+	N.Reward = { at = {}, codesTried = {}, groupChecked = nil, log = {}, claimTries = {} }
 	local function due(key, seconds)
 		local at = N.Reward.at
 		if os.clock() >= (at[key] or 0) then
@@ -31675,7 +31742,13 @@ do
 		end
 		if on("AutoQuests") and due("quests", 5) then
 			for _, quest in ipairs(N.questList()) do
-				if not quest.claimed and quest.progress >= quest.target and quest.expiresAt then
+				-- A claim the server refused is tried at most 3 times (30 s apart), not every 5 seconds forever.
+				local tag = quest.period .. "/" .. tostring(quest.id) .. "/" .. tostring(quest.expiresAt)
+				local tries = N.Reward.claimTries[tag] or { n = 0, at = -1e9 }
+				if not quest.claimed and quest.progress >= quest.target and quest.expiresAt and tries.n < 3 and os.clock() - tries.at > 30 then
+					tries.n += 1
+					tries.at = os.clock()
+					N.Reward.claimTries[tag] = tries
 					fire(R.quest, quest.period, quest.id, quest.expiresAt)
 					Session.quests += 1
 					note(quest.period .. " quest: " .. tostring(quest.title))
@@ -31693,7 +31766,7 @@ do
 			end
 			for _, name in ipairs(order) do
 				if not N.ownsPass(name) then
-					if N.ticketPrice(name) <= tickets then
+					if N.ticketPrice(name) <= tickets and due("pass " .. name, 60) then
 						fire(R.questBuy, name)
 						note("Bought the " .. name .. " gamepass with tickets")
 					end
@@ -31883,16 +31956,20 @@ end
 do
 	-- Smart Spending: every way to spend cash goes on one scale, payback time = price / extra $ per second.
 	--   Slot level: +25% of the unit's level-1 income (exact, N.levelGain).
-	--   Money upgrade: plot income * amount / current money percent.
+	--   Money upgrade: plot income * amount / current money percent (the percent bucket is additive).
 	--   Dice, Luck/Fortune upgrades, Roll Speed: the server rolls with weights 1/(chance/luck) over every unit
 	--     and mutation whose chance/luck >= 1 (RollUtil.RollUnit). The hub rebuilds that exact distribution,
 	--     takes K = rolls in the planning horizon and computes how much plot income those rolls are expected to
 	--     add (expected best of K against the weakest plot unit, capped by the slots). The difference between
 	--     the new and the current luck/speed is the gain.
-	--   Rebirth: costs all your cash, multiplies luck and money.
+	--   Sell upgrades: the cash per second the hub really got from selling so far * amount / sell percent.
+	--   Upgrade tree: an upgrade can only be bought after its parent, so a cheap upgrade that opens a great one
+	--     (Luck III -> Roll Speed I, Luck VI -> Fortune I) is rated by the best payback of the path up to 3 steps deep.
+	--   Rebirth: costs all your cash, multiplies luck and money and opens plot slots (filled with spare units).
 	-- The best payback is bought when affordable. Otherwise the hub saves for it, unless another option pays
-	-- back within 3x and saving would take longer than that option's own payback.
-	N.Spend = { at = -1e9, last = "", plan = {}, cache = {} }
+	-- back within 3x and saving would take longer than that option's own payback. A purchase that did not go
+	-- through is verified and that option is skipped for 30 s (no remote spam).
+	N.Spend = { at = -1e9, nextAt = 0, collectAt = -1e9, last = "", plan = {}, cache = {}, cacheCount = 0, failed = {}, top = nil }
 	local Sp = N.Spend
 	-- Every unit/mutation outcome with its weight and level-1 income (before money buffs).
 	function N.rollOutcomes()
@@ -31974,29 +32051,25 @@ do
 			end
 			value = math.min(perRoll * rolls, math.max(best - weakest, 0) * math.max(slots, 1))
 		end
+		if Sp.cacheCount > 400 then
+			table.clear(Sp.cache)
+			Sp.cacheCount = 0
+		end
+		Sp.cacheCount += 1
 		Sp.cache[key] = { at = os.clock(), value = value }
 		return value
 	end
-	local function luckParts()
-		-- Luck = dice luck * Luck buff; the buff's base part comes from upgrades, gear and boosts.
-		local base = 1
-		local owned = N.field("Upgrades", {}) or {}
-		for name in pairs(owned) do
+	-- Sum of one buff bucket over the upgrades you own (luck base, money percent, sell percent).
+	local function bucketSum(buffName, bucket)
+		local total = 0
+		for name in pairs(N.field("Upgrades", {}) or {}) do
 			local data = N.G.Upgrades[name]
-			local buff = type(data) == "table" and type(data.buffs) == "table" and data.buffs.Luck
-			if buff and buff.bucket == "base" then
-				base += tonumber(buff.amount) or 0
+			local buff = type(data) == "table" and type(data.buffs) == "table" and data.buffs[buffName]
+			if buff and buff.bucket == bucket then
+				total += tonumber(buff.amount) or 0
 			end
 		end
-		local percent = 1
-		for name in pairs(owned) do
-			local data = N.G.Upgrades[name]
-			local buff = type(data) == "table" and type(data.buffs) == "table" and data.buffs["Money Multiplier"]
-			if buff and buff.bucket == "percentage" then
-				percent += tonumber(buff.amount) or 0
-			end
-		end
-		return base, percent
+		return total
 	end
 	function N.horizon()
 		return math.clamp(optionNumber("SpendHorizon", 30), 5, 720) * 60
@@ -32017,65 +32090,171 @@ do
 		local mult = N.buff("Money Multiplier", 1) or 1
 		return math.max(after - now, 0) * mult * 0.5
 	end
-	function N.spendOptions()
-		local list = {}
-		local income = math.max(N.plotIncome(), 1)
-		local money = N.money()
-		local buffLuck = N.buff("Luck", 1) or 1
-		local diceName = tostring(N.field("Dice", "Basic"))
-		local diceLuck = N.diceLuck(diceName)
-		local luckBase, moneyPercent = luckParts()
-		local function add(kind, name, price, gain, buy)
-			if price and price > 0 and gain and gain > 0 then
-				table.insert(list, { kind = kind, name = name, price = price, gain = gain, payback = price / gain, buy = buy })
+	-- Everything the gain maths needs, read once per planning round.
+	function N.spendContext()
+		local elapsed = os.clock() - Session.started
+		local stuck = N.Roll.fullSince ~= nil and os.clock() - N.Roll.fullSince > 20
+		return {
+			income = math.max(N.plotIncome(), 1),
+			money = N.money(),
+			buffLuck = N.buff("Luck", 1) or 1,
+			diceLuck = N.diceLuck(tostring(N.field("Dice", "Basic"))),
+			luckBase = 1 + bucketSum("Luck", "base"),
+			moneyPercent = 1 + bucketSum("Money Multiplier", "percentage"),
+			sellPercent = 1 + bucketSum("Sell Multiplier", "percentage"),
+			sellRate = if elapsed > 120 then Session.soldCash / elapsed else 0,
+			stuck = stuck,
+			nearFull = N.UnitCache.count >= N.storage() * 0.85,
+		}
+	end
+	local function newDelta()
+		return { money = 0, luck = 0, duration = 0, sell = 0, storage = 0, other = 0 }
+	end
+	local function addUpgrade(into, name)
+		local data = N.G.Upgrades[name]
+		local buffs = type(data) == "table" and type(data.buffs) == "table" and data.buffs or {}
+		for buffName, buff in pairs(buffs) do
+			local amount = tonumber(buff.amount) or 0
+			if buffName == "Money Multiplier" and buff.bucket == "percentage" then
+				into.money += amount
+			elseif buffName == "Luck" and buff.bucket == "base" then
+				into.luck += amount
+			elseif buffName == "Roll Duration" then
+				into.duration += amount
+			elseif buffName == "Sell Multiplier" and buff.bucket == "percentage" then
+				into.sell += amount
+			elseif buffName == "Unit Storage" then
+				into.storage += 1
+			else
+				-- Damage, health, walkspeed, trait/grade luck: no direct income.
+				into.other += 1
 			end
 		end
-		for i, option in ipairs(N.levelOptions()) do
+	end
+	-- Extra plot $/s from a summed change of buffs.
+	local function deltaGain(d, ctx)
+		local gain = 0
+		if d.money ~= 0 then
+			gain += ctx.income * d.money / math.max(ctx.moneyPercent, 1)
+		end
+		if d.luck ~= 0 or d.duration ~= 0 then
+			local newLuck = if d.luck ~= 0 then ctx.diceLuck * ctx.buffLuck * (ctx.luckBase + d.luck) / math.max(ctx.luckBase, 1) else nil
+			gain += N.luckGain(newLuck, if d.duration ~= 0 then N.rollDuration() + d.duration else nil)
+		end
+		if d.sell ~= 0 then
+			gain += ctx.sellRate * d.sell / math.max(ctx.sellPercent, 1)
+		end
+		if d.storage > 0 then
+			-- Storage only matters when it blocks rolling.
+			gain += ctx.income * (if ctx.stuck then 0.5 elseif ctx.nearFull then 0.05 else 0.002)
+		end
+		return gain + ctx.income * 0.002 * d.other
+	end
+	-- Best payback of buying `head` and then walking down its children (max 3 steps): returns payback and the
+	-- upgrade that makes it worth it.
+	local function bestPath(head, ctx, owned)
+		local d = newDelta()
+		addUpgrade(d, head.name)
+		local gain = deltaGain(d, ctx)
+		local best, via = if gain > 0 then head.price / gain else math.huge, nil
+		local function walk(name, depth, price, sum)
+			for _, child in ipairs(N.treeChildren(name)) do
+				local data = N.G.Upgrades[child]
+				if type(data) == "table" and not owned[child] and allows(Options.UpgradeCats, N.upgradeCategory(child)) then
+					local total = price + (tonumber(data.price) or math.huge)
+					local nextSum = table.clone(sum)
+					addUpgrade(nextSum, child)
+					local g = deltaGain(nextSum, ctx)
+					if g > 0 and total / g < best then
+						best, via = total / g, child
+					end
+					if depth < 3 then
+						walk(child, depth + 1, total, nextSum)
+					end
+				end
+			end
+		end
+		walk(head.name, 1, head.price, d)
+		return best, via
+	end
+	-- Plot income added by the next rebirth: the money multiplier on everything plus the spare units that fill
+	-- the slots it opens.
+	local function rebirthSlotsGain(ctx, moneyRatio)
+		local current = N.rebirth()
+		local opened = 0
+		for i = 1, N.maxSlots() do
+			local ok, need = pcall(N.G.Plot.GetSlotRebirthRequirement, i)
+			if ok and type(need) == "number" and need > current and need <= current + 1 then
+				opened += 1
+			end
+		end
+		local spare = 0
+		if opened > 0 then
+			for _, info in ipairs(N.units()) do
+				if not info.slot and opened > 0 then
+					spare += info.income
+					opened -= 1
+				end
+			end
+		end
+		local mult = N.buff("Money Multiplier", 1) or 1
+		return (ctx.income + spare * mult) * moneyRatio - ctx.income
+	end
+	function N.spendOptions()
+		local list = {}
+		local now = os.clock()
+		local ctx = N.spendContext()
+		local owned = N.field("Upgrades", {}) or {}
+		local function add(kind, name, price, gain, buy, done)
+			if price and price > 0 and gain and gain > 0 and (Sp.failed[name] or 0) <= now then
+				local option = { kind = kind, name = name, price = price, gain = gain, payback = price / gain, buy = buy, done = done }
+				table.insert(list, option)
+				return option
+			end
+			return nil
+		end
+		-- Always ranked by payback here, whatever the Level Strategy says (that one only drives Auto Level).
+		for i, option in ipairs(N.levelOptions("Fastest payback")) do
 			if i > 6 then
 				break
 			end
 			local info = option.info
-			add("Level", string.format("Slot %d %s Lv %d", info.slot, info.name, info.level + 1), option.price, option.gain, function()
-				fire(N.R.levelUp, info.slot)
-				Session.levels += 1
+			local key, slot, before = info.key, info.slot, info.level
+			add("Level", string.format("Slot %d %s Lv %d", slot, info.name, before + 1), option.price, option.gain, function()
+				fire(N.R.levelUp, slot)
+			end, function()
+				local item = N.inventory()[key]
+				local attrs = type(item) == "table" and item.attributes
+				return (tonumber(type(attrs) == "table" and attrs.level) or 1) > before
 			end)
 		end
 		if allows(Options.SpendOn, "Dice") then
 			for _, dice in ipairs(N.diceList()) do
-				if dice.price and not N.ownsDice(dice.name) and dice.luck > diceLuck then
-					add("Dice", dice.name .. " Dice", dice.price, N.luckGain(dice.luck * buffLuck), function()
-						fire(N.R.buyDice, dice.name)
-						Session.bought += 1
+				if dice.price and not N.ownsDice(dice.name) and dice.luck > ctx.diceLuck then
+					local name = dice.name
+					add("Dice", name .. " Dice", dice.price, N.luckGain(dice.luck * ctx.buffLuck), function()
+						fire(N.R.buyDice, name)
+					end, function()
+						return N.ownsDice(name)
 					end)
 				end
 			end
 		end
 		if allows(Options.SpendOn, "Upgrades") then
 			for _, upgrade in ipairs(N.upgradeAvailable()) do
-				if allows(Options.UpgradeCats, upgrade.category) then
-					local data = N.G.Upgrades[upgrade.name]
-					local buffs = type(data) == "table" and type(data.buffs) == "table" and data.buffs or {}
-					local gain = 0
-					for buffName, buff in pairs(buffs) do
-						local amount = tonumber(buff.amount) or 0
-						if buffName == "Money Multiplier" and buff.bucket == "percentage" then
-							gain += income * amount / math.max(moneyPercent, 1)
-						elseif buffName == "Luck" and buff.bucket == "base" then
-							gain += N.luckGain(diceLuck * buffLuck * (luckBase + amount) / math.max(luckBase, 1))
-						elseif buffName == "Roll Duration" then
-							gain += N.luckGain(nil, N.rollDuration() + amount)
-						elseif buffName == "Unit Storage" then
-							-- Storage only matters when it blocks rolling.
-							gain += income * (if N.UnitCache.count >= N.storage() * 0.85 then 0.05 else 0.002)
-						else
-							-- Sell, damage, health, walkspeed, trait/grade luck: no direct income.
-							gain += income * 0.002
+				if allows(Options.UpgradeCats, upgrade.category) and (Sp.failed[upgrade.name] or 0) <= now then
+					local payback, via = bestPath(upgrade, ctx, owned)
+					if payback < math.huge then
+						local name = upgrade.name
+						local option = add("Upgrade", name, upgrade.price, upgrade.price / payback, function()
+							fire(N.R.upgrade, name)
+						end, function()
+							return (N.field("Upgrades", {}) or {})[name] == true
+						end)
+						if option and via then
+							option.label = name .. " (opens " .. via .. ")"
 						end
 					end
-					add("Upgrade", upgrade.name, upgrade.price, gain, function()
-						fire(N.R.upgrade, upgrade.name)
-						Session.bought += 1
-					end)
 				end
 			end
 		end
@@ -32085,13 +32264,17 @@ do
 			if nextData and type(current) == "table" then
 				local moneyRatio = (tonumber(nextData.moneyMultiplier) or 1) / math.max(tonumber(current.moneyMultiplier) or 1, 1e-9)
 				local luckRatio = (tonumber(nextData.luckMultiplier) or 1) / math.max(tonumber(current.luckMultiplier) or 1, 1e-9)
-				local gain = income * (moneyRatio - 1) + N.luckGain(diceLuck * buffLuck * luckRatio)
+				local gain = rebirthSlotsGain(ctx, moneyRatio) + N.luckGain(ctx.diceLuck * ctx.buffLuck * luckRatio)
+				local before = N.rebirth()
 				-- A rebirth takes all the cash, so its real price is everything you hold (at least its cost).
-				add("Rebirth", "Rebirth " .. (N.rebirth() + 1), math.max(tonumber(nextData.cost) or 0, money), gain, function()
+				local option = add("Rebirth", "Rebirth " .. (before + 1), math.max(tonumber(nextData.cost) or 0, ctx.money), gain, function()
 					fire(N.R.rebirth)
-					Session.rebirths += 1
+				end, function()
+					return N.rebirth() > before
 				end)
-				list[#list].need = tonumber(nextData.cost) or 0
+				if option then
+					option.need = tonumber(nextData.cost) or 0
+				end
 			end
 		end
 		table.sort(list, function(a, b)
@@ -32106,6 +32289,7 @@ do
 		local list = N.spendOptions()
 		Sp.plan = list
 		local best = list[1]
+		Sp.top = best
 		if not best then
 			return nil
 		end
@@ -32119,33 +32303,83 @@ do
 				return option
 			end
 		end
-		Sp.last = string.format("Saving for %s ($%s, %s)", best.name, formatNumber(best.need or best.price), N.longTime(wait))
+		Sp.last = string.format("Saving for %s ($%s, %s)", best.label or best.name, formatNumber(best.need or best.price), N.longTime(wait))
 		return nil
 	end
+	-- Cash that is still sitting on the plot slots.
+	function N.pendingBalance()
+		local total = 0
+		for slot, info in pairs(N.slots()) do
+			local index = tonumber(slot)
+			local balance = type(info) == "table" and tonumber(info.balance) or 0
+			if balance > 0 and index and N.slotUnlocked(index) then
+				total += balance
+			end
+		end
+		return total
+	end
 	function N.spendStep()
-		if not on("SmartSpend") or os.clock() - Sp.at < 0.5 then
+		if not on("SmartSpend") then
 			return false
 		end
+		local now = os.clock()
+		if now < Sp.nextAt then
+			return false
+		end
+		-- Nothing bought: look again in a second (the plan only changes when cash or the game state does).
+		Sp.nextAt = now + 1
 		local pick = N.spendPick()
 		if not pick then
+			-- The cash for the next purchase may already be waiting on the plot.
+			local top = Sp.top
+			if top and on("AutoCollect") and now - Sp.collectAt > 1.5 then
+				local pending = N.pendingBalance()
+				if pending > 0 and (top.need or top.price) <= N.money() + pending then
+					Sp.collectAt = now
+					N.collectStep()
+					N.Data.at = -1e9
+					Sp.nextAt = now + 0.3
+				end
+			end
 			return false
 		end
-		Sp.at = os.clock()
+		Sp.at = now
 		pick.buy()
-		Sp.last = string.format("Bought %s for $%s (pays back in %s)", pick.name, formatNumber(pick.price), N.longTime(pick.payback))
-		log("SPEND", pick.kind, pick.name, "price", pick.price, "gain/s", pick.gain, "payback", math.floor(pick.payback))
+		local gone = waitFor(function()
+			N.Data.at = -1e9
+			return pick.done()
+		end, if pick.kind == "Rebirth" then 3 else 2)
+		N.UnitCache.at = -1e9
+		N.Data.at = -1e9
+		table.clear(Sp.cache)
+		Sp.cacheCount = 0
+		if not gone then
+			Sp.failed[pick.name] = os.clock() + 30
+			Sp.last = string.format("%s did not go through, trying something else", pick.name)
+			log("SPEND failed", pick.kind, pick.name, "price", pick.price, "cash", N.money())
+			Sp.nextAt = os.clock() + 0.3
+			return true
+		end
+		if pick.kind == "Level" then
+			Session.levels += 1
+		else
+			Session.bought += 1
+		end
+		Sp.nextAt = 0
+		Sp.last = string.format("Bought %s for $%s (pays back in %s)", pick.label or pick.name, formatNumber(pick.price), N.longTime(pick.payback))
+		log("SPEND", pick.kind, pick.label or pick.name, "price", pick.price, "gain/s", pick.gain, "payback", math.floor(pick.payback))
 		table.insert(N.Shop.log, 1, pick.name)
 		while #N.Shop.log > 5 do
 			table.remove(N.Shop.log)
 		end
-		N.UnitCache.at = -1e9
-		N.Data.at = -1e9
-		Sp.outcomes = nil
-		table.clear(Sp.cache)
-		if pick.kind ~= "Level" and N.Events.bought then
+		if pick.kind == "Rebirth" then
+			Session.rebirths += 1
+			if N.Events.rebirth then
+				pcall(N.Events.rebirth, N.rebirth())
+			end
+		elseif pick.kind ~= "Level" and N.Events.bought then
 			pcall(N.Events.bought, pick.name, pick.price)
 		end
-		task.wait(0.4)
 		return true
 	end
 	function N.spendText()
@@ -32154,7 +32388,7 @@ do
 			if i > 6 then
 				break
 			end
-			table.insert(rows, string.format("%d. %s: $%s, +$%s/s, pays back %s", i, option.name, formatNumber(option.need or option.price), formatNumber(option.gain), N.longTime(option.payback)))
+			table.insert(rows, string.format("%d. %s: $%s, +$%s/s, pays back %s", i, option.label or option.name, formatNumber(option.need or option.price), formatNumber(option.gain), N.longTime(option.payback)))
 		end
 		return (if #rows > 0 then table.concat(rows, "\n") else "Nothing to buy") .. (if Sp.last ~= "" then "\n" .. Sp.last else "")
 	end
@@ -32321,37 +32555,43 @@ do
 		Session.towerRuns += 1
 		local rewards = {}
 		local finished, misses = false, 0
-		while alive() and on("AutoTower") do
-			local okFloor, sequence = invoke(R.floor, 10)
-			if not okFloor or type(sequence) ~= "table" then
-				misses += 1
-				if misses > 40 then
-					break
-				end
-				task.wait(0.25)
-			else
-				misses = 0
-				local ended = false
-				for _, step in ipairs(sequence) do
-					if step.action == "floorCompleted" then
-						T.floor = tonumber(step.floor) or T.floor + 1
-						Session.towerFloors += 1
-						for name, amount in pairs(type(step.rewards) == "table" and step.rewards or {}) do
-							rewards[name] = (rewards[name] or 0) + (tonumber(amount) or 0)
+		-- An error in the loop must never leave T.running stuck on (the tower would never run again).
+		local loopOk, loopError = pcall(function()
+			while alive() and on("AutoTower") do
+				local okFloor, sequence = invoke(R.floor, 10)
+				if not okFloor or type(sequence) ~= "table" then
+					misses += 1
+					if misses > 40 then
+						break
+					end
+					task.wait(0.25)
+				else
+					misses = 0
+					local ended = false
+					for _, step in ipairs(sequence) do
+						if step.action == "floorCompleted" then
+							T.floor = tonumber(step.floor) or T.floor + 1
+							Session.towerFloors += 1
+							for name, amount in pairs(type(step.rewards) == "table" and step.rewards or {}) do
+								rewards[name] = (rewards[name] or 0) + (tonumber(amount) or 0)
+							end
+						elseif step.action == "ended" then
+							ended = true
 						end
-					elseif step.action == "ended" then
-						ended = true
+					end
+					setStatus(string.format("%s  \u{00B7}  floor %d", tower.name, T.floor))
+					task.wait(N.sequenceWait(sequence) + 0.05)
+					if ended then
+						finished = tower.maxFloors ~= nil and T.floor >= tower.maxFloors
+						break
 					end
 				end
-				setStatus(string.format("%s  \u{00B7}  floor %d", tower.name, T.floor))
-				task.wait(N.sequenceWait(sequence) + 0.05)
-				if ended then
-					finished = tower.maxFloors ~= nil and T.floor >= tower.maxFloors
-					break
-				end
 			end
+		end)
+		if not loopOk then
+			log("ERROR", "tower run", tostring(loopError))
 		end
-		if not on("AutoTower") then
+		if not on("AutoTower") or not loopOk then
 			invoke(R.cancelTower, 5)
 		end
 		if finished then
@@ -32945,6 +33185,8 @@ N.AllAutoToggles = {
 	"AutoBoosts",
 	"AutoTrait",
 	"AutoGrade",
+	"AutoTicketPasses",
+	"AutoTicketSpins",
 }
 do
 	function N.manualRunning()
@@ -33358,7 +33600,7 @@ do
 			toggleCommand("collect", { "cash" }, { "AutoCollect" }, "Auto Collect")
 			toggleCommand("sell", { "autosell" }, { "AutoSell" }, "Auto Sell")
 			toggleCommand("level", { "levels" }, { "AutoLevel" }, "Auto Level Up")
-			toggleCommand("upgrades", { "buy", "shop" }, { "AutoUpgrade", "AutoBuyDice" }, "Auto upgrades and dice")
+			toggleCommand("upgrades", { "buy", "shop" }, { "SmartSpend", "AutoUpgrade", "AutoBuyDice" }, "Smart Spending, auto upgrades and dice")
 			toggleCommand("rebirth", {}, { "AutoRebirth" }, "Auto Rebirth")
 			toggleCommand("tower", { "towers" }, { "AutoTower" }, "Auto Tower")
 			toggleCommand("farmbest", { "all" }, { "AutoFarmBest" }, "Auto Farm Best")
@@ -33466,7 +33708,7 @@ do
 					roll = { "AutoRoll", "AutoEquipDice" },
 					plot = { "AutoCollect", "AutoEquipBest", "AutoLevel" },
 					sell = { "AutoSell" },
-					upgrades = { "AutoBuyDice", "AutoUpgrade", "AutoRebirth", "AutoGear" },
+					upgrades = { "SmartSpend", "AutoBuyDice", "AutoUpgrade", "AutoRebirth", "AutoGear" },
 					towers = { "AutoTower", "TowerEquipTeam" },
 					rewards = { "AutoDaily", "AutoOffline", "AutoGroup", "AutoCodes", "AutoQuests", "AutoTicketPasses" },
 				}
@@ -33696,6 +33938,12 @@ do
 			task.wait(1)
 		end
 	end)
+	local function shown(tab)
+		if tab == nil or Library.Toggled == false then
+			return false
+		end
+		return Library.ActiveTab == nil or Library.ActiveTab == tab
+	end
 	-- Builds every label text here, the draw thread below only copies strings.
 	N.InfoText = {}
 	task.spawn(function()
@@ -33790,7 +34038,8 @@ do
 					table.insert(towerLines, "Last drops: " .. table.concat(T.rewards, ", "))
 				end
 				I.tower = table.concat(towerLines, "\n")
-				if choreDue("towerOdds", 5) then
+				-- The fight simulations and the spending plan are the heavy ones: only worked out while you look at them.
+				if shown(Tabs.Towers) and choreDue("towerOdds", 5) then
 					local team = N.towerTeam()
 					local odds = {}
 					for _, tower in ipairs(N.towerList()) do
@@ -33799,10 +34048,10 @@ do
 					end
 					I.towerOdds = if #team > 0 then table.concat(odds, "\n") else "You need units first"
 				end
-				if choreDue("spendText", 2) then
-					if not on("SmartSpend") then
-						N.Spend.plan = N.spendOptions()
-					end
+				if on("SmartSpend") then
+					I.spend = N.spendText()
+				elseif shown(Tabs.Upgrades) and choreDue("spendText", 2) then
+					N.Spend.plan = N.spendOptions()
 					I.spend = N.spendText()
 				end
 				local quests = {}
@@ -33947,12 +34196,6 @@ do
 				Labels.SlotsTop:SetText(textValue)
 			end
 		end
-	end
-	local function shown(tab)
-		if tab == nil or Library.Toggled == false then
-			return false
-		end
-		return Library.ActiveTab == nil or Library.ActiveTab == tab
 	end
 	task.spawn(function()
 		local uiErrorAt = -1e9
