@@ -30505,6 +30505,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	autoGift = false,
     	autoPartyEgg = false,
     	autoHatch = false,
+    	autoAdminChat = true,
+    	stayPrivate = true,
     	hatchEggName = "",
     	hatchMode = "Max",
     	autoFruitMachine = false,
@@ -32647,6 +32649,15 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     		S.ufoHopWindow = UI.HopWindows[v] or 60
     	end,
     })
+    UI.UfoBox:AddToggle("StayPrivate", {
+    	Text = "Stay On Private Server",
+    	Description = "Never hops away from a private server",
+    	Tooltip = "After a hop you cannot come back to a private server, so every automatic hop is skipped while you are on one.",
+    	Default = true,
+    	Callback = function(v)
+    		S.stayPrivate = v
+    	end,
+    })
     UI.UfoBox:AddToggle("UfoHopChase", {
     	Text = "Keep chasing",
     	Description = "Hops again after each UFO is down",
@@ -32825,6 +32836,15 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	end,
     })
     UI.ExtrasBox = Tabs.Rewards:AddRightGroupbox("Extras", "sparkles")
+    UI.ExtrasBox:AddToggle("AutoAdminChat", {
+    	Text = "Auto Type Admin Phrases",
+    	Description = "Types the word an admin asks for in chat",
+    	Tooltip = "When a global admin message says something like \"type WORD for 100x eggs\", the hub writes that word in chat once.",
+    	Default = true,
+    	Callback = function(v)
+    		S.autoAdminChat = v
+    	end,
+    })
     UI.ExtrasBox:AddToggle("AutoPartner", {
     	Text = "Auto Claim Partner Rewards",
     	Description = "Only for players with a partner rank",
@@ -37535,7 +37555,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     
     			do
     				-- Profit engine v2: every spend and time option on one dV/C scale (CLAUDE.md.txt 8.00, notes.md)
-    				local P = { ready = false, H = 86400, w = { Coins = 1, Rubies = 0, Gems = 0 }, byId = {}, best = {}, keep = { Coins = 0, Rubies = 0, Gems = 0 }, egg = nil, eggWhy = "", fishOff = false, act = {}, last = nil, lastLog = {}, rebirthNow = false, rebirthPath = false, moonTry = -1e9, I = { Coins = 0, Rubies = 0, Gems = 0 } }
+    				local P = { ready = false, H = 86400, w = { Coins = 1, Rubies = 0, Gems = 0 }, byId = {}, best = {}, keep = { Coins = 0, Rubies = 0, Gems = 0 }, egg = nil, eggWhy = "", fishOff = false, act = {}, last = nil, lastLog = {}, rebirthNow = false, rebirthPath = false, moonTry = -1e9, I = { Coins = 0, Rubies = 0, Gems = 0 }, Ib = { Coins = 0, Rubies = 0, Gems = 0 }, evt = { Luck = 1, Coins = 1, Rubies = 1, Gems = 1, HatchSpeed = 1, EggOpen = 0, active = {} }, frozen = nil }
     				Auto.Plan = P
     				local plMods = {}
     				local plLog = function(...)
@@ -37681,6 +37701,55 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     					return pay
     				end
     
+    				-- admin events (ReplicatedStorage.AdminEventsState): <Kind> = end time, <Kind>Value = multiplier/bonus
+    				local plKinds = { "Luck", "HatchSpeed", "Coins", "EggOpen", "Rubies", "Gems", "FreeEggs", "RubyRush", "FishingLuck", "FishingSpeed", "TapPower", "WeatherSunny", "WeatherRainy", "WeatherStorm", "WeatherRainbow", "WeatherBloodMoon", "WeatherAlienInvasion", "WeatherGolden", "WeatherSunrise", "WeatherSunset" }
+    				local plEvtWas = {}
+    				local function plEvents()
+    					local evt = { Luck = 1, Coins = 1, Rubies = 1, Gems = 1, HatchSpeed = 1, EggOpen = 0, active = {}, fishBoost = false }
+    					local folder = ReplicatedStorage:FindFirstChild("AdminEventsState")
+    					if not folder then
+    						return evt
+    					end
+    					local okNow, now = pcall(workspace.GetServerTimeNow, workspace)
+    					now = if okNow and type(now) == "number" and now > 0 then now else os.time()
+    					for _, kind in ipairs(plKinds) do
+    						local stamp = folder:FindFirstChild(kind)
+    						local valueObj = folder:FindFirstChild(kind .. "Value")
+    						local okS, ends = pcall(function() return stamp and stamp.Value end)
+    						local left = math.max(0, math.floor(plNum(okS and ends or nil, 0) - now))
+    						if left > 0 then
+    							local okV, value = pcall(function() return valueObj and valueObj.Value end)
+    							value = plNum(okV and value or nil, 1)
+    							evt.active[kind] = left
+    							if kind == "Luck" or kind == "Coins" or kind == "Rubies" or kind == "Gems" or kind == "HatchSpeed" then
+    								evt[kind] = math.max(1, value)
+    							elseif kind == "EggOpen" then
+    								evt.EggOpen = math.max(0, value)
+    							elseif kind == "FreeEggs" then
+    								evt.FreeEggs = true
+    							elseif kind == "RubyRush" then
+    								evt.RubyRush = true
+    							elseif kind == "WeatherSunny" then
+    								evt.coinsBonus = (evt.coinsBonus or 0) + 0.25
+    							elseif kind == "WeatherBloodMoon" then
+    								evt.rubiesBonus = (evt.rubiesBonus or 0) + 0.5
+    							elseif kind == "WeatherRainbow" then
+    								evt.luckBonus = 0.25
+    							elseif kind == "FishingLuck" or kind == "FishingSpeed" or kind == "WeatherGolden" or kind == "WeatherSunrise" or kind == "WeatherSunset" then
+    								evt.fishBoost = true
+    							end
+    							if not plEvtWas[kind] then
+    								plEvtWas[kind] = true
+    								plLog("EVENT", kind, "value=" .. string.format("%.3g", value), "until=" .. left)
+    							end
+    						elseif plEvtWas[kind] then
+    							plEvtWas[kind] = nil
+    							plLog("EVENT", kind, "over")
+    						end
+    					end
+    					return evt
+    				end
+
     				-- dV in coin-equivalent per second for each kind of effect
     				local V = {}
     				function V.dmg(rel)
@@ -37693,10 +37762,10 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     					return P.w.Rubies * P.I.Rubies * delta / P.Mr
     				end
     				function V.gemsMul(rel)
-    					return P.w.Gems * P.I.Gems * rel
+    					return P.w.Gems * P.Ib.Gems * rel
     				end
     				function V.gemsAdd(delta)
-    					return P.w.Gems * P.I.Gems * delta / P.gemsAdd
+    					return P.w.Gems * P.Ib.Gems * delta / P.gemsAdd
     				end
     				function V.luck(delta)
     					local h = P.hatch
@@ -37745,11 +37814,11 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				end
     				function V.bonus(cur, extra)
     					if cur == "Coins" then
-    						return P.I.Coins * extra
+    						return P.Ib.Coins * extra
     					elseif cur == "Rubies" then
-    						return P.w.Rubies * P.I.Rubies * extra
+    						return P.w.Rubies * P.Ib.Rubies * extra
     					end
-    					return P.w.Gems * P.I.Gems * extra
+    					return P.w.Gems * P.Ib.Gems * extra
     				end
     
     				local plTreeValue = {
@@ -37878,7 +37947,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     						local price, free = getEggPrice(egg)
     						local event = Auto.eggEvent(egg)
     						local world = Auto.eggWorld(egg)
-    						if price and Auto.eggCurrency(egg) == "Coins" and not (event and (event.ended or event.locked)) and worldUnlocked(world) then
+    						if price and (Auto.eggCurrency(egg) == "Coins" or free) and not (event and (event.ended or event.locked)) and worldUnlocked(world) then
     							local gain = plEggGain(egg, P.luck, P.gold) or 0
     							local perEgg = gain / P.team.power * P.V
     							local eff = plWorldEff(world)
@@ -37894,7 +37963,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     						local eff = plWorldEff(info.next)
     						local rel = if eff and eff.Coins and bestEff > 0 then eff.Coins / bestEff - 1 else 0
     						local rubyRel = if eff and eff.Rubies and (P.farmRubyEff or 0) > 0 then eff.Rubies / P.farmRubyEff - 1 else 0
-    						plAdd(list, { id = "world:" .. info.next, cur = "Coins", kind = "World", name = info.next, cost = info.price, dV = P.I.Coins * math.max(0, rel) + P.w.Rubies * P.I.Rubies * math.max(0, rubyRel) })
+    						plAdd(list, { id = "world:" .. info.next, cur = "Coins", kind = "World", name = info.next, cost = info.price, dV = P.Ib.Coins * math.max(0, rel) + P.w.Rubies * P.Ib.Rubies * math.max(0, rubyRel) })
     					end
     					-- Moon world (rubies): progress, bought when affordable
     					local cost = Auto.GameData.worldCost
@@ -38036,7 +38105,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     							end
     						end
     					end
-    					local gems = P.I.Gems
+    					local gems = P.Ib.Gems
     					local after = gems * 1.1 / (dmgB * gemsB)
     					local T = if gems > 0 then rebuild / math.max((after + gems * 1.1) / 2, 1e-9) else math.huge
     					local drop = P.V * (1 - 1 / dmgB) + P.w.Gems * gems / dmgB * (1 - 1 / gemsB)
@@ -38079,6 +38148,21 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     					P.hatchSpeed = math.max(0.1, plNum(plCall(eff, "GetHatchSpeed", LocalPlayer), 1))
     					P.treeDmg = math.max(1, plNum(plCall(eff, "GetTreePetDamageMultiplier", LocalPlayer), 1))
     					P.treeAtk = math.max(1, plNum(plCall(eff, "GetTreeAttackSpeedMultiplier", LocalPlayer), 1))
+    					-- admin events: the measured income includes them, the 24 h value of a buy must not (additive coin/ruby stack, gems multiplicative)
+    					local evt = plEvents()
+    					P.evt = evt
+    					local Ib = P.Ib
+    					local bc = (evt.Coins - 1) + (evt.coinsBonus or 0)
+    					local br = (evt.Rubies - 1) + (evt.rubiesBonus or 0)
+    					Ib.Coins = I.Coins * math.max(0.05, P.Mc - bc) / P.Mc
+    					Ib.Rubies = I.Rubies * math.max(0.05, P.Mr - br) / P.Mr
+    					Ib.Gems = I.Gems / math.max(1, evt.Gems)
+    					if evt.RubyRush and P.frozen then
+    						-- only ruby breakables spawn: the coin rate measured now is not the normal one
+    						Ib.Coins, Ib.Rubies, Ib.Gems = P.frozen.Coins, P.frozen.Rubies, P.frozen.Gems
+    					elseif not evt.RubyRush then
+    						P.frozen = { Coins = Ib.Coins, Rubies = Ib.Rubies, Gems = Ib.Gems }
+    					end
     					local moonCfg = Auto.GameData.moonConfig
     					local more = moonCfg and moonCfg.Incremental and moonCfg.Incremental.MoreGems
     					P.gemsAdd = math.max(1, plBoostAt(more, readLevel("MoonUpgradesData", "MoreGems"), 1))
@@ -38112,7 +38196,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     					P.farmEff, P.farmRubyEff = bestEff, bestRuby
     					local options
     					for _ = 1, 3 do
-    						P.V = I.Coins + P.w.Rubies * I.Rubies + P.w.Gems * I.Gems
+    						P.V = Ib.Coins + P.w.Rubies * Ib.Rubies + P.w.Gems * Ib.Gems
     						-- the egg to hatch: best gain per coin (needed first, luck and hatch speed are valued through it)
     						P.hatch = nil
     						options = plOptions()
@@ -38168,6 +38252,14 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     							option.allowed = net > target.dV * option.cost / income
     						else
     							option.allowed = false
+    						end
+    					end
+    					-- Luck / Free Eggs event: coins go into eggs while the window lasts (pets keep the luck-boosted value for good)
+    					if evt.Luck > 1 or evt.FreeEggs then
+    						for _, option in ipairs(options) do
+    							if option.kind == "Egg" and option.score > 1 then
+    								option.allowed = true
+    							end
     						end
     					end
     					-- rebirth path: finishing the Incremental shop is one option, the rebirth decides the rest
@@ -38287,6 +38379,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     					local farm, fishAct = P.act.Farm, P.act.Fish
     					if not (S.farmAll and S.autoFish) then
     						P.fishOff = false
+    					elseif P.evt and P.evt.fishBoost then
+    						P.fishOff = false
     					elseif not fishAct or fishAct.t < 180 then
     						P.fishOff = false
     					elseif not farm or farm.t < 180 then
@@ -38296,11 +38390,20 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     					end
     				end
     
+    				local function plEvtText()
+    					local parts = {}
+    					for kind, left in pairs(P.evt and P.evt.active or {}) do
+    						table.insert(parts, kind .. "(" .. left .. "s)")
+    					end
+    					table.sort(parts)
+    					return if #parts > 0 then table.concat(parts, ",") else "none"
+    				end
+
     				local function plReport(now)
     					local I = P.I
     					if now - (P.lastLog.rate or -1e9) >= 60 then
     						P.lastLog.rate = now
-    						plLog("RATE", "coins/s=" .. plFmt(I.Coins), "rubies/s=" .. plFmt(I.Rubies), "gems/s=" .. plFmt(I.Gems), "eggs/s=" .. plFmt(P.eggRate), "V=" .. plFmt(P.V), "Mc=" .. plFmt(P.Mc), "Mr=" .. plFmt(P.Mr), "luck=" .. plFmt(P.luck), "team=" .. plFmt(P.team.power), "weakest=" .. plFmt(P.team.weakest), "slots=" .. tostring(P.team.count) .. "/" .. tostring(P.team.slots), "w_r=" .. plFmt(P.w.Rubies), "w_g=" .. plFmt(P.w.Gems), "H=" .. P.H)
+    						plLog("RATE", "coins/s=" .. plFmt(I.Coins), "rubies/s=" .. plFmt(I.Rubies), "gems/s=" .. plFmt(I.Gems), "eggs/s=" .. plFmt(P.eggRate), "V=" .. plFmt(P.V), "Mc=" .. plFmt(P.Mc), "Mr=" .. plFmt(P.Mr), "luck=" .. plFmt(P.luck), "team=" .. plFmt(P.team.power), "weakest=" .. plFmt(P.team.weakest), "slots=" .. tostring(P.team.count) .. "/" .. tostring(P.team.slots), "w_r=" .. plFmt(P.w.Rubies), "w_g=" .. plFmt(P.w.Gems), "H=" .. P.H, "base=" .. plFmt(P.Ib.Coins) .. "/" .. plFmt(P.Ib.Rubies) .. "/" .. plFmt(P.Ib.Gems), "evt=" .. plEvtText())
     						local parts = {}
     						for name, a in pairs(P.act) do
     							table.insert(parts, name .. "=" .. plFmt(if a.t > 0 then a.v / a.t else 0) .. "/s(" .. math.floor(a.t) .. "s)")
@@ -38807,6 +38910,17 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     
     			local function hopNow(reason)
     				if Hop.teleporting then return end
+    				if S.stayPrivate and tostring(game.PrivateServerId or "") ~= "" then
+    					Hop.status = "Private server, staying"
+    					if os.clock() - (Hop.privateWarn or -1e9) > 300 then
+    						Hop.privateWarn = os.clock()
+    						queueToast("UFO Hop", "Hop skipped: you are on a private server (Stay On Private Server)")
+    						if Auto.log then
+    							Auto.log("HOP", "skipped private server", tostring(reason))
+    						end
+    					end
+    					return
+    				end
     				Hop.lastHop = os.clock()
     				local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", game.PlaceId)
     				local body = nil
@@ -42434,6 +42548,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     		Auto.Mover = Mover
     		Auto.Hunter = Hunter
     		Auto.goToEgg = goToEgg
+    		Auto.loadEggPets = loadEggPets
     		Auto.updateHunter = updateHunter
     		Auto.collectMachines = collectMachines
     		Auto.collectItems = collectItems
@@ -42445,7 +42560,172 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	setupAutomation()
     end
     
+    do
+    	-- Admin chat phrases: a global/system message like "type WORD for 100x eggs" -> the hub writes WORD once
+    	local Chat = { seen = {}, ignored = 0, sent = 0 }
+    	Auto.AdminChat = Chat
+    	local function chatSend(word)
+    		local sent = false
+    		pcall(function()
+    			local channels = game:GetService("TextChatService"):FindFirstChild("TextChannels")
+    			local general = channels and channels:FindFirstChild("RBXGeneral")
+    			if general then
+    				general:SendAsync(word)
+    				sent = true
+    			end
+    		end)
+    		if not sent then
+    			pcall(function()
+    				local events = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+    				local say = events and events:FindFirstChild("SayMessageRequest")
+    				if say then
+    					say:FireServer(word, "All")
+    					sent = true
+    				end
+    			end)
+    		end
+    		return sent
+    	end
+    	local function chatWord(text)
+    		local lower = string.lower(text)
+    		for _, verb in ipairs({ "type", "say", "write", "enter" }) do
+    			local at = 1
+    			while true do
+    				local s, e = string.find(lower, "%f[%a]" .. verb .. "%f[%A]", at)
+    				if not s then
+    					break
+    				end
+    				local rest = string.sub(text, e + 1)
+    				local quoted = string.match(rest, '^%s*[:%-]?%s*["\']([%w_!%-]+)["\']')
+    				if quoted then
+    					return quoted
+    				end
+    				local bare = string.match(rest, "^%s*[:%-]?%s*([%w_!%-]+)")
+    				if bare and #bare >= 3 and string.find(bare, "%a") and bare == string.upper(bare) then
+    					return bare
+    				end
+    				at = e + 1
+    			end
+    		end
+    		return nil
+    	end
+    	local function onSystemMessage(text, source)
+    		if type(text) ~= "string" or text == "" or #text > 400 then
+    			return
+    		end
+    		text = string.gsub(text, "<[^>]->", "")
+    		local word = chatWord(text)
+    		if not word then
+    			if Chat.ignored < 5 then
+    				Chat.ignored += 1
+    				Auto.log("ADMIN", "ignore", source, 'msg="' .. text .. '"')
+    			end
+    			return
+    		end
+    		local now = os.clock()
+    		local key = string.lower(word)
+    		if now - (Chat.seen[key] or -1e9) < 60 then
+    			return
+    		end
+    		Chat.seen[key] = now
+    		if not S.autoAdminChat then
+    			Auto.log("ADMIN", 'msg="' .. text .. '"', "word=" .. word, "toggle off")
+    			return
+    		end
+    		task.delay(1 + math.random() * 2, function()
+    			local ok = chatSend(word)
+    			Chat.sent += 1
+    			Auto.log("ADMIN", 'msg="' .. text .. '"', "typed=" .. word, "sent=" .. tostring(ok), source)
+    			notify("Admin Phrase", (if ok then "Typed " else "Could not type ") .. word, 4)
+    		end)
+    	end
+    	Auto.onSystemMessage = onSystemMessage
+    	pcall(function()
+    		local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    		local announcements = remotes and remotes:FindFirstChild("Announcements")
+    		local remote = announcements and announcements:FindFirstChild("GlobalBoostAnnounce")
+    		if remote and remote:IsA("RemoteEvent") then
+    			Library:GiveSignal(remote.OnClientEvent:Connect(function(text)
+    				onSystemMessage(text, "announce")
+    			end))
+    		end
+    	end)
+    	task.spawn(function()
+    		pcall(function()
+    			local channels = game:GetService("TextChatService"):WaitForChild("TextChannels", 30)
+    			if not channels then
+    				return
+    			end
+    			local function hook(channel)
+    				if channel and channel:IsA("TextChannel") then
+    					Library:GiveSignal(channel.MessageReceived:Connect(function(message)
+    						local ok, system = pcall(function() return message.TextSource == nil end)
+    						if ok and system then
+    							onSystemMessage(message.Text, "chat:" .. channel.Name)
+    						end
+    					end))
+    				end
+    			end
+    			for _, channel in ipairs(channels:GetChildren()) do
+    				hook(channel)
+    			end
+    			Library:GiveSignal(channels.ChildAdded:Connect(hook))
+    		end)
+    	end)
+    end
+
+    -- Luck Combo (EggLuckComboConfig): the combo drops after 150 s without a hatch, one cheap egg keeps it
+    local ComboKeep = { last = -1e9, count = 0 }
+    local function comboKeep(now)
+    	if not (S.farmAll and S.autoHatch and EggHatch) then
+    		return false
+    	end
+    	if now - HatchState.lastFire < 110 or now - ComboKeep.last < 20 then
+    		return false
+    	end
+    	if Auto.Mover.busy or (Auto.Fish and Auto.Fish.active) then
+    		return false
+    	end
+    	local folder = getDataFolder("EggLuckComboData")
+    	local levelObj = folder and folder:FindFirstChild("Level")
+    	local okLevel, level = pcall(function() return levelObj and levelObj.Value end)
+    	level = tonumber(okLevel and level or nil) or 0
+    	if level <= 0 then
+    		return false
+    	end
+    	ComboKeep.last = now
+    	local pets = if Auto.loadEggPets then Auto.loadEggPets() else nil
+    	local pick, pickPrice = nil, math.huge
+    	for egg in pairs(pets or {}) do
+    		local price, free = getEggPrice(egg)
+    		local cost = if free then 0 else price
+    		if cost and cost < pickPrice and Auto.eggCurrency(egg) == "Coins" and checkHatch(egg) then
+    			pick, pickPrice = egg, cost
+    		end
+    	end
+    	if not pick then
+    		Auto.log("COMBO", "keep", "level=" .. level, "idle=" .. math.floor(now - HatchState.lastFire), "no egg in range")
+    		return false
+    	end
+    	ComboKeep.count += 1
+    	Auto.log("COMBO", "keep", "level=" .. level, "idle=" .. math.floor(now - HatchState.lastFire), "egg=" .. pick, "price=" .. pickPrice, "was=" .. tostring(HatchState.status))
+    	HatchState.lastFire = now
+    	HatchState.waiting = true
+    	HatchState.status = "Keeping the luck combo"
+    	HatchState.count = 1
+    	pcall(function() EggHatch:FireServer(pick, "Single") end)
+    	return true
+    end
+
+    local hatchStepInner
     local function hatchStep()
+    	hatchStepInner()
+    	if not HatchState.waiting then
+    		comboKeep(Clock)
+    	end
+    end
+
+    function hatchStepInner()
     	local huntEgg = if S.indexHunt then Auto.Hunter.egg else nil
     	local eggName = huntEgg or (if S.autoHatch then (if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName) else nil)
     	if eggName == "" and not huntEgg and S.autoHatch and Auto.Plan and Auto.Plan.on() then
