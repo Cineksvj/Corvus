@@ -5309,6 +5309,14 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         end
         local Url = if typeof(Code) == "string" and Code ~= "" then "https://discord.gg/" .. Code else Invite
 
+        local Copied = false
+        do
+            local Setter = setclipboard or toclipboard or (Clipboard and Clipboard.set)
+            if typeof(Setter) == "function" then
+                Copied = pcall(Setter, Url)
+            end
+        end
+
         local RequestFunction = GetRequestFunction()
         if typeof(RequestFunction) == "function" and typeof(Code) == "string" and Code ~= "" then
             for Port = 6463, 6472 do
@@ -5328,7 +5336,8 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 })
                 if Success and typeof(Response) == "table" then
                     local Status = tonumber(Response.StatusCode)
-                    if (Status and Status >= 200 and Status < 300) or Response.Success == true then
+                    local BodyText = tostring(Response.Body or "")
+                    if ((Status and Status >= 200 and Status < 300) or Response.Success == true) and not string.find(BodyText, '"evt":"ERROR"', 1, true) then
                         print("[Corvus] discord invite: rpc")
                         return true
                     end
@@ -5336,15 +5345,20 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             end
         end
 
-        local Opened = pcall(function()
+        -- OpenBrowserWindow is a silent no-op on most executors, so its result is never trusted
+        pcall(function()
             game:GetService("GuiService"):OpenBrowserWindow(Url)
         end)
-        if Opened then
-            print("[Corvus] discord invite: browser")
-            return true
-        end
 
-        Library:CopyToClipboard(Invite, "Invite copied")
+        if Copied then
+            Library:Notify({
+                Title = "Invite copied",
+                Description = "Paste it in your browser: " .. Url,
+                Time = 8,
+            })
+        else
+            Library:CopyToClipboard(Url, "Invite copied")
+        end
         print("[Corvus] discord invite: clipboard")
         return false
     end
@@ -11705,7 +11719,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                     return
                 end
     
-                Num = math.clamp(Num, Slider.Min, Slider.Max)
+                Num = math.clamp(Num, math.min(Slider.Min, Slider.Max), math.max(Slider.Min, Slider.Max))
     
                 Slider.Value = Num
                 Slider:Display()
@@ -21989,7 +22003,7 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         end
     
         function Window:SetSidebarWidth(Width)
-            Width = math.clamp(Width, 48, MainFrame.Size.X.Offset - WindowInfo.MinContainerWidth - 1)
+            Width = math.clamp(Width, 48, math.max(48, MainFrame.Size.X.Offset - WindowInfo.MinContainerWidth - 1))
     
             DividerLine.Position = UDim2.fromOffset(Width, 0)
     
@@ -32563,7 +32577,7 @@ do
 		if N.pickText("StageMode", "Auto (by power)") ~= "Auto (by power)" then
 			return cap
 		end
-		local planned = if F.run and F.runTarget then F.runTarget elseif N.Plan then N.Plan.stage else nil
+		local planned = if F.run and F.runTarget then F.runTarget elseif N.Plan and N.plannerWanted and N.plannerWanted() then N.Plan.stage else nil
 		if planned then
 			return math.max(1, math.min(cap, planned))
 		end
@@ -34213,8 +34227,54 @@ do
 		local class = have[index] or "Class_1"
 		return index, class, N.rarityText(N.call(N.G.Class.GetRarity, class))
 	end
+	-- The Races menu (PlayerGui.ScreenMain.Class). Every roll makes the server fire Class/ShowLuckResultRE; the game's
+	-- LuckAnim then opens the menu with UIController.OpenScreenMain but never sets the GUI's own "open" flag, so its X
+	-- (ClassGUI.close) does nothing and the player is stuck (owner report 2026-10-05). The hub rolls only while no
+	-- menu is open, one roll per 4 s (the result animation takes about 3 s), and closes the menu it caused through
+	-- the same UIController.CloseScreenMain("Class") the X button uses.
+	local function raceMenu()
+		local gui = LocalPlayer:FindFirstChild("PlayerGui")
+		local screen = gui and gui:FindFirstChild("ScreenMain")
+		return screen and screen:FindFirstChild("Class")
+	end
+	function N.closeRaceMenu()
+		local menu = raceMenu()
+		if not menu or not menu.Visible then
+			return false
+		end
+		local ok = pcall(function()
+			require(game:GetService("ReplicatedStorage"):WaitForChild("Utils", 5):WaitForChild("UIController", 5)).CloseScreenMain("Class")
+		end)
+		if not ok or menu.Visible then
+			-- Fallback: what CloseScreenMain does (hide the frame, clear the open flag, give the HUD back).
+			pcall(function()
+				menu.Visible = false
+				workspace:SetAttribute("SCREENMAINOPEN", nil)
+				local gui = LocalPlayer.PlayerGui
+				for _, name in ipairs({ "Hud", "Main", "UIVFX" }) do
+					local g = gui:FindFirstChild(name)
+					if g and g:IsA("ScreenGui") then
+						g.Enabled = true
+					end
+				end
+			end)
+		end
+		log("CLASS menu closed after the roll", if ok then "(UIController)" else "(fallback)")
+		return true
+	end
 	function N.classStep()
-		if not N.want("AutoClassRoll") or os.clock() - N.ClassRoll.at < 0.6 then
+		local C = N.ClassRoll
+		-- Close the menu our own roll opened, once its result animation is over.
+		if C.ownMenu and os.clock() - C.at > 3.5 then
+			C.ownMenu = false
+			pcall(N.closeRaceMenu)
+		end
+		if not N.want("AutoClassRoll") or os.clock() - C.at < 4 then
+			return
+		end
+		-- Never roll while the player (or the game) has a menu open.
+		local menu = raceMenu()
+		if (menu and menu.Visible) or workspace:GetAttribute("SCREENMAINOPEN") then
 			return
 		end
 		local data = N.store("Class")
@@ -34238,6 +34298,7 @@ do
 			return
 		end
 		N.ClassRoll.at = os.clock()
+		N.ClassRoll.ownMenu = true
 		fire(N.R.classRoll, index)
 		Session.classRolls += 1
 		N.ClassRoll.last = string.format("Rolled slot %s (was %s %s, %d rolls left)", tostring(index), rarity, tostring(class), rolls - 1)
@@ -35937,7 +35998,9 @@ do
 		local income = math.max(N.coinIncome(), farmI)
 		if m and m.left > 0 then
 			local u = N.rebirthBoost()
-			local T = math.max(m.cost / rate, 1)
+			-- Time this rebirth still needs (the live game keeps levels through a rebirth, so the total level cost would
+			-- overstate it: log 2026-10-05 showed 59m for a rebirth that takes minutes).
+			local T = math.max(m.left / rate, 1)
 			eta = m.left / rate
 			-- Tower tickets the rebirth gives are extra coins on top of the same farming.
 			local tickets = num(N.call(N.G.Rebirth.GetDungeonTicket, r + 1), 0)
