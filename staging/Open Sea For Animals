@@ -32091,6 +32091,7 @@ end
 			AutoSea = "sea", AutoTrain = "train", TrainSea = "train", AutoSell = "sell", AutoPlaceEggs = "eggs", AutoHatch = "eggs",
 			AutoEquipBest = "spend", AutoUpgrade = "spend", AutoBuyStaff = "spend", AutoEquipStaff = "spend",
 			AutoBuyDumbbell = "spend", AutoEquipDumbbell = "spend", AutoRebirth = "spend",
+			EventRush = "events", AutoStars = "events", AutoLucky = "events",
 		}
 		function on(name)
 			local t = Toggles[name]
@@ -32123,22 +32124,9 @@ end
 			table.sort(names)
 			return parts, names
 		end
-		-- No master switch. Smart Planner (AutoPlanner) lets the planner decide; there is no exclude list any more.
-		function Game.myFilters()
-			return false
-		end
-		function Game.opMode()
+		-- No master switch: Smart Planner (AutoPlanner) is one toggle that drives its own loops
+		function Game.plannerOn()
 			return on("AutoPlanner")
-		end
-		Game.OPReserveLabel = "Money reserve (keep 25% of cash)"
-		function Game.opExclKey()
-			return false
-		end
-		function Game.opExcluded()
-			return nil
-		end
-		function Game.opReserve()
-			return 0
 		end
 		function count(t)
 			local n = 0
@@ -32484,6 +32472,82 @@ end
 				EventAnimals = set
 			end
 			return EventAnimals[typeName] == true
+		end
+		-- Index Hunter: animals each index tab (mutation) still misses; only eggs inside that tab count (IsInMutationIndex)
+		local HuntMap = { at = -1e9, map = {} }
+		local function huntMap()
+			if os.clock() - HuntMap.at < 60 then
+				return HuntMap.map
+			end
+			HuntMap.at = os.clock()
+			local map = {}
+			local cfg = Game.EggsConfig
+			if type(cfg) == "table" and type(cfg.IsInMutationIndex) == "function" then
+				for _, mutation in ipairs(MutationList) do
+					local set = {}
+					for _, egg in pairs(Eggs) do
+						local ok, inIndex = pcall(cfg.IsInMutationIndex, egg, mutation)
+						if ok and inIndex == true and type(egg.items) == "table" then
+							for _, item in ipairs(egg.items) do
+								if type(item) == "table" and item.type == "Brainrot" and Brainrots[item.id] then
+									set[item.id] = true
+								end
+							end
+						end
+					end
+					map[mutation] = set
+				end
+			end
+			HuntMap.map = map
+			return map
+		end
+		function Game.huntWanted(info)
+			if not on("IndexHunter") or type(info) ~= "table" or info.kind == "Egg" then
+				return false
+			end
+			if not selected(Options.IndexTiers, MutationNames[info.mutation] or info.mutation) then
+				return false
+			end
+			if info.rarity ~= "?" and not selected(Options.IndexRarities, info.rarity) then
+				return false
+			end
+			local data = Data()
+			local unlocked = data and data.UnlockedBrainrots
+			if type(unlocked) ~= "table" then
+				return false
+			end
+			local have = unlocked[info.type]
+			if type(have) == "table" and have[info.mutation] then
+				return false
+			end
+			local set = huntMap()[info.mutation]
+			return set ~= nil and set[info.type] == true
+		end
+		function Game.huntText()
+			if not on("IndexHunter") then
+				return '<font transparency="0.4">Index Hunter is off</font>'
+			end
+			local data = Data()
+			local unlocked = data and type(data.UnlockedBrainrots) == "table" and data.UnlockedBrainrots or {}
+			local parts = {}
+			for _, mutation in ipairs(MutationList) do
+				local label = MutationNames[mutation] or mutation
+				if selected(Options.IndexTiers, label) then
+					local owned, total = 0, 0
+					for typeName in pairs(huntMap()[mutation] or {}) do
+						local cfg = Brainrots[typeName]
+						if not (cfg and cfg.rarity and not selected(Options.IndexRarities, cfg.rarity)) then
+							total += 1
+							local h = unlocked[typeName]
+							if type(h) == "table" and h[mutation] then
+								owned += 1
+							end
+						end
+					end
+					table.insert(parts, label .. " <b>" .. owned .. "/" .. total .. "</b>")
+				end
+			end
+			return if #parts > 0 then "Owned: " .. table.concat(parts, "  \u{00B7}  ") else "Pick at least one index tab"
 		end
 		function matches(info, prefix, minValue)
 			if not info then
@@ -33401,6 +33465,9 @@ end
 		local function sortTargets(list)
 			local priority = Options.SeaPriority and Options.SeaPriority.Value or "Best Value"
 			table.sort(list, function(a, b)
+				if (a.hunt == true) ~= (b.hunt == true) then
+					return a.hunt == true
+				end
 				if priority == "Rarest" then
 					if a.info.rank ~= b.info.rank then
 						return a.info.rank > b.info.rank
@@ -33430,7 +33497,8 @@ end
 					local info = modelInfo(model)
 					if info then
 						total += 1
-						if matches(info, "Catch", minValue) then
+						local hunt = Game.huntWanted(info)
+						if hunt or matches(info, "Catch", minValue) then
 							local ok, pivot = pcall(model.GetPivot, model)
 							local pos = ok and pivot and pivot.Position
 							if pos then
@@ -33456,6 +33524,7 @@ end
 										local target = {
 											model = model,
 											info = info,
+											hunt = hunt,
 											pos = pos,
 											lateral = lateral,
 											plate = plate,
@@ -33675,7 +33744,7 @@ end
 			return 240 - #StarLog
 		end
 		local function sweepStars(wave, mode, speed, keep)
-			if not (on("AutoStars") and starsActive()) or Game.opExclKey("Stars (event)") then
+			if not (on("AutoStars") and starsActive()) then
 				return 0
 			end
 			local stars = starModels()
@@ -33827,7 +33896,7 @@ end
 		function isBlatant()
 			return (Options.SeaMove and Options.SeaMove.Value) == "Blatant" and not Sea.instant.off
 		end
-		local BossLogAt = {}
+		local BossLogAt, BossBlockUntil = {}, {}
 		function Game.bossLeft(id)
 			if id == nil then
 				return 0
@@ -33838,13 +33907,38 @@ end
 			return if readyAt then math.max(0, readyAt - os.time()) else 0
 		end
 		function Game.bossBlocked(id)
+			local key = tostring(id or "boss")
 			local left = Game.bossLeft(id)
-			if left > 0 and os.clock() - (BossLogAt[id] or -1e9) > 60 then
-				BossLogAt[id] = os.clock()
-				log("BOSS", tostring(id), "reward on cooldown for", math.floor(left) .. "s, its item is skipped until then")
+			local learned = math.max(BossBlockUntil[key] or 0, BossBlockUntil["*"] or 0) - os.clock()
+			if left > 0 and os.clock() > (BossLogAt[key] or -1e9) then
+				BossLogAt[key] = os.clock() + left
+				log("BOSS", key, "reward on cooldown for", math.floor(left) .. "s, its item is skipped until then")
 			end
-			return left > 0
+			return left > 0 or learned > 0
 		end
+		-- game messages that mean "stop asking for now": boss cooldown, equip cooldown, nothing unlocked to sell
+		onEvent("NotificationService", "NotifySignal", function(_, text)
+			text = tostring(text or "")
+			if string.find(text, "Boss reward is on cooldown", 1, true) then
+				local p = Sea.pendingBoss
+				local list = if p and os.clock() - p.at < 3 and #p.ids > 0 then p.ids else { { key = "*" } }
+				for _, boss in ipairs(list) do
+					if (BossBlockUntil[boss.key] or 0) < os.clock() then
+						local left = if boss.id ~= nil then Game.bossLeft(boss.id) else 0
+						local wait = if left > 0 then left else 300
+						BossBlockUntil[boss.key] = os.clock() + wait
+						log("BOSS", boss.key, "server says the reward is on cooldown, boss items skipped for", math.floor(wait) .. "s" .. (if boss.key == "*" then " (no boss item was flagged in the wave)" else ""))
+					end
+				end
+			elseif string.find(text, "before equipping again", 1, true) then
+				Game.equipBlockUntil = os.clock() + 15
+			elseif string.find(text, "All your items are locked", 1, true) then
+				Game.sellBlockUntil = os.clock() + 120
+				if Game.sellSkip then
+					Game.sellSkip("locked", "the game says every item is locked")
+				end
+			end
+		end)
 		local function spawnInfo(spawn)
 			local e = type(spawn) == "table" and spawn.entity
 			if type(e) ~= "table" or e.id == nil then
@@ -34052,16 +34146,17 @@ end
 				local info = if blockKey then nil else spawnInfo(spawn)
 				if info then
 					total += 1
-					if matches(info, "Catch", minValue) and not (spawn.isBossItem and Game.bossBlocked(spawn.bossId)) then
-						table.insert(list, { id = spawn.entity.id, info = info, boss = spawn.isBossItem, plate = tonumber(spawn.wavePart) })
+					local hunt = Game.huntWanted(info)
+					if (hunt or matches(info, "Catch", minValue)) and not (spawn.isBossItem and Game.bossBlocked(spawn.bossId)) then
+						table.insert(list, { id = spawn.entity.id, info = info, boss = spawn.isBossItem, bossId = spawn.bossId, hunt = hunt, plate = tonumber(spawn.wavePart) })
 					end
 				end
 			end
 			local floor = Game.plotFloor and Game.plotFloor() or 0
 			local anyIndex = false
-			-- the planner (value, index, event rush, lucky blocks) works only with Smart Planner; alone Blatant follows the player's filters and priority
-			local planner = Game.opMode()
-			local rushing = planner and Game.event ~= nil and Game.event.rushing()
+			-- value and index math run with Smart Planner; Event Rush, Index Hunter and lucky blocks are toggles of their own
+			local planner = Game.plannerOn()
+			local rushing = on("EventRush") and Game.event ~= nil and Game.event.rushing()
 			local evCount = 0
 			for _, item in ipairs(list) do
 				item.gain = planner and Game.itemGain and Game.itemGain(item.info, floor) or 0
@@ -34072,6 +34167,9 @@ end
 					evCount += 1
 					anyIndex = true
 				end
+				if item.hunt then
+					anyIndex = true
+				end
 				if planner and item.info.kind ~= "Egg" and not item.info.special and Game.indexGain then
 					item.idx = Game.indexGain(item.info.type, item.info.mutation)
 					if item.idx > 0 then
@@ -34079,10 +34177,13 @@ end
 					end
 				end
 			end
-			local pr = not Game.opMode() and Options.SeaPriority and Options.SeaPriority.Value or "Best Value"
+			local pr = not Game.plannerOn() and Options.SeaPriority and Options.SeaPriority.Value or "Best Value"
 			table.sort(list, function(a, b)
 				if a.ev ~= b.ev then
 					return a.ev == true
+				end
+				if (a.hunt == true) ~= (b.hunt == true) then
+					return a.hunt == true
 				end
 				if pr == "Rarest" and a.info.rank ~= b.info.rank then
 					return a.info.rank > b.info.rank
@@ -34118,13 +34219,16 @@ end
 						if item.ev and not dup then
 							g += 1e30
 						end
+						if item.hunt and not dup then
+							g += 1e29
+						end
 						if not bestAt or g > bestGain then
 							bestAt, bestGain = i, g
 						end
 					end
 					local item = table.remove(pool, bestAt)
 					table.insert(chosen, item)
-					if item.idx > 0 or item.ev then
+					if item.idx > 0 or item.ev or item.hunt then
 						seen[item.info.type .. "|" .. item.info.mutation] = true
 					end
 				end
@@ -34132,14 +34236,22 @@ end
 			end
 			local ids, infos = {}, {}
 			-- while rushing the event items keep their slots: lucky blocks only get what is left
-			for _, id in ipairs(Game.lucky.take(blocks, if planner then capacity - math.min(evCount, capacity) else 0)) do
+			for _, id in ipairs(Game.lucky.take(blocks, capacity - math.min(evCount, capacity))) do
 				table.insert(ids, id)
 			end
 			local blockCount = #ids
+			local bossIds, hunted = {}, {}
 			for i = 1, math.min(capacity - blockCount, #list) do
 				table.insert(ids, list[i].id)
 				table.insert(infos, list[i].info)
+				if list[i].boss then
+					table.insert(bossIds, { id = list[i].bossId, key = tostring(list[i].bossId or "boss") })
+				end
+				if list[i].hunt then
+					table.insert(hunted, infoTitle(list[i].info))
+				end
 			end
+			Sea.pendingBoss = { at = os.clock(), ids = bossIds }
 			if #ids == 0 then
 				Session.rerolled += 1
 				setStatus("Blatant: nothing worth taking in this wave, rerolling")
@@ -34174,6 +34286,9 @@ end
 			I.ok += 1
 			I.refused = 0
 			Session.trips += 1
+			if #hunted > 0 then
+				log("INDEX hunt took " .. table.concat(hunted, ", "))
+			end
 			for _, info in ipairs(infos) do
 				Track.caught(info)
 				emit("caught", info)
@@ -34197,7 +34312,7 @@ end
 			return folder and folder:FindFirstChild("Collect")
 		end
 		onEvent("CollectEventService", "OnPickupsCreated", function(payload)
-			if not (on("AutoStars") or (Game.event ~= nil and Game.event.rush)) or Game.opExclKey("Stars (event)") or type(payload) ~= "table" or type(payload.events) ~= "table" then
+			if not (on("AutoStars") or (Game.event ~= nil and Game.event.rush)) or type(payload) ~= "table" or type(payload.events) ~= "table" then
 				return
 			end
 			for eventId, event in pairs(payload.events) do
@@ -34795,7 +34910,7 @@ end
 			for key, entity in pairs(data and data.PlacedAnimals or {}) do
 				if type(entity) == "table" and entity.brainrotType then
 					local info = describe("Brainrot", entity.brainrotType, entity.mutation, entity.size, entity.level, entity.traits)
-					if not info.special and not Game.opExcluded(info) and (not worstValue or info.value < worstValue) then
+					if not info.special and (not worstValue or info.value < worstValue) then
 						worstId, worstValue = entity.id or key, info.value
 					end
 				end
@@ -35093,6 +35208,9 @@ end
 			return math.max(info.value - floor, 0) + Game.indexGain(info.type, info.mutation)
 		end
 		function equipBest(force)
+			if os.clock() < (Game.equipBlockUntil or 0) then
+				return false
+			end
 			local amount, _, worst = placedStats()
 			local best = bestInventoryBrainrot()
 			if not force and (best <= 0 or (amount >= maxAnimals() and best <= worst)) then
@@ -35126,7 +35244,7 @@ end
 			or selected(Options.LockSizes, SizeNames[info.size] or info.size)
 		end
 		function lockProtected()
-			if Game.opMode() then
+			if Game.plannerOn() then
 				return 0
 			end
 			local data = Data()
@@ -35153,40 +35271,64 @@ end
 			end
 			return 0
 		end
+		-- items Corvus locked for a moment while selling (keep set); if the unlock got lost they are freed next sell
+		local TempLocked = {}
+		pcall(function()
+			for key in string.gmatch(tostring(Library:GetSetting("OSFA_TempLocked", "") or ""), "[^,]+") do
+				TempLocked[key] = true
+			end
+		end)
+		local function saveTempLocked()
+			local keys = {}
+			for key in pairs(TempLocked) do
+				table.insert(keys, key)
+			end
+			pcall(function()
+				Library:SetSetting("OSFA_TempLocked", table.concat(keys, ","))
+			end)
+		end
+		local SellWhy = { key = nil, at = -1e9 }
+		function Game.sellSkip(key, detail)
+			Game.sellNote = "Not selling: " .. detail
+			if key ~= SellWhy.key or os.clock() - SellWhy.at > (if key == "threshold" then 300 else 60) then
+				SellWhy.key, SellWhy.at = key, os.clock()
+				log("SELL skipped reason=" .. key .. " " .. detail)
+			end
+		end
 		local function sellCandidates()
 			local data = Data()
 			local list = {}
+			local why = { total = 0, special = 0, protected = 0, locked = 0, event = 0, filters = 0, below = 0, kept = 0 }
 			local below = parseAmount(Options.SellBelow and Options.SellBelow.Value)
+			local smartMode = Game.sellMode() == "Smart"
 			for key, entry in pairs(data and data.Inventory or {}) do
 				local info = entryInfo(entry)
-				if
-				info
-				and entry.innerEntity.locked ~= true
-				and not info.special
-				and not isProtected(info)
-				and not Game.opExcluded(info)
-				and matches(info, "Sell", 0)
-				and (not below or info.value < below)
-				and not (Game.event ~= nil and Game.event.wanted(info))
-				then
-					table.insert(list, { key = key, info = info, kind = entry.itemType })
+				if info then
+					why.total += 1
+					local isLocked = entry.innerEntity.locked == true
+					if info.special then
+						why.special += 1
+					elseif isProtected(info) then
+						why.protected += 1
+					elseif isLocked and not TempLocked[key] then
+						why.locked += 1
+					elseif Game.event ~= nil and Game.event.wanted(info) then
+						why.event += 1
+					elseif not smartMode and not matches(info, "Sell", 0) then
+						why.filters += 1
+					elseif below and info.value >= below and not (smartMode and Game.plannerOn()) then
+						why.below += 1
+					else
+						table.insert(list, { key = key, info = info, kind = entry.itemType, locked = isLocked })
+					end
 				end
 			end
 			table.sort(list, function(a, b)
 				return a.info.value < b.info.value
 			end)
-			if Game.sellMode() == "Smart" then
+			if smartMode then
 				-- Smart ignores the sell filters: the best eggs (two plot loads) and a few animals stay, the rest is cash
-				local smart = {}
-				for key, entry in pairs(data and data.Inventory or {}) do
-					local info = entryInfo(entry)
-					local locked = info ~= nil and entry.innerEntity.locked == true
-					local cap = parseAmount(Options.SellBelow and Options.SellBelow.Value)
-					local mine = info ~= nil and (isProtected(info) or (not Game.opMode() and cap ~= nil and info.value >= cap))
-					if info and not info.special and (not locked or isProtected(info)) and not mine and not Game.opExcluded(info) and not (Game.event ~= nil and Game.event.wanted(info)) then
-						table.insert(smart, { key = key, info = info, kind = entry.itemType, locked = locked })
-					end
-				end
+				local smart = list
 				local floor = Game.plotFloor()
 				for _, item in ipairs(smart) do
 					item.score = if item.kind == "Egg" then Game.eggGain(item.info.type, item.info.mutation, floor) else 0
@@ -35203,14 +35345,25 @@ end
 				for _, item in ipairs(smart) do
 					if item.kind == "Egg" and keepEggs > 0 then
 						keepEggs -= 1
+						why.kept += 1
 					elseif item.kind ~= "Egg" and keepAnimals > 0 then
 						keepAnimals -= 1
+						why.kept += 1
 					else
 						table.insert(list, 1, item)
 					end
 				end
 			end
-			return list
+			return list, why
+		end
+		local function whyText(why)
+			local parts = {}
+			for _, k in ipairs({ "protected", "locked", "filters", "below", "kept", "special", "event" }) do
+				if (why[k] or 0) > 0 then
+					table.insert(parts, why[k] .. " " .. ({ protected = "protected (Protect lists)", locked = "locked", filters = "outside the sell filters", below = "above Only Below", kept = "kept for the plot", special = "special", event = "event wanted" })[k])
+				end
+			end
+			return "nothing matches of " .. why.total .. " items: " .. (if #parts > 0 then table.concat(parts, ", ") else "inventory empty")
 		end
 		function Game.sellMode()
 			if Game.drivenBy("AutoSell") then
@@ -35237,12 +35390,32 @@ end
 				task.wait(0.6)
 			end
 			local mode = Game.sellMode()
-			if mode == "Sell All Unlocked" and Game.opMode() and type(Options.OPExclude and Options.OPExclude.Value) == "table" and next(Options.OPExclude.Value) ~= nil then
-				-- the game's Sell All cannot skip excluded items: sell one by one instead
-				mode = "Filtered"
-			end
 			local startCash, startCount = cash(), inventoryCount()
 			LastSell = os.clock()
+			-- items Corvus locked in an earlier sell and could not unlock: free them first (never protected ones)
+			do
+				local inv = Data()
+				local free = {}
+				for key in pairs(TempLocked) do
+					local entry = inv and inv.Inventory and inv.Inventory[key]
+					local info = entry and entryInfo(entry)
+					if not entry then
+						TempLocked[key] = nil
+					elseif entry.innerEntity.locked == true and not (info and isProtected(info)) then
+						table.insert(free, key)
+					else
+						TempLocked[key] = nil
+					end
+				end
+				for i = 1, #free, 40 do
+					call("InventoryService", "SetItemsLocked", table.move(free, i, math.min(i + 39, #free), 1, {}), false)
+				end
+				if #free > 0 then
+					log("SELL unlocked " .. #free .. " item(s) left locked by an earlier sell")
+					task.wait(0.4)
+				end
+				saveTempLocked()
+			end
 			if mode == "Sell All Unlocked" then
 				if on("AutoLock") then
 					for _ = 1, 5 do
@@ -35255,11 +35428,12 @@ end
 				setStatus("Selling everything that is not locked")
 				call("InventoryService", "SellAll")
 			else
-				local list = sellCandidates()
+				local list, why = sellCandidates()
 				if #list == 0 then
 					SellQuietUntil = os.clock() + 60
+					Game.sellSkip("nothing", whyText(why))
 					if force then
-						notify("Sell", "Nothing matches your sell filters", 3)
+						notify("Sell", "Nothing to sell: " .. whyText(why), 6)
 					end
 					return false
 				end
@@ -35275,8 +35449,34 @@ end
 					end
 				end
 				local function lockKeep(state)
+					if state then
+						for _, key in ipairs(keep) do
+							TempLocked[key] = true
+						end
+						saveTempLocked()
+					end
 					for i = 1, #keep, 40 do
 						call("InventoryService", "SetItemsLocked", table.move(keep, i, math.min(i + 39, #keep), 1, {}), state)
+					end
+					if not state then
+						waitFor(function()
+							local d = Data()
+							for _, key in ipairs(keep) do
+								local entry = d and d.Inventory and d.Inventory[key]
+								if entry and entry.innerEntity.locked then
+									return false
+								end
+							end
+							return true
+						end, 2)
+						local d = Data()
+						for _, key in ipairs(keep) do
+							local entry = d and d.Inventory and d.Inventory[key]
+							if not (entry and entry.innerEntity.locked) then
+								TempLocked[key] = nil
+							end
+						end
+						saveTempLocked()
 					end
 				end
 				local relock = {}
@@ -35333,6 +35533,7 @@ end
 			local soldItems = math.max(startCount - inventoryCount(), 0)
 			local gained = math.max(cash() - startCash, 0)
 			log("SELL", mode, "sold", soldItems, "for $" .. formatNumber(gained), "inventory", startCount, "->", inventoryCount())
+			Game.sellNote = if soldItems > 0 then "Last sell: " .. soldItems .. " item(s) for $" .. formatNumber(gained) else "Last sell: the game sold nothing"
 			if soldItems > 0 then
 				Track.sold(gained, soldItems)
 				emit("sold", gained, soldItems)
@@ -35343,24 +35544,30 @@ end
 			return false
 		end
 		function sellDue()
-			if not on("AutoSell") or os.clock() - LastSell < 8 then
+			if not on("AutoSell") then
+				Game.sellNote = nil
 				return false
 			end
-			if inventoryCount() >= inventoryLimit() - math.max(maxPickup(), 1) then
-				return true
-			end
-			if os.clock() < SellQuietUntil then
+			if os.clock() - LastSell < 8 or os.clock() < SellQuietUntil or os.clock() < (Game.sellBlockUntil or 0) then
 				return false
 			end
-			if Game.cashBoost and Game.cashBoost() and inventoryCount() > 0 then
+			local count, cap = inventoryCount(), inventoryLimit()
+			if count >= cap - math.max(maxPickup(), 1) then
 				return true
 			end
-			local limit = math.min(tonumber(Options.SellAt and Options.SellAt.Value) or 150, inventoryLimit())
-			if inventoryCount() >= limit then
+			if Game.cashBoost and Game.cashBoost() and count > 0 then
+				return true
+			end
+			local limit = math.min(tonumber(Options.SellAt and Options.SellAt.Value) or 150, cap)
+			if count >= limit then
 				return true
 			end
 			local every = (tonumber(Options.SellEvery and Options.SellEvery.Value) or 0) * 60
-			return every > 0 and os.clock() - LastSell >= every
+			if every > 0 and os.clock() - LastSell >= every then
+				return true
+			end
+			Game.sellSkip("threshold", string.format("inventory %d of %d, sells at %d%s", count, cap, limit, if every > 0 then " or every " .. math.floor(every / 60) .. " min" else ""))
+			return false
 		end
 		local function spendFraction()
 			return math.clamp((tonumber(Options.UpgradeSpend and Options.UpgradeSpend.Value) or 100) / 100, 0.01, 1)
@@ -35370,15 +35577,15 @@ end
 			return type(tier) == "table" and type(tier.Cost) == "table" and tonumber(tier.Cost.Cash) or nil
 		end
 		function spendable()
-			if Game.opMode() then
-				-- the planner decides (Game.plan), minus the "Money reserve" exclusion
-				return math.max(cash() - Game.opReserve(), 0)
+			if Game.plannerOn() then
+				-- the planner decides (Game.plan)
+				return cash()
 			end
 			local reserve = 0
 			if on("SaveForRebirth") and on("AutoRebirth") then
 				reserve = nextRebirthCost() or 0
 				local perHour = Metrics.current("Money")
-				if Game.opMode() and reserve > 0 and perHour and cash() + perHour / 4 < reserve then
+				if Game.plannerOn() and reserve > 0 and perHour and cash() + perHour / 4 < reserve then
 					reserve = 0
 				end
 			end
@@ -35413,7 +35620,7 @@ end
 				local move = Options.SeaMove and Options.SeaMove.Value
 				local useless = id == "MovementSpeed" and (move == "Blatant" or move == "Teleport")
 				if not useless and allows(Options.UpgradeFilter, label) and (UpgradeBackoff[id] or 0) <= os.clock() then
-					local amount = maxBuyable(id, if Game.opMode() then Game.budget(id) elseif id == "Carry" then cash() else spendable())
+					local amount = maxBuyable(id, if Game.plannerOn() then Game.budget(id) elseif id == "Carry" then cash() else spendable())
 					if amount > 0 then
 						local level = upgradeLevel(id)
 						setStatus("Buying " .. label .. " x" .. amount)
@@ -35615,7 +35822,7 @@ end
 		end
 		task.spawn(function()
 			while alive() do
-				if Game.opMode() or on("EventRush") then
+				if Game.plannerOn() or on("EventRush") then
 					pcall(Weather.update)
 				end
 				task.wait(5)
@@ -35813,9 +36020,9 @@ end
 			end
 			local tried = 0
 			for _, key in ipairs(list) do
-				if Game.opMode() then
+				if Game.plannerOn() then
 					-- a staff with no more luck (and no longer sea when you walk) is wasted cash
-					local byTime = not Game.opMode() and (Options.StaffPick and Options.StaffPick.Value) == "Longest Time"
+					local byTime = false
 					local betterLuck = not byTime and effectiveLuck(Staffs[key], owned) > ownedLuck
 					local betterTime = (byTime or not isBlatant()) and (tonumber(Staffs[key].time) or 0) > ownedTime
 					if not (betterLuck or betterTime) or not Game.spendOk("Staff:" .. key, Staffs[key].cost) then
@@ -35912,7 +36119,7 @@ end
 			end
 			local tried = 0
 			for _, id in ipairs(list) do
-				if Game.opMode() then
+				if Game.plannerOn() then
 					if (tonumber(TrainTools[id].gainPerTrain) or 0) <= ownedGain or not Game.spendOk("Dumbbell:" .. id, TrainTools[id].cost) then
 						continue
 					end
@@ -35994,7 +36201,7 @@ end
 				return false
 			end
 			local cost = nextRebirthCost()
-			if not cost or cash() < cost or (Game.opMode() and not Game.spendOk("Rebirth", cost)) then
+			if not cost or cash() < cost or (Game.plannerOn() and not Game.spendOk("Rebirth", cost)) then
 				return false
 			end
 			local before = rebirths()
@@ -36138,7 +36345,7 @@ end
 				end
 				return false
 			end
-			local planned = Game.opMode() or (Game.opMode() and tonumber(Options.SeaMinutes and Options.SeaMinutes.Value) == 10 and tonumber(Options.TrainMinutes and Options.TrainMinutes.Value) == 5)
+			local planned = Game.plannerOn()
 			if planned then
 				-- profit engine v2: train only while the next plate bought with sea time (gain/$ of Train) beats the best
 				-- money purchase and pays back inside the horizon (Game.plan, PLAN log)
@@ -36393,7 +36600,7 @@ end
 				notify("Discord reward", "The game did not give the reward", 4)
 			end
 		end
-		local KnownCodes = { "ZEUS" }
+		local KnownCodes = {}
 		function redeemCode(code, manual)
 			code = tostring(code or ""):gsub("^%s+", ""):gsub("%s+$", "")
 			if code == "" then
@@ -36440,17 +36647,28 @@ end
 		-- the code list lives in the hub repo (file "Codes", JSON {game: [codes]}); fetched at start and every 6 h
 		local function fetchCodes()
 			CodesFetchAt = os.clock()
-			local ok, body = pcall(function()
-				return game:HttpGet(HubRepo .. "Codes")
-			end)
-			local decoded
-			if ok and type(body) == "string" then
-				local okJson, value = pcall(HttpService.JSONDecode, HttpService, body)
-				decoded = if okJson then value else nil
+			local list, why = nil, "no answer"
+			for _, path in ipairs({ "Codes", "staging/Codes" }) do
+				local ok, body = pcall(function()
+					return game:HttpGet(HubRepo .. path)
+				end)
+				if ok and type(body) == "string" then
+					local okJson, value = pcall(HttpService.JSONDecode, HttpService, body)
+					if okJson and type(value) == "table" then
+						if type(value["Open Sea For Animals"]) == "table" then
+							list = value["Open Sea For Animals"]
+							break
+						end
+						why = path .. " has no entry for this game"
+					else
+						why = path .. " is not a code list (" .. string.sub(body, 1, 40) .. ")"
+					end
+				else
+					why = path .. " fetch failed"
+				end
 			end
-			local list = type(decoded) == "table" and decoded["Open Sea For Animals"]
 			if type(list) ~= "table" then
-				log("CODES fetch failed or no entry for this game")
+				log("CODES fetch failed: " .. why)
 				return
 			end
 			RemoteCodes = {}
@@ -36861,7 +37079,7 @@ end
 			return math.max(target.cost - cash(), 0) / math.max(plan.income, 1e-9)
 		end
 		function Game.spendOk(key, cost)
-			local reserve = Game.opReserve()
+			local reserve = 0
 			if reserve > 0 and cash() - cost < reserve then
 				return false
 			end
@@ -36880,7 +37098,7 @@ end
 			return item.payback <= saveEta(plan)
 		end
 		function Game.budget(key)
-			local reserve = Game.opReserve()
+			local reserve = 0
 			local plan = Game.plan()
 			if not plan then
 				return math.max(cash() - reserve, 0)
@@ -37092,6 +37310,49 @@ end
 				end
 			end
 			Game.fixIdentity()
+			-- a write that fails for missing rights is queued for the frame thread (connected here, with the hub's rights)
+			local UiLater, uiMoved, uiErrorAt = {}, false, -1e9
+			pcall(function()
+				game:GetService("RunService").Heartbeat:Connect(function()
+					if #UiLater == 0 then
+						return
+					end
+					local queue = UiLater
+					UiLater = {}
+					for _, job in ipairs(queue) do
+						pcall(job.fn, table.unpack(job.args, 1, job.args.n))
+					end
+				end)
+			end)
+			function Game.uiCall(fn, ...)
+				Game.fixIdentity()
+				local ok, err = pcall(fn, ...)
+				if ok then
+					return
+				end
+				if string.find(tostring(err), "lacking capability", 1, true) then
+					if #UiLater < 60 then
+						table.insert(UiLater, { fn = fn, args = table.pack(...) })
+					end
+					if not uiMoved then
+						uiMoved = true
+						log("UI thread lost its rights, UI writes now run on the frame thread")
+					end
+				elseif os.clock() - uiErrorAt > 30 then
+					uiErrorAt = os.clock()
+					log("ERROR", "ui", (string.match(tostring(err), "^[^\n]*")))
+				end
+			end
+			function Game.guardText(obj)
+				if type(obj) ~= "table" or type(obj.SetText) ~= "function" or obj.CorvusGuarded then
+					return
+				end
+				obj.CorvusGuarded = true
+				local base = obj.SetText
+				obj.SetText = function(self, ...)
+					Game.uiCall(base, self, ...)
+				end
+			end
 		end
 		Window = Library:CreateWindow({
 			Title = "Corvus",
@@ -37145,45 +37406,6 @@ end
 		Labels = {}
 		do
 			local SeaBox = Tabs.Main:AddLeftGroupbox("Quick Start", "zap")
-			local FarmAllSet = {
-				"AutoSea", "AutoSell", "AutoEquipBest", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff",
-				"AutoEquipStaff", "AutoBuyDumbbell", "AutoEquipDumbbell", "AutoTrain", "AutoBonus", "AutoRebirth",
-				"AutoPotions", "SmartPotions", "AutoOffline", "SkipEmpty", "EquipBeforeSell", "SaveForRebirth",
-				"AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoCodes", "AutoStars", "AutoLucky", "EventRush", "AutoAd", "AutoGroup", "AutoLock",
-			}
-			SeaBox:AddToggle("AutoPlanner", {
-				Text = "Smart Planner (best value)",
-				Default = false,
-				Tooltip = "Runs the farm by itself with the real game odds: opens the sea, trains (TRAIN and SEA split), places and hatches eggs, Smart Sells (your Protect lists stay) and spends on upgrades, staffs, dumbbells and rebirth by payback. Your own switches are not changed. Potions and rewards keep their own switches.",
-			})
-			SeaBox:AddLabel({
-				Text = '<font transparency="0.35">Every automation is its own switch in the tabs and nothing turns on by itself. Smart Planner alone runs the sea, training, eggs, selling and spending for you; turn it off and only your own switches run.</font>',
-				DoesWrap = true,
-			})
-			SeaBox:AddButton({
-				Text = "Stop Everything",
-				Tooltip = "Turns every automation toggle off",
-				Func = function()
-					task.spawn(function()
-						for _, list in ipairs({ { "AutoPlanner", "TrainSea" }, Game.AllAuto or {}, FarmAllSet }) do
-							for _, name in ipairs(list) do
-								local toggle = Toggles[name]
-								if toggle and toggle.Value then
-									toggle:SetValue(false)
-								end
-							end
-						end
-						notify("Stop Everything", "All automation is off", 4)
-					end)
-				end,
-			})
-			SeaBox:AddButton({
-				Text = "Reset Hub Options",
-				Tooltip = "Every toggle, dropdown, slider and input goes back to its default. Saved configs are not deleted.",
-				Func = function()
-					Library:AskResetHubOptions(SaveManager and SaveManager.Ignore or nil)
-				end,
-			})
 			SeaBox:AddToggle("AutoSea", {
 				Text = "Auto Open Sea",
 				Default = false,
@@ -37270,17 +37492,6 @@ end
 				Text = "Extra Trips Per Wave",
 				Default = false,
 				Tooltip = "Heads out again when the sea is still open after banking.",
-			})
-			SeaBox:AddButton({
-				Text = "Open Sea Once",
-				Func = function()
-					task.spawn(runManual, seaCycle, true)
-				end,
-			}):AddButton({
-				Text = "Close Sea",
-				Func = function()
-					task.spawn(endWave)
-				end,
 			})
 			local FilterBox = Tabs.Sea:AddRightGroupbox("Catch Filters", "funnel")
 			FilterBox:AddDropdown(
@@ -37491,7 +37702,7 @@ end
 			)
 			SellBox:AddSlider("SellEvery", {
 				Text = "Also Sell Every",
-				Default = 0,
+				Default = 10,
 				Min = 0,
 				Max = 60,
 				Rounding = 0,
@@ -37499,6 +37710,7 @@ end
 				HideMax = true,
 				Tooltip = "0 sells only when the inventory reaches the number above",
 			})
+			Labels.Sell = SellBox:AddLabel({ Text = '<font transparency="0.4">Auto Sell is off</font>', DoesWrap = true })
 			SellBox:AddToggle(
 				"EquipBeforeSell",
 				{
@@ -37631,7 +37843,7 @@ end
 			FreeBox:AddToggle("AutoLimited", { Text = "Auto Claim 25 Min Reward", Default = false, Tooltip = "The Play for 25 Mins / Win 5 Games reward on your plot" })
 			FreeBox:AddToggle(
 				"AutoGroup",
-				{ Text = "Auto Claim Group Reward", Default = true, Tooltip = "Only when you are in the game's group" }
+				{ Text = "Auto Claim Group Reward", Default = false, Tooltip = "Only when you are in the game's group" }
 			)
 			FreeBox:AddToggle("AutoLucky", { Text = "Auto Lucky Blocks", Default = false, Tooltip = "Takes the lucky blocks of admin events from the sea and opens them" })
 			FreeBox:AddToggle("AutoAd", { Text = "Auto Free Ad Reward", Default = false, Tooltip = "Asks the game for the free video reward when it is available" })
@@ -37670,7 +37882,7 @@ end
 			CodeBox:AddToggle("AutoCodes", { Text = "Auto Redeem Known Codes", Default = false, Tooltip = "Fetches the known codes list at start and every 6 hours and redeems each code once per account, 2 seconds apart." })
 			Game.codesText = CodeBox:AddLabel({ Text = "Codes redeemed 0 / invalid 0", DoesWrap = true })
 			CodeBox:AddLabel({
-				Text = '<font transparency="0.35">Known code: </font><font color="#59cdff">ZEUS</font><font transparency="0.35">. New codes get posted in the game community.</font>',
+				Text = '<font transparency="0.35">Corvus keeps the code list updated; codes the game refuses are not tried again.</font>',
 				DoesWrap = true,
 			})
 			CodeBox:AddInput("CodeInput", { Text = "Code", Placeholder = "Type a code", Default = "", Finished = false })
@@ -37700,6 +37912,115 @@ end
 			Labels.Potions = PotionBox:AddLabel({ Text = "-", DoesWrap = true })
 			local EventBox = Tabs.Rewards:AddRightGroupbox("Events", "sparkles")
 			Labels.Events = EventBox:AddLabel({ Text = "-", DoesWrap = true })
+			-- Index Hunter: the game's index has one tab per mutation (EggsConfig.IsInMutationIndex, MutationConfig ids);
+			-- every egg completed in any tab adds +10% cash for good (Modifiers CompletedEggs, CashMulti * (1 + 0.1 * done))
+			local HuntBox = Tabs.Sea:AddRightGroupbox("Index Hunter", "book-open")
+			HuntBox:AddToggle("IndexHunter", {
+				Text = "Index Hunter",
+				Default = false,
+				Tooltip = "Catches the animals still missing from the index tabs and rarities picked below first, even when your Catch Filters skip them. Every completed index egg is +10% cash for good.",
+			})
+			HuntBox:AddDropdown("IndexTiers", {
+				Text = "Index Tabs",
+				Values = MutationLabels,
+				Default = { "Normal", "Gold", "Diamond" },
+				Multi = true,
+				AllowNull = true,
+				Tooltip = "Which index tabs to complete: Normal, Gold, Diamond, Radioactive, Rainbow",
+			})
+			HuntBox:AddDropdown("IndexRarities", {
+				Text = "Hunt Rarities",
+				Values = RarityList,
+				Default = RarityList,
+				Multi = true,
+				AllowNull = true,
+				Searchable = true,
+			})
+			Labels.Hunt = HuntBox:AddLabel({ Text = "-", DoesWrap = true })
+			-- Quick Start: the main loop, each switch the same control as in its own tab (two-way)
+			Library:MirrorToggle("AutoTrain", SeaBox)
+			SeaBox:AddToggle("AutoPlanner", {
+				Text = "Smart Planner",
+				Default = false,
+				Tooltip = "Runs the farm with the real game odds: opens the sea, trains (TRAIN and SEA split), places and hatches eggs, Smart Sells (your Protect lists stay) and spends on upgrades, staffs, dumbbells and rebirth by payback. Your own switches are not changed.",
+			})
+			do
+				-- Smart Sell = Auto Sell with Sell Mode Smart (not a saved option of its own)
+				local key = {}
+				local smart = SeaBox:AddToggle(key, {
+					Text = "Smart Sell",
+					Default = false,
+					Tooltip = "Auto Sell in Smart mode: keeps your best eggs for the plot and your Protect lists, sells the rest by value",
+				})
+				Library.Toggles[key] = nil
+				if smart then
+					local show = smart.SetValue
+					local function wanted()
+						return Toggles.AutoSell ~= nil and Toggles.AutoSell.Value == true and (Options.SellMode and Options.SellMode.Value) == "Smart"
+					end
+					smart.SetValue = function(_, value)
+						value = value == true
+						Game.toggleSource = "Smart Sell"
+						if value then
+							pcall(Options.SellMode.SetValue, Options.SellMode, "Smart")
+						end
+						pcall(Toggles.AutoSell.SetValue, Toggles.AutoSell, value)
+						Game.toggleSource = nil
+						log("CLICK SmartSell=" .. tostring(value))
+						pcall(show, smart, wanted())
+					end
+					task.spawn(function()
+						while alive() do
+							if smart.Value ~= wanted() then
+								pcall(show, smart, wanted())
+							end
+							task.wait(0.5)
+						end
+					end)
+				end
+			end
+			Library:MirrorToggle("AutoSell", SeaBox)
+			Library:MirrorToggle("EventRush", SeaBox)
+			SeaBox:AddLabel({
+				Text = '<font transparency="0.35">Every switch also lives in its own tab and nothing turns on by itself. Smart Planner runs the sea, training, eggs, selling and spending for you; off, only your own switches run.</font>',
+				DoesWrap = true,
+			})
+			SeaBox:AddButton({
+				Text = "Stop Everything",
+				Tooltip = "Turns every automation toggle off",
+				Func = function()
+					task.spawn(function()
+						Game.toggleSource = "Stop Everything"
+						for _, name in ipairs(Game.AllAuto or {}) do
+							local toggle = Toggles[name]
+							if toggle and toggle.Value then
+								toggle:SetValue(false)
+							end
+						end
+						Game.toggleSource = nil
+						log("STOP everything off")
+						notify("Stop Everything", "All automation is off", 4)
+					end)
+				end,
+			})
+			SeaBox:AddButton({
+				Text = "Reset Hub Options",
+				Tooltip = "Every toggle, dropdown, slider and input goes back to its default. Saved configs are not deleted.",
+				Func = function()
+					Library:AskResetHubOptions(SaveManager and SaveManager.Ignore or nil)
+				end,
+			})
+			SeaBox:AddButton({
+				Text = "Open Sea Once",
+				Func = function()
+					task.spawn(runManual, seaCycle, true)
+				end,
+			}):AddButton({
+				Text = "Close Sea",
+				Func = function()
+					task.spawn(endWave)
+				end,
+			})
 		end
 		StatRows = {}
 		do
@@ -38251,12 +38572,15 @@ end
 			else
 				state = not (first and first.Value)
 			end
+			local source = Game.toggleSource
+			Game.toggleSource = source or "command"
 			for _, name in ipairs(names) do
 				local toggle = Toggles[name]
 				if toggle then
 					toggle:SetValue(state)
 				end
 			end
+			Game.toggleSource = source
 			return state
 		end
 		local function toggleCommand(name, aliases, names, text)
@@ -38271,20 +38595,14 @@ end
 				end,
 			})
 		end
-				AllAutoToggles = {
-			"AutoPlanner",
-			"AutoSea",
-			"AutoEquipBest",
-			"AutoPlaceEggs",
-			"AutoHatch",
-			"AutoSell",
-			"AutoUpgrade",
-			"AutoBuyStaff",
-			"AutoTrain",
-			"AutoBuyDumbbell",
-			"AutoRebirth",
-			"AutoPotions",
+		AllAutoToggles = {
+			"AutoPlanner", "AutoSea", "AutoTrain", "TrainSea", "AutoSell", "EventRush", "AutoStars", "IndexHunter",
+			"AutoEquipBest", "AutoOffline", "AutoPlaceEggs", "AutoHatch", "AutoLock", "AutoUpgrade", "AutoBuyStaff",
+			"AutoEquipStaff", "AutoBuyDumbbell", "AutoEquipDumbbell", "AutoBonus", "AutoRebirth", "AutoPotions",
+			"AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited",
+			"AutoGroup", "AutoCodes", "AutoLucky", "AutoAd", "LuckHop",
 		}
+		Game.AllAuto = AllAutoToggles
 		if Library.AddCommand then
 			pcall(function()
 				toggleCommand("planner", { "smart", "plan" }, { "AutoPlanner" }, "Smart Planner")
@@ -38512,6 +38830,7 @@ end
 				return
 			end
 			AutoloadLogged = true
+			Game.autoloadDone = true
 			local names = {}
 			for name, toggle in pairs(Toggles) do
 				if typeof(name) == "string" and string.sub(name, 1, 6) ~= "Corvus" and type(toggle) == "table" and toggle.Value == true then
@@ -38522,7 +38841,9 @@ end
 			log("AUTOLOAD toggles=" .. (if #names > 0 then table.concat(names, ",") else "none"))
 		end
 		Library.OnAutoload = logAutoload
+		Game.clickAt = {}
 		Library.OnUserToggle = function(name, value)
+			Game.clickAt[name] = os.clock()
 			log("CLICK " .. tostring(name) .. "=" .. tostring(value))
 		end
 		task.delay(8, function()
@@ -38559,8 +38880,15 @@ end
 						Description = "Pick everything you want running. Tap again to unpick.",
 						Multi = true,
 						Required = true,
-						Default = { "sea", "plot", "train" },
+						Default = {},
 						Choices = {
+							{
+								Id = "planner",
+								Title = "Smart Planner",
+								Description = "Runs the sea, training, eggs, selling and spending by payback for you",
+								Icon = "zap",
+								Color = "#ffd166",
+							},
 							{
 								Id = "sea",
 								Title = "Open the sea",
@@ -38684,6 +39012,7 @@ end
 				Finish = function(values)
 					local picked = type(values.tasks) == "table" and values.tasks or {}
 					local groups = {
+						planner = { "AutoPlanner" },
 						sea = { "AutoSea" },
 						plot = { "AutoEquipBest", "AutoPlaceEggs", "AutoHatch" },
 						sell = { "AutoSell" },
@@ -38691,11 +39020,13 @@ end
 						train = { "AutoTrain" },
 						rebirth = { "AutoRebirth" },
 					}
+					Game.toggleSource = "wizard"
 					for id, names in pairs(groups) do
 						if picked[id] then
 							setToggles(names, { "on" })
 						end
 					end
+					Game.toggleSource = nil
 					if picked.sea then
 						if type(values.move) == "string" then
 							pcall(Options.SeaMove.SetValue, Options.SeaMove, values.move)
@@ -38774,12 +39105,17 @@ end
 		end
 		function Debug.running()
 			local running = {}
-			for name, toggle in pairs(Toggles) do
-				if type(toggle) == "table" and toggle.Value == true and string.sub(name, 1, 4) == "Auto" then
+			for _, name in ipairs(AllAutoToggles) do
+				local toggle = Toggles[name]
+				if type(toggle) == "table" and toggle.Value == true then
 					table.insert(running, name)
 				end
 			end
 			table.sort(running)
+			local parts = Game.drives()
+			if #parts > 0 then
+				table.insert(running, "planner drives=" .. table.concat(parts, ","))
+			end
 			return running
 		end
 		function Debug.header()
@@ -38851,7 +39187,6 @@ end
 				"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
 				string.rep("-", 70),
 			}
-			Game.AllAuto = AllAutoToggles
 			return table.concat(lines, "\n")
 		end
 		Log.header = Debug.header
@@ -39423,6 +39758,58 @@ end
 			return string.format("%s items caught  \u{00B7}  %s waves", formatNumber(Session.caught), formatNumber(Session.waves))
 		end
 	end)
+	-- every automation toggle that turns on says why: CLICK (player), AUTOLOAD (saved config), or AUTO <name> by <source>
+	do
+		local watched = {}
+		for _, name in ipairs(AllAutoToggles) do
+			watched[name] = true
+		end
+		for name, toggle in pairs(Toggles) do
+			if watched[name] and type(toggle) == "table" and type(toggle.SetValue) == "function" then
+				local base = toggle.SetValue
+				toggle.SetValue = function(self, value)
+					local was = self.Value
+					base(self, value)
+					if value == true and was ~= true and Game.autoloadDone then
+						local source = Game.toggleSource
+						local trace = if source then nil else debug.traceback("", 2)
+						task.delay(0.3, function()
+							if source then
+								log("AUTO " .. name .. "=true by " .. source)
+							elseif os.clock() - (Game.clickAt[name] or -1e9) > 0.6 then
+								local lines = {}
+								for line in string.gmatch(tostring(trace), "[^\n]+") do
+									if #lines < 4 and string.find(line, "%d") then
+										table.insert(lines, (string.gsub(line, "^%s+", "")))
+									end
+								end
+								log("AUTO " .. name .. "=true by unknown | " .. table.concat(lines, " | "))
+							end
+						end)
+					end
+				end
+			end
+		end
+		-- UI writes from any thread: rights fixed first, a write that still fails runs on the frame thread
+		for _, label in pairs(Labels) do
+			Game.guardText(label)
+		end
+		Game.guardText(Game.codesText)
+		Game.guardText(StatRows.Since)
+		for _, row in pairs(StatRows) do
+			if type(row) == "table" and type(row.set) == "function" then
+				local set = row.set
+				row.set = function(value)
+					Game.uiCall(set, value)
+				end
+			end
+		end
+	end
+	local function waitAutoload()
+		while alive() and not Game.autoloadDone do
+			task.wait(0.2)
+		end
+	end
 	local EggCheckAt = 0
 	local ErrorLogAt = {}
 	local function reportError(where, err)
@@ -39436,6 +39823,7 @@ end
 		return first
 	end
 	task.spawn(function()
+		waitAutoload()
 		while alive() do
 			Game.fixIdentity()
 			local ok, err = xpcall(function()
@@ -39545,6 +39933,7 @@ end
 			end },
 		}
 		local RushPaused = { lucky = true, ad = true, luckhop = true }
+		waitAutoload()
 		while alive() do
 			if Data() then
 				local rushing = Game.event ~= nil and Game.event.rushing()
@@ -39553,7 +39942,7 @@ end
 						runJob(job[2], job[4])
 					end
 				end
-				if Game.opMode() then
+				if Game.plannerOn() then
 					if every("plan", 5) then
 						local parts, names = Game.drives()
 						local key = table.concat(names, ",")
@@ -39648,6 +40037,16 @@ end
 					Sea.activeSince = nil
 				end
 			end)
+			if shown(Tabs.Items) then
+				group(function()
+					Labels.Sell:SetText(Game.sellNote or (if on("AutoSell") then "Auto Sell checks every few seconds" else '<font transparency="0.4">Auto Sell is off</font>'))
+				end)
+			end
+			if shown(Tabs.Sea) then
+				group(function()
+					Labels.Hunt:SetText(Game.huntText())
+				end)
+			end
 			local data = Data()
 			local reach = math.floor(tonumber(waveReach()) or 5)
 			if shown(Tabs.Main) or shown(Tabs.Sea) then
@@ -39655,7 +40054,7 @@ end
 					Labels.Status:SetText(Status)
 				end)
 				group(function()
-					if not Game.opMode() then
+					if not Game.plannerOn() then
 						Labels.UpNext:SetText("Switch on Smart Planner to see the plan")
 						return
 					end
@@ -39778,7 +40177,7 @@ end
 							)
 						)
 					end
-					local plan = Game.opMode() and Game.lastPlan
+					local plan = Game.plannerOn() and Game.lastPlan
 					if plan and plan.target then
 						table.insert(upgradeLines, string.format('<font color="#60d696">Saving for %s ($%s), pays back in %s</font>', plan.target.name, formatNumber(plan.target.cost), clockText(plan.target.payback)))
 					end
