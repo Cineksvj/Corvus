@@ -26103,15 +26103,12 @@ end)
             local SupportedGames = Info.SupportedGames or {
                 { Name = "+1 Stone Skipping", PlaceId = 111543903102439 },
                 { Name = "Anime Dice", PlaceId = 113290951185459 },
-                { Name = "Bizarre", PlaceId = 135621866300031 },
                 { Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
                 { Name = "Loot To Forge", PlaceId = 118805555015549 },
                 { Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
                 { Name = "Pets Universe", PlaceId = 74629631798007 },
                 { Name = "Ride A Pet", PlaceId = 124216119978534 },
-                { Name = "Steal An Egg", PlaceId = 107778070777162 },
                 { Name = "Steal From The Rich", PlaceId = 120475074479690 },
-                { Name = "Voltline Electric Scooters", PlaceId = 118315378611589 },
                 { Name = "Welcome to Bloxburg", PlaceId = 185655149 },
             }
             local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
@@ -34284,60 +34281,118 @@ do
 	Labels = {}
 	do
 		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
-		-- Auto Farm Everything = the planner: the full automatic farm (sells, rerolls, spends) over this toggle list.
-		N.FarmBestOn = { "SmartSpend", "AutoRoll", "AutoCollect", "AutoEquipBest", "AutoLevel", "AutoSell", "AutoEquipDice", "AutoBuyDice", "AutoUpgrade", "AutoRebirth", "AutoGear", "AutoDaily", "AutoGroup", "AutoOffline", "AutoFriend", "AutoCodes", "AutoQuests", "AutoTicketPasses", "AutoTower", "TowerEquipTeam", "AutoSpin", "AutoBoosts" }
-		N.FarmApplied = nil
-		-- Auto Farm Everything switches the whole planner list on and turns off exactly what it turned on.
-		function N.farmApply(value)
-			if value then
-				N.FarmApplied = N.FarmBestOn
-				for _, name in ipairs(N.FarmBestOn) do
-					local toggle = Toggles[name]
-					if toggle and not toggle.Value then
-						toggle:SetValue(true)
+			-- Auto Farm Everything: Mode "Best value" = the planner (sells, rerolls, spends for max profit over FarmBestOn);
+			-- Mode "My filters" = no planner, no destructive actions: only the loops picked in "Run", under the player's own filters.
+			N.FarmBestOn = { "SmartSpend", "AutoRoll", "AutoCollect", "AutoEquipBest", "AutoLevel", "AutoSell", "AutoEquipDice", "AutoBuyDice", "AutoUpgrade", "AutoRebirth", "AutoGear", "AutoDaily", "AutoGroup", "AutoOffline", "AutoFriend", "AutoCodes", "AutoQuests", "AutoTicketPasses", "AutoTower", "TowerEquipTeam", "AutoSpin", "AutoBoosts" }
+			N.FarmModes = { "Best value", "My filters" }
+			-- "Run" list of My filters: label -> toggles. Never Auto Sell, rerolls, spins, boosts, Smart Spending or rebirth.
+			N.FarmRunMap = {
+				{ "Auto Roll", { "AutoRoll" } },
+				{ "Collect Plot Cash", { "AutoCollect" } },
+				{ "Equip Best Units", { "AutoEquipBest" } },
+				{ "Equip Best Dice", { "AutoEquipDice" } },
+				{ "Equip Best Gear", { "AutoGear" } },
+				{ "Equip Best Team", { "TowerEquipTeam" } },
+				{ "Level Up Slots", { "AutoLevel" } },
+				{ "Buy Best Dice", { "AutoBuyDice" } },
+				{ "Buy Upgrades", { "AutoUpgrade" } },
+				{ "Auto Tower", { "AutoTower" } },
+				{ "Claim Daily Reward", { "AutoDaily" } },
+				{ "Claim Offline Cash", { "AutoOffline" } },
+				{ "Claim Group Reward", { "AutoGroup" } },
+				{ "Redeem Codes", { "AutoCodes" } },
+				{ "Claim Quests", { "AutoQuests" } },
+				{ "Auto Friend", { "AutoFriend" } },
+			}
+			N.FarmRunValues = {}
+			for _, entry in ipairs(N.FarmRunMap) do
+				table.insert(N.FarmRunValues, entry[1])
+			end
+			N.FarmApplied = nil
+			function N.farmMode()
+				local mode = Options.FarmMode and Options.FarmMode.Value
+				return if mode == "My filters" then "My filters" else "Best value"
+			end
+			-- The toggles the master switch turns on in the current mode.
+			function N.farmList()
+				if N.farmMode() == "Best value" then
+					return N.FarmBestOn
+				end
+				local picked = Options.FarmRun and Options.FarmRun.Value
+				local list = {}
+				if type(picked) == "table" then
+					for _, entry in ipairs(N.FarmRunMap) do
+						if picked[entry[1]] then
+							for _, name in ipairs(entry[2]) do
+								table.insert(list, name)
+							end
+						end
 					end
 				end
-			else
-				for _, name in ipairs(N.FarmApplied or N.FarmBestOn) do
-					local toggle = Toggles[name]
-					if toggle and toggle.Value then
-						toggle:SetValue(false)
+				return list
+			end
+			-- Switches the mode's list on and turns off exactly what it turned on (a re-apply also drops what was unpicked).
+			function N.farmApply(value)
+				if value then
+					local list = N.farmList()
+					local keep = {}
+					for _, name in ipairs(list) do
+						keep[name] = true
 					end
+					for _, name in ipairs(N.FarmApplied or {}) do
+						local toggle = Toggles[name]
+						if not keep[name] and toggle and toggle.Value then
+							toggle:SetValue(false)
+						end
+					end
+					N.FarmApplied = list
+					for _, name in ipairs(list) do
+						local toggle = Toggles[name]
+						if toggle and not toggle.Value then
+							toggle:SetValue(true)
+						end
+					end
+				else
+					for _, name in ipairs(N.FarmApplied or N.FarmBestOn) do
+						local toggle = Toggles[name]
+						if toggle and toggle.Value then
+							toggle:SetValue(false)
+						end
+					end
+					N.FarmApplied = nil
 				end
-				N.FarmApplied = nil
 			end
-		end
-		-- Confirmation card for Auto Farm Everything: the library modal (the toggle stays off until the player presses enable).
-		function N.askOP(onYes)
-			local gui = Library.ScreenGui
-			if not gui then
-				onYes()
-				return
+			-- Confirmation card for Auto Farm Everything in Best value: the library modal (the toggle stays off until the player presses enable).
+			function N.askOP(onYes)
+				local gui = Library.ScreenGui
+				if not gui then
+					onYes()
+					return
+				end
+				local shown = Library.ShowModal and Library:ShowModal({
+					Icon = "sparkles",
+					Title = "Enable Auto Farm Everything?",
+					Text = "Best value: the planner buys, sells, rerolls and spends for max profit. It can change or sell your items. For a safe version switch Mode to My filters and pick what it runs.",
+					Warning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
+					ConfirmText = "I understand, enable",
+					CancelText = "Cancel",
+					OnConfirm = onYes,
+				})
+				if not shown then
+					notify("Auto Farm Everything", "Could not open the confirmation, nothing was changed", 4)
+				end
 			end
-			local shown = Library.ShowModal and Library:ShowModal({
-				Icon = "sparkles",
-				Title = "Enable Auto Farm Everything?",
-				Text = "Full automatic: the planner buys, sells, rerolls and spends for max profit. It can change or sell your items. For a safe version use Auto Farm Everything and pick what it includes.",
-				Warning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
-				ConfirmText = "I understand, enable OP",
-				CancelText = "Cancel",
-				OnConfirm = onYes,
-			})
-			if not shown then
-				notify("Auto Farm Everything OP", "Could not open the confirmation, nothing was changed", 4)
-			end
-		end
 			N.OPWarning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
 			N.BootAt = os.clock()
 			QuickBox:AddToggle("AutoFarmBest", {
 				Text = "Auto Farm Everything",
 				Default = false,
-				Tooltip = "The planner rolls, buys, sells, rerolls and spends for max profit and can change or sell your items. " .. N.OPWarning .. " Asks to confirm.",
+				Tooltip = "Best value: the planner rolls, buys, sells, rerolls and spends for max profit and can change or sell your items (asks to confirm). My filters: only runs what you pick in Run, under your own filters. Never saved, always starts off.",
 				Callback = function(value)
 					if N.FarmBusy then
 						return
 					end
-					if value and not N.OPConfirmed then
+					if value and N.farmMode() == "Best value" and not N.OPConfirmed then
 						-- Stays off until the player confirms on the card. A config load never turns it on.
 						N.FarmBusy = true
 						Toggles.AutoFarmBest:SetValue(false)
@@ -34354,29 +34409,47 @@ do
 						end)
 						return
 					end
-					if N.saveOPState then
-						N.saveOPState()
-					end
 					task.defer(function()
 						if value then
-							log("MODE", "OP")
+							log("MODE", N.farmMode())
 						end
 						N.farmApply(value)
 					end)
 				end,
 			})
-			QuickBox:AddToggle("RememberFarm", {
-				Text = "Remember Auto Farm Everything",
-				Default = false,
-				Tooltip = "Off (default): Auto Farm Everything always starts switched off. On: it starts again by itself after a rejoin, without asking. " .. N.OPWarning,
+			QuickBox:AddDropdown("FarmMode", {
+				Text = "Mode",
+				Values = N.FarmModes,
+				Default = "Best value",
+				Tooltip = "Best value: the planner decides everything for max profit (respects Exclude). My filters: no planner and no selling or rerolling, only the loops you pick in Run, using your dice, sell and keep choices",
 				Callback = function()
-					if N.saveOPState then
-						N.saveOPState()
+					local run = Options.FarmRun
+					if run and run.SetVisible then
+						run:SetVisible(N.farmMode() == "My filters")
+					end
+					-- A mode change while running stops the farm (Best value needs its confirmation again).
+					if on("AutoFarmBest") then
+						Toggles.AutoFarmBest:SetValue(false)
+						notify("Auto Farm Everything", "Mode changed, switch it on again", 4)
+					end
+				end,
+			})
+			QuickBox:AddDropdown("FarmRun", {
+				Text = "Run",
+				Values = N.FarmRunValues,
+				Default = N.FarmRunValues,
+				Multi = true,
+				AllowNull = true,
+				Visible = false,
+				Tooltip = "What Auto Farm Everything runs in My filters mode. Nothing here sells, rerolls, spins, boosts or spends by a plan",
+				Callback = function()
+					if on("AutoFarmBest") and N.farmMode() == "My filters" then
+						N.farmApply(true)
 					end
 				end,
 			})
 			QuickBox:AddLabel({
-				Text = '<font color="#ff8a5c">' .. N.OPWarning .. " With Remember on it restarts by itself next time.</font>",
+				Text = '<font color="#ff8a5c">Best value: ' .. N.OPWarning .. "</font>",
 				DoesWrap = true,
 			})
 			QuickBox:AddToggle("AutoRoll", {
@@ -35555,12 +35628,11 @@ do
 		})
 	end
 end
--- Auto Farm Everything and Remember are never part of a saved config (see Remember in p10).
+-- The Auto Farm Everything master toggle is never part of a saved config and never restored.
 	pcall(function()
 		if type(SaveManager) == "table" then
 			SaveManager.Ignore = SaveManager.Ignore or {}
 			SaveManager.Ignore.AutoFarmBest = true
-			SaveManager.Ignore.RememberFarm = true
 		end
 	end)
 	if Window.AddSettingsTab then
@@ -35589,42 +35661,6 @@ else
 		SaveManager:LoadAutoloadConfig()
 	end)
 end
--- Remember Auto Farm Everything: it and its Remember switch are never part of a saved config (SaveManager.Ignore),
--- only of Corvus/AD_auto_farm.json, and it is restored only when Remember is on.
-do
-	local OPFile = "Corvus/AD_auto_farm.json"
-	function N.saveOPState()
-		if N.OPRestoring or os.clock() - (N.BootAt or 0) < 6 then
-			return
-		end
-		pcall(function()
-			if makefolder and isfolder and not isfolder("Corvus") then
-				makefolder("Corvus")
-			end
-			writefile(OPFile, HttpService:JSONEncode({ remember = on("RememberFarm"), op = on("RememberFarm") and on("AutoFarmBest") }))
-		end)
-	end
-	function N.restoreOP()
-		local ok, data = pcall(function()
-			return HttpService:JSONDecode(readfile(OPFile))
-		end)
-		if not ok or type(data) ~= "table" or data.remember ~= true or not alive() then
-			return
-		end
-		N.OPRestoring = true
-		pcall(function()
-			Toggles.RememberFarm:SetValue(true)
-			if data.op == true and not on("AutoFarmBest") then
-				N.OPConfirmed = true
-				Toggles.AutoFarmBest:SetValue(true)
-				N.OPConfirmed = false
-				log("OP restored (Remember Auto Farm Everything)")
-			end
-		end)
-		N.OPRestoring = false
-	end
-	task.delay(6.5, N.restoreOP)
-end
 -- Recommended Settings: safe filters, then Auto Farm Everything.
 function N.recommended()
 	local function set(name, value)
@@ -35640,6 +35676,7 @@ function N.recommended()
 	set("KeepMutations", { Emerald = true, Diamond = true, Ruby = true, Rainbow = true })
 	set("TicketPassFirst", "Roll Speed")
 	set("AutoKnownCodes", true)
+	set("FarmMode", "Best value")
 	if not on("AutoFarmBest") then
 		set("AutoFarmBest", true)
 	end
