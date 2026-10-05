@@ -30525,6 +30525,48 @@ do
 			jh.net:FireServer({ Type = "ExitBuild" })
 		end)
 	end
+	-- Auto Needs: the normal "use this object" packets for objects on YOUR OWN plot (sleep, shower, TV, quick meal
+	-- from your fridge), eating what you hold, getting up, and the teleport to your plot.
+	local AllowedNeedsFire = { Interact = true, TakeQuickFood = true, EatEquipped = true, Detach = true }
+	local AllowedNeedsInvoke = { ToPlot = true, GetPlayerObjectiveDailyState = true }
+	function N.needsFire(packet)
+		local jh = N.jobHandler()
+		if not (jh and AllowedNeedsFire[packet.Type]) then
+			log("BLOCKED needs", tostring(packet.Type))
+			return false
+		end
+		if packet.Type == "Interact" then
+			local plot = N.myPlot and N.myPlot()
+			if not (plot and typeof(packet.Target) == "Instance" and packet.Target:IsDescendantOf(plot)) then
+				log("BLOCKED needs", "Interact outside your plot", brief(packet.Target))
+				return false
+			end
+		end
+		local ok, err = pcall(function()
+			jh.net:FireServer(packet)
+		end)
+		log("NEEDS send", packet.Type, brief(packet.Target), tostring(packet.Path or packet.Name or ""), if ok then "" else "failed: " .. tostring(err))
+		return ok
+	end
+	function N.needsInvoke(packet, timeout)
+		local jh = N.jobHandler()
+		if not (jh and AllowedNeedsInvoke[packet.Type]) then
+			log("BLOCKED needs", tostring(packet.Type))
+			return false, nil
+		end
+		local box = { done = false }
+		task.spawn(function()
+			box.ok, box.result = pcall(function()
+				return jh.net:InvokeServer(packet)
+			end)
+			box.done = true
+		end)
+		local started = os.clock()
+		while not box.done and os.clock() - started < (timeout or 20) do
+			task.wait(0.05)
+		end
+		return box.done and box.ok, box.result
+	end
 	function N.jobFire(packet)
 		local jh = N.jobHandler()
 		if not (jh and AllowedJob[packet.Type]) then
@@ -34654,6 +34696,718 @@ do
 		task.wait(if worked then N.actionDelay() else 0.25)
 	end
 end
+-- Auto Needs. Bloxburg keeps four moods in ClientStats "MoodData" (StringValue = mood name, children Energy, Hunger,
+-- Hygiene, Fun = 0..100, each with a Rate child). The server computes the shift Efficiency (pay factor, 0..1); the
+-- dump shows players with near full moods at 0.80 and with moods around 25 at 0.70, so the link is weak and unknown:
+-- the hub measures it (MOOD lines next to EFF) and fits the slope k of efficiency over the mean mood. Restoring a need
+-- costs time away from the job (teleport home, walk, the action: sleep is the long one) and sometimes money (a quick
+-- meal), so a trip is taken when the expected pay loss from the falling moods beats that cost, or when a safety
+-- floor is hit (mood below the floor, efficiency below the floor). Everything uses the game's own interactions on
+-- YOUR OWN plot: InteractionData:GetData lists the object's buttons ("I_Sleep", "I_Use" shower, "I_TurnOn" +
+-- "I_Watch" TV, "I_TakeQuickMeal" fridge) and the hub sends the same Interact {Target, Path} the menu click sends.
+-- Cheapest items per need (dump prices): bed "Standard Single Bed" $200 (Comfort 5), shower "Hygienic Shower" $340
+-- (Hygiene 3), TV "NYX VintageView TV" $400 (Fun 3), fridge "Icebox Fridge" $500; quick meals cost their CookPrice.
+-- Server mood rates from the dump: Sleeping Energy +2 + Comfort*0.3, Shower Hygiene +2 + Hygiene*0.25, Watching TV
+-- Fun +1.5 + Fun*0.2 (and Energy -0.4, Hygiene -0.3); idle decay Fun -0.2, Hunger -0.2, Energy -0.15, Hygiene -0.1
+-- (unit unknown, the hub measures per minute). Also: work session limit with a break, and the daily objectives log.
+N.Needs = {
+	names = { "Energy", "Hunger", "Hygiene", "Fun" },
+	decay = {}, -- measured mood loss per minute (positive numbers)
+	restore = {}, -- measured mood gain per minute while restoring
+	samples = {},
+	fails = {},
+	backoff = {},
+	missingAt = {},
+	model = { k = 0.15, n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0 },
+	active = false,
+	reason = nil,
+	plan = {},
+	planAt = -1e9,
+	tripAt = -1e9,
+	trips = 0,
+	workSeconds = 0,
+	workAt = nil,
+	breakUntil = 0,
+	breaks = 0,
+	travel = 60,
+	text = "",
+	objAt = -1e9,
+	moodLogAt = -1e9,
+}
+do
+	local Q = N.Needs
+	local REFILL = 70 -- a need under this joins the trip once a trip is taken
+	local TARGET = 95
+	local HORIZON_H = 2
+	local MAX_RESTORE = 25 * 60
+	local Keys = {
+		Energy = { "I_Sleep" },
+		Hygiene = { "I_Use", "I_UseShower", "I_UseBathtub" },
+		Fun = { "I_Watch" },
+		Hunger = { "I_TakeQuickMeal" },
+	}
+	local Types = {
+		Energy = { "Beds", "CanSleep" },
+		Hygiene = { "Shower", "TubShowerCombo", "Bathtub" },
+		Fun = { "TV" },
+		Hunger = { "Fridge" },
+	}
+	-- restore rate priors per minute (server formulas with the cheapest item's stat)
+	local RestorePrior = { Energy = 3.5, Hygiene = 2.75, Fun = 2.1, Hunger = 60 }
+	local DecayPrior = { Energy = 0.15, Hunger = 0.2, Hygiene = 0.1, Fun = 0.2 }
+
+	local function moodStat()
+		local jh = N.jobHandler()
+		return jh and isolated(function()
+			return jh.Modules.ClientStats:GetStat("MoodData")
+		end)
+	end
+	-- {Energy = 0..100, ...}, {Energy = game rate, ...}, mood name
+	function N.moods()
+		local stat = moodStat()
+		if typeof(stat) ~= "Instance" then
+			return nil
+		end
+		local values, rates = {}, {}
+		for _, name in ipairs(Q.names) do
+			local v = stat:FindFirstChild(name)
+			if v and type(v.Value) == "number" then
+				values[name] = math.clamp(v.Value, 0, 100)
+				local r = v:FindFirstChild("Rate")
+				rates[name] = r and tonumber(r.Value) or 0
+			end
+		end
+		if next(values) == nil then
+			return nil
+		end
+		return values, rates, tostring(stat.Value)
+	end
+	local function meanMood(values)
+		local sum, n = 0, 0
+		for _, name in ipairs(Q.names) do
+			if values[name] then
+				sum += values[name]
+				n += 1
+			end
+		end
+		return if n > 0 then sum / n else 100
+	end
+	function N.moodText()
+		local values, _, name = N.moods()
+		if not values then
+			return "moods unknown"
+		end
+		return string.format("%s  E %d%%  H %d%%  Hy %d%%  F %d%%", name or "?", values.Energy or -1, values.Hunger or -1, values.Hygiene or -1, values.Fun or -1)
+	end
+	local function decayOf(name, rates)
+		local measured = Q.decay[name]
+		if measured and measured.n >= 3 then
+			return math.max(measured.v, 0.01)
+		end
+		local gameRate = rates and rates[name]
+		if gameRate and gameRate < 0 then
+			return -gameRate
+		end
+		return DecayPrior[name]
+	end
+	local function restoreRate(name)
+		local measured = Q.restore[name]
+		if measured and measured.n >= 1 then
+			return math.max(measured.v, 0.2)
+		end
+		return RestorePrior[name]
+	end
+	-- natural decay per minute, measured from 10 s samples while nothing restores the need
+	local function sampleDecay(values)
+		local now = os.clock()
+		local attached = N.attachWeld() ~= nil
+		for _, name in ipairs(Q.names) do
+			local v = values[name]
+			local last = Q.samples[name]
+			if v and last and not Q.active and not attached and now - last.at >= 10 and now - last.at <= 40 then
+				local perMin = (last.v - v) / (now - last.at) * 60
+				if perMin >= 0 and perMin < 5 then
+					local d = Q.decay[name] or { v = perMin, n = 0 }
+					d.v = if d.n == 0 then perMin else d.v * 0.9 + perMin * 0.1
+					d.n += 1
+					Q.decay[name] = d
+				end
+			end
+			if v and (not last or now - last.at >= 10) then
+				Q.samples[name] = { v = v, at = now }
+			end
+		end
+	end
+	-- efficiency over the mean mood while working: eff = a + k * mean/100
+	local function sampleModel(values, eff)
+		if not (eff and eff > 0 and N.currentJob() ~= "") then
+			return
+		end
+		local m = Q.model
+		local x = meanMood(values) / 100
+		m.n += 1
+		m.sx += x
+		m.sy += eff
+		m.sxx += x * x
+		m.sxy += x * eff
+		if m.n >= 10 then
+			local varx = m.sxx / m.n - (m.sx / m.n) ^ 2
+			if varx > 0.01 then
+				local k = (m.sxy / m.n - m.sx / m.n * m.sy / m.n) / varx
+				m.k = math.clamp(k, 0, 1)
+			end
+		end
+	end
+	-- $/h of the job you work now (lifetime measurement), else the session rate
+	local function payRate()
+		local key = N.currentJob()
+		local entry = key ~= "" and N.Pay.jobs[key]
+		if entry and (entry.seconds or 0) >= 120 then
+			return entry.money / entry.seconds * 3600
+		end
+		local best = 0
+		for _, e in pairs(N.Pay.jobs) do
+			if type(e) == "table" and (e.seconds or 0) >= 300 then
+				best = math.max(best, e.money / e.seconds * 3600)
+			end
+		end
+		if best > 0 then
+			return best
+		end
+		local elapsed = math.max(os.clock() - Session.started, 60)
+		return Session.earned / elapsed * 3600
+	end
+	N.payRate = payRate
+
+	-- Logs MOOD every 60 s (next to EFF) and feeds the measurements.
+	function N.moodTick(eff)
+		local values, rates = N.moods()
+		if not values then
+			return
+		end
+		sampleDecay(values)
+		sampleModel(values, eff)
+		if os.clock() - Q.moodLogAt >= 60 then
+			Q.moodLogAt = os.clock()
+			local d = {}
+			for _, name in ipairs(Q.names) do
+				local m = Q.decay[name]
+				table.insert(d, string.format("%s=%.3f%s", name, decayOf(name, rates), if m and m.n >= 3 then "" else "?"))
+			end
+			log("MOOD", string.format("energy=%d%% hunger=%d%% hygiene=%d%% fun=%d%% eff=%s", values.Energy or -1, values.Hunger or -1, values.Hygiene or -1, values.Fun or -1, tostring(eff)), "decay/min", table.concat(d, " "), "k", string.format("%.2f", Q.model.k), "n", Q.model.n, "rates", brief(rates))
+		end
+	end
+
+	-- Your plot's objects for every need: the game's item data tells the type and stat of each placed model.
+	local function plotObjects()
+		local plot = N.myPlot()
+		local house = plot and plot:FindFirstChild("House")
+		if not house then
+			return {}
+		end
+		local jh = N.jobHandler()
+		local root = N.root()
+		local found = isolated(function()
+			local list = {}
+			for _, model in ipairs(house:GetDescendants()) do
+				if model:IsA("Model") then
+					local ok, item = pcall(function()
+						return jh.Items:GetItemFromObject(model)
+					end)
+					if ok and type(item) == "table" and type(item.IsType) == "function" then
+						for need, types in pairs(Types) do
+							for _, kind in ipairs(types) do
+								local okType, yes = pcall(item.IsType, item, kind)
+								if okType and yes then
+									local stat = 0
+									pcall(function()
+										stat = item:GetStat(if need == "Energy" then "Comfort" else need, 0)
+									end)
+									local pos = N.posOf(model)
+									table.insert(list, { need = need, object = model, kind = kind, name = tostring(item.Name or model.Name), stat = tonumber(stat) or 0, pos = pos, dist = if pos and root then (pos - root.Position).Magnitude else 1e9 })
+									break
+								end
+							end
+						end
+					end
+				end
+			end
+			return list
+		end)
+		return if type(found) == "table" then found else {}
+	end
+	local function bestObject(objects, need)
+		local best
+		for _, o in ipairs(objects) do
+			if o.need == need and o.pos and (not best or o.stat > best.stat or (o.stat == best.stat and o.dist < best.dist)) then
+				best = o
+			end
+		end
+		return best
+	end
+
+	-- The interaction list the game's menu would show for this object: index i and raw title of each button.
+	local function findInteraction(target, keys)
+		local jh = N.jobHandler()
+		local root = N.root()
+		if not (jh and root) then
+			return nil
+		end
+		return isolated(function()
+			local menu = { Path = "", IsCustom = false, Target = target, MouseTarget = nil, GetPosition = function()
+				return root.Position
+			end }
+			local data = jh.Shared.InteractionData:GetData(target, LocalPlayer, menu)
+			if type(data) ~= "table" then
+				return nil, nil, "no data"
+			end
+			local titles, hit, hitTitle = {}, nil, nil
+			for i, fn in pairs(data) do
+				if type(fn) == "function" then
+					local ok, title = pcall(fn, target)
+					if ok and title ~= nil then
+						local raw = tostring(title)
+						table.insert(titles, tostring(i) .. ":" .. raw)
+						if not hit then
+							for _, key in ipairs(keys) do
+								if raw == key then
+									hit, hitTitle = i, raw
+								end
+							end
+						end
+					end
+				end
+			end
+			return hit, hitTitle, table.concat(titles, ",")
+		end)
+	end
+	local function interact(target, keys)
+		local index, title, all = findInteraction(target, keys)
+		if not index then
+			log("NEEDS no button", brief(target), "wanted", table.concat(keys, "/"), "has", tostring(all))
+			return false
+		end
+		return N.needsFire({ Type = "Interact", Target = target, Path = tostring(index) }), title
+	end
+
+	-- Walks with the game's pathfinding (plots have walls), then the plain walk for the last studs.
+	function N.pathWalk(pos, near, timeout)
+		local root = N.root()
+		if not root then
+			return false
+		end
+		local deadline = os.clock() + (timeout or 40)
+		local ok, path = pcall(function()
+			local p = game:GetService("PathfindingService"):CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })
+			p:ComputeAsync(root.Position, pos)
+			return p
+		end)
+		if ok and path and path.Status == Enum.PathStatus.Success then
+			local points = path:GetWaypoints()
+			for i = 2, #points do
+				local wp = points[i]
+				if os.clock() > deadline or not alive() then
+					return false
+				end
+				if wp.Action == Enum.PathWaypointAction.Jump then
+					local hum = N.humanoid()
+					if hum then
+						hum.Jump = true
+					end
+				end
+				N.walkTo(wp.Position, 2.5, 6)
+			end
+		end
+		return N.walkTo(pos, near or 4, math.max(5, deadline - os.clock()))
+	end
+	-- The game's own "go to my plot" teleport (HouseHandler:ToPlot = InvokeServer ToPlot).
+	function N.goHome()
+		local root = N.root()
+		local plot = N.myPlot()
+		if not (root and plot) then
+			log("NEEDS no plot", "Plot_" .. LocalPlayer.Name, "not found")
+			return false
+		end
+		if N.plotAt(root.Position) == plot then
+			return true
+		end
+		local jh = N.jobHandler()
+		N.detach()
+		local started = os.clock()
+		local called = N.callModule(25, jh and jh.Modules.HouseHandler, "ToPlot")
+		if called == nil then
+			N.needsInvoke({ Type = "ToPlot" }, 25)
+		end
+		local there = waitFor(function()
+			local r = N.root()
+			return r ~= nil and N.plotAt(r.Position) == plot
+		end, 15)
+		log("NEEDS home", if there then "ok" else "failed", "after", math.floor(os.clock() - started), "s")
+		return there
+	end
+
+	-- Quick meal choice: the game's own list (QuickFoods not hidden/locked), the cheapest you can cook, never portion
+	-- trays (they must be placed on a counter first); the daily objective's quick food first when it is still open.
+	local function quickFood()
+		local jh = N.jobHandler()
+		local wantId = 0
+		pcall(function()
+			local modules = ReplicatedStorage:FindFirstChild("Modules")
+			modules = modules and modules:FindFirstChild("ObjectivesShared")
+			local v = modules and modules:FindFirstChild("DailyQuickFoodID")
+			wantId = v and tonumber(v.Value) or 0
+		end)
+		local pick = isolated(function()
+			local list = {}
+			for _, item in pairs(jh.Items.QuickFoods) do
+				local okHidden, hidden = pcall(item.IsHidden, item, LocalPlayer)
+				local okLocked, locked = pcall(item.IsLocked, item, LocalPlayer)
+				if okHidden and okLocked and not hidden and not locked and not item.PortionItem and not item.PortionItems and not item.CookECPrice then
+					table.insert(list, { name = tostring(item.Name), price = tonumber(item.CookPrice) or 0, skill = tonumber(item.CookSkill) or 0, id = tonumber(item.ID) or 0 })
+				end
+			end
+			table.sort(list, function(a, b)
+				if a.skill ~= b.skill then
+					return a.skill < b.skill
+				end
+				return a.price < b.price
+			end)
+			for _, f in ipairs(list) do
+				if wantId > 0 and f.id == wantId and Q.objQuickFoodOpen then
+					return f, #list
+				end
+			end
+			return list[1], #list
+		end)
+		return pick
+	end
+
+	-- One need at one object. Returns ok. Sleep/shower/TV: interact, wait until the value reaches the target (or
+	-- the time cap), then get up (the game's Detach). Fridge: interact, answer the quick meal pick, eat it.
+	local function restoreNeed(need, object, deadline)
+		local values = N.moods()
+		local before = values and values[need] or 0
+		setStatus(string.format("Needs: %s at %s (%d%%)", need, object.name, before))
+		if not N.pathWalk(object.pos, 4, 45) then
+			log("NEEDS walk failed", need, object.name, "dist", math.floor(object.dist))
+			return false
+		end
+		task.wait(0.3)
+		local ok, title
+		if need == "Fun" then
+			local data = object.object:FindFirstChild("ObjectData")
+			local isOn = data and data:FindFirstChild("IsOn")
+			if isOn and isOn.Value == false then
+				interact(object.object, { "I_TurnOn" })
+				waitFor(function()
+					return isOn.Value == true
+				end, 4)
+				task.wait(0.5)
+			end
+		end
+		ok, title = interact(object.object, Keys[need])
+		if not ok then
+			return false
+		end
+		local started = os.clock()
+		if need == "Hunger" then
+			local food, count = quickFood()
+			if not food then
+				log("NEEDS no quick food", "list", tostring(count))
+				N.detach()
+				return false
+			end
+			local price = food.price
+			if N.money() < price then
+				log("NEEDS cannot afford", food.name, "$" .. price)
+				N.detach()
+				return false
+			end
+			task.wait(0.6)
+			N.needsFire({ Type = "TakeQuickFood", Name = food.name })
+			local held = waitFor(function()
+				return N.heldName() ~= ""
+			end, 6)
+			log("NEEDS food", food.name, "$" .. price, "held", tostring(N.heldName()), if held then "" else "(nothing equipped)")
+			task.wait(0.8)
+			N.detach()
+			task.wait(0.4)
+			N.needsFire({ Type = "EatEquipped", IsQuick = true })
+			waitFor(function()
+				local v = N.moods()
+				return v ~= nil and v[need] >= math.min(TARGET, before + 15)
+			end, 25)
+			task.wait(1)
+		else
+			local attached = waitFor(function()
+				return N.attachWeld() ~= nil
+			end, 5)
+			if not attached then
+				log("NEEDS not attached", need, object.name, "button", tostring(title))
+				return false
+			end
+			local lastLog = os.clock()
+			while alive() and on("AutoJob") do
+				values = N.moods()
+				local v = values and values[need] or 100
+				if v >= TARGET then
+					break
+				end
+				if os.clock() - started > MAX_RESTORE or os.clock() > deadline then
+					log("NEEDS time cap", need, "at", math.floor(v), "% after", math.floor(os.clock() - started), "s")
+					break
+				end
+				if N.attachWeld() == nil and os.clock() - started > 8 then
+					log("NEEDS detached early", need, "at", math.floor(v), "%")
+					break
+				end
+				if os.clock() - lastLog >= 60 then
+					lastLog = os.clock()
+					log("NEEDS progress", need, math.floor(v), "% after", math.floor(os.clock() - started), "s")
+				end
+				setStatus(string.format("Needs: %s at %s (%d%% -> %d%%)", need, object.name, v, TARGET))
+				task.wait(2)
+			end
+			N.detach()
+			task.wait(0.5)
+		end
+		values = N.moods()
+		local after = values and values[need] or before
+		local minutes = math.max((os.clock() - started) / 60, 0.05)
+		local gained = after - before
+		if gained > 1 then
+			local r = Q.restore[need] or { v = gained / minutes, n = 0 }
+			r.v = if r.n == 0 then gained / minutes else r.v * 0.7 + gained / minutes * 0.3
+			r.n += 1
+			Q.restore[need] = r
+		end
+		local success = gained >= 5
+		log("NEEDS do", need, "via", object.name, "ok=" .. tostring(success), string.format("%d%% -> %d%% in %ds (%.2f/min)", before, after, math.floor(minutes * 60), gained / minutes))
+		return success
+	end
+
+	-- Plans the trip (every 30 s while working). Returns the reason string when a trip is due, else nil.
+	function N.needsDue()
+		local now = os.clock()
+		if Q.active or now - Q.planAt < 30 or now < (Q.pausedUntil or 0) then
+			return nil
+		end
+		Q.planAt = now
+		-- work session clock and the break
+		local job = N.currentJob()
+		if job ~= "" then
+			if Q.workAt then
+				Q.workSeconds += now - Q.workAt
+			end
+			Q.workAt = now
+		else
+			Q.workAt = nil
+		end
+		local maxWork = optionNumber("WorkSessionMax", 210) * 60
+		if maxWork > 0 and Q.workSeconds >= maxWork and on("AutoNeeds") then
+			return "break"
+		end
+		if not on("AutoNeeds") then
+			return nil
+		end
+		local values, rates = N.moods()
+		if not values then
+			return nil
+		end
+		local eff = N.efficiency()
+		eff = if eff and eff > 0 then eff else 1
+		local R = payRate()
+		local floorPct = optionNumber("NeedFloor", 25)
+		local effFloor = optionNumber("EffFloor", 70) / 100
+		local k = Q.model.k
+		local need, floorHit, gain, cost, lines = {}, nil, 0, 0, {}
+		local lowest, lowestV = nil, 101
+		for _, name in ipairs(Q.names) do
+			local v = values[name]
+			-- a need the plot cannot restore (nothing placed, or 3 failures) does not start trips for 15 min
+			local blocked = now - (Q.missingAt[name] or -1e9) < 900 or now - (Q.backoff[name] or -1e9) < 900
+			if v and not blocked then
+				if v < lowestV then
+					lowest, lowestV = name, v
+				end
+				if v <= floorPct then
+					floorHit = name
+				end
+				if v < REFILL then
+					local d = decayOf(name, rates)
+					local avgNext = math.max(0, v - d * 30)
+					local lossPerHour = R * k / 4 * (100 - avgNext) / 100
+					local seconds = if name == "Hunger" then 30 else math.clamp((TARGET - v) / restoreRate(name) * 60, 20, MAX_RESTORE)
+					local price = if name == "Hunger" then 15 else 0
+					table.insert(need, name)
+					gain += lossPerHour * HORIZON_H
+					cost += R * eff * seconds / 3600 + price
+					table.insert(lines, string.format("NEEDS plan %s cost=%ds lossPerHour=$%d value=%d%% decay=%.3f/min", name, math.floor(seconds), math.floor(lossPerHour), v, d))
+				end
+			end
+		end
+		if #need == 0 then
+			Q.text = "all fine"
+			return nil
+		end
+		cost += R * eff * Q.travel / 3600
+		local effHit = eff < effFloor and lowestV < 60
+		Q.plan = need
+		Q.text = string.format("%s low (%d%%), trip worth $%d vs cost $%d", lowest, lowestV, math.floor(gain), math.floor(cost))
+		local reason
+		if floorHit then
+			reason = "floor " .. floorHit .. " " .. math.floor(values[floorHit]) .. "%"
+		elseif effHit then
+			reason = string.format("efficiency %.2f < %.2f", eff, effFloor)
+		elseif gain > cost then
+			reason = string.format("profit: loss $%d/%dh > cost $%d", math.floor(gain), HORIZON_H, math.floor(cost))
+		end
+		if reason and now - Q.tripAt < 300 and not floorHit then
+			reason = nil
+		end
+		if reason then
+			for _, line in ipairs(lines) do
+				log(line)
+			end
+			log("NEEDS trip", reason, "rate $" .. math.floor(R) .. "/h", "eff", string.format("%.2f", eff), "k", string.format("%.2f", k), "travel", math.floor(Q.travel), "s")
+		end
+		return reason
+	end
+
+	-- Daily objectives: the state the game's Objectives app asks for (3 tasks, streak, reward 5000 + 750 * streak
+	-- capped at 4). The reward is paid by the server when the 3 tasks are done (no claim packet exists in the client).
+	function N.objectivesLog(why)
+		local jh = N.jobHandler()
+		local ok, state = N.needsInvoke({ Type = "GetPlayerObjectiveDailyState" }, 15)
+		if not (ok and type(state) == "table" and type(state.States) == "table") then
+			log("OBJ", why, "state unreadable", brief(state))
+			return
+		end
+		local descriptions = isolated(function()
+			return jh.Shared.ObjectivesShared:GetDailyDescriptions()
+		end)
+		local parts, done = {}, 0
+		for i, s in ipairs(state.States) do
+			local text = type(descriptions) == "table" and tostring(descriptions[i] or "?") or "?"
+			if type(s) == "table" and s.Completed then
+				done += 1
+			end
+			table.insert(parts, string.format("%d:%s[%s]", i, text, if type(s) == "table" and s.Completed then "done" else "open"))
+		end
+		local third = state.States[3]
+		Q.objQuickFoodOpen = type(third) == "table" and not third.Completed
+		local streak = tonumber(state.Streak) or 0
+		log("OBJ", why, string.format("done=%d/%d streak=%d reward=$%d", done, #state.States, streak, math.clamp(streak, 0, 4) * 750 + 5000), table.concat(parts, " | "))
+	end
+
+	-- The trip: leave the job, home, restore every need under the refill point (break: everything under 90 and sleep
+	-- until the break ends), then the main loop goes back to work by itself.
+	function N.needsRun(reason)
+		if Q.active then
+			return
+		end
+		Q.active = true
+		Q.reason = reason
+		local isBreak = reason == "break"
+		local started = os.clock()
+		local breakSeconds = optionNumber("BreakMinutes", 20) * 60
+		local deadline = if isBreak then started + breakSeconds else started + 60 * 60
+		log("NEEDS start", reason, N.moodText(), "money", N.money())
+		if isBreak then
+			Q.breaks += 1
+			log("BREAK start", "after", math.floor(Q.workSeconds / 60), "min of work, break", math.floor(breakSeconds / 60), "min")
+		end
+		setStatus("Needs: leaving the job (" .. tostring(reason) .. ")")
+		N.taxiRelease()
+		N.bbLeave()
+		N.cookLeave()
+		N.endShift()
+		task.wait(1)
+		local okRun, err = pcall(function()
+			if not N.goHome() then
+				Q.pausedUntil = os.clock() + 300
+				return
+			end
+			local arrived = os.clock()
+			Q.travel = math.clamp(Q.travel * 0.7 + (arrived - started) * 0.3 * 2, 20, 300)
+			local objects = plotObjects()
+			log("NEEDS plot objects", #objects, (function()
+				local names = {}
+				for _, o in ipairs(objects) do
+					table.insert(names, o.need .. "=" .. o.name .. "(" .. o.stat .. ")")
+				end
+				table.sort(names)
+				return table.concat(names, ", ")
+			end)())
+			local values = N.moods() or {}
+			local order = { "Hunger", "Hygiene", "Fun", "Energy" }
+			local limit = if isBreak then 90 else REFILL
+			for _, need in ipairs(order) do
+				local v = values[need]
+				if not alive() or not on("AutoJob") then
+					break
+				end
+				if v and v < limit and os.clock() - (Q.backoff[need] or -1e9) > 900 then
+					local object = bestObject(objects, need)
+					if not object then
+						if os.clock() - (Q.missingAt[need] or -1e9) > 900 then
+							Q.missingAt[need] = os.clock()
+							log("NEEDS missing", need, "no", table.concat(Types[need], "/"), "on your plot (cheapest: " .. ({ Energy = "Standard Single Bed $200", Hygiene = "Hygienic Shower $340", Fun = "NYX VintageView TV $400", Hunger = "Icebox Fridge $500" })[need] .. ")")
+							notify("Corvus", "Your plot has nothing for " .. need .. ". Place a cheap " .. ({ Energy = "bed", Hygiene = "shower", Fun = "TV", Hunger = "fridge" })[need] .. " so Auto Needs can keep your pay up.", 8)
+						end
+					else
+						local ok = restoreNeed(need, object, deadline)
+						if ok then
+							Q.fails[need] = 0
+						else
+							Q.fails[need] = (Q.fails[need] or 0) + 1
+							if Q.fails[need] >= 3 then
+								Q.fails[need] = 0
+								Q.backoff[need] = os.clock()
+								log("NEEDS unsupported", need, "3 failures, 15 min backoff")
+							end
+						end
+						values = N.moods() or values
+					end
+				end
+			end
+			if isBreak then
+				N.objectivesLog("break")
+				-- the rest of the break: sleep if a bed is there (energy is the slowest need), else wait at home
+				local bed = bestObject(objects, "Energy")
+				local v = N.moods()
+				if bed and v and v.Energy and v.Energy < 100 and os.clock() < deadline - 60 then
+					restoreNeed("Energy", bed, deadline)
+				end
+				while alive() and on("AutoJob") and os.clock() < deadline do
+					setStatus(string.format("Break: %s left", N.longTime(deadline - os.clock())))
+					task.wait(2)
+				end
+				N.detach()
+				Q.workSeconds = 0
+				Q.workAt = nil
+				log("BREAK end", N.moodText())
+			end
+		end)
+		if not okRun then
+			log("ERROR", "needs", tostring(err))
+		end
+		Q.trips += 1
+		Q.tripAt = os.clock()
+		Q.active = false
+		local eff = N.efficiency()
+		log("NEEDS done", "eff=" .. tostring(eff), N.moodText(), "took", math.floor(os.clock() - started), "s", "money", N.money())
+		setStatus("Needs done, back to work")
+	end
+	function N.needsStatus()
+		local line = N.moodText()
+		if Q.active then
+			return line .. "\nTrip: " .. tostring(Q.reason)
+		end
+		local maxWork = optionNumber("WorkSessionMax", 210) * 60
+		return string.format("%s\nPlan: %s\nWork session %s of %s, trips %d, breaks %d", line, Q.text ~= "" and Q.text or "-", N.longTime(Q.workSeconds), N.longTime(maxWork), Q.trips, Q.breaks)
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -34782,6 +35536,32 @@ do
 	})
 	local PayBox = Tabs.Jobs:AddRightGroupbox("Pay Per Job", "coins")
 	Labels.Pay = PayBox:AddLabel({ Text = "-", DoesWrap = true })
+	local NeedsBox = Tabs.Jobs:AddLeftGroupbox("Auto Needs", "heart-pulse")
+	NeedsBox:AddToggle("AutoNeeds", {
+		Text = "Auto Needs",
+		Default = true,
+		Tooltip = "Part of Auto Work: keeps Energy, Hunger, Hygiene and Fun up with your own bed, fridge, shower and TV. Low moods lower the shift efficiency (your pay) and at 0% you cannot work. Goes home only when the lost pay would cost more than the trip, or when a floor below is hit",
+	})
+	NeedsBox:AddLabel({
+		Text = '<font transparency="0.35">Needs a bed, a fridge, a shower and a TV on your plot (cheapest: Standard Single Bed $200, Icebox Fridge $500, Hygienic Shower $340, NYX VintageView TV $400). Quick meals cost their price.</font>',
+		DoesWrap = true,
+	})
+	NeedsBox:AddSlider("NeedFloor", { Text = "Never below", Default = 25, Min = 5, Max = 60, Rounding = 0, Suffix = "%", Tooltip = "Safety floor: a mood at or under this starts a trip home right away" })
+	NeedsBox:AddSlider("EffFloor", { Text = "Restore before efficiency", Default = 70, Min = 30, Max = 95, Rounding = 0, Suffix = "%", Tooltip = "Safety floor: shift efficiency under this (with a mood under 60%) starts a trip home" })
+	NeedsBox:AddSlider("WorkSessionMax", { Text = "Work session max", Default = 210, Min = 0, Max = 600, Rounding = 0, Suffix = " min", Tooltip = "After this much work the hub takes a break at home (needs and daily objectives). 0 = no breaks" })
+	NeedsBox:AddSlider("BreakMinutes", { Text = "Break", Default = 20, Min = 5, Max = 60, Rounding = 0, Suffix = " min" })
+	NeedsBox:AddButton({
+		Text = "Restore needs now",
+		Func = function()
+			if not on("AutoJob") then
+				notify("Corvus", "Turn Auto Work on first, the trip runs inside it", 4)
+				return
+			end
+			N.Needs.forced = true
+			notify("Corvus", "Going home to restore every need", 4)
+		end,
+	})
+	Labels.Needs = NeedsBox:AddLabel({ Text = "-", DoesWrap = true })
 
 	local CopyBox = Tabs.Build:AddLeftGroupbox("Copy a Plot", "copy")
 	CopyBox:AddLabel({
@@ -34933,6 +35713,7 @@ do
 			"Status: " .. tostring(Status),
 			"Running: " .. table.concat(Debug.running(), ", "),
 			"Job: " .. tostring(N.InfoText.job or "-") .. ", speed " .. optionText("JobSpeed", "Fast") .. ", job handler " .. tostring(N.jobHandler() ~= nil),
+			"Needs: " .. tostring(N.needsStatus and (string.gsub(N.needsStatus(), "\n", " | ")) or "-"),
 			"Perf: " .. Debug.perfText(),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
 			string.rep("-", 70),
@@ -35554,6 +36335,13 @@ do
 		end
 		if on("AutoJob") then
 			wasWorking = true
+			-- needs and breaks come first: the trip leaves the job, the next pass clocks in again
+			local due = if N.Needs.forced then "manual" else N.needsDue()
+			if due then
+				N.Needs.forced = nil
+				N.needsRun(due)
+				return
+			end
 			local pick = optionText("JobPick", "Hairdresser")
 			if pick == "Best Pay (auto)" then
 				pick = N.bestJobPick()
@@ -35615,6 +36403,16 @@ do
 					end
 				end
 				N.planTick()
+				-- moods every 10 s: decay and efficiency model samples, the MOOD log line every 60 s
+				if os.clock() - (N.Needs.sampleAt or -1e9) >= 10 then
+					N.Needs.sampleAt = os.clock()
+					N.moodTick((N.efficiency()))
+					if os.clock() - N.Needs.objAt >= 3600 then
+						N.Needs.objAt = os.clock()
+						task.spawn(N.objectivesLog, "hourly")
+					end
+				end
+				N.InfoText.needs = N.needsStatus()
 				N.InfoText.pay = N.payText() .. (if N.Plan.text ~= "" then "\n\n" .. N.Plan.text else "")
 				local job = N.currentJob()
 				N.InfoText.job = if job == "" then "not working" else job
@@ -35662,6 +36460,7 @@ do
 			if shown(Tabs.Jobs) then
 				group(function()
 					Labels.Pay:SetText(N.InfoText.pay or "-")
+					Labels.Needs:SetText(N.InfoText.needs or "-")
 				end)
 			end
 			if Labels.Build and shown(Tabs.Build) then
