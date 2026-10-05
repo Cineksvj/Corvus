@@ -30460,6 +30460,8 @@ do
 		["Potion/TryUsePotionRE"] = true,
 		["Class/LuckOnceRE"] = true,
 		["WorldBoss/TryClaimBossRewardRE"] = true,
+		["Season/LuckRE"] = true,
+		["Season/ExchangeGoodsRE"] = true,
 	}
 	local AllowedInvoke = {
 		["Profile/GetTotalDataRF"] = true,
@@ -30468,6 +30470,7 @@ do
 		["Index/TryClaimLevelRewardRF"] = true,
 		["Dungeon/TryIntoDungeonRF"] = true,
 		["Code/TryUseCodeRF"] = true,
+		["Backpack/EnhantEquipmentRF"] = true,
 	}
 	-- Bindable events are the game's own buttons: ExitFightBE is the Return button (banks the ores),
 	-- ATKOnceBE is one click of the attack button.
@@ -30662,6 +30665,9 @@ do
 	N.G.Dungeon = N.tableOr(safeRequire("Config.Dungeon.Helper"))
 	N.G.Any = N.tableOr(safeRequire("Config.AnyHelper"))
 	N.G.Balance = N.tableOr(safeRequire("Utils.BalanceUtils"))
+	N.G.SuperLoot = N.tableOr(safeRequire("Config.SuperLoot.Helper"))
+	N.G.Enhant = N.tableOr(safeRequire("Config.Enhant.Helper"))
+	N.G.Season = N.tableOr(safeRequire("Config.Season.Helper"))
 end
 local formatNumber, allows, selected, on, optionNumber, optionText, Status, setStatus, picked
 do
@@ -31036,6 +31042,10 @@ local Session = {
 	potions = 0,
 	classRolls = 0,
 	codes = 0,
+	superKills = 0,
+	enhances = 0,
+	seasonSpins = 0,
+	shopBuys = 0,
 	trainSeconds = 0,
 	bestStage = 0,
 	bestForge = nil,
@@ -31072,6 +31082,9 @@ N.R = {
 	attack = "Attack/ATKOnceBE",
 	attackEnemy = "Attack/AttackEnemyBE",
 	enemyHit = "Attack/EnemyHitBE",
+	seasonLuck = "Season/LuckRE",
+	seasonShop = "Season/ExchangeGoodsRE",
+	enhance = "Backpack/EnhantEquipmentRF",
 }
 do
 	-- Stages: the enemies live only on this client. Touching StageMap.AreaPart.Stage_N starts the stage, the
@@ -31235,7 +31248,9 @@ do
 		local points = if stageN then N.stagePoints(stageN) else nil
 		local me = N.myPos()
 		for _, model in ipairs(folder:GetChildren()) do
-			if enemyAlive(model) then
+			-- The Super Loot runner has its own hunter (it runs away and has 6-15 hits of HP): it must never count
+			-- as the stage's enemy or a stage would look "too strong" while it dodges.
+			if enemyAlive(model) and model:GetAttribute("EnemyID") ~= "Super_1" then
 				local pos = pivotOf(model)
 				if pos then
 					local near = true
@@ -31280,6 +31295,122 @@ do
 	end
 	function N.attackClick()
 		N.bindable(N.R.attack)
+	end
+	-- Super Loot: every 12 / 30 / 45 min the server sends a runner (RefreshSuperLootRE: rarity, uuid, ore id,
+	-- stage number, CFrame) that carries a Legendary / Eternal / Secret ore, the best ores of its stages (1-7,
+	-- 8-14, 15-22). It lives only on this client with 6 / 10 / 15 HP, and every EnemyHitBE on it is one hit
+	-- (the game's own handler turns each into 1/HP of its health). The kill sends KillSuperLootRE and drops the
+	-- ore model into OreCache like any other drop. Profit: one kill is one ore worth far more than a whole stage
+	-- run of common ores, for about 2 s of work. It is only hunted on stages the run can reach (<= target).
+	N.Super = { info = {}, tries = {}, kills = 0, last = "", pickUntil = 0, noted = {} }
+	N.onRemote("SuperLoot/RefreshSuperLootRE", function(rarity, uuid, oreId, stageNo)
+		if type(uuid) == "string" then
+			N.Super.info[uuid] = { rarity = tostring(rarity), ore = oreId, stage = tonumber(stageNo) }
+			log("SUPER spawned", tostring(rarity), "stage", tostring(stageNo), "ore", tostring(oreId))
+		end
+	end)
+	function N.superNearestStage(pos)
+		local best, bestDist
+		for n, cf in pairs(N.StageSpots) do
+			local dist = (cf.Position - pos).Magnitude
+			if not bestDist or dist < bestDist then
+				best, bestDist = n, dist
+			end
+		end
+		return best
+	end
+	function N.superList()
+		local folder = workspace:FindFirstChild("EnemyFolder")
+		local list = {}
+		if not folder then
+			return list
+		end
+		for _, model in ipairs(folder:GetChildren()) do
+			if model:GetAttribute("EnemyID") == "Super_1" and enemyAlive(model) then
+				local pos = pivotOf(model)
+				if pos then
+					local info = N.Super.info[model.Name] or {}
+					table.insert(list, {
+						model = model,
+						uuid = model.Name,
+						pos = pos,
+						rarity = info.rarity or "?",
+						stage = info.stage or N.superNearestStage(pos) or 1,
+					})
+				end
+			end
+		end
+		-- Deepest stage first: it carries the best ore.
+		table.sort(list, function(a, b)
+			return a.stage > b.stage
+		end)
+		return list
+	end
+	-- The runner worth going for right now (nil when none, or when it is on a stage the run cannot reach yet).
+	function N.superPick()
+		if not on("AutoSuperLoot") then
+			return nil
+		end
+		local target = N.stageTarget()
+		for _, entry in ipairs(N.superList()) do
+			if entry.stage <= target then
+				if (N.Super.tries[entry.uuid] or 0) < 4 then
+					return entry
+				end
+			elseif not N.Super.noted[entry.uuid] then
+				N.Super.noted[entry.uuid] = true
+				log("SUPER out of reach", entry.rarity, "stage", entry.stage, "target", target)
+			end
+		end
+		return nil
+	end
+	-- One step of the hunt, called inside the stage run. True when it used the step.
+	function N.superStep()
+		local entry = N.superPick()
+		if not entry then
+			return false
+		end
+		local packNow, packMax = N.pack()
+		if packNow >= packMax then
+			N.bank("pack full, super loot is up")
+			return true
+		end
+		if F.stage ~= entry.stage then
+			setStatus(string.format("Super loot (%s) is on stage %d, going there", entry.rarity, entry.stage))
+			log("SUPER going to stage", entry.stage, entry.rarity)
+			N.enterStage(entry.stage)
+			task.wait(0.4)
+			return true
+		end
+		local hits = (tonumber(N.call(N.G.SuperLoot.GetHP, entry.rarity)) or 15) + 2
+		N.Super.tries[entry.uuid] = (N.Super.tries[entry.uuid] or 0) + 1
+		setStatus(string.format("Super loot (%s) on stage %d: hitting it", entry.rarity, entry.stage))
+		local model = entry.model
+		local sent = 0
+		for _ = 1, hits do
+			if not model.Parent or not enemyAlive(model) then
+				break
+			end
+			local pos = pivotOf(model)
+			if pos then
+				N.standAt(pos, 3.5)
+			end
+			N.bindable(N.R.enemyHit, entry.uuid, 1, {})
+			sent += 1
+			task.wait(0.1)
+		end
+		if not model.Parent or not enemyAlive(model) then
+			N.Super.kills += 1
+			Session.superKills += 1
+			N.Super.pickUntil = os.clock() + 10
+			F.seen[F.stage] = true
+			N.Super.last = string.format("Killed a %s runner on stage %d", entry.rarity, entry.stage)
+			log("SUPER killed", entry.rarity, "stage", entry.stage, "hits", sent)
+		else
+			N.Super.last = string.format("The %s runner did not die after %d hits", entry.rarity, sent)
+			log("SUPER hit failed", entry.rarity, "stage", entry.stage, "hits", sent, "try", N.Super.tries[entry.uuid])
+		end
+		return true
 	end
 	-- Kill Aura: hits every client enemy in range through the game's own damage path (AttackEnemyBE with your
 	-- weapon's basic attack), so the damage is your real damage, just on all of them at once and without
@@ -31507,6 +31638,9 @@ do
 			N.bank(string.format("HP %d%%", math.floor(hp / maxHp * 100)))
 			return
 		end
+		if on("AutoSuperLoot") and N.superStep() then
+			return
+		end
 		local packNow, packMax = N.pack()
 		local enemies = N.enemies("EnemyFolder", F.stage)
 		if #enemies > 0 then
@@ -31552,7 +31686,7 @@ do
 		local target = N.stageTarget()
 		-- The pack is small and deeper stages drop better ores, so ores are only picked on the deepest stage of
 		-- the run (unless every stage is picked on purpose). Low stages are just cleared to unlock the next one.
-		local pickHere = optionText("PickOres", "Deepest stage only") == "Every stage" or F.stage >= target
+		local pickHere = optionText("PickOres", "Deepest stage only") == "Every stage" or F.stage >= target or os.clock() < N.Super.pickUntil
 		if pickHere and N.collectOne() then
 			setStatus(string.format("Stage %d: picking ores  \u{00B7}  pack %d/%d", F.stage, N.pack()))
 			return
@@ -31951,6 +32085,87 @@ do
 		end
 		return false
 	end
+	-- Gear enhance (Backpack/EnhantEquipmentRF(uuid, useProtect), opens at rebirth 6). Level L -> L+1 costs coins
+	-- and EnhantStone_1/_2 (the stones fall from every stage for free, the pack never holds them, so they are idle
+	-- capital) and succeeds with the chance in Config.Enhant.Config. Every level adds a boost to the item's main
+	-- stat, which the gear score already includes. Levels 1-5 are the cheap ones (26k coins and 135 stones in all,
+	-- 100%/100%/85%/75%/65%, about 6 tries for 5 levels) and a failed try below level 6 loses nothing but the cost, so the
+	-- default stops at +5. From +6 a failure can lower the item, so deeper levels are only tried on purpose (the
+	-- slider) and then with a Protection Scroll whenever one is in the pack. Only equipped gear is enhanced, the
+	-- weapon first (Train power), and a try needs coins x3 in the bank so upgrades stay funded.
+	N.Enhance = { last = "", tried = {}, pauseUntil = 0, refused = 0, tries = 0 }
+	function N.enhanceMaxLevel()
+		return math.clamp(math.floor(optionNumber("EnhanceMax", 5)), 1, 20)
+	end
+	function N.enhanceNext(item)
+		local config = N.call(N.G.Enhant.GetConfig)
+		if type(config) ~= "table" then
+			return nil
+		end
+		local level = tonumber(item.Level) or 0
+		local row = config[level + 1]
+		if type(row) ~= "table" then
+			return nil
+		end
+		local boostNow = tonumber(type(config[level]) == "table" and config[level].Boost) or 0
+		return {
+			level = level,
+			coin = tonumber(row.NeedCoin) or math.huge,
+			stone1 = tonumber(row.EnhantStone_1) or 0,
+			stone2 = tonumber(row.EnhantStone_2) or 0,
+			percent = tonumber(row.Percent) or 1,
+			gain = (1 + (tonumber(row.Boost) or 0)) / (1 + boostNow),
+		}
+	end
+	function N.enhanceStep()
+		local E = N.Enhance
+		if os.clock() < E.pauseUntil or N.rebirth() < 6 or N.fightMode() ~= nil then
+			return false
+		end
+		local bp = N.backpack()
+		local maxLevel = N.enhanceMaxLevel()
+		local failLevel = tonumber(N.call(N.G.Enhant.GetFailLevel)) or 6
+		for _, slot in ipairs({ "Weapon", "Armor", "Hat" }) do
+			local uuid = bp.equiped[slot]
+			local item = uuid and bp.have[uuid]
+			if type(item) == "table" then
+				local step = N.enhanceNext(item)
+				local last = E.tried[uuid]
+				if step and step.level < maxLevel and (not last or os.clock() - last > 5)
+					and N.material("EnhantStone_1") >= step.stone1 and N.material("EnhantStone_2") >= step.stone2
+					and N.coin() >= step.coin * 3 then
+					local protect = step.level >= failLevel and N.material("EnhantProtect") > 0
+					local coinBefore, stonesBefore = N.coin(), N.material("EnhantStone_1") + N.material("EnhantStone_2")
+					E.tried[uuid] = os.clock()
+					local ok, result = invoke(N.R.enhance, 10, uuid, protect)
+					E.tries += 1
+					Session.enhances += 1
+					task.wait(0.6)
+					local item2 = N.backpack().have[uuid]
+					local levelAfter = tonumber(type(item2) == "table" and item2.Level) or step.level
+					local spent = N.coin() < coinBefore or N.material("EnhantStone_1") + N.material("EnhantStone_2") < stonesBefore
+					if levelAfter > step.level then
+						E.refused = 0
+						E.last = string.format("%s %s +%d -> +%d", slot, N.itemName(slot, item.ID), step.level, levelAfter)
+					elseif spent then
+						E.refused = 0
+						E.last = string.format("%s %s +%d failed (%d%% chance), try again", slot, N.itemName(slot, item.ID), step.level, math.floor(step.percent * 100))
+					else
+						E.refused += 1
+						E.last = "The game did not take the enhance (" .. brief(result) .. ")"
+						if E.refused >= 3 then
+							E.pauseUntil = os.clock() + 600
+							E.refused = 0
+							logProblem("Enhance refused 3 times, resting 10 min (" .. brief(result) .. ")")
+						end
+					end
+					log("ENHANCE", slot, "level", step.level, "->", levelAfter, ok and "" or "no answer")
+					return true
+				end
+			end
+		end
+		return false
+	end
 	function N.rebirthNeed()
 		return tonumber(N.call(N.G.Rebirth.GetNeedLevel, N.rebirth() + 1))
 	end
@@ -32340,6 +32555,55 @@ do
 			fire(N.R.seasonAll)
 		end
 	end
+	-- Season Luck: the daily ticket (and the pass rewards) pay Season Tickets, a spin of 1 / 3 / 10 costs that many
+	-- (the game opens a Robux prompt only when you have fewer, so the hub never spins without the tickets). Every
+	-- prize is worth having (Enhance stones, Class rolls, Protection Scrolls, Season Coins, a weapon, coins), and an
+	-- unspent ticket earns nothing, so they are spun as soon as they arrive. 10 at once saves calls.
+	function N.seasonLuckStep()
+		local season = workspace:GetAttribute("Season")
+		local data = N.store("Season")
+		local mine = if season and type(data[season]) == "table" then data[season] else {}
+		local tickets = tonumber(mine.SeasonTicket) or 0
+		if tickets >= 1 and once("seasonLuck", 7) then
+			local n = if tickets >= 10 then 10 elseif tickets >= 3 then 3 else 1
+			fire(N.R.seasonLuck, n)
+			Session.seasonSpins += n
+			noteReward("Season luck x" .. n)
+		end
+	end
+	-- Season Shop: Season Coins have no other use, so everything is spent, strictly in this order (saving for the
+	-- first item that still has stock, 2-day stock refresh): tower ticket (one ticket = up to 50 floors of
+	-- rewards), Train potion, Class roll, Damage potion, Enhance stones (feed the gear enhance), Protection
+	-- Scroll, then the Season weapon and hats (bought last, the best gear is equipped by score anyway). The 2000
+	-- coin deal and the extra Season Ticket (800 coins for a spin worth less than that) are skipped.
+	N.SeasonShopOrder = { "12", "9", "5", "10", "8", "6", "4", "3", "2", "1" }
+	function N.seasonShopStep()
+		local season = workspace:GetAttribute("Season")
+		local data = N.store("Season")
+		local mine = if season and type(data[season]) == "table" then data[season] else {}
+		local coins = tonumber(mine.SeasonCoin) or 0
+		local goods = if type(mine.Goods) == "table" then mine.Goods else {}
+		local config = N.call(N.G.Season.GetGoodsConfig)
+		if type(config) ~= "table" then
+			return false
+		end
+		for _, id in ipairs(N.SeasonShopOrder) do
+			local row = config[id]
+			if type(row) == "table" then
+				local left = (tonumber(row.Store) or 0) - (tonumber(goods[id]) or 0)
+				if left > 0 then
+					if coins >= (tonumber(row.NeedSeasonCoin) or math.huge) and once("shop" .. id, 6) then
+						fire(N.R.seasonShop, id)
+						Session.shopBuys += 1
+						noteReward("Season shop " .. tostring(row.ID) .. " x" .. tostring(row.Number))
+						return true
+					end
+					return false
+				end
+			end
+		end
+		return false
+	end
 	function N.towerDailyStep()
 		local data = N.store("Dungeon")
 		local today = workspace:GetAttribute("today")
@@ -32386,6 +32650,12 @@ do
 		end
 		if on("AutoSeason") then
 			N.seasonStep()
+		end
+		if on("AutoSeasonLuck") then
+			N.seasonLuckStep()
+		end
+		if on("AutoSeasonShop") then
+			N.seasonShopStep()
 		end
 		if on("AutoTowerTicket") then
 			N.towerDailyStep()
@@ -32501,12 +32771,17 @@ do
 			})
 		end)
 	end
-	Tabs.Farm = N.addTab("Farm", "swords", "Stage farm, ore pickup and banking")
+	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+	Tabs.Farm = N.addTab("Farm", "swords", "Stage farm, ore pickup, Super Loot and Kill Aura")
 	Tabs.Forge = N.addTab("Forge", "hammer", "Forging, best gear and selling")
-	Tabs.Train = N.addTab("Train", "dumbbell", "Training, upgrades and rebirth")
+	Tabs.Train = N.addTab("Train", "dumbbell", "Training areas")
 	Tabs.Events = N.addTab("Events", "castle", "Frostbound Tower and the world boss")
-	Tabs.Items = N.addTab("Items", "gift", "Rewards, potions, class rolls and codes")
+	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Upgrades, rebirth and gear enhance")
+	Tabs.Rewards = N.addTab("Rewards", "gift", "Gifts, season luck and shop, index, quests and codes")
+	Tabs.Items = N.addTab("Items", "backpack", "Potions and class rolls")
+	Tabs.Player = N.addTab("Player", "user", "God mode, untouchable and walk speed")
 	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and rates")
+	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts")
 	if Window.AddMiscTab then
 		pcall(function()
 			Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
@@ -32514,17 +32789,19 @@ do
 	end
 	Labels = {}
 	do
-		local QuickBox = Tabs.Farm:AddLeftGroupbox("Quick Farm", "sparkles")
+		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
 		N.FarmBestOn = {
 			"KillAura",
 			"GodMode",
 			"Untouchable",
 			"AutoStages",
+			"AutoSuperLoot",
 			"AutoTrain",
 			"AutoForge",
 			"AutoEquip",
 			"AutoSellGear",
 			"AutoUpgrade",
+			"AutoEnhance",
 			"AutoRebirth",
 			"AutoTower",
 			"AutoWorldBoss",
@@ -32532,6 +32809,8 @@ do
 			"AutoOffline",
 			"AutoIndex",
 			"AutoSeason",
+			"AutoSeasonLuck",
+			"AutoSeasonShop",
 			"AutoTowerTicket",
 			"AutoQuests",
 			"AutoUpdateRewards",
@@ -32540,9 +32819,9 @@ do
 		-- Turning the quick farm off turns off everything it turned on.
 		N.FarmBestOff = N.FarmBestOn
 		QuickBox:AddToggle("AutoFarmBest", {
-			Text = "Auto Farm Best",
+			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "Turns on everything: stage farm with ore pickup, training between runs, forging, best gear, selling, upgrades, rebirths, the tower, the world boss and every reward",
+			Tooltip = "Turns on everything: stage farm with ore pickup and Super Loot hunting, training between runs, forging, best gear, selling, upgrades, gear enhance, rebirths, the tower, the world boss, season luck and shop and every reward",
 			Callback = function(value)
 				task.defer(function()
 					for _, name in ipairs(if value then N.FarmBestOn else N.FarmBestOff) do
@@ -32555,15 +32834,30 @@ do
 			end,
 		})
 		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">One switch for the whole loop: fight, pick ores, bank them, forge, equip the best, train and repeat. Everything below still works on its own.</font>',
+			Text = '<font transparency="0.35">One switch for the whole loop: fight, pick ores, hunt Super Loot runners, bank, forge, equip the best, train and repeat. Everything in the other tabs still works on its own.</font>',
 			DoesWrap = true,
 		})
-		local StageBox = Tabs.Farm:AddLeftGroupbox("Stage Farm", "swords")
-		StageBox:AddToggle("AutoStages", {
+		QuickBox:AddToggle("AutoStages", {
 			Text = "Auto Farm Stages",
 			Default = false,
 			Tooltip = "Runs the stages in order up to the best one you can clear, picks up every ore and banks the pack when it is full",
 		})
+		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		StatusBox:AddButton({
+			Text = "Bank Ores Now",
+			Func = function()
+				task.spawn(N.bank, "button")
+			end,
+		})
+		StatusBox:AddButton({
+			Text = "Stop Everything",
+			Func = function()
+				N.stopAll()
+			end,
+		})
+		local StageBox = Tabs.Farm:AddLeftGroupbox("Stage Farm", "swords")
 		StageBox:AddDropdown("StageMode", {
 			Text = "Deepest Stage",
 			Values = { "Auto (by power)", "Pick a stage" },
@@ -32604,7 +32898,14 @@ do
 			Tooltip = "Only ores of the picked rarities go into your pack. Untick the low ones to keep the pack for the good drops",
 		})
 		StageBox:AddSlider("StuckSeconds", { Text = "Give Up On A Stage After", Default = 20, Min = 5, Max = 120, Rounding = 0, Suffix = " s without damage" })
-		local AuraBox = Tabs.Farm:AddLeftGroupbox("Kill Aura", "zap")
+		local SuperBox = Tabs.Farm:AddLeftGroupbox("Super Loot", "gem")
+		SuperBox:AddToggle("AutoSuperLoot", {
+			Text = "Hunt Super Loot Runners",
+			Default = false,
+			Tooltip = "Every 12 / 30 / 45 minutes a runner with a Legendary / Eternal / Secret ore appears on a stage. The hub goes there, kills it in about 2 seconds and picks the ore up. Needs Auto Farm Stages, and only stages your run can reach",
+		})
+		Labels.Super = SuperBox:AddLabel({ Text = "-", DoesWrap = true })
+		local AuraBox = Tabs.Farm:AddRightGroupbox("Kill Aura", "zap")
 		AuraBox:AddToggle("KillAura", {
 			Text = "Kill Aura",
 			Default = false,
@@ -32618,26 +32919,6 @@ do
 		})
 		AuraBox:AddSlider("AuraRange", { Text = "Range", Default = 40, Min = 10, Max = 500, Rounding = 0, Suffix = " studs", Tooltip = "500 hits every enemy of the stage you are on" })
 		AuraBox:AddSlider("AuraSpeed", { Text = "Hit Every", Default = 0.3, Min = 0.1, Max = 1, Rounding = 2, Suffix = " s" })
-		local PowerBox = Tabs.Farm:AddLeftGroupbox("Player", "shield-plus")
-		PowerBox:AddToggle("GodMode", { Text = "God Mode", Default = false, Tooltip = "Your HP becomes a trillion and stays full, nothing can kill you, so ores are never lost" })
-		PowerBox:AddToggle("Untouchable", { Text = "Untouchable", Default = false, Tooltip = "Enemy attacks never hit you at all (stages, the tower and the world boss)" })
-		PowerBox:AddToggle("SpeedHack", { Text = "Walk Speed", Default = false })
-		PowerBox:AddSlider("WalkSpeed", { Text = "Speed", Default = 60, Min = 16, Max = 250, Rounding = 0 })
-		local StatusBox = Tabs.Farm:AddRightGroupbox("Status", "activity")
-		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
-		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		StatusBox:AddButton({
-			Text = "Bank Ores Now",
-			Func = function()
-				task.spawn(N.bank, "button")
-			end,
-		})
-		StatusBox:AddButton({
-			Text = "Stop Everything",
-			Func = function()
-				N.stopAll()
-			end,
-		})
 		local MapBox = Tabs.Farm:AddRightGroupbox("Stages For Your Power", "map")
 		Labels.Stages = MapBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
@@ -32723,23 +33004,6 @@ do
 			Tooltip = "How long to train after banking before the next stage run",
 		})
 		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
-		local UpgradeBox = Tabs.Train:AddRightGroupbox("Upgrades", "arrow-big-up")
-		UpgradeBox:AddToggle("AutoUpgrade", { Text = "Auto Buy Upgrades", Default = false, Tooltip = "Buys the upgrade with the best gain per coin: more pack slots, faster training or more luck" })
-		UpgradeBox:AddDropdown("UpgradeKinds", {
-			Text = "Upgrades (none = all)",
-			Values = { "Ore Pack", "Train", "Luck" },
-			Default = { "Ore Pack", "Train", "Luck" },
-			Multi = true,
-			AllowNull = true,
-		})
-		Labels.Upgrades = UpgradeBox:AddLabel({ Text = "-", DoesWrap = true })
-		local RebirthBox = Tabs.Train:AddRightGroupbox("Rebirth", "refresh-cw")
-		RebirthBox:AddToggle("AutoRebirth", {
-			Text = "Auto Rebirth",
-			Default = false,
-			Tooltip = "Rebirths as soon as your level allows it. Each rebirth multiplies training and coins and opens better areas",
-		})
-		Labels.Rebirth = RebirthBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
 		local TowerBox = Tabs.Events:AddLeftGroupbox("Frostbound Tower", "castle")
@@ -32759,7 +33023,42 @@ do
 		Labels.Boss = BossBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
-		local RewardBox = Tabs.Items:AddLeftGroupbox("Rewards", "gift")
+		local UpgradeBox = Tabs.Upgrades:AddLeftGroupbox("Upgrades", "arrow-big-up")
+		UpgradeBox:AddToggle("AutoUpgrade", { Text = "Auto Buy Upgrades", Default = false, Tooltip = "Buys the upgrade with the best gain per coin: more pack slots, faster training or more luck" })
+		UpgradeBox:AddDropdown("UpgradeKinds", {
+			Text = "Upgrades (none = all)",
+			Values = { "Ore Pack", "Train", "Luck" },
+			Default = { "Ore Pack", "Train", "Luck" },
+			Multi = true,
+			AllowNull = true,
+		})
+		Labels.Upgrades = UpgradeBox:AddLabel({ Text = "-", DoesWrap = true })
+		local RebirthBox = Tabs.Upgrades:AddRightGroupbox("Rebirth", "refresh-cw")
+		RebirthBox:AddToggle("AutoRebirth", {
+			Text = "Auto Rebirth",
+			Default = false,
+			Tooltip = "Rebirths as soon as your level allows it. Each rebirth multiplies training and coins and opens better areas",
+		})
+		Labels.Rebirth = RebirthBox:AddLabel({ Text = "-", DoesWrap = true })
+		local EnhanceBox = Tabs.Upgrades:AddLeftGroupbox("Gear Enhance", "hammer")
+		EnhanceBox:AddToggle("AutoEnhance", {
+			Text = "Auto Enhance Equipped Gear",
+			Default = false,
+			Tooltip = "Spends the Enhance stones that drop on every stage (they have no other use) plus a few coins on your equipped weapon, armor and hat. Opens at rebirth 6",
+		})
+		EnhanceBox:AddSlider("EnhanceMax", {
+			Text = "Enhance Up To",
+			Default = 5,
+			Min = 1,
+			Max = 20,
+			Rounding = 0,
+			Prefix = "+",
+			Tooltip = "+1 to +5 are cheap and a failed try loses only the cost. From +6 a failed try can lower the item, and Protection Scrolls are used when you have them",
+		})
+		Labels.Enhance = EnhanceBox:AddLabel({ Text = "-", DoesWrap = true })
+	end
+	do
+		local RewardBox = Tabs.Rewards:AddLeftGroupbox("Rewards", "gift")
 		RewardBox:AddToggle("AutoOnline", { Text = "Claim Online Gifts", Default = true })
 		RewardBox:AddToggle("AutoOffline", { Text = "Claim Offline Reward", Default = true })
 		RewardBox:AddToggle("AutoIndex", { Text = "Claim Index EXP And Levels", Default = true })
@@ -32768,7 +33067,21 @@ do
 		RewardBox:AddToggle("AutoQuests", { Text = "Claim Event Quests", Default = true })
 		RewardBox:AddToggle("AutoUpdateRewards", { Text = "Claim Update And Group Gifts", Default = true, Tooltip = "Update log gifts, and the group gift once you are in the game's group" })
 		Labels.Rewards = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
-		local PotionBox = Tabs.Items:AddRightGroupbox("Potions", "flask-conical")
+		local SeasonBox = Tabs.Rewards:AddRightGroupbox("Season", "ticket")
+		SeasonBox:AddToggle("AutoSeasonLuck", { Text = "Spin Season Luck", Default = true, Tooltip = "Spends the Season Tickets from the daily claim and the pass on the Season Luck wheel (stones, class rolls, scrolls, Season Coins, a weapon). Never spins without tickets, so it never opens a Robux prompt" })
+		SeasonBox:AddToggle("AutoSeasonShop", { Text = "Spend Season Coins", Default = true, Tooltip = "Buys from the Season Shop in a fixed best-first order: tower ticket, Train potion, Class roll, Damage potion, Enhance stones, scroll, then the Season gear" })
+		Labels.Season = SeasonBox:AddLabel({ Text = "-", DoesWrap = true })
+		local CodeBox = Tabs.Rewards:AddLeftGroupbox("Codes", "ticket")
+		CodeBox:AddInput("CodeText", { Text = "Code", Placeholder = "Type a code from the game's socials", Finished = false, Default = "" })
+		CodeBox:AddButton({
+			Text = "Redeem",
+			Func = function()
+				N.redeemCode(Options.CodeText and Options.CodeText.Value)
+			end,
+		})
+	end
+	do
+		local PotionBox = Tabs.Items:AddLeftGroupbox("Potions", "flask-conical")
 		PotionBox:AddToggle("AutoPotions", { Text = "Auto Use Potions", Default = false, Tooltip = "Keeps one potion of each picked kind running while you have them" })
 		PotionBox:AddDropdown("PotionKinds", {
 			Text = "Potion Kinds",
@@ -32785,14 +33098,14 @@ do
 		})
 		ClassBox:AddDropdown("ClassTarget", { Text = "Stop At", Values = { "Rare", "Epic", "Legendary", "Mythic" }, Default = "Legendary" })
 		Labels.Class = ClassBox:AddLabel({ Text = "-", DoesWrap = true })
-		local CodeBox = Tabs.Items:AddLeftGroupbox("Codes", "ticket")
-		CodeBox:AddInput("CodeText", { Text = "Code", Placeholder = "Type a code from the game's socials", Finished = false, Default = "" })
-		CodeBox:AddButton({
-			Text = "Redeem",
-			Func = function()
-				N.redeemCode(Options.CodeText and Options.CodeText.Value)
-			end,
-		})
+	end
+	do
+		local PowerBox = Tabs.Player:AddLeftGroupbox("Player", "shield-plus")
+		PowerBox:AddToggle("GodMode", { Text = "God Mode", Default = false, Tooltip = "Your HP becomes a trillion and stays full, nothing can kill you, so ores are never lost" })
+		PowerBox:AddToggle("Untouchable", { Text = "Untouchable", Default = false, Tooltip = "Enemy attacks never hit you at all (stages, the tower and the world boss)" })
+		local MoveBox = Tabs.Player:AddRightGroupbox("Movement", "activity")
+		MoveBox:AddToggle("SpeedHack", { Text = "Walk Speed", Default = false })
+		MoveBox:AddSlider("WalkSpeed", { Text = "Speed", Default = 60, Min = 16, Max = 250, Rounding = 0 })
 	end
 end
 N.StatRows = {}
@@ -32832,6 +33145,7 @@ do
 	N.StatRows.Gear = statRow(FarmStats, "shield", "Equips / sold", 22)
 	N.StatRows.Events = statRow(FarmStats, "castle", "Tower runs / boss fights", 22)
 	N.StatRows.Claims = statRow(FarmStats, "gift", "Rewards claimed", 22)
+	N.StatRows.Extras = statRow(FarmStats, "sparkles", "Super kills / enhances / spins", 22)
 	function N.drawStats()
 		local elapsed = math.max(os.clock() - Session.started, 1)
 		local hours = elapsed / 3600
@@ -32850,6 +33164,7 @@ do
 		N.StatRows.Gear.set(formatNumber(Session.equips) .. " / " .. formatNumber(Session.sold))
 		N.StatRows.Events.set(formatNumber(Session.towerRuns) .. " / " .. formatNumber(Session.bossFights))
 		N.StatRows.Claims.set(formatNumber(Session.claims))
+		N.StatRows.Extras.set(formatNumber(Session.superKills) .. " / " .. formatNumber(Session.enhances) .. " / " .. formatNumber(Session.seasonSpins))
 	end
 end
 local Debug = {}
@@ -32901,7 +33216,7 @@ do
 				os.date("%Y-%m-%d %H:%M:%S")
 			),
 			string.format(
-				"Session %dh %02dm  |  runs %d  |  stages %d  |  kills %d  |  ores %d  |  banks %d  |  deaths %d (lost runs %d)  |  forged %d  |  equips %d  |  sold %d  |  upgrades %d  |  rebirths %d  |  tower %d  |  boss %d",
+				"Session %dh %02dm  |  runs %d  |  stages %d  |  kills %d  |  ores %d  |  banks %d  |  deaths %d (lost runs %d)  |  forged %d  |  equips %d  |  sold %d  |  upgrades %d  |  rebirths %d  |  tower %d  |  boss %d  |  super %d  |  enhance %d  |  spins %d  |  shop %d",
 				elapsed // 3600,
 				(elapsed % 3600) // 60,
 				Session.runs,
@@ -32917,7 +33232,11 @@ do
 				Session.upgrades,
 				Session.rebirths,
 				Session.towerRuns,
-				Session.bossFights
+				Session.bossFights,
+				Session.superKills,
+				Session.enhances,
+				Session.seasonSpins,
+				Session.shopBuys
 			),
 			"Status: " .. tostring(Status),
 			"Running: " .. table.concat(Debug.running(), ", "),
@@ -32960,6 +33279,8 @@ N.AllAutoToggles = {
 	"AutoRebirth",
 	"AutoTower",
 	"AutoWorldBoss",
+	"AutoSuperLoot",
+	"AutoEnhance",
 	"AutoPotions",
 	"AutoClassRoll",
 }
@@ -33244,13 +33565,13 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		end)
 	end
 	pcall(function()
-		local holder = Tabs.Misc or Tabs.Farm
+		local holder = Tabs.Misc or Tabs.Main
 		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
 		Labels.Perf = PerfBox:AddLabel({ Text = "Measuring...", DoesWrap = true })
 	end)
-	if Tabs.Misc then
+	if Tabs.Webhook then
 		pcall(function()
-			local HookBox = Tabs.Misc:AddLeftGroupbox("Discord Webhook", "webhook")
+			local HookBox = Tabs.Webhook:AddLeftGroupbox("Discord Webhook", "webhook")
 				HookBox:AddToggle("WebhookOn", {
 					Text = "Post to Discord",
 					Default = false,
@@ -33357,7 +33678,9 @@ do
 	end
 	if Library.AddCommand then
 		pcall(function()
-			toggleCommand("stages", { "farm" }, { "AutoStages" }, "Auto Farm Stages")
+			toggleCommand("stages", {}, { "AutoStages" }, "Auto Farm Stages")
+			toggleCommand("superloot", { "super", "runner" }, { "AutoSuperLoot" }, "Super Loot hunting")
+			toggleCommand("enhance", {}, { "AutoEnhance" }, "Auto Enhance Equipped Gear")
 			toggleCommand("train", {}, { "AutoTrain" }, "Auto Train")
 			toggleCommand("forge", {}, { "AutoForge" }, "Auto Forge")
 			toggleCommand("equip", { "gear" }, { "AutoEquip" }, "Auto Equip Best Gear")
@@ -33366,7 +33689,7 @@ do
 			toggleCommand("rebirth", {}, { "AutoRebirth" }, "Auto Rebirth")
 			toggleCommand("tower", { "dungeon" }, { "AutoTower" }, "Auto Tower")
 			toggleCommand("boss", { "worldboss" }, { "AutoWorldBoss" }, "Auto World Boss")
-			toggleCommand("farmbest", { "all" }, { "AutoFarmBest" }, "Auto Farm Best")
+			toggleCommand("farmall", { "farmbest", "all", "farm" }, { "AutoFarmBest" }, "Auto Farm Everything")
 			Library:AddCommand({
 				Name = "bank",
 				Description = "Banks the ores in your pack and leaves the stage",
@@ -33429,7 +33752,7 @@ do
 	if Library.SetQuickBar then
 		pcall(function()
 			Library:SetQuickBar({
-				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm" },
+				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm All" },
 				{ Toggle = "AutoStages", Icon = "swords", Label = "Stages" },
 				{ Toggle = "AutoTrain", Icon = "dumbbell", Label = "Train" },
 				{ Toggle = "AutoForge", Icon = "hammer", Label = "Forge" },
@@ -33467,8 +33790,9 @@ do
 					Description = "Pick everything you want running. Tap again to unpick.",
 					Multi = true,
 					Required = true,
-					Default = { "stages", "train", "forge", "upgrades", "rewards" },
+					Default = { "farm" },
 					Choices = {
+						{ Id = "farm", Title = "Auto Farm Everything", Description = "One switch: stage farm, Super Loot runners, training, forging, gear, upgrades and enhance, rebirths, tower, world boss, season and every reward", Icon = "sparkles", Color = "#60d696" },
 						{ Id = "stages", Title = "Farm stages", Description = "Fights the best stage for your power, picks every ore and banks them safely", Icon = "swords", Color = "#fab428" },
 						{ Id = "train", Title = "Train", Description = "Trains in the best open area between runs", Icon = "dumbbell", Color = "#3ccf91" },
 						{ Id = "forge", Title = "Forge and gear", Description = "Forges from your strongest ores and equips the best weapon, armor and hat", Icon = "hammer", Color = "#5fb8ff" },
@@ -33481,17 +33805,18 @@ do
 			Finish = function(values)
 				local chosen = type(values.tasks) == "table" and values.tasks or {}
 				local groups = {
-					stages = { "AutoStages" },
+					stages = { "AutoStages", "AutoSuperLoot" },
 					train = { "AutoTrain" },
 					forge = { "AutoForge", "AutoEquip" },
-					upgrades = { "AutoUpgrade", "AutoRebirth" },
+					upgrades = { "AutoUpgrade", "AutoEnhance", "AutoRebirth" },
 					events = { "AutoTower", "AutoWorldBoss" },
-					rewards = { "AutoOnline", "AutoOffline", "AutoIndex", "AutoSeason", "AutoTowerTicket", "AutoQuests", "AutoUpdateRewards", "AutoPotions" },
+					rewards = { "AutoOnline", "AutoOffline", "AutoIndex", "AutoSeason", "AutoSeasonLuck", "AutoSeasonShop", "AutoTowerTicket", "AutoQuests", "AutoUpdateRewards", "AutoPotions" },
 				}
 				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] then "on" else "off" })
+					setToggles(names, { if chosen[id] and not chosen.farm then "on" else "off" })
 				end
 				N.markSetupDone()
+				setToggles({ "AutoFarmBest" }, { if chosen.farm then "on" else "off" })
 				notify("Quick setup done", "Change anything in the tabs any time", 5)
 			end,
 			Skipped = function()
@@ -33584,12 +33909,17 @@ if Window.AddInfoTab then
 	}
 	for _, tab in ipairs({
 		Tabs.Info,
+		Tabs.Main,
 		Tabs.Farm,
 		Tabs.Forge,
 		Tabs.Train,
 		Tabs.Events,
+		Tabs.Upgrades,
+		Tabs.Rewards,
 		Tabs.Items,
+		Tabs.Player,
 		Tabs.Stats,
+		Tabs.Webhook,
 		Tabs.Misc,
 		Tabs.Settings,
 	}) do
@@ -33726,7 +34056,9 @@ do
 			return
 		end
 		local training = on("AutoTrain")
-		if on("AutoStages") and (not training or os.clock() >= N.Fight.trainUntil) then
+		-- A Super Loot runner is worth more than the rest of the training break (it expires in minutes).
+		local superUp = on("AutoStages") and on("AutoSuperLoot") and N.superPick() ~= nil
+		if on("AutoStages") and (not training or os.clock() >= N.Fight.trainUntil or superUp) then
 			if not N.startRun() then
 				task.wait(1)
 			end
@@ -33768,6 +34100,9 @@ do
 		end
 		if on("AutoRebirth") and choreDue("rebirth", 1) then
 			N.rebirthStep()
+		end
+		if on("AutoEnhance") and choreDue("enhance", 4) then
+			N.enhanceStep()
 		end
 		if choreDue("rewards", 5) then
 			N.rewardStep()
@@ -33876,6 +34211,49 @@ do
 					table.insert(ups, string.format("%s: %s", N.UpgradeNames[kind3], if nextUp then string.format("level %d, next %s coins", nextUp.level, formatNumber(nextUp.price)) else "max"))
 				end
 				I.upgrades = table.concat(ups, "\n") .. string.format("\nBought <b>%d</b> this session", Session.upgrades)
+				local enh = {}
+				for _, slot in ipairs({ "Weapon", "Armor", "Hat" }) do
+					local uuid = bp.equiped[slot]
+					local item = uuid and bp.have[uuid]
+					if type(item) == "table" then
+						local step = N.enhanceNext(item)
+						table.insert(enh, string.format("%s +%d%s", slot, tonumber(item.Level) or 0, if step then string.format(" (next %s coins, %d stones, %d%%)", formatNumber(step.coin), step.stone1, math.floor(step.percent * 100)) else " (max)"))
+					end
+				end
+				I.enhance = string.format(
+					"%s\nStones <b>%s</b> / <b>%s</b>  \u{00B7}  scrolls <b>%d</b>  \u{00B7}  <b>%d</b> tries this session%s%s",
+					if #enh > 0 then table.concat(enh, "\n") else "No gear equipped",
+					formatNumber(N.material("EnhantStone_1")),
+					formatNumber(N.material("EnhantStone_2")),
+					N.material("EnhantProtect"),
+					Session.enhances,
+					if N.rebirth() < 6 then '\n<font color="#fab428">Opens at rebirth 6</font>' else "",
+					if N.Enhance.last ~= "" then "\n" .. N.Enhance.last else ""
+				)
+				I.super = string.format(
+					"Runners killed <b>%d</b> this session%s%s",
+					Session.superKills,
+					if N.Super.last ~= "" then "\n" .. N.Super.last else "",
+					(function()
+						local entry = N.superList()[1]
+						if entry then
+							return string.format('\n<font color="#60d696">A %s runner is up on stage %d</font>', entry.rarity, entry.stage)
+						end
+						return "\nNo runner right now"
+					end)()
+				)
+				do
+					local season = workspace:GetAttribute("Season")
+					local mine = N.store("Season")
+					mine = if season and type(mine[season]) == "table" then mine[season] else {}
+					I.season = string.format(
+						"Season Coins <b>%s</b>  \u{00B7}  tickets <b>%d</b>\nSpins <b>%d</b>, shop buys <b>%d</b> this session",
+						formatNumber(tonumber(mine.SeasonCoin) or 0),
+						tonumber(mine.SeasonTicket) or 0,
+						Session.seasonSpins,
+						Session.shopBuys
+					)
+				end
 				local need = N.rebirthNeed()
 				I.rebirth = if need
 					then string.format("Rebirth <b>%d</b>  \u{00B7}  next at level <b>%d</b> (you are %d)", N.rebirth(), need, N.level())
@@ -33941,11 +34319,16 @@ do
 			group(UIQueue.flush)
 			if frame % 3 == 0 then
 				local I = N.InfoText
-				if shown(Tabs.Farm) then
+				if shown(Tabs.Main) then
 					group(function()
 						Labels.Status:SetText(Status)
 						Labels.Info:SetText(I.info or "-")
+					end)
+				end
+				if shown(Tabs.Farm) then
+					group(function()
 						Labels.Stages:SetText(I.stages or "-")
+						Labels.Super:SetText(I.super or "-")
 					end)
 				end
 				if shown(Tabs.Forge) then
@@ -33958,8 +34341,13 @@ do
 				if shown(Tabs.Train) then
 					group(function()
 						Labels.Train:SetText(I.train or "-")
+					end)
+				end
+				if shown(Tabs.Upgrades) then
+					group(function()
 						Labels.Upgrades:SetText(I.upgrades or "-")
 						Labels.Rebirth:SetText(I.rebirth or "-")
+						Labels.Enhance:SetText(I.enhance or "-")
 					end)
 				end
 				if shown(Tabs.Events) then
@@ -33968,9 +34356,14 @@ do
 						Labels.Boss:SetText(I.boss or "-")
 					end)
 				end
-				if shown(Tabs.Items) then
+				if shown(Tabs.Rewards) then
 					group(function()
 						Labels.Rewards:SetText(I.rewards or "-")
+						Labels.Season:SetText(I.season or "-")
+					end)
+				end
+				if shown(Tabs.Items) then
+					group(function()
 						Labels.Class:SetText(I.class or "-")
 					end)
 				end
@@ -34031,7 +34424,7 @@ do
 		end
 	end)
 	pcall(function()
-		Tabs.Farm:Show()
+		Tabs.Main:Show()
 	end)
 	do
 		local key = "RightControl"
