@@ -27286,6 +27286,7 @@ end
                     "CorvusConfigList",
                     "CorvusShareCode",
                     "CorvusAutoSave",
+                    "FarmAll",
                 })
                 SaveManager:SetFolder(Folder)
                 if Info.SubFolder then
@@ -31809,6 +31810,35 @@ do
 	function N.rarityRank(rarity)
 		return table.find(N.RarityOrder, rarity) or 0
 	end
+	-- Exclude from OP: while Auto Farm Everything OP runs, anything picked in OPExclude is never sold, rerolled, used or spent.
+	N.OPResources = { "Gems", "Spins", "Tickets", "Boosts", "Trait Rerolls" }
+	N.opLogged = {}
+	function N.opExcluded(key)
+		if not on("AutoFarmBest") or not selected(Options.OPExclude, key) then
+			return false
+		end
+		if not N.opLogged[key] then
+			N.opLogged[key] = true
+			log("OP exclude", key)
+		end
+		return true
+	end
+	function N.opUnitExcluded(info)
+		return N.opExcluded(tostring(info.rarity) .. " units") or N.opExcluded("Unit: " .. tostring(info.name))
+	end
+	-- True when any unit rarity or specific unit is picked (the game's own auto sell is then switched off during OP).
+	function N.opAnyUnitExcluded()
+		local picked = Options.OPExclude and Options.OPExclude.Value
+		if not on("AutoFarmBest") or type(picked) ~= "table" then
+			return false
+		end
+		for key, value in pairs(picked) do
+			if value and (string.find(tostring(key), " units$") or string.find(tostring(key), "^Unit: ")) then
+				return true
+			end
+		end
+		return false
+	end
 	function N.chanceText(chance)
 		return "1 in " .. formatNumber(math.max(tonumber(chance) or 0, 1))
 	end
@@ -31922,7 +31952,7 @@ do
 		end
 	end
 	function N.spinStep()
-		if not on("AutoSpin") then
+		if not on("AutoSpin") or N.opExcluded("Spins") then
 			return
 		end
 		for _, entry in pairs(N.field("ActiveEntries", {}) or {}) do
@@ -32257,13 +32287,14 @@ do
 		local keepTop = #N.unlockedSlots() + (if relax >= 1 then 0 else math.floor(optionNumber("KeepExtra", 4)))
 		local keepRank = N.rarityRank(optionText("KeepRarity", "Celestial"))
 		local plan = {}
-		local why = { best = 0, plot = 0, team = 0, locked = 0, mutation = 0, rarity = 0 }
+		local why = { best = 0, plot = 0, team = 0, locked = 0, mutation = 0, rarity = 0, op = 0 }
 		for i, info in ipairs(list) do
 			local reason = if i <= keepTop
 				then "best"
 				elseif info.slot ~= nil then "plot"
 				elseif info.team then "team"
 				elseif info.locked then "locked"
+				elseif N.opUnitExcluded(info) then "op"
 				elseif relax < 2 and info.mutation and selected(Options.KeepMutations, info.mutation) then "mutation"
 				elseif keepRank > 0 and N.rarityRank(info.rarity) >= keepRank then "rarity"
 				else nil
@@ -32301,8 +32332,8 @@ do
 		if #plan == 0 then
 			local why = N.Sell.why or {}
 			local text = string.format(
-				"nothing to sell, kept: %d best, %d on plot, %d team, %d locked, %d by mutation, %d by rarity",
-				why.best or 0, why.plot or 0, why.team or 0, why.locked or 0, why.mutation or 0, why.rarity or 0
+				"nothing to sell, kept: %d best, %d on plot, %d team, %d locked, %d by mutation, %d by rarity, %d excluded",
+				why.best or 0, why.plot or 0, why.team or 0, why.locked or 0, why.mutation or 0, why.rarity or 0, why.op or 0
 			)
 			if text ~= N.Sell.lastWhy then
 				N.Sell.lastWhy = text
@@ -32337,6 +32368,13 @@ do
 	end
 	function N.gameSellStep()
 		local want = N.GameSellValues[optionText("GameAutoSell", "Off")] or 0
+		if want ~= 0 and N.opAnyUnitExcluded() then
+			if not N.opLogged["Game auto sell"] then
+				N.opLogged["Game auto sell"] = true
+				log("OP exclude", "Game auto sell off (excluded units)")
+			end
+			want = 0
+		end
 		local have = tonumber(N.field("AutoSell", 0)) or 0
 		if want ~= have and os.clock() - N.Sell.gameAt > 5 then
 			N.Sell.gameAt = os.clock()
@@ -32398,7 +32436,7 @@ do
 		return name == "Basic" or owned[name] == true
 	end
 	function N.farmActive()
-		return on("AutoFarmBest") or on("AutoFarmOP")
+		return on("AutoFarmBest")
 	end
 	function N.diceStep()
 		local list = N.diceList()
@@ -32411,7 +32449,7 @@ do
 				end
 			end
 			-- Normal farm mode keeps the dice the player picked: we only switch from Basic or from a dice we equipped ourselves.
-			local pinned = N.farmActive() and not on("AutoFarmOP") and current ~= "Basic" and current ~= N.lastAutoDice
+			local pinned = false
 			if pinned and N.dicePin ~= current then
 				N.dicePin = current
 				log("DICE", "keeping your pick", tostring(current))
@@ -32589,7 +32627,115 @@ do
 		local list = N.field("RedeemedCodes", {}) or {}
 		return list[code] ~= nil or table.find(list, code) ~= nil
 	end
-	function N.questList()
+	-- Known codes: HubRepo .. "Codes" ({ game: [codes] }) is fetched at start and every 6 h. Each code is redeemed once
+	-- per account (2 s apart) through CodesService/RE/RedeemCode; the result is the game's own RedeemedCodes data.
+	-- Redeemed and invalid codes are remembered in Corvus/AD_codes_<UserId>.json.
+	N.Codes = { known = {}, state = { redeemed = {}, invalid = {} }, fetchedAt = -1e9, sentAt = -1e9, loaded = false, noRepoLogged = false }
+	local CodeFile = "Corvus/AD_codes_" .. tostring(LocalPlayer.UserId) .. ".json"
+	local function loadCodes()
+		local C = N.Codes
+		C.loaded = true
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(readfile(CodeFile))
+		end)
+		if ok and type(data) == "table" then
+			C.state.redeemed = N.tableOr(data.redeemed)
+			C.state.invalid = N.tableOr(data.invalid)
+		end
+	end
+	local function saveCodes()
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Corvus") then
+				makefolder("Corvus")
+			end
+			writefile(CodeFile, HttpService:JSONEncode(N.Codes.state))
+		end)
+	end
+	function N.httpGet(url)
+		return game:HttpGet(url)
+	end
+	function N.fetchCodes()
+		local C = N.Codes
+		C.fetchedAt = os.clock()
+		if type(HubRepo) ~= "string" then
+			if not C.noRepoLogged then
+				C.noRepoLogged = true
+				log("CODES skipped, no HubRepo")
+			end
+			return false
+		end
+		local ok, body = pcall(N.httpGet, HubRepo .. "Codes")
+		local data
+		if ok and type(body) == "string" then
+			local okJson, decoded = pcall(function()
+				return HttpService:JSONDecode(body)
+			end)
+			data = if okJson then decoded else nil
+		end
+		if type(data) ~= "table" then
+			log("CODES list unreadable")
+			return false
+		end
+		local list = data[GameName] or data["Anime Dice"]
+		local added = 0
+		for _, code in ipairs(type(list) == "table" and list or {}) do
+			if type(code) == "string" and code ~= "" and #code <= 40 and not table.find(C.known, code) then
+				table.insert(C.known, code)
+				added += 1
+			end
+		end
+		log("CODES list", #C.known, "known,", added, "new")
+		return true
+	end
+	function N.codesText()
+		local C = N.Codes
+		local redeemed, invalid = 0, 0
+		for _ in pairs(C.state.redeemed) do
+			redeemed += 1
+		end
+		for _ in pairs(C.state.invalid) do
+			invalid += 1
+		end
+		return string.format("Codes redeemed %d / invalid %d", redeemed, invalid)
+	end
+	function N.knownCodesStep()
+		local C = N.Codes
+		if not C.loaded then
+			loadCodes()
+		end
+		if os.clock() - C.fetchedAt > 21600 then
+			N.fetchCodes()
+		end
+		if os.clock() - C.sentAt < 2 then
+			return false
+		end
+		for _, code in ipairs(C.known) do
+			if not C.state.redeemed[code] and not C.state.invalid[code] and not N.Reward.codesTried[code] then
+				if N.redeemedCode(code) then
+					C.state.redeemed[code] = true
+					saveCodes()
+				else
+					C.sentAt = os.clock()
+					N.Reward.codesTried[code] = true
+					fire(R.code, code)
+					local done = waitFor(function()
+						N.Data.at = -1e9
+						return N.redeemedCode(code)
+					end, 3)
+					if done then
+						C.state.redeemed[code] = true
+						Session.codes += 1
+					else
+						C.state.invalid[code] = true
+					end
+					saveCodes()
+					note("Code " .. code .. (if done then " redeemed" else " invalid"))
+					return true
+				end
+			end
+		end
+		return false
+	end	function N.questList()
 		local list = {}
 		for period, config in pairs(type(N.G.Quest.Periods) == "table" and N.G.Quest.Periods or {}) do
 			local state = (N.field("Quests", {}) or {})[period]
@@ -32655,6 +32801,9 @@ do
 				end
 			end
 		end
+		if on("AutoKnownCodes") then
+			N.knownCodesStep()
+		end
 		if on("AutoQuests") and due("quests", 5) then
 			for _, quest in ipairs(N.questList()) do
 				-- A claim the server refused is tried at most 3 times (30 s apart), not every 5 seconds forever.
@@ -32671,7 +32820,10 @@ do
 				end
 			end
 		end
-		if on("SmartSpend") then
+		local ticketsOff = N.opExcluded("Tickets")
+		if ticketsOff then
+			-- Excluded from OP: tickets are kept.
+		elseif on("SmartSpend") then
 			-- Profit engine: passes and spins ranked by income gained per ticket (p05_spend).
 			if (on("AutoTicketPasses") or on("AutoTicketSpins")) and due("ticketPlan", 15) then
 				N.ticketStep()
@@ -32694,7 +32846,7 @@ do
 				end
 			end
 		end
-		if not on("SmartSpend") and on("AutoTicketSpins") and due("ticketSpins", 10) then
+		if not ticketsOff and not on("SmartSpend") and on("AutoTicketSpins") and due("ticketSpins", 10) then
 			local allPasses = true
 			for _, name in ipairs(N.TicketPasses) do
 				if not N.ownsPass(name) then
@@ -32722,7 +32874,7 @@ do
 		return list
 	end
 	function N.boostStep()
-		if not on("AutoBoosts") then
+		if not on("AutoBoosts") or N.opExcluded("Boosts") then
 			return false
 		end
 		local active = {}
@@ -32839,7 +32991,7 @@ do
 					break
 				end
 				local current = if kind == "trait" then info.trait else info.grade
-				if N.rankMult(kind, current) < target and not N.protected(kind, current) then
+				if N.rankMult(kind, current) < target and not N.protected(kind, current) and not N.opUnitExcluded(info) then
 					return info
 				end
 			end
@@ -32855,7 +33007,7 @@ do
 			local toggle = if kind == "trait" then "AutoTrait" else "AutoGrade"
 			local token = if kind == "trait" then "Trait Reroll" else "Gems"
 			local reserve = math.floor(optionNumber(if kind == "trait" then "TraitReserve" else "GradeReserve", 0))
-			if on(toggle) and N.amount(token) > reserve then
+			if on(toggle) and N.amount(token) > reserve and not N.opExcluded(if kind == "trait" then "Trait Rerolls" else "Gems") then
 				local info = N.rerollPick(kind)
 				if info then
 					N.Reroll.at = os.clock()
@@ -33693,6 +33845,9 @@ do
 		return list
 	end
 	function N.ticketStep()
+		if N.opExcluded("Tickets") then
+			return false
+		end
 		N.measureRates()
 		local ctx = N.spendContext()
 		local list = N.ticketOptions(ctx)
@@ -33724,9 +33879,9 @@ do
 			if i > 6 then
 				break
 			end
-			table.insert(rows, string.format("%d. %s: $%s, +$%s/s, pays back %s", i, option.label or option.name, formatNumber(option.price), formatNumber(option.gain), N.longTime(option.payback)))
+			table.insert(rows, string.format("%d. %s (costs $%s, pays itself back in %s)", i, option.label or option.name, formatNumber(option.price), N.longTime(option.payback)))
 		end
-		return (if #rows > 0 then table.concat(rows, "\n") else "Nothing to buy") .. (if Sp.last ~= "" then "\n" .. Sp.last else "")
+		return (if #rows > 0 then table.concat(rows, "\n") else "Nothing worth buying yet") .. (if Sp.last ~= "" then "\n" .. Sp.last else "")
 	end
 end
 -- Towers are fought on the server: PlayTower starts a run with your tower team, every CompleteTowerFloor plays out
@@ -33992,13 +34147,13 @@ do
 		end)
 	end
 	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
-	Tabs.Roll = N.addTab("Roll", "dice-5", "Spins and dice")
-	Tabs.Towers = N.addTab("Towers", "castle", "Auto towers with your best team")
+	Tabs.Roll = Tabs.Main
 	Tabs.Plot = N.addTab("Plot", "layout-grid", "Income, selling and every slot with its unit")
 	Tabs.Slots = Tabs.Plot
-	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Smart Spending, upgrade tree, rebirth and gear")
-	Tabs.Rewards = N.addTab("Rewards", "gift", "Daily, codes, quests and tickets")
-	Tabs.Items = N.addTab("Items", "backpack", "Boosts and trait or grade rerolls")
+	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Smart Spending, upgrade tree, rebirth, gear and towers")
+	Tabs.Towers = Tabs.Upgrades
+	Tabs.Rewards = N.addTab("Rewards", "gift", "Daily, codes, quests, tickets, boosts and rerolls")
+	Tabs.Items = Tabs.Rewards
 	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and rates")
 	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts")
 	if Window.AddMiscTab then
@@ -34009,80 +34164,30 @@ do
 	Labels = {}
 	do
 		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
-		-- OP = the planner: today's full automatic farm (sells, rerolls, spends). Normal = only the toggles picked in "Farm Everything includes".
+		-- Auto Farm Everything = the planner: the full automatic farm (sells, rerolls, spends) over this toggle list.
 		N.FarmBestOn = { "SmartSpend", "AutoRoll", "AutoCollect", "AutoEquipBest", "AutoLevel", "AutoSell", "AutoEquipDice", "AutoBuyDice", "AutoUpgrade", "AutoRebirth", "AutoGear", "AutoDaily", "AutoGroup", "AutoOffline", "AutoFriend", "AutoCodes", "AutoQuests", "AutoTicketPasses", "AutoTower", "TowerEquipTeam", "AutoSpin", "AutoBoosts" }
-		-- Every main farm toggle of this game: key, visible name, safe (nothing sells, rerolls, opens, converts or spends gems and spins).
-		N.FarmSetList = {
-			{ "AutoRoll", "Auto Roll (Fast)", true },
-			{ "AutoCollect", "Auto Collect Plot Cash", true },
-			{ "AutoEquipBest", "Auto Equip Best Units", true },
-			{ "AutoLevel", "Auto Level Up Slots", true },
-			{ "AutoEquipDice", "Auto Equip Best Dice", true },
-			{ "AutoBuyDice", "Auto Buy Best Dice", true },
-			{ "AutoUpgrade", "Auto Buy Upgrades", true },
-			{ "AutoGear", "Auto Equip Best Gear", true },
-			{ "AutoTower", "Auto Tower", true },
-			{ "TowerEquipTeam", "Equip Best Team First", true },
-			{ "AutoDaily", "Claim Daily Reward", true },
-			{ "AutoOffline", "Claim Offline Cash", true },
-			{ "AutoGroup", "Claim Group Reward", true },
-			{ "AutoCodes", "Redeem All Codes", true },
-			{ "AutoQuests", "Claim Quests", true },
-			{ "AutoTicketPasses", "Buy Ticket Gamepasses", true },
-			{ "AutoFriend", "Auto Friend", true },
-			{ "AutoSell", "Auto Sell Weak Units", false },
-			{ "SmartSpend", "Smart Spending", false },
-			{ "AutoRebirth", "Auto Rebirth", false },
-			{ "AutoSpin", "Use Spins", false },
-			{ "AutoBoosts", "Auto Use Boosts", false },
-			{ "AutoTicketSpins", "Spend Spare Tickets", false },
-			{ "AutoTrait", "Auto Trait Reroll", false },
-			{ "AutoGrade", "Auto Grade Reroll", false },
-		}
-		local farmNames, farmDefault = {}, {}
-		for _, entry in ipairs(N.FarmSetList) do
-			table.insert(farmNames, entry[2])
-			if entry[3] then
-				table.insert(farmDefault, entry[2])
-			end
-		end
-		N.FarmApplied = {}
-		-- The toggles a farm kind switches: OP = the whole planner list, Normal = exactly what the player ticked in FarmSet.
-		function N.farmKeys(kind)
-			if kind == "OP" then
-				return N.FarmBestOn
-			end
-			local list = {}
-			local chosen = Options.FarmSet and Options.FarmSet.Value
-			for _, entry in ipairs(N.FarmSetList) do
-				if type(chosen) == "table" and chosen[entry[2]] then
-					table.insert(list, entry[1])
-				end
-			end
-			return list
-		end
-		function N.farmApply(kind, value)
+		N.FarmApplied = nil
+		-- Auto Farm Everything switches the whole planner list on and turns off exactly what it turned on.
+		function N.farmApply(value)
 			if value then
-				local keys = N.farmKeys(kind)
-				N.FarmApplied[kind] = keys
-				for _, name in ipairs(keys) do
+				N.FarmApplied = N.FarmBestOn
+				for _, name in ipairs(N.FarmBestOn) do
 					local toggle = Toggles[name]
 					if toggle and not toggle.Value then
 						toggle:SetValue(true)
 					end
 				end
 			else
-				-- Turning a farm off turns off everything it turned on (nothing keeps spending cash).
-				for _, name in ipairs(N.FarmApplied[kind] or N.farmKeys(kind)) do
+				for _, name in ipairs(N.FarmApplied or N.FarmBestOn) do
 					local toggle = Toggles[name]
 					if toggle and toggle.Value then
 						toggle:SetValue(false)
 					end
 				end
-				N.FarmApplied[kind] = nil
+				N.FarmApplied = nil
 			end
 		end
-		-- Confirmation card for Auto Farm Everything OP (the toggle stays off until the player presses Enable OP).
+		-- Confirmation card for Auto Farm Everything (the toggle stays off until the player presses the enable button).
 		function N.askOP(onYes)
 			local gui = Library.ScreenGui
 			if not gui then
@@ -34129,7 +34234,7 @@ do
 					l.Parent = card
 					return l
 				end
-				label("Enable Auto Farm Everything OP?", 12, 22, 16, true)
+				label("Enable Auto Farm Everything?", 12, 22, 16, true)
 				label("Full automatic: the planner buys, sells, rerolls and spends for max profit. It can change or sell your items. For a safe version use Auto Farm Everything and pick what it includes.", 40, 96, 13, false, 0.15)
 				label("Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.", 138, 64, 12, true).TextColor3 = Color3.fromRGB(255, 140, 60)
 				local function button(text, x, color, fn)
@@ -34163,106 +34268,126 @@ do
 				notify("Auto Farm Everything OP", "Could not open the confirmation, nothing was changed", 4)
 			end
 		end
-		QuickBox:AddToggle("AutoFarmBest", {
-			Text = "Auto Farm Everything",
-			Default = false,
-			Tooltip = "Turns on exactly the toggles ticked below, with your own filters and dropdowns. Nothing is sold, rerolled or converted unless you tick it yourself",
-			Callback = function(value)
-				if N.FarmBusy then
-					return
-				end
-				if value and on("AutoFarmOP") then
-					N.FarmBusy = true
-					Toggles.AutoFarmOP:SetValue(false)
-					N.FarmBusy = false
-					N.farmApply("OP", false)
-				end
-				task.defer(function()
-					if value then
-						log("MODE", "Normal", #N.farmKeys("Normal"))
+			N.OPWarning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
+			N.BootAt = os.clock()
+			QuickBox:AddToggle("AutoFarmBest", {
+				Text = "Auto Farm Everything",
+				Default = false,
+				Tooltip = "The planner rolls, buys, sells, rerolls and spends for max profit and can change or sell your items. " .. N.OPWarning .. " Asks to confirm.",
+				Callback = function(value)
+					if N.FarmBusy then
+						return
 					end
-					N.farmApply("Normal", value)
-				end)
-			end,
-		})
-		QuickBox:AddDropdown("FarmSet", {
-			Text = "Farm Everything includes",
-			Values = farmNames,
-			Default = farmDefault,
-			Multi = true,
-			AllowNull = true,
-			Searchable = true,
-			Tooltip = "The toggles Auto Farm Everything switches on. Safe ones are ticked. Add Auto Sell, Smart Spending, Rebirth, spins, boosts or rerolls yourself if you want them",
-			Callback = function()
-				if on("AutoFarmBest") and not N.FarmBusy then
-					local old, keep = N.FarmApplied.Normal or {}, {}
-					local new = N.farmKeys("Normal")
-					for _, name in ipairs(new) do
-						keep[name] = true
-					end
-					for _, name in ipairs(old) do
-						local toggle = Toggles[name]
-						if not keep[name] and toggle and toggle.Value then
-							toggle:SetValue(false)
+					if value and not N.OPConfirmed then
+						-- Stays off until the player confirms on the card. A config load never turns it on.
+						N.FarmBusy = true
+						Toggles.AutoFarmBest:SetValue(false)
+						N.FarmBusy = false
+						if os.clock() - (N.BootAt or 0) < 10 then
+							log("Auto Farm Everything not restored from a config")
+							return
 						end
+						N.askOP(function()
+							log("OP confirmed")
+							N.OPConfirmed = true
+							Toggles.AutoFarmBest:SetValue(true)
+							N.OPConfirmed = false
+						end)
+						return
 					end
-					N.farmApply("Normal", true)
-				end
-			end,
-		})
-		QuickBox:AddToggle("AutoFarmOP", {
-			Text = "Auto Farm Everything OP",
-			Default = false,
-			Tooltip = "The planner buys, sells, rerolls and spends for max profit and can change or sell your items. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
-			Callback = function(value)
-				if N.FarmBusy then
-					return
-				end
-				if value and not N.OPConfirmed then
-					-- Stays off until the player confirms on the card.
-					N.FarmBusy = true
-					Toggles.AutoFarmOP:SetValue(false)
-					N.FarmBusy = false
-					N.askOP(function()
-						log("OP confirmed")
-						N.OPConfirmed = true
-						Toggles.AutoFarmOP:SetValue(true)
-						N.OPConfirmed = false
+					if N.saveOPState then
+						N.saveOPState()
+					end
+					task.defer(function()
+						if value then
+							log("MODE", "OP")
+						end
+						N.farmApply(value)
 					end)
-					return
-				end
-				if value and on("AutoFarmBest") then
-					N.FarmBusy = true
-					Toggles.AutoFarmBest:SetValue(false)
-					N.FarmBusy = false
-					N.farmApply("Normal", false)
-				end
-				task.defer(function()
-					if value then
-						log("MODE", "OP")
+				end,
+			})
+			QuickBox:AddToggle("RememberFarm", {
+				Text = "Remember Auto Farm Everything",
+				Default = false,
+				Tooltip = "Off (default): Auto Farm Everything always starts switched off. On: it starts again by itself after a rejoin, without asking. " .. N.OPWarning,
+				Callback = function()
+					if N.saveOPState then
+						N.saveOPState()
 					end
-					N.farmApply("OP", value)
-				end)
-			end,
-		})
-		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">One switch for the whole farm. Everything below still works if you want to fine tune it.</font>',
-			DoesWrap = true,
-		})
-		local RollBox = QuickBox
-		RollBox:AddToggle("AutoRoll", {
-			Text = "Auto Roll (Fast)",
-			Default = false,
-			Tooltip = "Rolls again the moment the server allows it, without waiting for the roll animation. Turns the game's own slower auto roll off",
-		})
-		RollBox = Tabs.Roll:AddLeftGroupbox("Spins", "dice-5")
+				end,
+			})
+			QuickBox:AddLabel({
+				Text = '<font color="#ff8a5c">' .. N.OPWarning .. " With Remember on it restarts by itself next time.</font>",
+				DoesWrap = true,
+			})
+			QuickBox:AddToggle("AutoRoll", {
+				Text = "Auto Roll (Fast)",
+				Default = false,
+				Tooltip = "Rolls again the moment the server allows it, without waiting for the roll animation. Turns the game's own slower auto roll off",
+			})
+			QuickBox:AddButton({
+				Text = "Recommended Settings",
+				Tooltip = "Safe filters (keeps Celestial and better, the best units and strong mutations), then turns Auto Farm Everything on",
+				Func = function()
+					N.recommended()
+				end,
+			})
+			QuickBox:AddButton({
+				Text = "Stop Everything",
+				Func = function()
+					N.stopAll()
+				end,
+			})
+			local ExBox = Tabs.Main:AddLeftGroupbox("Exclude", "shield")
+			N.OPExcludeValues = {}
+			for _, rarity in ipairs(N.RarityOrder) do
+				if N.rarityRank(rarity) >= N.rarityRank("Mythical") then
+					table.insert(N.OPExcludeValues, rarity .. " units")
+				end
+			end
+			do
+				local names = {}
+				local ok, entries = pcall(N.G.Entry.entriesOfKind, "Unit")
+				for name, cfg in pairs(if ok and type(entries) == "table" then entries else {}) do
+					if type(cfg) == "table" and N.rarityRank(tostring(N.call(cfg.getRarity, {}) or cfg.rarity or "")) >= N.rarityRank("Mythical") then
+						table.insert(names, "Unit: " .. tostring(name))
+					end
+				end
+				table.sort(names)
+				for _, name in ipairs(names) do
+					table.insert(N.OPExcludeValues, name)
+				end
+			end
+			for _, name in ipairs(N.OPResources) do
+				table.insert(N.OPExcludeValues, name)
+			end
+			local exDefault = {}
+			for _, name in ipairs(N.OPExcludeValues) do
+				if string.find(name, " units$") or name == "Gems" then
+					table.insert(exDefault, name)
+				end
+			end
+			ExBox:AddDropdown("OPExclude", {
+				Text = "Never touch",
+				Values = N.OPExcludeValues,
+				Default = exDefault,
+				Multi = true,
+				AllowNull = true,
+				Searchable = true,
+				Tooltip = "Auto Farm Everything never sells, rerolls, uses or spends these: Mythical and better units (or one specific unit), Gems, Spins, Tickets, Boosts, Trait Rerolls",
+			})
+			ExBox:AddLabel({
+				Text = '<font transparency="0.4">Everything picked here is skipped by every automatic action.</font>',
+				DoesWrap = true,
+			})
+		local RollBox = Tabs.Main:AddRightGroupbox("Spins", "dice-5")
 			RollBox:AddToggle("AutoSpin", {
 			Text = "Use Spins",
 			Default = false,
 			Tooltip = "Uses a Lucky Spin (100x) or Jackpot Spin (1000x) before a roll. Spins multiply your dice luck, so they are worth more with a better dice",
 		})
 		RollBox:AddDropdown("SpinTypes", { Text = "Spins To Use", Values = { "Lucky Spin", "Jackpot Spin" }, Default = { "Lucky Spin", "Jackpot Spin" }, Multi = true, AllowNull = true })
-		local DiceBox = Tabs.Roll:AddRightGroupbox("Dice", "dice-6")
+		local DiceBox = Tabs.Main:AddRightGroupbox("Dice", "dice-6")
 		DiceBox:AddToggle("AutoBuyDice", { Text = "Auto Buy Best Dice", Default = false, Tooltip = "Buys the luckiest dice you can afford" })
 		DiceBox:AddToggle("AutoEquipDice", { Text = "Auto Equip Best Dice", Default = true })
 		Labels.Dice = DiceBox:AddLabel({ Text = "-", DoesWrap = true })
@@ -34270,12 +34395,8 @@ do
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 		Labels.Recent = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		StatusBox:AddButton({
-			Text = "Stop Everything",
-			Func = function()
-				N.stopAll()
-			end,
-		})
+		local NextBox = Tabs.Main:AddRightGroupbox("Up next", "list-todo")
+		Labels.UpNext = NextBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
 		local IncomeBox = Tabs.Plot:AddLeftGroupbox("Income", "coins")
@@ -34635,7 +34756,8 @@ do
 		end
 		RewardBox:AddToggle("AutoOffline", { Text = "Claim Offline Cash", Default = true })
 		RewardBox:AddToggle("AutoGroup", { Text = "Claim Group Reward", Default = true, Tooltip = "Works once you are in the game's group" })
-		RewardBox:AddToggle("AutoCodes", { Text = "Redeem All Codes", Default = true })
+		RewardBox:AddToggle("AutoCodes", { Text = "Redeem All Codes", Default = true, Tooltip = "The codes in the game's own code list" })
+		RewardBox:AddToggle("AutoKnownCodes", { Text = "Auto redeem known codes", Default = true, Tooltip = "Gets the newest code list from Corvus at start and every 6 hours and redeems each code once on this account" })
 		Labels.Rewards = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
 		local QuestBox = Tabs.Rewards:AddRightGroupbox("Quests", "scroll-text")
 		QuestBox:AddToggle("AutoQuests", { Text = "Claim Quests", Default = true })
@@ -34817,7 +34939,6 @@ do
 end
 N.AllAutoToggles = {
 	"AutoFarmBest",
-	"AutoFarmOP",
 	"SmartSpend",
 	"AutoRoll",
 	"AutoSpin",
@@ -35251,8 +35372,7 @@ do
 			toggleCommand("upgrades", { "buy", "shop" }, { "SmartSpend", "AutoUpgrade", "AutoBuyDice" }, "Smart Spending, auto upgrades and dice")
 			toggleCommand("rebirth", {}, { "AutoRebirth" }, "Auto Rebirth")
 			toggleCommand("tower", { "towers" }, { "AutoTower" }, "Auto Tower")
-			toggleCommand("farmall", { "farmbest", "all", "farm" }, { "AutoFarmBest" }, "Auto Farm Everything (Normal: your picked toggles)")
-			toggleCommand("farmop", { "op" }, { "AutoFarmOP" }, "Auto Farm Everything OP (full planner, asks to confirm)")
+			toggleCommand("farmall", { "farmbest", "all", "farm" }, { "AutoFarmBest" }, "Auto Farm Everything (full automatic, asks to confirm)")
 			Library:AddCommand({
 				Name = "stop",
 				Aliases = { "alloff" },
@@ -35303,7 +35423,6 @@ do
 		pcall(function()
 			Library:SetQuickBar({
 				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm All" },
-				{ Toggle = "AutoFarmOP", Icon = "zap", Label = "OP" },
 				{ Toggle = "AutoRoll", Icon = "dice-5", Label = "Roll" },
 				{ Toggle = "AutoSell", Icon = "badge-dollar-sign", Label = "Sell" },
 				{ Toggle = "AutoUpgrade", Icon = "arrow-big-up", Label = "Upgrades" },
@@ -35343,8 +35462,7 @@ do
 					Required = true,
 					Default = { "farm" },
 					Choices = {
-						{ Id = "farm", Title = "Auto Farm Everything", Description = "One switch: turns on the safe farm toggles (rolls, plot, upgrades, rewards, towers). Never sells or rerolls", Icon = "sparkles", Color = "#60d696" },
-						{ Id = "op", Title = "Auto Farm Everything OP", Description = "Aggressive: the planner buys, sells, rerolls and spends for max profit. Can change or sell your items", Icon = "zap", Color = "#ff5d5d" },
+						{ Id = "farm", Title = "Auto Farm Everything", Description = "Full automatic: the planner rolls, buys, sells, rerolls and spends for max profit. Can sell your items (keep some safe in Exclude)", Icon = "sparkles", Color = "#60d696" },
 						{ Id = "roll", Title = "Roll fast", Description = "Rolls the moment the server allows, without the animation", Icon = "dice-5", Color = "#fab428" },
 						{ Id = "plot", Title = "Plot income", Description = "Collects cash, puts your best units on the plot and levels them", Icon = "house", Color = "#3ccf91" },
 						{ Id = "sell", Title = "Sell weak units", Description = "Keeps storage free, never sells your plot, team, mutated or rare units", Icon = "badge-dollar-sign", Color = "#5fb8ff" },
@@ -35365,11 +35483,10 @@ do
 					rewards = { "AutoDaily", "AutoOffline", "AutoGroup", "AutoCodes", "AutoQuests", "AutoTicketPasses" },
 				}
 				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] and not chosen.farm and not chosen.op then "on" else "off" })
+					setToggles(names, { if chosen[id] and not chosen.farm then "on" else "off" })
 				end
 				N.markSetupDone()
-				setToggles({ "AutoFarmBest" }, { if chosen.farm and not chosen.op then "on" else "off" })
-				setToggles({ "AutoFarmOP" }, { if chosen.op then "on" else "off" })
+				setToggles({ "AutoFarmBest" }, { if chosen.farm then "on" else "off" })
 				notify("Quick setup done", "Change anything in the tabs any time", 5)
 			end,
 			Skipped = function()
@@ -35379,7 +35496,15 @@ do
 		})
 	end
 end
-if Window.AddSettingsTab then
+-- Auto Farm Everything and Remember are never part of a saved config (see Remember in p10).
+	pcall(function()
+		if type(SaveManager) == "table" then
+			SaveManager.Ignore = SaveManager.Ignore or {}
+			SaveManager.Ignore.AutoFarmBest = true
+			SaveManager.Ignore.RememberFarm = true
+		end
+	end)
+	if Window.AddSettingsTab then
 	local ok, tab = pcall(Window.AddSettingsTab, Window, {
 		ThemeManager = ThemeManager,
 		SaveManager = SaveManager,
@@ -35404,6 +35529,62 @@ else
 		ThemeManager:ApplyToTab(Tabs.Settings)
 		SaveManager:LoadAutoloadConfig()
 	end)
+end
+-- Remember Auto Farm Everything: it and its Remember switch are never part of a saved config (SaveManager.Ignore),
+-- only of Corvus/AD_auto_farm.json, and it is restored only when Remember is on.
+do
+	local OPFile = "Corvus/AD_auto_farm.json"
+	function N.saveOPState()
+		if N.OPRestoring or os.clock() - (N.BootAt or 0) < 6 then
+			return
+		end
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Corvus") then
+				makefolder("Corvus")
+			end
+			writefile(OPFile, HttpService:JSONEncode({ remember = on("RememberFarm"), op = on("RememberFarm") and on("AutoFarmBest") }))
+		end)
+	end
+	function N.restoreOP()
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(readfile(OPFile))
+		end)
+		if not ok or type(data) ~= "table" or data.remember ~= true or not alive() then
+			return
+		end
+		N.OPRestoring = true
+		pcall(function()
+			Toggles.RememberFarm:SetValue(true)
+			if data.op == true and not on("AutoFarmBest") then
+				N.OPConfirmed = true
+				Toggles.AutoFarmBest:SetValue(true)
+				N.OPConfirmed = false
+				log("OP restored (Remember Auto Farm Everything)")
+			end
+		end)
+		N.OPRestoring = false
+	end
+	task.delay(6.5, N.restoreOP)
+end
+-- Recommended Settings: safe filters, then Auto Farm Everything.
+function N.recommended()
+	local function set(name, value)
+		local holder = Toggles[name] or Options[name]
+		if holder then
+			pcall(holder.SetValue, holder, value)
+		end
+	end
+	set("KeepRarity", "Celestial")
+	set("KeepExtra", 4)
+	set("SellAt", 80)
+	set("GameAutoSell", "Off")
+	set("KeepMutations", { Emerald = true, Diamond = true, Ruby = true, Rainbow = true })
+	set("TicketPassFirst", "Roll Speed")
+	set("AutoKnownCodes", true)
+	if not on("AutoFarmBest") then
+		set("AutoFarmBest", true)
+	end
+	notify("Recommended Settings", "Filters set. Confirm Auto Farm Everything on the card.", 5)
 end
 if Window.AddInfoTab then
 	local DonateMethods = {
@@ -35690,7 +35871,7 @@ do
 				end
 				if on("SmartSpend") then
 					I.spend = N.spendText()
-				elseif shown(Tabs.Upgrades) and choreDue("spendText", 2) then
+				elseif (shown(Tabs.Upgrades) or shown(Tabs.Main)) and choreDue("spendText", 2) then
 					N.Spend.plan = N.spendOptions()
 					I.spend = N.spendText()
 				end
@@ -35701,9 +35882,10 @@ do
 				I.quests = string.format("Tickets <b>%d</b>\n%s", N.amount("Tickets"), table.concat(quests, "\n"))
 				local left = N.dailyLeft()
 				I.rewards = string.format(
-					"Daily %s  \u{00B7}  codes used <b>%d</b>%s",
+					"Daily %s  \u{00B7}  codes used <b>%d</b>\n%s%s",
 					if left <= 0 then "<b>ready</b>" else "in " .. N.longTime(left),
 					Session.codes,
+					N.codesText(),
 					if #N.Reward.log > 0 then "\n" .. table.concat(N.Reward.log, "\n") else ""
 				)
 				I.reroll = string.format(
@@ -35865,6 +36047,7 @@ do
 						Labels.Info:SetText(I.info or "-")
 						Labels.Recent:SetText(I.recent or "-")
 						Labels.Dice:SetText(I.dice or "-")
+							Labels.UpNext:SetText(I.spend or "-")
 					end)
 				end
 				if shown(Tabs.Plot) then
@@ -35983,12 +36166,12 @@ do
 				end
 				writefile(flag, "1")
 			end)
-			notify("Auto Farm Everything", "Auto Farm Everything is now on Main. Normal = your toggles, OP = full automatic.", 8)
+			notify("Auto Farm Everything", "Auto Farm Everything is now one full automatic switch on Main. Pick what it must never touch in Exclude.", 8)
 		end
 	end
 	if Library.ShowWizard and not N.setupDone() then
 		task.delay(1.5, function()
-			if on("AutoRoll") or on("AutoFarmBest") or on("AutoFarmOP") or on("AutoTower") or on("AutoUpgrade") then
+			if on("AutoRoll") or on("AutoFarmBest") or on("AutoTower") or on("AutoUpgrade") then
 				N.markSetupDone()
 				return
 			end
