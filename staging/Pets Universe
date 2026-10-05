@@ -26105,15 +26105,12 @@ end)
             local SupportedGames = Info.SupportedGames or {
                 { Name = "+1 Stone Skipping", PlaceId = 111543903102439 },
                 { Name = "Anime Dice", PlaceId = 113290951185459 },
-                { Name = "Bizarre", PlaceId = 135621866300031 },
                 { Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
                 { Name = "Loot To Forge", PlaceId = 118805555015549 },
                 { Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
                 { Name = "Pets Universe", PlaceId = 74629631798007 },
                 { Name = "Ride A Pet", PlaceId = 124216119978534 },
-                { Name = "Steal An Egg", PlaceId = 107778070777162 },
                 { Name = "Steal From The Rich", PlaceId = 120475074479690 },
-                { Name = "Voltline Electric Scooters", PlaceId = 118315378611589 },
                 { Name = "Welcome to Bloxburg", PlaceId = 185655149 },
             }
             local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
@@ -33609,6 +33606,60 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     function Auto.farmOP()
     	return S.farmOP == true
     end
+    -- My filters: the loops the player can pick in "Run". Nothing here opens inventory eggs, fuses, converts, crafts, sells or spends rubies/gems.
+    -- { label, toggle key, on by default }
+    Auto.runEntries = {
+    	{ "Auto Farm", "AutoFarm", true },
+    	{ "Auto Tap", "AutoTap", true },
+    	{ "Farm In Best World", "FarmWorldOn", true },
+    	{ "Auto Buy Egg (chosen egg)", "AutoHatch", false },
+    	{ "Go to egg automatically", "EggAutoTravel", false },
+    	{ "Auto Fish", "AutoFish", false },
+    	{ "Auto Tap (fishing)", "FishTap", false },
+    	{ "Auto Break UFO", "AutoUfo", true },
+    	{ "Travel to the UFO", "UfoTravel", true },
+    	{ "Auto Claim Gifts", "AutoGift", true },
+    	{ "Auto Claim Party Egg", "AutoPartyEgg", true },
+    	{ "Auto Claim Group Chest", "AutoGroupChest", true },
+    	{ "Auto Claim Moon Chest", "AutoMoonChest", true },
+    	{ "Auto Claim Partner Rewards", "AutoPartner", true },
+    	{ "Auto Claim Quests", "AutoQuests", true },
+    	{ "Auto redeem known codes", "AutoCodes", true },
+    	{ "Auto Friend", "AutoFriend", true },
+    	{ "Auto Type Admin Phrases", "AutoAdminChat", true },
+    	{ "Auto Find Bens", "AutoBen", false },
+    	{ "Auto Equip Best", "AutoEquipBest", true },
+    	{ "Skip hatch animation", "SkipHatchAnim", false },
+    	{ "Auto Buy Worlds", "AutoBuyWorlds", false },
+    	{ "Auto Upgrade", "AutoSpawnUpgrades", false },
+    	{ "Auto Upgrade Tree", "AutoTree", false },
+    }
+    Auto.runLabels, Auto.runDefaults, Auto.runKey = {}, {}, {}
+    for _, entry in ipairs(Auto.runEntries) do
+    	table.insert(Auto.runLabels, entry[1])
+    	Auto.runKey[entry[1]] = entry[2]
+    	if entry[3] then
+    		table.insert(Auto.runDefaults, entry[1])
+    	end
+    end
+    function Auto.myFilters()
+    	local mode = Options.FarmMode and Options.FarmMode.Value
+    	return mode == "My filters"
+    end
+    -- the toggle keys picked in Run
+    function Auto.runWanted()
+    	local wanted = {}
+    	local value = Options.FarmRun and Options.FarmRun.Value
+    	if type(value) == "table" then
+    		for label, on in pairs(value) do
+    			local key = on and Auto.runKey[label]
+    			if key then
+    				wanted[key] = true
+    			end
+    		end
+    	end
+    	return wanted
+    end
     -- the budget reserve of a currency; an excluded currency is fully reserved (never spent)
     function Auto.reserve(currency)
     	if currency == "Rubies" then
@@ -33639,15 +33690,19 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	end
     end
     function Auto.farmOPSet(value)
-    	S.farmOP = value == true
+    	local filters = Auto.myFilters()
+    	S.farmOP = value == true and not filters
     	S.farmAll = S.farmOP
-    	if value then
+    	if value and filters then
+    		Auto.farmTurn("OP", Auto.runWanted())
+    		Auto.log("FARMALL", "on, My filters")
+    	elseif value then
     		local all = {}
     		for _, name in ipairs(Auto.farmNames) do
     			all[name] = true
     		end
     		Auto.farmTurn("OP", all)
-    		Auto.log("FARMALL", "on")
+    		Auto.log("FARMALL", "on, Best value")
     	else
     		Auto.log("FARMALL", "off")
     		Auto.farmTurn("OP", {})
@@ -33719,7 +33774,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     		if Auto.reverting then
     			return
     		end
-    		if v and not Auto.opGate then
+    		if v and not Auto.opGate and not Auto.myFilters() then
     			task.defer(function()
     				Auto.reverting = true
     				pcall(function() Toggles.FarmAll:SetValue(false) end)
@@ -33727,26 +33782,59 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				if os.clock() - Auto.bootAt >= 10 then
     					Auto.opAsk()
     				else
-    					Auto.log("FARMALL", "not restored at start (Remember is off)")
+    					Auto.log("FARMALL", "not started at launch")
     				end
     			end)
     			return
     		end
-    		Saved.farmAllWas = v == true
-    		SaveDirty = true
     		task.spawn(Auto.farmOPSet, v)
     	end,
     })
-    UI.AllBox:AddToggle("RememberFarmAll", {
-    	Text = "Remember Auto Farm Everything",
-    	Description = "Starts it again by itself after a rejoin. Full automatic: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
-    	Tooltip = "Off by default. When on, Auto Farm Everything comes back on after a rejoin or a restart of the hub if it was running. When off, it always starts switched off. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
-    	Default = false,
+    UI.AllBox:AddDropdown("FarmMode", {
+    	Text = "Mode",
+    	Values = { "Best value", "My filters" },
+    	Default = "Best value",
+    	Tooltip = "Best value: the planner picks and spends for maximum profit (asks to confirm, respects Exclude). My filters: no planner and nothing destructive, it only runs the loops you pick in Run and keeps your egg, world and upgrade choices.",
     	Callback = function(v)
-    		S.rememberFarmAll = v == true
+    		local filters = tostring(v) == "My filters"
+    		if UI.FarmRunDropdown then
+    			pcall(function() UI.FarmRunDropdown:SetVisible(filters) end)
+    		end
+    		if UI.FarmExcludeDropdown then
+    			pcall(function() UI.FarmExcludeDropdown:SetVisible(not filters) end)
+    		end
+    		if Toggles.FarmAll and Toggles.FarmAll.Value then
+    			-- switching the mode while running: stop the old set, start the new one (Best value asks again)
+    			Auto.reverting = true
+    			pcall(function() Toggles.FarmAll:SetValue(false) end)
+    			Auto.reverting = false
+    			task.spawn(Auto.farmOPSet, false)
+    			if filters then
+    				Auto.opGate = true
+    				pcall(function() Toggles.FarmAll:SetValue(true) end)
+    				Auto.opGate = false
+    			end
+    		end
     	end,
     })
-    UI.AllBox:AddDropdown("FarmExclude", {
+    UI.FarmRunDropdown = UI.AllBox:AddDropdown("FarmRun", {
+    	Text = "Run",
+    	Values = Auto.runLabels,
+    	Default = Auto.runDefaults,
+    	Multi = true,
+    	Searchable = true,
+    	AllowNull = true,
+    	Visible = false,
+    	Tooltip = "My filters runs only these loops when you switch on Auto Farm Everything. The list has no action that opens inventory eggs, fuses, converts, crafts, sells or spends rubies and gems. Buying eggs, fishing, worlds and upgrades are off until you pick them and follow your own egg, world and upgrade choices.",
+    	Callback = function(value)
+    		if Toggles.FarmAll and Toggles.FarmAll.Value and Auto.myFilters() then
+    			task.spawn(function()
+    				Auto.farmTurn("OP", Auto.runWanted())
+    			end)
+    		end
+    	end,
+    })
+    UI.FarmExcludeDropdown = UI.AllBox:AddDropdown("FarmExclude", {
     	Text = "Exclude",
     	Values = Auto.excludeLabels,
     	Default = Auto.excludeDefaults,
@@ -46062,24 +46150,6 @@ end
     		DoesWrap = true,
     	})
     	right.BoxHolder.LayoutOrder = -100
-    end)
-    
-    -- Remember Auto Farm Everything: the only way it comes back after a rejoin (FarmAll is on the SaveManager ignore list)
-    task.spawn(function()
-    	task.wait(10)
-    	if Library.Unloaded then
-    		return
-    	end
-    	local remember = Toggles.RememberFarmAll and Toggles.RememberFarmAll.Value == true
-    	if remember and Saved.farmAllWas == true and Toggles.FarmAll and not Toggles.FarmAll.Value then
-    		Auto.log("FARMALL", "restored, Remember is on")
-    		Auto.opGate = true
-    		pcall(function() Toggles.FarmAll:SetValue(true) end)
-    		Auto.opGate = false
-    	elseif not remember and Saved.farmAllWas == true then
-    		Saved.farmAllWas = false
-    		SaveDirty = true
-    	end
     end)
     
     Tabs.Main:Show()
