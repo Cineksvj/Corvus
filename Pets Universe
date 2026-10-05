@@ -31156,6 +31156,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	autoMoonIncr = false,
     	moonIncrPick = {},
     	upgradeOrder = "Best value",
+	farmMode = "Normal",
     	autoFriendSend = false,
     	autoFriendAccept = false,
     	webhookOn = false,
@@ -33112,6 +33113,10 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	"MoonGameAuto", "AutoRebirth", "AutoServerLuck", "SkipHatchAnim", "SkipLuckyAnim",
     }
     Auto.farmSet = {}
+    -- Normal keeps the player's own picks; OP lets the planner override them
+    function Auto.farmOP()
+    	return S.farmAll == true and S.farmMode == "OP"
+    end
     function Auto.farmAll(value)
     	S.farmAll = value == true
     	if value then
@@ -33123,6 +33128,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     			end
     		end
     		Auto.log("FARMALL", "on")
+    		Auto.log("MODE", tostring(S.farmMode))
     	else
     		Auto.log("FARMALL", "off")
     		for name in pairs(Auto.farmSet) do
@@ -33144,6 +33150,20 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	Default = false,
     	Callback = function(v)
     		task.spawn(Auto.farmAll, v)
+    	end,
+    })
+    local modeSeen = nil
+    FarmBox:AddDropdown("FarmMode", {
+    	Text = "Farm Mode",
+    	Values = { "Normal", "OP" },
+    	Default = "Normal",
+    	Tooltip = "Normal = automate everything within your own picks. OP = the planner overrides every choice for max profit.",
+    	Callback = function(choice)
+    		S.farmMode = if choice == "OP" then "OP" else "Normal"
+    		if modeSeen ~= S.farmMode then
+    			modeSeen = S.farmMode
+    			pcall(Auto.log, "MODE", S.farmMode)
+    		end
     	end,
     })
     FarmBox:AddDivider()
@@ -33709,6 +33729,7 @@ end
     		S.hatchEggName = if type(choice) == "string" then choice else ""
     	end,
     })
+    Auto.defaultEgg = initialEggs[1]
     S.hatchEggName = if type(Options.HatchEgg.Value) == "string" then Options.HatchEgg.Value else ""
     EggBox:AddDropdown("HatchMode", {
     	Text = "Hatch Count",
@@ -37344,7 +37365,7 @@ end
     			local balance = getStat(shop.currency) or 0
     			local reserve = if shop.currency == "Rubies" then S.rubyReserve elseif shop.currency == "Gems" then S.gemReserve else 0
     			local plan = Auto.Plan
-    			local planOn = plan ~= nil and plan.ready and (S.farmAll or S.upgradeOrder == "Best value")
+    			local planOn = plan ~= nil and plan.ready and (Auto.farmOP() or S.upgradeOrder == "Best value")
     			local bestValue = -math.huge
     			for index, name in ipairs(shop.names) do
     				local level = readLevel(shop.folder, name)
@@ -38059,7 +38080,7 @@ end
     				local best, bestCost, bestIndex
     				local now = os.clock()
     				local plan = Auto.Plan
-    				local planOn = plan ~= nil and plan.ready and (S.farmAll or S.treeOrder == "Best value")
+    				local planOn = plan ~= nil and plan.ready and (Auto.farmOP() or S.treeOrder == "Best value")
     				local bestValue = -math.huge
     				for index, group in ipairs(tree.Groups) do
     					if group.parent then
@@ -39043,7 +39064,7 @@ end
     				end
     
     				function P.on()
-    					return P.ready and S.farmAll
+    					return P.ready and Auto.farmOP()
     				end
     
     				-- time: value earned per second in each activity (coin-equivalent), half-life 30 min
@@ -39090,7 +39111,7 @@ end
     					P.last = { t = now, value = value, activity = activity }
     					-- fishing vs farming: measure both, keep the better one (tokens from fish are not counted as money)
     					local farm, fishAct = P.act.Farm, P.act.Fish
-    					if not (S.farmAll and S.autoFish) then
+    					if not (Auto.farmOP() and S.autoFish) then
     						P.fishOff = false
     					elseif P.evt and P.evt.fishBoost then
     						P.fishOff = false
@@ -39179,8 +39200,16 @@ end
     					end
     				end)
     
+    				-- Normal: the player's egg stays unless it is empty or still the list default
+    				function P.eggAuto()
+    					if not (P.ready and S.farmAll) then
+    						return false
+    					end
+    					return S.farmMode == "OP" or S.hatchEggName == "" or S.hatchEggName == Auto.defaultEgg
+    				end
+
     				function Auto.effectiveEgg()
-    					if P.on() then
+    					if P.eggAuto() then
     						return P.egg or ""
     					end
     					return S.hatchEggName
@@ -43390,7 +43419,7 @@ end
     -- Luck Combo (EggLuckComboConfig): the combo drops after 150 s without a hatch, one cheap egg keeps it
     local ComboKeep = { last = -1e9, count = 0 }
     local function comboKeep(now)
-    	if not (S.farmAll and S.autoHatch and EggHatch) then
+    	if not (Auto.farmOP() and S.autoHatch and EggHatch) then
     		return false
     	end
     	if now - HatchState.lastFire < 110 or now - ComboKeep.last < 20 then
@@ -43441,7 +43470,7 @@ end
     function hatchStepInner()
     	local huntEgg = if S.indexHunt then Auto.Hunter.egg else nil
     	local eggName = huntEgg or (if S.autoHatch then (if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName) else nil)
-    	if eggName == "" and not huntEgg and S.autoHatch and Auto.Plan and Auto.Plan.on() then
+    	if eggName == "" and not huntEgg and S.autoHatch and Auto.Plan and Auto.Plan.eggAuto and Auto.Plan.eggAuto() then
     		HatchState.status = "Plan: " .. Auto.Plan.eggWhy
     		HatchState.waiting = false
     		return
