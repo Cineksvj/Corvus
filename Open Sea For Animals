@@ -30207,13 +30207,20 @@ local BootOk, BootError = xpcall(function()
 						return true
 					end, 3)
 					if safe then
+						local count = inventoryCount()
 						call("InventoryService", "SellAll")
-						list = {}
+						if waitFor(function()
+							return inventoryCount() < count
+						end, 2) then
+							list = {}
+						else
+							log("SELL Sell All did not sell, going one by one")
+						end
 					end
 					lockKeep(false)
 				end
 				for i, item in ipairs(list) do
-					if i > 60 or not alive() then
+					if i > 120 or not alive() then
 						break
 					end
 					local data = Data()
@@ -30239,7 +30246,13 @@ local BootOk, BootError = xpcall(function()
 			return false
 		end
 		function sellDue()
-			if not on("AutoSell") or os.clock() - LastSell < 8 or os.clock() < SellQuietUntil then
+			if not on("AutoSell") or os.clock() - LastSell < 8 then
+				return false
+			end
+			if inventoryCount() >= inventoryLimit() - math.max(maxPickup(), 1) then
+				return true
+			end
+			if os.clock() < SellQuietUntil then
 				return false
 			end
 			local limit = math.min(tonumber(Options.SellAt and Options.SellAt.Value) or 150, inventoryLimit())
@@ -33210,6 +33223,16 @@ local BootOk, BootError = xpcall(function()
 			SaveManager:LoadAutoloadConfig()
 		end)
 	end
+	-- one time: configs saved before Blatant existed still say Teleport, the instant catch is much faster
+	pcall(function()
+		if not Library:GetSetting("OSFA_BlatantDefault") then
+			Library:SetSetting("OSFA_BlatantDefault", true)
+			if Options.SeaMove and Options.SeaMove.Value == "Teleport" then
+				Options.SeaMove:SetValue("Blatant")
+				log("MIGRATE movement Teleport -> Blatant")
+			end
+		end
+	end)
 	if Window.AddInfoTab then
 		local DonateMethods = {
 			{
