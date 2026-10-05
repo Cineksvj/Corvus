@@ -31352,6 +31352,21 @@ do
 		local value = option and option.Value
 		return if type(value) == "string" and value ~= "" then value else default
 	end
+	-- Farm Mode: Normal keeps every pick of the player, OP lets the planner override them while Auto Farm Everything is on.
+	N.PlayerOff = {}
+	N.Forcing = false
+	function N.farmMode()
+		return optionText("FarmMode", "Normal")
+	end
+	function N.opActive()
+		return N.farmMode() == "OP" and on("AutoFarmBest")
+	end
+	function N.pickText(name, default)
+		if N.opActive() then
+			return default
+		end
+		return optionText(name, default)
+	end
 	Status = "Idle"
 	local StatusSeen, StatusSeenCount = {}, 0
 	function setStatus(text)
@@ -31748,7 +31763,7 @@ do
 	-- below it when the profit planner has run data (p09_plan). A run keeps the target it started with.
 	function N.stageTarget()
 		local cap = N.stageTargetByPower()
-		if optionText("StageMode", "Auto (by power)") ~= "Auto (by power)" then
+		if N.pickText("StageMode", "Auto (by power)") ~= "Auto (by power)" then
 			return cap
 		end
 		local planned = if F.run and F.runTarget then F.runTarget elseif N.Plan then N.Plan.stage else nil
@@ -31763,7 +31778,7 @@ do
 			return 1
 		end
 		local best = 1
-		if optionText("StageMode", "Auto (by power)") == "Pick a stage" then
+		if N.pickText("StageMode", "Auto (by power)") == "Pick a stage" then
 			best = math.clamp(math.floor(optionNumber("StageFixed", 1)), 1, list[#list].n)
 		else
 			local power = N.power()
@@ -32419,13 +32434,13 @@ do
 	-- "Auto (best value)": the profit planner prices every kind and ore count with the game's own forge roll
 	-- (N.forgeChoice). Without the game's forge module it falls back to alternating with the slider count.
 	local function autoChoice()
-		if optionText("ForgeType", "Auto (best value)") ~= "Auto (best value)" or not N.forgeChoice then
+		if N.pickText("ForgeType", "Auto (best value)") ~= "Auto (best value)" or not N.forgeChoice then
 			return nil
 		end
 		return N.forgeChoice()
 	end
 	function N.forgeKind()
-		local pick = optionText("ForgeType", "Auto (best value)")
+		local pick = N.pickText("ForgeType", "Auto (best value)")
 		if pick == "Weapon" or pick == "Armor" then
 			return pick
 		end
@@ -32555,7 +32570,7 @@ do
 			Session.forged += 1
 			Fo.at = os.clock()
 			noteForge(result, kind)
-			if optionText("ForgeType", "Auto (best value)") ~= "Weapon" and optionText("ForgeType", "Auto (best value)") ~= "Armor" then
+			if N.pickText("ForgeType", "Auto (best value)") ~= "Weapon" and N.pickText("ForgeType", "Auto (best value)") ~= "Armor" then
 				Fo.alternate = if kind == "Weapon" then "Armor" else "Weapon"
 			end
 			if choice then
@@ -33406,7 +33421,7 @@ do
 		if rolls <= 0 or index == nil or locked then
 			return
 		end
-		local target = optionText("ClassTarget", "Auto (expected value)")
+		local target = N.pickText("ClassTarget", "Auto (expected value)")
 		local W = if target == "Auto (expected value)" then N.classThreshold(rolls) else nil
 		if W then
 			-- Optimal stopping: roll only while the class is worth less than what the rolls left are expected to reach.
@@ -33534,13 +33549,26 @@ do
 			Tooltip = "Turns on everything: stage farm with ore pickup and Super Loot hunting, training whenever it pays more than a run, forging, best gear, selling, upgrades, gear enhance, rebirths, the tower, the world boss, season luck and shop and every reward",
 			Callback = function(value)
 				task.defer(function()
+					N.Forcing = true
 					for _, name in ipairs(if value then N.FarmBestOn else N.FarmBestOff) do
 						local toggle = Toggles[name]
-						if toggle and toggle.Value ~= value then
+						-- Normal never switches on what the player switched off by hand.
+						local skip = value and N.farmMode() ~= "OP" and N.PlayerOff[name]
+						if toggle and toggle.Value ~= value and not skip then
 							toggle:SetValue(value)
 						end
 					end
+					N.Forcing = false
 				end)
+			end,
+		})
+		QuickBox:AddDropdown("FarmMode", {
+			Text = "Farm Mode",
+			Values = { "Normal", "OP" },
+			Default = "Normal",
+			Tooltip = "Normal = automate everything within your own picks. OP = the planner overrides every choice for max profit",
+			Callback = function(value)
+				log("MODE", tostring(value))
 			end,
 		})
 		QuickBox:AddLabel({
@@ -34103,6 +34131,20 @@ N.AllAutoToggles = {
 	"AutoPotions",
 	"AutoClassRoll",
 }
+-- A toggle the player switches off by hand stays off for Auto Farm Everything in Normal mode.
+for _, name in ipairs(N.FarmBestOn) do
+	local toggle = Toggles[name]
+	if toggle and type(toggle.OnChanged) == "function" then
+		pcall(function()
+			toggle:OnChanged(function(value)
+				if not N.Forcing then
+					N.PlayerOff[name] = if value then nil else true
+				end
+			end)
+		end)
+	end
+end
+log("MODE", N.farmMode())
 do
 	function N.manualRunning()
 		return N.Manual.running
@@ -35070,7 +35112,7 @@ do
 		end
 		F.at = os.clock()
 		F.choice = nil
-		local pick = optionText("ForgeType", "Auto (best value)")
+		local pick = N.pickText("ForgeType", "Auto (best value)")
 		local kinds = if pick == "Weapon" or pick == "Armor" then { pick } else { "Weapon", "Armor" }
 		local best
 		for _, kind in ipairs(kinds) do
