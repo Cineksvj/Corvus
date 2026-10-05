@@ -30135,6 +30135,34 @@ end
 function N.farmAny()
 return on("FarmAll") or on("AutoFarmOP")
 end
+-- Exclude from OP: while Auto Farm Everything OP runs, anything picked in OPExclude is never sold, fed, used or spent.
+N.opLogged = {}
+function N.opExcluded(key)
+if not on("AutoFarmOP") or not selected(Options.OPExclude, key) then
+return false
+end
+if not N.opLogged[key] then
+N.opLogged[key] = true
+log("OP exclude", key)
+end
+return true
+end
+function N.opEggProtected(info)
+if N.opExcluded(tostring(info.rarity) .. " pets and eggs") then
+return true
+end
+if (info.mutation or info.spawnMutation) and N.opExcluded("Mutated eggs") then
+return true
+end
+local cfg = N.eggConfig(info.name)
+if
+(info.item:GetAttribute("AdminSpawn") == true or (cfg and (cfg.Event or cfg.Limited or cfg.AdminOnly)))
+and N.opExcluded("Event eggs")
+then
+return true
+end
+return false
+end
 function N.nothingPicked(option)
 local v = option and option.Value
 return type(v) ~= "table" or next(v) == nil
@@ -30813,6 +30841,9 @@ end
 do
 local PlotState = { hatchAt = {}, seenPets = {}, hatchFiredAt = -1e9, lanternUntil = 0, placeFails = {}, favAt = {} }
 local function reserveCash()
+if on("AutoFarmOP") and not N.opExcluded("Money reserve") then
+return 0
+end
 local option = Options.KeepCash
 return parseAmount(option and option.Value) or 0
 end
@@ -31400,6 +31431,9 @@ return done
 end
 function N.foodTools()
 local list = {}
+if N.opExcluded("Food items") then
+return list
+end
 for _, tool in ipairs(N.toolsWithTag("Food")) do
 local cfg = N.FoodData[tool.Name]
 if type(cfg) == "table" and allows(Options.FeedFoods, tool.Name) then
@@ -31430,7 +31464,7 @@ function N.feedTargets()
 local maxAge = tonumber(N.PetAging.MaxAge) or 100
 local list = {}
 for _, pet in ipairs(N.plotPets()) do
-if pet.age < maxAge and allows(Options.FeedRarities, pet.rarity) then
+if pet.age < maxAge and allows(Options.FeedRarities, pet.rarity) and not N.opExcluded(tostring(pet.rarity) .. " pets and eggs") then
 table.insert(list, pet)
 end
 end
@@ -31583,7 +31617,7 @@ end)
 return list
 end
 function N.lanternDue()
-if os.clock() < PlotState.lanternUntil or #N.lanternTools() == 0 then
+if os.clock() < PlotState.lanternUntil or #N.lanternTools() == 0 or N.opExcluded("Lanterns") then
 return false
 end
 for _, model in ipairs(N.plotEggModels()) do
@@ -32197,7 +32231,7 @@ local per = tonumber(A.GrowthPerAge) or 0.01
 local std = tonumber(A.WeightStandardKG) or 10
 local mults = N.tableOr(N.GeneralData.RarityLevelRequirementMultiplier)
 for _, pet in ipairs(placed) do
-if pet.age < maxAge and allows(Options.FeedRarities, pet.rarity) then
+if pet.age < maxAge and allows(Options.FeedRarities, pet.rarity) and not N.opExcluded(tostring(pet.rarity) .. " pets and eggs") then
 local scale = 1 + per * (pet.age - 1)
 local bw = math.max(pet.weight / scale / std, 0.01)
 local rm = tonumber(mults[pet.rarity]) or tonumber(mults.Common) or 10
@@ -32314,7 +32348,11 @@ log("PLAN error", tostring(err))
 P.at = os.clock()
 end
 end
-local have = if kind == "rebirth" then N.cash() else N.spendable()
+local opKeys = { food = "Food items", lantern = "Lanterns", shop = "Shop items", rebirth = "Rebirth", luck = "Luck upgrades" }
+if opKeys[kind] and N.opExcluded(opKeys[kind]) then
+return false
+end
+local have = if kind == "rebirth" and not (on("AutoFarmOP") and N.opExcluded("Money reserve")) then N.cash() else N.spendable()
 if have < cost then
 return false
 end
@@ -32336,7 +32374,7 @@ local function radarActive()
 return #N.radarTargets() > 0
 end
 function N.radarDue()
-return #N.radarTools() > 0 and not radarActive() and os.clock() - N.Radar.at > 10
+return #N.radarTools() > 0 and not radarActive() and os.clock() - N.Radar.at > 10 and not N.opExcluded("Radars")
 end
 function N.useRadar()
 local tools = N.radarTools()
@@ -32468,6 +32506,7 @@ if
 selected(Options.SellRarities, info.rarity)
 and not (on("SellKeepMutated") and (info.mutation or info.spawnMutation))
 and info.kg < N.optionAmount("SellBelowKG", math.huge)
+and not N.opEggProtected(info)
 then
 table.insert(list, info)
 end
@@ -32648,6 +32687,7 @@ end,
 end)
 end
 Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything, egg farm and status")
+Tabs.AutoOP = N.addTab("Auto OP", "zap", "Full automatic farm, its protections and reminders")
 Tabs.Eggs = N.addTab("Eggs", "egg", "Egg filters, volcano and the eggs on the map")
 Tabs.Plot = N.addTab("Plot", "layout-grid", "Nests, hatching, pets and feeding")
 Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Luck, rebirth and shop")
@@ -32778,7 +32818,13 @@ Multi = true,
 AllowNull = true,
 Tooltip = "The switches Auto Farm Everything turns on, with your own filters. The default has only safe ones: nothing here sells, feeds or spends unless you add it yourself.",
 })
-FarmBox:AddToggle("AutoFarmOP", {
+FarmBox:AddLabel({
+Text = '<font transparency="0.4">Auto Farm Everything OP (full automatic planner) lives in the Auto OP tab.</font>',
+DoesWrap = true,
+})
+local OPBox = Tabs.AutoOP:AddLeftGroupbox("Auto OP", "zap")
+local OPExBox = Tabs.AutoOP:AddRightGroupbox("Exclude from OP", "shield")
+OPBox:AddToggle("AutoFarmOP", {
 Text = "Auto Farm Everything OP",
 Default = false,
 Tooltip = "The planner buys, feeds, sells and spends for max profit and can sell your pets and eggs. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
@@ -32791,22 +32837,60 @@ local flagOk = false
 pcall(function()
 flagOk = isfile("Corvus/RAP_op_ok.txt")
 end)
-if flagOk and tick() - N.opBoot < 20 then
+if flagOk and on("RememberOP") and tick() - N.opBoot < 20 then
 N.opOk = true
 else
 N.opBusy = true
 Toggles.AutoFarmOP:SetValue(false)
 N.opBusy = false
+if tick() - N.opBoot > 8 then
 N.askOP()
+else
+log("OP not restored (Remember Auto OP is off)")
+end
 return
 end
 end
 N.opOk = false
+pcall(function()
+if makefolder and isfolder and not isfolder("Corvus") then
+makefolder("Corvus")
+end
+writefile("Corvus/RAP_op_on.txt", if value then "1" else "0")
+end)
 if value and on("FarmAll") then
 Toggles.FarmAll:SetValue(false)
 end
 task.spawn(N.farmAll, value, true)
 end,
+})
+OPBox:AddToggle("RememberOP", {
+Text = "Remember Auto OP",
+Default = false,
+Tooltip = "Off (default): Auto OP always starts switched off, even if your saved config had it on. On: Auto OP switches itself back on at the next start. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
+})
+OPBox:AddLabel({
+Text = "Warning: with Remember Auto OP on, the hub starts the full automatic planner by itself next time. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
+DoesWrap = true,
+})
+N.OPExcludeValues = {}
+for _, rarity in ipairs(N.RarityList) do
+table.insert(N.OPExcludeValues, rarity .. " pets and eggs")
+end
+for _, name in ipairs({ "Mutated eggs", "Event eggs", "Food items", "Lanterns", "Radars", "Shop items", "Luck upgrades", "Rebirth", "Money reserve" }) do
+table.insert(N.OPExcludeValues, name)
+end
+OPExBox:AddDropdown("OPExclude", {
+Text = "Exclude from OP",
+Values = N.OPExcludeValues,
+Default = { "Legendary pets and eggs", "Mythic pets and eggs", "Divine pets and eggs", "Ethereal pets and eggs", "Secret pets and eggs", "Mutated eggs", "Event eggs", "Money reserve" },
+Multi = true,
+AllowNull = true,
+Tooltip = "While Auto Farm Everything OP runs, these are never sold, fed, used or spent: eggs and pets of those rarities, mutated or event eggs, food, lanterns, radars, shop purchases, luck upgrades, rebirth. Money reserve keeps your Keep Cash amount untouched (OP ignores Keep Cash otherwise).",
+})
+OPExBox:AddLabel({
+Text = '<font transparency="0.4">Everything picked here is skipped by every OP action. Logged as OP exclude in the debug log.</font>',
+DoesWrap = true,
 })
 FarmBox:AddToggle("AutoFarm", {
 Text = "Auto Farm Eggs",
@@ -35431,6 +35515,12 @@ end,
 end)
 end
 end
+N.opBoot = tick()
+pcall(function()
+Library.ShareIgnore = Library.ShareIgnore or {}
+Library.ShareIgnore.AutoFarmOP = true
+SaveManager:SetIgnoreIndexes({ "AutoFarmOP" })
+end)
 if Window.AddSettingsTab then
 local ok, tab = pcall(Window.AddSettingsTab, Window, {
 ThemeManager = ThemeManager,
@@ -35449,7 +35539,7 @@ pcall(function()
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
-SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoFarmOP" })
 ThemeManager:SetFolder("Corvus")
 SaveManager:SetFolder("Corvus/RideAPet")
 SaveManager:BuildConfigSection(Tabs.Settings)
@@ -36396,6 +36486,20 @@ end
 end)
 Perf.work.stats = (Perf.work.stats or 0) + (os.clock() - statsStarted)
 task.wait(0.5)
+end
+end)
+task.spawn(function()
+task.wait(4)
+if on("RememberOP") and not on("AutoFarmOP") and Toggles.AutoFarmOP then
+local was = false
+pcall(function()
+was = isfile("Corvus/RAP_op_ok.txt") and readfile("Corvus/RAP_op_on.txt") == "1"
+end)
+if was then
+log("OP restored (Remember Auto OP)")
+N.opOk = true
+Toggles.AutoFarmOP:SetValue(true)
+end
 end
 end)
 pcall(function()
