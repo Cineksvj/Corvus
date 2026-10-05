@@ -28846,7 +28846,7 @@ end
 return distance + (cruise - from.Y) + (cruise - to.Y)
 end
 local function plannedSpeed(mode)
-if mode ~= "Safe" or N.isRiding() or not on("RideOnTrips") then
+if mode ~= "Safe" or N.isRiding() or not on("RideOnTrips") or (N.MountState and os.clock() < N.MountState.blockedUntil) then
 return N.modeSpeed(mode)
 end
 if os.clock() - PlanSpeed.at > 5 then
@@ -28913,6 +28913,7 @@ Noclip.travel = false
 return ok
 end
 local Mount = { blockedUntil = 0, fails = 0 }
+N.MountState = Mount
 function N.mount()
 if N.isRiding() then
 return true
@@ -30182,7 +30183,7 @@ end
 return ok
 end
 function N.placePetsDue()
-if N.tutorialActive() or not N.baseplate() then
+if N.tutorialActive() or not N.baseplate() or os.clock() < (N.PlaceBlockUntil or 0) then
 return false
 end
 local candidates = placeCandidates()
@@ -30228,6 +30229,8 @@ local placed = N.plotPets()
 if #placed < N.maxPets() then
 setStatus("Placing " .. N.petTitle(best) .. " on your plot")
 if not placeOnePet(best, taken) then
+N.PlaceBlockUntil = os.clock() + 120
+log("PETS placing paused for 2 minutes after a failed place")
 break
 end
 done += 1
@@ -30262,6 +30265,8 @@ end
 end
 Session.swapped += 1
 if not placeOnePet(best, taken) then
+N.PlaceBlockUntil = os.clock() + 120
+log("PETS placing paused for 2 minutes after a failed place")
 break
 end
 done += 1
@@ -31260,7 +31265,7 @@ if option then
 pcall(option.SetValue, option, value)
 end
 end
-for name, value in pairs({ RidePet = true, WaitOnPlot = true, TeleportIfFar = false }) do
+for name, value in pairs({ RideOnTrips = true, WaitOnPlot = true, TeleportIfFar = false }) do
 local toggle = Toggles[name]
 if toggle then
 pcall(toggle.SetValue, toggle, value)
@@ -32148,6 +32153,10 @@ end
 table.sort(list, function(a, b)
 if a.wanted ~= b.wanted then
 return a.wanted
+end
+-- what the farm can really take comes first, the too far ones after
+if a.reachable ~= b.reachable then
+return a.reachable
 end
 local sa, sb = N.eggScore(a, from), N.eggScore(b, from)
 if sa ~= sb then
