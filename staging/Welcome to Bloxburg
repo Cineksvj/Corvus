@@ -32172,9 +32172,15 @@ do
 	-- 2026-10-05 "it does not avoid obstacles") it switches to N.pathWalk (pathfinding, doors, short hops).
 	function N.walkTo(pos, near, timeout, straightOnly)
 		near = near or 3
+		-- a long trip (pizza address, far tree): the game's own FastTravel / server move first (p05_travel), the
+		-- walk below does the last meters
+		if not straightOnly and N.travelNear then
+			N.travelNear(pos, "walk")
+		end
 		local deadline = os.clock() + (timeout or 12)
 		local lastIssue, best, bestAt = -1e9, math.huge, os.clock()
 		local stuck = 0
+		local startFlat, startAt = nil, os.clock()
 		while alive() and os.clock() < deadline do
 			local root, hum = N.root(), N.humanoid()
 			if not root or not hum or hum.Health <= 0 then
@@ -32183,8 +32189,12 @@ do
 			local flat = Vector3.new(pos.X - root.Position.X, 0, pos.Z - root.Position.Z).Magnitude
 			if flat <= near then
 				pcall(hum.MoveTo, hum, root.Position)
+				if best ~= math.huge and startFlat and startFlat >= 40 then
+					log("WALK done", math.floor(startFlat), "in", string.format("%.1fs", os.clock() - startAt), "(straight)")
+				end
 				return true
 			end
+			startFlat = startFlat or flat
 			if flat < best - 0.3 then
 				best, bestAt = flat, os.clock()
 			elseif os.clock() - bestAt > 1.2 then
@@ -32193,7 +32203,11 @@ do
 					log("WALK straight line blocked at", string.format("(%d,%d,%d)", root.Position.X, root.Position.Y, root.Position.Z), "dist", math.floor(flat), "-> pathfinding")
 					return N.pathWalk(pos, near, math.max(deadline - os.clock(), 6) + 6, nil, true)
 				end
-				hum.Jump = true
+				if N.unstick and not straightOnly then
+					N.unstick(stuck, pos, "straight walk")
+				else
+					hum.Jump = true
+				end
 				bestAt = os.clock()
 				lastIssue = -1e9
 			end
@@ -33796,6 +33810,493 @@ do
 		return false, "the game refused " .. math.min(#spots, 10) .. " spots (last answer " .. tostring(last) .. ")"
 	end
 end
+-- Auto Garden (toggle AutoGarden, default OFF) and Skill breaks (toggle SkillBreaks, default OFF).
+-- Gardening skill levels pay $100 .. $21,000 (SkillData 361929-361965, $60,600 + 500 Blockbux to level 10), paid by
+-- the server on level up. XP per level (L+1)^2.2188 (362130). Every packet is the game's own (dump ObjectInteractions
+-- 276570-277070, GardeningService 260082-260440):
+--   plant:    InvokeServer {Type = "PlantObject", Name = <plant item>, Target = <empty planter>} (the I_Plant menu),
+--             price = ceil(Price * PLANTING_PRICE_MULTIPLIER 0.5); only plants whose harvest removes them
+--             (HarvestData.Destroy), so the planter frees itself. Grown plants are never sold back (no money flip).
+--   water:    Interact "I_WaterPlant" (water level under the wither threshold), gives active Gardening XP.
+--   grown:    FireServer {Type = "CompletePlantGrowth", Object = plant} = what the client sends by itself within
+--             12 studs once GrowProgress is 1; the server gives 3 * XPPerMinute / 12 Gardening XP (260150).
+--             Garden speed "Instant" (default): the server only checks that the plant is yours and still has a
+--             GrowProgress, not its value (260121-260134), so it is sent right after planting. Measured: GrowProgress
+--             gone + XP up, else after 2 refusals the hub falls back to Natural (water and wait) for the session.
+--   harvest:  Interact "Store"/"Take" (HarvestPlant): the bouquet goes to your inventory, the plant is removed.
+-- Cadence: at least 1.5 s between garden actions (>= 4.5 s per plant cycle), like a quick player.
+-- Self-measuring: Gardening XP and money per session -> $/h of the remaining level rewards, which the Smart Planner
+-- compares with the best job (`PLAN garden ...`). Log: `GARDEN start/plant/instant/grown/water/harvest/done ...`.
+N.Garden = { running = false, instantBad = false, instantFails = 0, xp = 0, seconds = 0, spent = 0, measured = {}, status = "Auto Garden is off", worth = nil, workFrom = nil, lastAct = -1e9, buyAt = -1e9, bad = {}, sessions = 0 }
+do
+	local G = N.Garden
+	local LevelMoney = { 100, 100, 400, 1000, 2000, 4000, 7000, 10000, 15000, 21000 }
+	local function reqXP(level)
+		return (level + 1) ^ 2.218812493
+	end
+	local function stat(path)
+		local jh = N.jobHandler()
+		return jh and tonumber(isolated(function()
+			return (jh.Modules.ClientStats:Get(path))
+		end)) or nil
+	end
+	local function skill()
+		return stat("SkillData/Gardening") or 0, stat("SkillData/Gardening/XP") or 0
+	end
+	-- XP counted from level 0, so a level up inside a session does not look like a loss
+	local function xpTotal()
+		local level, xp = skill()
+		local sum = 0
+		for l = 0, level - 1 do
+			sum += reqXP(l)
+		end
+		return sum + xp, level
+	end
+	N.gardenXpTotal = xpTotal
+	function N.gardenOn()
+		return on("AutoGarden") or (N.planOn() and G.worth == true)
+	end
+	function N.skillBreaksOn()
+		return on("SkillBreaks") or (N.planOn() and G.worth == true)
+	end
+	-- remaining Gardening reward money and XP, and the measured $/h of gardening (nil while unmeasured)
+	function N.gardenValue()
+		local level, xp = skill()
+		if level >= 10 then
+			return 0, 0, 0
+		end
+		local money, need = 0, reqXP(level) - xp
+		for l = level + 1, 10 do
+			money += LevelMoney[l]
+		end
+		for l = level + 1, 9 do
+			need += reqXP(l)
+		end
+		if G.seconds < 60 or G.xp <= 0 then
+			return nil, money, need
+		end
+		local xph = G.xp / G.seconds * 3600
+		local costph = G.spent / G.seconds * 3600
+		return money / math.max(need, 1) * xph - costph, money, need
+	end
+
+	local function pause()
+		local wait = 1.5 - (os.clock() - G.lastAct)
+		if wait > 0 then
+			task.wait(wait)
+		end
+		G.lastAct = os.clock()
+	end
+	-- the garden packets the game's menu and client send, only for objects on YOUR plot
+	local function onMyPlot(obj)
+		local plot = N.myPlot()
+		return plot ~= nil and typeof(obj) == "Instance" and obj:IsDescendantOf(plot)
+	end
+	local function plantObject(name, planter)
+		local jh = N.jobHandler()
+		if not (jh and onMyPlot(planter)) then
+			log("BLOCKED garden", "PlantObject outside your plot")
+			return false
+		end
+		local box = { done = false }
+		task.spawn(function()
+			box.ok, box.result = pcall(function()
+				return jh.net:InvokeServer({ Type = "PlantObject", Name = name, Target = planter })
+			end)
+			box.done = true
+		end)
+		waitFor(function()
+			return box.done
+		end, 10)
+		return box.done and box.ok, box.result
+	end
+	local function completeGrowth(plant)
+		local jh = N.jobHandler()
+		if not (jh and onMyPlot(plant)) then
+			log("BLOCKED garden", "CompletePlantGrowth outside your plot")
+			return false
+		end
+		return pcall(function()
+			jh.net:FireServer({ Type = "CompletePlantGrowth", Object = plant })
+		end)
+	end
+	local function growValue(obj)
+		local data = obj and obj:FindFirstChild("ObjectData")
+		return data and data:FindFirstChild("GrowProgress")
+	end
+	-- plants and empty planters on your plot
+	local function scan()
+		local out = { plants = {}, planters = {} }
+		local plot, jh = N.myPlot(), N.jobHandler()
+		if not (plot and jh) then
+			return out
+		end
+		isolated(function()
+			local gs = jh.Shared.GardeningService
+			G.wither = G.wither or tonumber(gs.WITHER_TRESHOLD) or 0.5
+			G.mult = G.mult or tonumber(gs.PLANTING_PRICE_MULTIPLIER) or 0.5
+			for _, data in ipairs(plot:GetDescendants()) do
+				if data.Name == "ObjectData" then
+					local obj = data.Parent
+					local okI, item = pcall(jh.Items.GetItemFromObject, jh.Items, obj)
+					if okI and type(item) == "table" and not G.bad[obj] then
+						if type(item.PlantData) == "table" then
+							local okP, progress, water = pcall(gs.GetPlantProgress, gs, obj, item)
+							table.insert(out.plants, { obj = obj, item = item, name = tostring(item.Name), growing = data:FindFirstChild("GrowProgress") ~= nil, progress = if okP then tonumber(progress) else nil, water = if okP then tonumber(water) else nil, harvest = type(item.PlantData.HarvestData) == "table" and item.PlantData.HarvestData.Item ~= nil })
+						end
+						if item.CanPlant then
+							local okH, has = pcall(gs.HasPlant, gs, obj)
+							if okH and not has then
+								table.insert(out.planters, { obj = obj, name = tostring(item.Name) })
+							end
+						end
+					end
+				end
+			end
+		end)
+		return out
+	end
+	-- plants you can plant in this planter now: unlocked, harvest removes them, price above the reserve
+	local function choices(planter, level, budget)
+		local jh = N.jobHandler()
+		local list = isolated(function()
+			local gs = jh.Shared.GardeningService
+			local out = {}
+			for _, v in pairs(jh.Items:GetItems("Garden")) do
+				local okT, isPlant = pcall(v.IsType, v, "Plant")
+				local okH, hidden = pcall(v.IsHidden, v, LocalPlayer)
+				local pd = v.PlantData
+				local hd = type(pd) == "table" and pd.HarvestData
+				if okT and isPlant and okH and not hidden and type(hd) == "table" and hd.Destroy and hd.Item and not v.BSPrice and not v.ECPrice then
+					local lock = type(v.Locked) == "table" and tonumber(v.Locked.Skill_Gardening) or 0
+					local cost = math.ceil((tonumber(v.Price) or 0) * (G.mult or 0.5))
+					local okF, fits = pcall(gs.PlantFits, gs, planter, v)
+					if lock <= level and cost > 0 and cost <= budget and okF and fits then
+						table.insert(out, { name = tostring(v.Name), cost = cost, lock = lock, hours = tonumber(pd.GrowDuration) or 1 })
+					end
+				end
+			end
+			return out
+		end)
+		return list or {}
+	end
+	local function instantMode()
+		return optionText("GardenSpeed", "Instant") == "Instant" and not G.instantBad
+	end
+	local function pickPlant(list)
+		local instant = instantMode()
+		table.sort(list, function(a, b)
+			if instant then
+				local xa = (G.measured[a.name] or (a.lock + 1)) / a.cost
+				local xb = (G.measured[b.name] or (b.lock + 1)) / b.cost
+				if xa ~= xb then
+					return xa > xb
+				end
+				return a.cost < b.cost
+			end
+			if a.hours ~= b.hours then
+				return a.hours < b.hours
+			end
+			return a.cost < b.cost
+		end)
+		return list[1]
+	end
+	local function goNear(obj, dist)
+		local pos = N.posOf(obj)
+		local root = N.root()
+		if not (pos and root) then
+			return false
+		end
+		if N.boxDist(obj, pos, root.Position) <= dist then
+			return true
+		end
+		return N.pathWalk(pos, dist - 1, 30, obj)
+	end
+	local function translated(key)
+		local jh = N.jobHandler()
+		local text = jh and isolated(function()
+			return jh.Modules.TranslationHandler:Format(key, nil)
+		end)
+		return if type(text) == "string" and text ~= "" then text else nil
+	end
+	-- one garden action; "acted", "wait" (plants still growing) or "none" (no plants and no planters)
+	local function step()
+		local s = scan()
+		local level = select(2, xpTotal())
+		-- 1. grown and harvestable: Store (inventory) first, Take otherwise
+		for _, p in ipairs(s.plants) do
+			if not p.growing and p.harvest then
+				pause()
+				G.status = "Harvesting " .. p.name
+				setStatus("Garden: harvesting " .. p.name)
+				if not goNear(p.obj, 8) then
+					G.bad[p.obj] = true
+					log("GARDEN harvest", p.name, "ok=false", "cannot reach it, skipped")
+					return "acted"
+				end
+				local keys = { "I_Store", "I_Take" }
+				for _, k in ipairs({ "I_Store", "I_Take" }) do
+					local t = translated(k)
+					if t then
+						table.insert(keys, t)
+					end
+				end
+				local sent, title, all = N.interactLoose(p.obj, keys)
+				local gone = sent and waitFor(function()
+					return p.obj.Parent == nil
+				end, 12)
+				log("GARDEN harvest", p.name, "ok=" .. tostring(gone == true), "via", tostring(title), if sent then "" else "menu " .. tostring(all))
+				if not gone then
+					G.bad[p.obj] = true
+				end
+				N.detach()
+				return "acted"
+			end
+		end
+		-- 2. growing: Instant -> CompletePlantGrowth now; Natural -> water when dry, complete at 100 %
+		local waiting = false
+		for _, p in ipairs(s.plants) do
+			if p.growing then
+				local ready = p.progress ~= nil and p.progress >= 1
+				if ready or instantMode() then
+					pause()
+					if not goNear(p.obj, 11) then
+						G.bad[p.obj] = true
+						log("GARDEN grow", p.name, "cannot reach it, skipped")
+						return "acted"
+					end
+					setStatus("Garden: " .. (if ready then "collecting " else "growing ") .. p.name)
+					local xp0 = xpTotal()
+					local sent = completeGrowth(p.obj)
+					local done = sent and waitFor(function()
+						return growValue(p.obj) == nil
+					end, 3)
+					task.wait(0.4)
+					local gained = xpTotal() - xp0
+					if done and gained > 0 then
+						G.measured[p.name] = gained
+					end
+					log(if ready then "GARDEN grown" else "GARDEN instant", "plant=" .. p.name, string.format("xp+=%.2f", gained), "ok=" .. tostring(done == true), "progress", string.format("%.2f", p.progress or -1))
+					if not ready then
+						if done then
+							G.instantFails = 0
+						else
+							G.instantFails += 1
+							if G.instantFails >= 2 then
+								G.instantBad = true
+								log("GARDEN instant refused", "2 plants kept growing, Natural (water and wait) for this session")
+							end
+						end
+					end
+					return "acted"
+				end
+				if p.water and p.water <= 1 - (G.wither or 0.5) then
+					pause()
+					if goNear(p.obj, 8) then
+						local xp0 = xpTotal()
+						local sent = N.interactLoose(p.obj, { "I_WaterPlant" })
+						task.wait(3)
+						log("GARDEN water", p.name, "ok=" .. tostring(sent == true), string.format("xp+=%.2f", xpTotal() - xp0), string.format("water %.2f", p.water))
+						N.detach()
+					else
+						G.bad[p.obj] = true
+					end
+					return "acted"
+				end
+				waiting = true
+			end
+		end
+		-- 3. an empty planter: plant the best choice above the money reserve
+		for _, planter in ipairs(s.planters) do
+			local budget = N.money() - N.reserve()
+			local pick = pickPlant(choices(planter.obj, level, budget))
+			if pick then
+				pause()
+				if not goNear(planter.obj, 8) then
+					G.bad[planter.obj] = true
+					log("GARDEN plant", pick.name, "cannot reach", planter.name, "skipped")
+					return "acted"
+				end
+				setStatus("Garden: planting " .. pick.name)
+				local before = N.money()
+				local ok, result = plantObject(pick.name, planter.obj)
+				local jh = N.jobHandler()
+				local planted = ok and waitFor(function()
+					return isolated(function()
+						return jh.Shared.GardeningService:HasPlant(planter.obj) ~= nil
+					end) == true
+				end, 4)
+				local spent = math.max(before - N.money(), 0)
+				G.spent += spent
+				log("GARDEN plant", pick.name, "in", planter.name, "cost=$" .. pick.cost, "spent=$" .. spent, "ok=" .. tostring(planted == true), "answer=" .. brief(result))
+				if not planted then
+					G.bad[planter.obj] = true
+				end
+				return "acted"
+			elseif #s.planters > 0 and not waiting then
+				G.status = "No plant you can afford above the money reserve"
+				return "wait"
+			end
+		end
+		if #s.plants == 0 and #s.planters == 0 then
+			return "none"
+		end
+		return "wait"
+	end
+	-- the cheapest planter (money, not hidden/locked) for a plot without any
+	local function buyPlanter()
+		if os.clock() - G.buyAt < 1800 then
+			return false
+		end
+		G.buyAt = os.clock()
+		local jh = N.jobHandler()
+		local pick = isolated(function()
+			local best
+			for _, v in pairs(jh.Items._IDList or {}) do
+				if type(v) == "table" and v.CanPlant and tonumber(v.Price) and not v.BSPrice and not v.ECPrice then
+					local okH, hidden = pcall(v.IsHidden, v, LocalPlayer)
+					local okL, locked = pcall(v.IsLocked, v, LocalPlayer)
+					if okH and okL and not hidden and not locked and (not best or v.Price < best.price) then
+						best = { name = tostring(v.Name), price = tonumber(v.Price) }
+					end
+				end
+			end
+			return best
+		end)
+		if not pick then
+			log("GARDEN buy planter", "none found in the item list")
+			return false
+		end
+		if N.money() < pick.price + N.reserve() then
+			G.status = string.format("Need a planter: %s $%d (money under price + reserve)", pick.name, pick.price)
+			log("GARDEN buy planter", pick.name, "$" .. pick.price, "ok=false", "money under price + reserve")
+			return false
+		end
+		setStatus("Garden: buying a planter " .. pick.name)
+		local ok, err = N.buyPlace(pick.name, pick.price)
+		log("GARDEN buy planter", pick.name, "$" .. pick.price, "ok=" .. tostring(ok == true), tostring(err or ""))
+		if ok then
+			G.spent += pick.price
+		end
+		return ok == true
+	end
+	local function leaveJob()
+		if N.currentJob() ~= "" then
+			N.taxiRelease()
+			N.bbLeave()
+			N.cookLeave()
+			N.endShift("garden")
+		end
+	end
+	-- One garden session at home, up to maxSeconds. why = idle / needs trip / break / skill break.
+	function N.gardenRun(maxSeconds, why)
+		if G.running then
+			return
+		end
+		G.running = true
+		G.sessions += 1
+		local t0 = os.clock()
+		local xp0, level0 = xpTotal()
+		local spent0 = G.spent
+		local acted = 0
+		local function keep()
+			return alive() and not N.dead() and (N.gardenOn() or (why == "skill break" and N.skillBreaksOn()))
+		end
+		log("GARDEN start", why, "level", level0, "for up to", N.longTime(maxSeconds), "speed", if instantMode() then "Instant" else "Natural")
+		local okRun, err = pcall(function()
+			leaveJob()
+			if not N.goHome() then
+				G.status = "Cannot reach your plot"
+				return
+			end
+			while keep() and os.clock() - t0 < maxSeconds do
+				local r = step()
+				if r == "acted" then
+					acted += 1
+				elseif r == "none" then
+					if not buyPlanter() then
+						G.status = G.status ~= "" and G.status or "No planter on your plot"
+						if not string.find(G.status, "planter", 1, true) then
+							G.status = "No planter or plant on your plot (place a pot or dirt pile)"
+						end
+						break
+					end
+				else
+					-- everything is growing (Natural): idle and breaks wait for it, other sessions go back
+					if why ~= "idle" and why ~= "break" then
+						break
+					end
+					G.status = "Plants are growing"
+					setStatus("Garden: plants are growing")
+					task.wait(5)
+				end
+			end
+		end)
+		if not okRun then
+			log("ERROR", "garden", tostring(err))
+		end
+		N.detach()
+		pcall(N.closeOpenedDoors)
+		local xp1, level1 = xpTotal()
+		local dt = os.clock() - t0
+		local gained = math.max(xp1 - xp0, 0)
+		local reward = 0
+		for l = level0 + 1, level1 do
+			reward += LevelMoney[l] or 0
+		end
+		if acted > 0 then
+			G.xp += gained
+			G.seconds += dt
+		end
+		local v = N.gardenValue()
+		log("GARDEN done", why, "actions", acted, string.format("xp+=%.2f", gained), "in", math.floor(dt), "s", "spent=$" .. math.floor(G.spent - spent0), "level", level0 .. "->" .. level1, "reward=$" .. reward, "value", if v then "$" .. math.floor(v) .. "/h" else "measuring")
+		G.running = false
+		-- nothing to do (no planter, no money, cannot reach the plot): idle gardening waits 5 min before the next try
+		G.idleUntil = if acted == 0 then os.clock() + 300 else 0
+		if acted > 0 then
+			G.status = string.format("Gardening level %d, last session %d actions, +%.1f XP%s", level1, acted, gained, if v then string.format(", worth $%s/h", formatNumber(math.floor(v))) else "")
+		end
+	end
+	-- Skill breaks: every <SkillBreakEvery> min of a shift, a garden session of <SkillBreakMinutes> min
+	function N.skillBreakDue()
+		if not N.skillBreaksOn() or N.currentJob() == "" then
+			if not N.skillBreaksOn() then
+				G.workFrom = nil
+			end
+			return false
+		end
+		G.workFrom = G.workFrom or os.clock()
+		if os.clock() - G.workFrom < optionNumber("SkillBreakEvery", 60) * 60 then
+			return false
+		end
+		G.workFrom = nil
+		-- Natural growth: only worth the trip when something is ready (the plot is readable from afar when streamed)
+		if not instantMode() then
+			local s = scan()
+			if #s.plants + #s.planters > 0 then
+				local ready = #s.planters > 0
+				for _, p in ipairs(s.plants) do
+					if not p.growing or (p.progress or 0) >= 1 or (p.water and p.water <= 1 - (G.wither or 0.5)) then
+						ready = true
+					end
+				end
+				if not ready then
+					log("GARDEN skill break skipped", "every plant is still growing")
+					return false
+				end
+			end
+		end
+		return true
+	end
+	function N.gardenText()
+		if not (on("AutoGarden") or on("SkillBreaks") or (N.planOn() and G.worth)) then
+			return "Auto Garden is off"
+		end
+		local level, xp = skill()
+		local v, money = N.gardenValue()
+		return string.format("Gardening level %d (%.0f / %.0f XP), %s rewards left%s\n%s", level, xp, reqXP(level), "$" .. formatNumber(money or 0), if v then ", worth $" .. formatNumber(math.floor(v)) .. "/h" else ", measuring", G.status)
+	end
+end
 -- Ben's Ice Cream: TakeIceCreamCup at Interior.TableObjects.IceCreamCups, AddIceCreamScoop {Taste, Ball = cup.Ball1 /
 -- Ball2} at Vanilla/Chocolate/Strawberry, AddIceCreamTopping {Taste} at Sprinkles/Caramel/Nuts, then JobCompleted
 -- {Workstation = CustomerTargets child} at the customer. The order sits in the customer's "Order" value (attributes or
@@ -34461,7 +34962,34 @@ end
 -- Cave Miner: the server sends only the exposed blocks (UpdateMineBlocks / NewMineBlock); the client keeps them as
 -- models named "x:depth:y" in a folder under JobHandler.GameFolder. Mining one is
 -- InvokeServer({Type = "MineBlock", P = Vector3.new(x, depth, y)}) with the Pickaxe, true when it broke.
-N.Miner = { skip = {}, folder = nil }
+-- Block types (dump MinerBlocks templates 17461-17478, cloned by id in createLocalBlock 45589): 1 = plain Part
+-- (stone), 2/3 = MeshPart + Part (ore), 4/5 = Part "M" + PointLight (gem), 10 = MeshPart with 6 Decals (TNT).
+-- The miner picks the best $ per second (measured pay per type, prior gem 4 : ore 2.5 : TNT 1.5 : stone 1).
+N.Miner = { skip = {}, folder = nil, pay = {}, logged = {}, kinds = setmetatable({}, { __mode = "k" }), Prior = { gem = 4, ore = 2.5, tnt = 1.5, stone = 1 } }
+function N.Miner.kindOf(block)
+	local cached = N.Miner.kinds[block]
+	if cached then
+		return cached
+	end
+	local kind = "stone"
+	if block:FindFirstChildWhichIsA("PointLight", true) then
+		kind = "gem"
+	else
+		local decals = 0
+		for _, d in ipairs(block:GetDescendants()) do
+			if d:IsA("Decal") then
+				decals += 1
+			end
+		end
+		if decals >= 6 then
+			kind = "tnt"
+		elseif block:FindFirstChildWhichIsA("MeshPart", true) then
+			kind = "ore"
+		end
+	end
+	N.Miner.kinds[block] = kind
+	return kind
+end
 do
 	local function blocksFolder()
 		if N.Miner.folder and N.Miner.folder.Parent then
@@ -34490,15 +35018,57 @@ do
 			task.wait(1)
 			return
 		end
-		local best, bestDist
+		-- pay of the last mined block: the ShiftEarnings change since it was mined, credited to its type
+		local M = N.Miner
+		local earnedNow = N.shiftEarnings()
+		if M.lastKind and M.lastEarn then
+			local gain = earnedNow - M.lastEarn
+			if gain >= 0 and gain < 5000 then
+				local e = M.pay[M.lastKind] or { money = 0, n = 0 }
+				e.money += gain
+				e.n += 1
+				M.pay[M.lastKind] = e
+				M.logged[M.lastKind] = (M.logged[M.lastKind] or 0) + 1
+				if M.logged[M.lastKind] <= 10 or M.logged[M.lastKind] % 25 == 0 then
+					log("MINE", "type=" .. M.lastKind, "pay+=$" .. gain, string.format("avg $%.1f/block (%d)", e.money / e.n, e.n))
+				end
+			end
+			M.lastKind, M.lastEarn = nil, nil
+		end
+		if os.clock() - (M.rateAt or 0) > 300 then
+			M.rateAt = os.clock()
+			local parts = {}
+			for kind, e in pairs(M.pay) do
+				table.insert(parts, string.format("%s=$%.1f(%d)", kind, e.money / math.max(e.n, 1), e.n))
+			end
+			table.sort(parts)
+			if #parts > 0 then
+				log("MINE rates", table.concat(parts, " "))
+			end
+		end
+		-- value per block: measured after 20 blocks of a type, else the prior (gem > ore > TNT > stone), scaled by the
+		-- measured stone pay when known; score = value / (mine time + walk time) -> the most $ per second
+		local stone = M.pay.stone
+		local scale = if stone and stone.n >= 20 and stone.money > 0 then stone.money / stone.n else 1
+		local function value(kind)
+			local e = M.pay[kind]
+			if e and e.n >= 20 then
+				return e.money / e.n
+			end
+			return (M.Prior[kind] or 1) * scale
+		end
+		local best, bestDist, bestScore, bestKind
 		local now = os.clock()
+		local speed = math.max((N.humanoid() and N.humanoid().WalkSpeed) or 16, 8)
 		for _, block in ipairs(folder:GetChildren()) do
 			if (N.Miner.skip[block] or 0) <= now then
 				local part = block.PrimaryPart or block:FindFirstChildWhichIsA("BasePart")
 				if part then
 					local d = (part.Position - root.Position).Magnitude
-					if not bestDist or d < bestDist then
-						best, bestDist = block, d
+					local kind = M.kindOf(block)
+					local score = value(kind) / (0.6 + math.max(d - 8, 0) / speed)
+					if not bestScore or score > bestScore then
+						best, bestDist, bestScore, bestKind = block, d, score, kind
 					end
 				end
 			end
@@ -34517,12 +35087,14 @@ do
 		if bestDist > 8 then
 			N.walkTo(part.Position, 6, 10)
 		end
-		setStatus(string.format("Miner: mining (%d blocks)", Session.done))
+		setStatus(string.format("Miner: mining %s (%d blocks)", tostring(bestKind), Session.done))
 		task.wait(N.actionDelay() * 0.5)
+		local earnBefore = N.shiftEarnings()
 		local ok, result = N.jobInvoke({ Type = "MineBlock", P = Vector3.new(tonumber(x), tonumber(depth), tonumber(y)) })
 		if ok and result then
 			Session.done += 1
 			Session.correct += 1
+			M.lastKind, M.lastEarn = bestKind, earnBefore
 		else
 			N.Miner.skip[best] = os.clock() + 10
 		end
@@ -37090,7 +37662,7 @@ do
 	end
 
 	-- The interaction list the game's menu would show for this object: index i and raw title of each button.
-	local function findInteraction(target, keys)
+	local function findInteraction(target, keys, loose)
 		local jh = N.jobHandler()
 		local root = N.root()
 		if not (jh and root) then
@@ -37113,7 +37685,7 @@ do
 						table.insert(titles, tostring(i) .. ":" .. raw)
 						if not hit then
 							for _, key in ipairs(keys) do
-								if raw == key then
+								if raw == key or (loose and key ~= "" and string.find(raw, key, 1, true)) then
 									hit, hitTitle = i, raw
 								end
 							end
@@ -37131,6 +37703,15 @@ do
 			return false
 		end
 		return N.needsFire({ Type = "Interact", Target = target, Path = tostring(index) }), title
+	end
+	-- Garden: plant buttons carry an icon tag and the translated text ("[ICON:..]Store (2)"), so a button counts
+	-- when its title contains one of the keys. Returns sent, title, and every title the menu had (for the log).
+	function N.interactLoose(target, keys)
+		local index, title, all = findInteraction(target, keys, true)
+		if not index then
+			return false, nil, all
+		end
+		return N.needsFire({ Type = "Interact", Target = target, Path = tostring(index) }), title, all
 	end
 
 	-- Walking inside a plot (walls, doors, fences, trees). The old walk aimed at the object's own centre, which is
@@ -37184,6 +37765,43 @@ do
 	end
 	local function posText(p)
 		return string.format("(%d,%d,%d)", p.X, p.Y, p.Z)
+	end
+	-- One recovery action per stuck check (no progress): 1 = jump (a low obstacle in front: hit at knee height, free
+	-- at head height), 2 = side-step 3 studs to the free side, 3+ = "repath" (the caller computes a new path from
+	-- where you stand). Log `WALK stuck n=<n> action=<a>`.
+	function N.unstick(n, goal, where)
+		local root, hum = N.root(), N.humanoid()
+		if not (root and hum) then
+			return "none"
+		end
+		local flat = Vector3.new(goal.X - root.Position.X, 0, goal.Z - root.Position.Z)
+		local dir = if flat.Magnitude > 0.1 then flat.Unit else Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z).Unit
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { LocalPlayer.Character }
+		local action
+		if n == 1 then
+			local knee = workspace:Raycast(root.Position - Vector3.new(0, 1.6, 0), dir * 3, params)
+			local head = workspace:Raycast(root.Position + Vector3.new(0, 1.6, 0), dir * 3, params)
+			action = if knee and not head then "jump (low obstacle)" else "jump"
+			hum.Jump = true
+			pcall(hum.MoveTo, hum, goal)
+			task.wait(0.35)
+		elseif n == 2 then
+			local right = Vector3.new(-dir.Z, 0, dir.X)
+			local side, name = right, "sidestep right"
+			if workspace:Raycast(root.Position, right * 4, params) then
+				side, name = -right, "sidestep left"
+			end
+			action = name
+			pcall(hum.MoveTo, hum, root.Position + side * 3 - dir * 1)
+			task.wait(0.7)
+			pcall(hum.MoveTo, hum, goal)
+		else
+			action = "repath"
+		end
+		log("WALK stuck", "n=" .. n, "action=" .. action, "at", posText(root.Position), "dist", math.floor(flat.Magnitude), where or "")
+		return action
 	end
 	-- The real door fix (owner log 2026-10-05: every path stopped at the same spot (1227,31,1071) in front of a door,
 	-- "I keep walking into doors"). A closed door's hitbox collides (dump ObjectInteractions: Parent.CanCollide =
@@ -37311,10 +37929,23 @@ do
 		table.insert(list, pos)
 		return list
 	end
+	-- The agent is sized from YOUR character (R15 adult ~5.2 studs, kids and toddlers smaller): height = hip height
+	-- + root part + head, radius = half the root's width. A narrower second try for doorways.
+	local function agentSize()
+		local root, hum = N.root(), N.humanoid()
+		local height, radius = 5, 1.25
+		pcall(function()
+			height = math.clamp(hum.HipHeight + root.Size.Y + 1.6, 3, 7)
+			radius = math.clamp(math.max(root.Size.X, root.Size.Z) / 2 + 0.25, 0.8, 1.6)
+		end)
+		return height, radius
+	end
+	N.agentSize = agentSize
 	local function computePath(from, to)
 		local last = "?"
-		for _, radius in ipairs({ 1.25, 0.6 }) do
-			local path = PFS:CreatePath({ AgentRadius = radius, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = false, WaypointSpacing = 4, Costs = { Water = 20 } })
+		local height, radius0 = agentSize()
+		for _, radius in ipairs({ radius0, 0.6 }) do
+			local path = PFS:CreatePath({ AgentRadius = radius, AgentHeight = height, AgentCanJump = true, AgentCanClimb = false, WaypointSpacing = 4, Costs = { Water = 20 } })
 			local ok = pcall(path.ComputeAsync, path, from, to)
 			if ok and path.Status == Enum.PathStatus.Success then
 				return path, "Success"
@@ -37344,7 +37975,11 @@ do
 				hum.Jump = true
 			end
 			pcall(hum.MoveTo, hum, wp.Position)
-			local issued, best, bestAt, hopped = os.clock(), math.huge, os.clock(), false
+			-- MoveTo per waypoint with its own timeout: twice the walking time + 1.5 s, else a stuck step
+			local root0 = N.root()
+			local speed = math.max(hum.WalkSpeed, 8)
+			local wpTimeout = (if root0 then (wp.Position - root0.Position).Magnitude else 4) / speed * 2 + 1.5
+			local issued, best, bestAt, stuckN, wpStart = os.clock(), math.huge, os.clock(), 0, os.clock()
 			while true do
 				local root
 				root, hum = N.root(), N.humanoid()
@@ -37363,13 +37998,15 @@ do
 					break
 				end
 				if flat < best - 0.25 then
-					best, bestAt, hopped = flat, os.clock(), false
-				elseif os.clock() - bestAt > 2 then
-					log("WALK blocked at", posText(root.Position), "waypoint", i .. "/" .. #points, "dist", string.format("%.1f", flat))
-					return done(false, "stuck")
-				elseif os.clock() - bestAt > 1 and not hopped then
-					hopped = true
-					hum.Jump = true
+					best, bestAt = flat, os.clock()
+				elseif os.clock() - bestAt > 0.9 or os.clock() - wpStart > wpTimeout then
+					stuckN += 1
+					local action = N.unstick(stuckN, wp.Position, "waypoint " .. i .. "/" .. #points)
+					if action == "repath" then
+						log("WALK blocked at", posText(root.Position), "waypoint", i .. "/" .. #points, "dist", string.format("%.1f", flat))
+						return done(false, "stuck")
+					end
+					best, bestAt, wpStart = math.huge, os.clock(), os.clock()
 				end
 				if os.clock() - issued > 1 then
 					issued = os.clock()
@@ -37381,7 +38018,7 @@ do
 		return done(true)
 	end
 	-- jobMode = called by N.walkTo inside a job building: no ToPlot fallback, hop only for short distances.
-	function N.pathWalk(pos, near, timeout, object, jobMode)
+	local function pathWalkInner(pos, near, timeout, object, jobMode)
 		near = near or 6
 		local deadline = os.clock() + (timeout or 45)
 		local function arrived()
@@ -37457,6 +38094,16 @@ do
 		end
 		return arrived()
 	end
+	-- Every path walk ends with one line: `WALK done <studs> in <s>` (or `WALK failed ...`), studs = the distance to
+	-- the goal at the start, so slow or failing spots show in the log.
+	function N.pathWalk(pos, near, timeout, object, jobMode)
+		local root = N.root()
+		local studs = if root then math.floor((pos - root.Position).Magnitude) else -1
+		local t0 = os.clock()
+		local ok = pathWalkInner(pos, near, timeout, object, jobMode)
+		log(if ok then "WALK done" else "WALK failed", studs, "in", string.format("%.1fs", os.clock() - t0), if jobMode then "(job)" else "")
+		return ok
+	end
 	-- The game's own "go to my plot" teleport (HouseHandler:ToPlot = InvokeServer ToPlot). force = also when you
 	-- already stand on your plot (the walk's fallback: it puts you back at the plot's spawn).
 	function N.goHome(force)
@@ -37484,6 +38131,15 @@ do
 			return r ~= nil and N.plotAt(r.Position) == plot
 		end, 15)
 		log("NEEDS home", if there then "ok" else "failed", "after", math.floor(os.clock() - started), "s")
+		if not there and N.travelTo then
+			-- ToPlot did not move you: the bus stop nearest your plot (FastTravel) and walk the rest
+			local _, ground = N.myPlot()
+			if typeof(ground) == "CFrame" then
+				local moved = N.travelTo(ground.Position + Vector3.new(0, 3, 0), 20, 90, "home")
+				local r = N.root()
+				there = moved and r ~= nil and N.plotAt(r.Position) == plot
+			end
+		end
 		return there
 	end
 
@@ -38073,6 +38729,10 @@ do
 					end
 				end
 			end
+			-- at home anyway: Auto Garden tends the plants for up to 2 min (breaks garden for their whole rest below)
+			if not isBreak and not Q.objMeal and N.gardenOn and N.gardenOn() and keep() then
+				N.gardenRun(120, "needs trip")
+			end
 			if isBreak then
 				N.objectivesLog("break")
 				-- the rest of the break: sleep if a bed is there (energy is the slowest need), else wait at home
@@ -38080,6 +38740,9 @@ do
 				local v = N.moods()
 				if bed and v and v.Energy and v.Energy < 100 and os.clock() < deadline - 60 then
 					restoreNeed("Energy", bed, deadline)
+				end
+				if N.gardenOn and N.gardenOn() and keep() and os.clock() < deadline - 30 then
+					N.gardenRun(deadline - os.clock(), "break")
 				end
 				while keep() and os.clock() < deadline do
 					setStatus(string.format("Break: %s left", N.longTime(deadline - os.clock())))
@@ -38289,7 +38952,8 @@ end
 --          d * 1440 * (1/r_now - 1/r_new) minutes worth R * eff; bought when that minus the price minus one day of
 --          house bills (0.6 % of the value, BillService) is positive within 24 h, above the money reserve, on the next
 --          trip home (no extra travel).
---   school / skills: valued and logged; not automated (minigames graded on the server, no verified packets).
+--   school / skills: valued and logged; Gardening runs (skill breaks + needs trips) while its measured $/h of level
+--          rewards beats the job (gardenPlan); the other skills and school are minigames graded on the server.
 N.Smart = { text = "Smart Planner is off", headline = nil, last = {}, lastAt = {}, wasOn = false, jobAt = -1e9, dueAt = -1e9, buildAt = -1e9, skillAt = -1e9, catalog = {}, failed = {}, upgrade = nil }
 do
 	local S = N.Smart
@@ -38535,17 +39199,43 @@ do
 		return ok == true
 	end
 
+	-- Gardening (Auto Garden, p05_garden) is the one skill with verified packets: its measured $/h of level rewards
+	-- against the job. Unmeasured: up to 3 sessions to measure it. The planner runs it through N.gardenOn /
+	-- N.skillBreaksOn (G.worth), never by flipping the toggles.
+	local function gardenPlan()
+		local G = N.Garden
+		local v, left, need = N.gardenValue()
+		local R = rate()
+		if v == 0 and left == 0 then
+			G.worth = false
+			decide("garden", "max", "garden: Gardening is level 10, no reward left", 3600)
+			return
+		end
+		if v == nil then
+			G.worth = G.sessions < 3
+			decide("garden", "measure " .. tostring(G.worth), string.format("garden %s: %s of Gardening level rewards left (%d XP), %s", if G.worth then "do" else "skip", money(left), math.floor(need), if G.worth then "measuring what an hour of gardening earns" else "3 sessions earned no XP (no planter or plant?)"), 1800)
+			return
+		end
+		G.worth = v > R
+		decide("garden", if G.worth then "do" else "skip", string.format("garden worth %s/h vs job %s/h -> %s (Gardening rewards %s left, %d XP to level 10)", money(v), money(R), if G.worth then "do (skill breaks + needs trips)" else "skip", money(left), math.floor(need)), 1800)
+	end
 	local function skillsPlan()
-		local list = {}
+		local list, left = {}, 0
 		for _, skill in ipairs(Skills) do
 			local level = stat("SkillData/" .. skill)
 			if level and level < 10 then
-				table.insert(list, string.format("%s %d (next %s)", skill, level, money(LevelMoney[level + 1])))
+				for l = level + 1, 10 do
+					left += LevelMoney[l]
+				end
+				if skill ~= "Gardening" then
+					table.insert(list, string.format("%s %d (next %s)", skill, level, money(LevelMoney[level + 1])))
+				end
 			end
 		end
 		if #list > 0 then
-			decide("skills", "skip", "skills skipped reason=XP only from furniture minigames on the server, no verified action; levels " .. table.concat(list, ", "), 3600)
+			decide("skills", "skip", string.format("skills: %s of skill level rewards left in total; Gardening by Auto Garden, the others skipped reason=XP only from furniture minigames on the server, no verified action; levels %s", money(left), table.concat(list, ", ")), 3600)
 		end
+		gardenPlan()
 		local school = N.Plan and N.Plan.school
 		if school and school.text then
 			decide("school", if (school.net or 0) > 0 then "worth" else "no", "school: " .. school.text .. (if (school.net or 0) > 0 then " (classes are minigames, attend them yourself)" else ""), 3600)
@@ -38627,9 +39317,188 @@ do
 	function N.smartOff()
 		S.wasOn = false
 		S.upgrade = nil
+		N.Garden.worth = nil
 		S.text = "Smart Planner is off"
 		S.headline = nil
 		table.clear(parts)
+	end
+end
+-- Long trips. The walk (N.walkTo / N.pathWalk) calls N.travelNear first; it moves you only when that saves time:
+--   FastTravel (dropdown "Long trips" = Bus, default): the game's own bus-stop travel (dump FastTravelShared
+--   258459-258586). The client checks ClientStats:IsPlaying, detaches, anchors its root and invokes
+--   {Type = "FastTravel", Player, Location}; the server finds the BusStop model of that name, moves you 5 studs in
+--   front of it (AttachService:MovePlayerYield) and answers after max(dist / 300, 10) - 0.5 s. No price, no check of
+--   where you stand (blatant.md #1). Used when walking from the nearest stop + 10 s beats the direct walk by 15 s.
+--   Never during a shift with a work area (leaving it clocks you out, JobHandler ShiftRadius/ShiftArea 40826), only
+--   Pizza Delivery (no work area) and trips between shifts.
+--   Server teleport (toggle ServerTeleport, default OFF): MovePlayerYield {Pos = CFrame} (dump AttachService 243029,
+--   sent by the game's faint recovery 36310) moves you to the exact spot. At most every 30 s; dropped for the session
+--   when the server does not move you.
+-- Log: `TRAVEL fast <place> ok=<bool> ...`, `MOVE yield ok=<bool> dist=<n>`, `TRAVEL fast off 10 min`.
+N.Travel = { fails = 0, offUntil = 0, busy = false, yieldOff = false, yieldAt = -1e9, trips = 0, saved = 0 }
+do
+	local T = N.Travel
+	-- FastTravelShared stop names and positions (dump 258462-258472)
+	local Stops = {
+		["Bloxburg Central"] = Vector3.new(429.1, 0.9, -11.7),
+		["Bloxy Acres"] = Vector3.new(719.5, 28.9, 704.9),
+		["Billygoat High"] = Vector3.new(719.6, 19.7, -416.6),
+		["Cape Beacon"] = Vector3.new(-353.4, 1, -2671.3),
+		["Lakeview Heights"] = Vector3.new(2210.8, 170.7, -712.4),
+		["Ocean Avenue"] = Vector3.new(-210.8, 1.1, -268.1),
+		["Peak Mountain"] = Vector3.new(3406.4, 166.9, -1405.9),
+		["Riverside Estates"] = Vector3.new(389.1, 41, -1634.4),
+		["Riverside Park"] = Vector3.new(1209.8, 14.8, -1123.1),
+		["Starlight Observatory"] = Vector3.new(1872.9, 234, -2833.6),
+		["Sunset Pointe"] = Vector3.new(-538.1, 1, 881),
+	}
+	local NoArea = { [""] = true, PizzaPlanetDelivery = true }
+	local function flat(a, b)
+		return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+	end
+	local function walkSpeed()
+		local hum = N.humanoid()
+		return math.max(hum and hum.WalkSpeed or 16, 8)
+	end
+	local function invoke(packet, timeout)
+		local jh = N.jobHandler()
+		if not jh then
+			return false, nil
+		end
+		local box = { done = false }
+		task.spawn(function()
+			box.ok, box.result = pcall(function()
+				return jh.net:InvokeServer(packet)
+			end)
+			box.done = true
+		end)
+		local started = os.clock()
+		while not box.done and os.clock() - started < timeout do
+			task.wait(0.1)
+		end
+		return box.done and box.ok, box.result
+	end
+	function N.fastTravel(name, why)
+		local jh, root = N.jobHandler(), N.root()
+		local stop = Stops[name]
+		if not (jh and root and stop) then
+			return false
+		end
+		local playing = isolated(function()
+			return jh.Modules.ClientStats:IsPlaying()
+		end)
+		if playing == false then
+			log("TRAVEL fast", name, "ok=false", "reason=not playing (menu open)")
+			return false
+		end
+		local from = root.Position
+		setStatus("Travel: bus to " .. name)
+		N.detach()
+		local t0 = os.clock()
+		pcall(function()
+			root.Anchored = true
+		end)
+		local answered, result = invoke({ Type = "FastTravel", Player = LocalPlayer, Location = name }, 60)
+		pcall(function()
+			root.Anchored = false
+		end)
+		local r = N.root()
+		if r and r ~= root then
+			pcall(function()
+				r.Anchored = false
+			end)
+		end
+		local left = if r then flat(r.Position, stop) else 1e9
+		local ok = left < 60
+		log("TRAVEL fast", name, "ok=" .. tostring(ok), "answer=" .. brief(result), "answered=" .. tostring(answered), "from", math.floor(flat(from, stop)), "studs, now", math.floor(left), "from the stop", "t=" .. string.format("%.1fs", os.clock() - t0), "why=" .. tostring(why))
+		if ok then
+			T.fails = 0
+			T.trips += 1
+		else
+			T.fails += 1
+			if T.fails >= 2 then
+				T.fails = 0
+				T.offUntil = os.clock() + 600
+				log("TRAVEL fast off 10 min", "2 trips did not move you, walking instead")
+			end
+		end
+		return ok
+	end
+	local function yieldTo(pos, why)
+		local jh, root = N.jobHandler(), N.root()
+		if not (jh and root) then
+			return false
+		end
+		T.yieldAt = os.clock()
+		local from = root.Position
+		local d0 = flat(from, pos)
+		N.detach()
+		local sent = pcall(function()
+			jh.net:FireServer({ Type = "MovePlayerYield", Pos = CFrame.new(pos + Vector3.new(0, 3, 0)) })
+		end)
+		local ok = sent and waitFor(function()
+			local r = N.root()
+			return r ~= nil and flat(r.Position, pos) < 15
+		end, 6)
+		log("MOVE yield", "ok=" .. tostring(ok), "dist=" .. math.floor(d0), "why=" .. tostring(why))
+		if not ok then
+			T.yieldOff = true
+			log("MOVE yield off", "the server did not move you, Server teleport is not used again this session")
+		end
+		return ok
+	end
+	-- Moves you close to pos when that is clearly faster than walking. True when you were moved.
+	function N.travelNear(pos, why)
+		if T.busy or typeof(pos) ~= "Vector3" then
+			return false
+		end
+		local root = N.root()
+		if not root then
+			return false
+		end
+		local d = flat(root.Position, pos)
+		if d < 60 then
+			return false
+		end
+		local speed = walkSpeed()
+		T.busy = true
+		local ok, moved = pcall(function()
+			if on("ServerTeleport") and not T.yieldOff and os.clock() - T.yieldAt >= 30 and d / speed >= 6 then
+				if yieldTo(pos, why) then
+					return true
+				end
+			end
+			if not NoArea[N.currentJob()] or optionText("LongTrips", "Bus (FastTravel)") ~= "Bus (FastTravel)" or os.clock() < T.offUntil then
+				return false
+			end
+			local bestName, bestD
+			for name, p in pairs(Stops) do
+				local s = flat(p, pos)
+				if not bestD or s < bestD then
+					bestName, bestD = name, s
+				end
+			end
+			local direct, via = d / speed, 10 + bestD / speed
+			if direct - via < 15 then
+				return false
+			end
+			local moved = N.fastTravel(bestName, string.format("%s, %d studs, saves ~%ds", tostring(why), math.floor(d), math.floor(direct - via)))
+			if moved then
+				T.saved += direct - via
+			end
+			return moved
+		end)
+		T.busy = false
+		if not ok then
+			log("ERROR", "travel", tostring(moved))
+			return false
+		end
+		return moved == true
+	end
+	-- travel (when it pays) + walk the last meters
+	function N.travelTo(pos, near, timeout, why)
+		N.travelNear(pos, why)
+		return N.walkTo(pos, near or 4, timeout or 60)
 	end
 end
 local Window, Tabs, Labels
@@ -38730,6 +39599,7 @@ do
 	mirror("QS_BestPay", "BestPay", "Best Pay", "Switches to the job that pays you the most over the next 24 h (measured, not guessed)")
 	mirror("QS_AutoNeeds", "AutoNeeds", "Auto Needs", "Sleeps, eats, showers and watches TV at home so low moods never cut your pay. Buys quick meals and missing furniture")
 	mirror("QS_Objectives", "Objectives", "Daily Objectives", "Does the daily job task and the daily quick meal for the $5,000+ daily reward")
+	mirror("QS_AutoGarden", "AutoGarden", "Auto Garden", "Plants, grows and harvests in your planters for Gardening level rewards ($60,600 to level 10)")
 	QuickBox:AddButton({
 		Text = "Stop Everything",
 		Func = function()
@@ -38792,6 +39662,44 @@ do
 		Tooltip = "Reward $5,000 + $750 per streak day (up to $8,000) when all 3 daily tasks are done. Corvus works the task's job (with Auto Work) and eats the daily quick meal. Tasks like donating or emotes are yours",
 	})
 	Labels.Obj = ObjBox:AddLabel({ Text = "-", DoesWrap = true })
+
+	local TravelBox = Tabs.Jobs:AddLeftGroupbox("Travel", "bus")
+	TravelBox:AddDropdown("LongTrips", {
+		Text = "Long trips",
+		Values = { "Bus (FastTravel)", "Walk" },
+		Default = "Bus (FastTravel)",
+		Tooltip = "Bus = the game's free fast travel to the bus stop nearest the goal when that saves 15 s or more (pizza addresses, the way home), then walking the last meters. Never during a shift with a work area",
+	})
+	TravelBox:AddToggle("ServerTeleport", {
+		Text = "Server teleport",
+		Default = false,
+		Tooltip = "Asks the server to move you straight to the goal (the game's faint recovery move). Faster than the bus, at most every 30 s. Turns itself off for the session if the server does not move you",
+	})
+	TravelBox:AddLabel({
+		Text = '<font transparency="0.35">Server teleport moves you the way the game does after fainting. It is off by default because staff could notice many such moves.</font>',
+		DoesWrap = true,
+	})
+
+	local GardenBox = Tabs.Jobs:AddRightGroupbox("Garden & Skills", "sprout")
+	GardenBox:AddToggle("AutoGarden", {
+		Text = "Auto Garden",
+		Default = false,
+		Tooltip = "In your own planters: plants, grows, waters and harvests (bouquets go to your inventory) for Gardening XP. Levels pay $100 to $21,000 ($60,600 to level 10). Runs when you are not working, on needs trips and breaks. Buys the cheapest planter if you have none",
+	})
+	GardenBox:AddDropdown("GardenSpeed", {
+		Text = "Garden speed",
+		Values = { "Instant", "Natural" },
+		Default = "Instant",
+		Tooltip = "Instant finishes a plant's growth right after planting (the game's own grown message, the server accepts it). Natural waters and waits for real growth. Instant falls back to Natural by itself if the server refuses",
+	})
+	GardenBox:AddToggle("SkillBreaks", {
+		Text = "Skill breaks",
+		Default = false,
+		Tooltip = "During long shifts: every few minutes of work, go home for a short garden session, then back to work",
+	})
+	GardenBox:AddSlider("SkillBreakEvery", { Text = "Skill break every", Default = 60, Min = 10, Max = 240, Rounding = 0, Suffix = " min" })
+	GardenBox:AddSlider("SkillBreakMinutes", { Text = "Skill break length", Default = 8, Min = 2, Max = 30, Rounding = 0, Suffix = " min" })
+	Labels.Garden = GardenBox:AddLabel({ Text = "Auto Garden is off", DoesWrap = true })
 
 	local NeedsBox = Tabs.Jobs:AddRightGroupbox("Auto Needs", "heart-pulse")
 	NeedsBox:AddToggle("AutoNeeds", {
@@ -39028,6 +39936,8 @@ N.AllAutoToggles = {
 	"BestPay",
 	"AutoNeeds",
 	"Objectives",
+	"AutoGarden",
+	"SkillBreaks",
 }
 do
 	function N.manualRunning()
@@ -39711,6 +40621,11 @@ do
 				N.cookLeave()
 			end
 			lastPick = pick
+			-- Skill breaks: a short garden session inside a long shift, then the next pass clocks in again
+			if N.skillBreakDue() then
+				N.gardenRun(optionNumber("SkillBreakMinutes", 8) * 60, "skill break")
+				return
+			end
 			local step = JobSteps[pick]
 			if step then
 				step()
@@ -39718,12 +40633,18 @@ do
 			task.wait(0.05)
 			return
 		end
+		-- not working: Auto Garden gardens in sessions of 5 min (needs trips can come in between)
+		if N.gardenOn() and os.clock() >= (N.Garden.idleUntil or 0) then
+			N.gardenRun(300, "idle")
+			task.wait(if N.Garden.status == "Plants are growing" then 1 else 10)
+			return
+		end
 		setStatus(if N.needsOn() then "Auto Needs: moods are fine, waiting" else "Idle")
 		task.wait(0.5)
 	end)
 	-- Every change of the main toggles is logged with the others' state, so a silent stop has a visible reason.
 	task.spawn(function()
-		local names = { "SmartPlanner", "AutoJob", "BestPay", "AutoNeeds", "Objectives" }
+		local names = { "SmartPlanner", "AutoJob", "BestPay", "AutoNeeds", "Objectives", "AutoGarden", "SkillBreaks", "ServerTeleport" }
 		local last = {}
 		while alive() do
 			for _, name in ipairs(names) do
@@ -39794,6 +40715,7 @@ do
 				N.InfoText.obj = if N.dailyOn() then N.objectiveText(false) or "-" else "Daily Objectives is off"
 				N.InfoText.needs = if N.needsOn() or N.Needs.active then N.needsStatus() else "Auto Needs is off"
 				N.InfoText.pay = N.payText()
+				N.InfoText.garden = N.gardenText()
 				-- the first pass runs inside task.spawn before N.upNextText below is defined (ERROR info: attempt to call a nil value)
 				N.InfoText.next = if N.upNextText then N.upNextText() else N.InfoText.next
 				local job = N.currentJob()
@@ -39821,8 +40743,12 @@ do
 		local Q = N.Needs
 		local lines = {}
 		local working, needs, daily = N.workOn(), N.needsOn(), N.dailyOn()
-		if not (working or needs or daily or Q.active) then
-			return "Switch on Smart Planner, or Auto Work, Auto Needs or Daily Objectives in Quick Start"
+		local garden = N.gardenOn() or N.skillBreaksOn()
+		if not (working or needs or daily or garden or Q.active) then
+			return "Switch on Smart Planner, or Auto Work, Auto Needs, Daily Objectives or Auto Garden in Quick Start"
+		end
+		if N.Garden.running then
+			table.insert(lines, "Now: gardening (" .. tostring(N.Garden.status) .. ")")
 		end
 		if N.planOn() and N.Smart.headline then
 			table.insert(lines, N.Smart.headline)
@@ -39900,6 +40826,7 @@ do
 					Labels.Smart:SetText(N.Smart.text or "-")
 					Labels.Needs:SetText(N.InfoText.needs or "-")
 					Labels.Obj:SetText(N.InfoText.obj or "-")
+					Labels.Garden:SetText(N.InfoText.garden or "-")
 				end)
 			end
 			if shown(Tabs.Stats) then
