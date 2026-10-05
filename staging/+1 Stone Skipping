@@ -26102,15 +26102,12 @@ end)
             local SupportedGames = Info.SupportedGames or {
                 { Name = "+1 Stone Skipping", PlaceId = 111543903102439 },
                 { Name = "Anime Dice", PlaceId = 113290951185459 },
-                { Name = "Bizarre", PlaceId = 135621866300031 },
                 { Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
                 { Name = "Loot To Forge", PlaceId = 118805555015549 },
                 { Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
                 { Name = "Pets Universe", PlaceId = 74629631798007 },
                 { Name = "Ride A Pet", PlaceId = 124216119978534 },
-                { Name = "Steal An Egg", PlaceId = 107778070777162 },
                 { Name = "Steal From The Rich", PlaceId = 120475074479690 },
-                { Name = "Voltline Electric Scooters", PlaceId = 118315378611589 },
                 { Name = "Welcome to Bloxburg", PlaceId = 185655149 },
             }
             local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
@@ -31682,12 +31679,44 @@ do
 	-- A toggle counts as on when the player switched it on, or when Auto Farm Everything (full automatic) runs and the
 	-- toggle is one of its jobs (N.FullSet). Full automatic never changes the player's own toggles.
 	N.FullSet = {}
+	-- Mode "My filters" (Main): no planner. The jobs picked in the Run dropdown run, nothing else is started for the player.
+	-- Fuse, delete and rebirth never run in this mode, not even from their own toggles.
+	N.RunMap = {
+		AutoThrow = "Auto Throw",
+		AutoTrain = "Auto Train",
+		AutoEquipBest = "Equip Best",
+		AutoOpenEggs = "Hatch owned eggs",
+		AutoDaily = "Daily reward",
+		AutoGifts = "Timed gifts",
+		AutoOffline = "Offline skill",
+		AutoGroupReward = "Group reward",
+		AutoIndex = "Pet index",
+		AutoCodes = "Redeem codes",
+		AutoFriend = "Auto Friend",
+	}
+	N.RunOrder = { "AutoThrow", "AutoTrain", "AutoEquipBest", "AutoOpenEggs", "AutoDaily", "AutoGifts", "AutoOffline", "AutoGroupReward", "AutoIndex", "AutoCodes", "AutoFriend" }
+	N.NeverInFilters = { AutoFuse = true, AutoDeletePets = true, AutoRebirth = true }
+	function N.farmOn()
+		return Toggles.AutoFarmAll ~= nil and Toggles.AutoFarmAll.Value == true
+	end
+	function N.myFilters()
+		return N.farmOn() and Options.FarmMode ~= nil and Options.FarmMode.Value == "My filters"
+	end
 	function on(name)
 		local t = Toggles[name]
 		if t ~= nil and t.Value == true then
+			if N.NeverInFilters[name] and N.myFilters() then
+				return false
+			end
 			return true
 		end
-		return N.FullSet[name] == true and Toggles.AutoFarmAll ~= nil and Toggles.AutoFarmAll.Value == true
+		if Toggles.AutoFarmAll ~= nil and Toggles.AutoFarmAll.Value == true then
+			if Options.FarmMode ~= nil and Options.FarmMode.Value == "My filters" then
+				return N.RunMap[name] ~= nil and selected(Options.FarmRun, N.RunMap[name])
+			end
+			return N.FullSet[name] == true
+		end
+		return false
 	end
 	function optionNumber(name, default)
 		local option = Options[name]
@@ -31701,10 +31730,10 @@ do
 	-- Auto Farm Everything = full automatic (confirmed by the player): the planner runs every job of this game, spending
 	-- included, independent of the manual toggles. Off = only the toggles the player switched on run.
 	function N.farmMode()
-		return if on("AutoFarmAll") then "Full auto" else "Manual"
+		return if not N.farmOn() then "Manual" elseif N.myFilters() then "My filters" else "Full auto"
 	end
 	function N.opActive()
-		return on("AutoFarmAll")
+		return N.farmOn() and not N.myFilters()
 	end
 	N.fullActive = N.opActive
 	-- "Exclude" (Main tab): resources Corvus never sells, deletes, fuses or uses, in full automatic and in manual mode.
@@ -34362,40 +34391,30 @@ do
 			notify("Auto Farm Everything", N.OPWarning .. " Turn it on again within 10 s to confirm.", 10)
 		end
 	end
-	-- Remember Auto Farm Everything: configs never save or load AutoFarmAll (SaveManager ignore list). It only comes back
-	-- after a rejoin when Remember is on and it was running when the player left.
-	N.OPState = "Corvus/STONE_auto_farm_" .. tostring(LocalPlayer.UserId) .. ".txt"
-	function N.saveOPState(value)
-		pcall(function()
-			if makefolder and isfolder and not isfolder("Corvus") then
-				makefolder("Corvus")
-			end
-			writefile(N.OPState, if value then "1" else "0")
-		end)
-	end
-	function N.restoreOP()
-		if not on("RememberAutoFarm") or Toggles.AutoFarmAll.Value then
-			return false
-		end
-		local ok, text = pcall(function()
-			return readfile(N.OPState)
-		end)
-		if ok and text == "1" then
-			N.OP.confirmed = true
-			log("FARM restored", "Remember Auto Farm Everything")
-			Toggles.AutoFarmAll:SetValue(true)
-			return true
-		end
-		return false
-	end
 	do
 		local FarmBox = Tabs.Main:AddLeftGroupbox("Auto Farm Everything", "sparkles")
+		-- Mode: Best value = the planner (spends, fuses, deletes, rebirths, asks to confirm). My filters = no planner, no
+		-- destructive step: only the jobs picked in Run. The master toggle is never saved in a config and never restored.
+		function N.needsConfirm()
+			return N.opActive() and not N.OP.confirmed
+		end
+		function N.syncFarmUI()
+			local run = Options.FarmRun
+			if run and run.SetVisible then
+				pcall(run.SetVisible, run, Options.FarmMode ~= nil and Options.FarmMode.Value == "My filters")
+			end
+		end
 		FarmBox:AddToggle("AutoFarmAll", {
 			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = N.OPWarning .. " The planner does every job of this game for the most Wins and progress: throwing at the fastest accepted rate, training, buying, hatching, fusing, deleting spare pets, potions and rebirths, except what is in Exclude. Your own toggles stay as they are. Asks to confirm first",
+			Tooltip = "Runs what Mode says. Best value: the planner does every job of this game for the most Wins and progress (throwing at the fastest accepted rate, training, buying, hatching, fusing, deleting spare pets, potions, rebirths) except what is in Exclude, and asks to confirm first. My filters: only the jobs you pick in Run, no buying, fusing, deleting or rebirth. Never saved in a config",
 			Callback = function(value)
 				if N.OP.ignore then
+					return
+				end
+				if value and N.myFilters() then
+					N.Plan.blockEnds = 0
+					log("FARM filters", "true")
 					return
 				end
 				if value and not N.OP.confirmed then
@@ -34416,22 +34435,47 @@ do
 				if not value then
 					N.OP.confirmed = false
 				end
-				N.saveOPState(value)
 				-- A fresh plan: the next activity block starts now.
 				N.Plan.blockEnds = 0
 				log("FARM full", tostring(value))
 			end,
 		})
-		FarmBox:AddToggle("RememberAutoFarm", {
-			Text = "Remember Auto Farm Everything",
-			Default = false,
-			Tooltip = N.OPWarning .. " Off: Auto Farm Everything always starts off, even when a config is loaded. On: if it was running when you left, it starts again by itself after a rejoin or a new server",
+		FarmBox:AddDropdown("FarmMode", {
+			Text = "Mode",
+			Values = { "Best value", "My filters" },
+			Default = "Best value",
+			Tooltip = "Best value: the planner picks the most profitable use of your time and Wins (buys, fuses, deletes, rebirths). My filters: no planner and nothing destructive, only the jobs picked in Run",
 			Callback = function(value)
-				if value then
-					notify("Remember Auto Farm Everything", N.OPWarning, 10)
+				N.syncFarmUI()
+				if value == "Best value" and Toggles.AutoFarmAll.Value and not N.OP.confirmed then
+					task.defer(function()
+						N.OP.ignore = true
+						Toggles.AutoFarmAll:SetValue(false)
+						N.OP.ignore = false
+						N.askOP()
+					end)
 				end
+				N.Plan.blockEnds = 0
+				log("FARM mode", tostring(value))
 			end,
 		})
+		do
+			local runValues, runDefaults = {}, {}
+			for _, key in ipairs(N.RunOrder) do
+				table.insert(runValues, N.RunMap[key])
+				table.insert(runDefaults, N.RunMap[key])
+			end
+			FarmBox:AddDropdown("FarmRun", {
+				Text = "Run",
+				Values = runValues,
+				Default = runDefaults,
+				Multi = true,
+				AllowNull = true,
+				Visible = false,
+				Tooltip = "My filters runs only these jobs: Auto Throw (at the Throw Speed you set), Auto Train, Equip Best, Hatch owned eggs, rewards, codes and Auto Friend. Nothing is bought, fused, deleted or used",
+			})
+			N.syncFarmUI()
+		end
 		local values, defaults = {}, {}
 		for _, rarity in ipairs(N.PetRarities) do
 			table.insert(values, "Pets: " .. rarity)
@@ -34481,7 +34525,7 @@ do
 					pcall(option.SetValue, option, value)
 				end
 			end
-			for name, value in pairs({ SkipAnimations = true, FuseForIndex = true, DeleteOnlyWeaker = true, KeepVariants = true, DiscardOnHatch = true, RememberAutoFarm = false }) do
+			for name, value in pairs({ SkipAnimations = true, FuseForIndex = true, DeleteOnlyWeaker = true, KeepVariants = true, DiscardOnHatch = true }) do
 				local toggle = Toggles[name]
 				if toggle then
 					pcall(toggle.SetValue, toggle, value)
@@ -34519,7 +34563,7 @@ do
 			Text = "Throw Speed",
 			Values = { "Legit (game pace)", "Max (Blatant)" },
 			Default = "Legit (game pace)",
-			Tooltip = "Manual play. Legit (Safe, default) waits like the game's own Auto Wins pass (about 2.4 s between throws). Max (Blatant, at your own risk) throws again the moment the game's 0.8 s cooldown ends. Auto Farm Everything always uses Max",
+			Tooltip = "Manual play. Legit (Safe, default) waits like the game's own Auto Wins pass (about 2.4 s between throws). Max (Blatant, at your own risk) throws again the moment the game's 0.8 s cooldown ends. Best value mode of Auto Farm Everything always uses Max",
 			Callback = function(value)
 				if value == "Max (Blatant)" then
 					notify("Blatant", "Max throw rate is faster than a normal player. Use it at your own risk", 6)
@@ -35530,18 +35574,12 @@ if Window.AddSettingsTab then
 		Folder = "StoneSkipping",
 		MenuKeybind = "RightControl",
 	})
-	-- AutoFarmAll is never saved in a config or loaded from one (also not through share codes): Remember Auto Farm
-	-- Everything decides.
+	-- AutoFarmAll is never saved in a config or loaded from one (also not through share codes), and never restored.
 	pcall(function()
 		SaveManager:SetIgnoreIndexes({ "AutoFarmAll" })
 	end)
 	pcall(function()
 		SaveManager.Ignore.AutoFarmAll = true
-	end)
-	task.delay(4, function()
-		if alive() then
-			pcall(N.restoreOP)
-		end
 	end)
 	if ok and tab then
 		Tabs.Settings = tab
