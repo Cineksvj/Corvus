@@ -20783,7 +20783,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 CanvasSize = UDim2.fromScale(0, 0),
                 Position = UDim2.fromOffset(0, 49),
                 ScrollBarThickness = 0,
-                Size = UDim2.new(0, InitialLeftWidth, 1, -100),
+                Size = UDim2.new(0, InitialLeftWidth, 1, -70),
                 Parent = MainFrame,
             })
             New("UIListLayout", {
@@ -20818,162 +20818,32 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             })
     
             do
-                local DiscordBlurple = Color3.fromRGB(88, 101, 242)
-                local FooterHeight = 32
-                local Footer = New("TextButton", {
-                    AnchorPoint = Vector2.new(0, 1),
-                    AutoButtonColor = false,
-                    BackgroundColor3 = "MainColor",
-                    BackgroundTransparency = 0.2,
-                    Name = "DiscordFooter",
-                    Position = UDim2.new(0, 4, 1, -24),
-                    Size = UDim2.new(0, InitialLeftWidth - 8, 0, FooterHeight),
-                    Text = "",
-                    ZIndex = 3,
-                    Parent = MainFrame,
-                })
-                New("UICorner", {
-                    CornerRadius = UDim.new(0, 8),
-                    Parent = Footer,
-                })
-                New("UIStroke", {
-                    Color = "AccentColor",
-                    Transparency = 0.6,
-                    Parent = Footer,
-                })
-                local FooterIcon = New("ImageLabel", {
-                    AnchorPoint = Vector2.new(0, 0.5),
-                    BackgroundColor3 = DiscordBlurple,
-                    BackgroundTransparency = 0,
-                    ImageColor3 = Color3.new(1, 1, 1),
-                    ImageTransparency = 0.1,
-                    Position = UDim2.new(0, 8, 0.5, 0),
-                    Size = UDim2.fromOffset(22, 22),
-                    ZIndex = 4,
-                    Parent = Footer,
-                })
-                New("UICorner", {
-                    CornerRadius = UDim.new(1, 0),
-                    Parent = FooterIcon,
-                })
-                pcall(function()
-                    Library:ApplyDiscordIcon(FooterIcon)
-                end)
-                Footer.MouseEnter:Connect(function()
-                    TweenService:Create(FooterIcon, Library.TweenInfo, { ImageTransparency = 0 }):Play()
-                end)
-                Footer.MouseLeave:Connect(function()
-                    TweenService:Create(FooterIcon, Library.TweenInfo, { ImageTransparency = 0.1 }):Play()
-                end)
-                local FooterTitle = New("TextLabel", {
-                    BackgroundTransparency = 1,
-                    FontFace = GetBoldFont,
-                    Position = UDim2.fromOffset(38, 3),
-                    Size = UDim2.new(1, -42, 0, 14),
-                    Text = "Discord",
-                    TextColor3 = "FontColor",
-                    TextSize = 12,
-                    TextTruncate = Enum.TextTruncate.AtEnd,
-                    TextXAlignment = Enum.TextXAlignment.Left,
-                    ZIndex = 4,
-                    Parent = Footer,
-                })
-                local FooterSub = New("TextLabel", {
-                    BackgroundTransparency = 1,
-                    Position = UDim2.fromOffset(38, 17),
-                    Size = UDim2.new(1, -42, 0, 12),
-                    Text = "Join our Discord",
-                    TextColor3 = "FontColor",
-                    TextSize = 10,
-                    TextTransparency = 0.35,
-                    TextTruncate = Enum.TextTruncate.AtEnd,
-                    TextXAlignment = Enum.TextXAlignment.Left,
-                    ZIndex = 4,
-                    Parent = Footer,
-                })
-                local FooterWidth = InitialLeftWidth
-                local function FooterLayout()
-                    local Narrow = Library.IsMobile or FooterWidth < 150
-                    local Tiny = FooterWidth < 100
-                    FooterTitle.Visible = not Tiny
-                    FooterSub.Visible = not Tiny and not Narrow
-                    FooterTitle.Position = if Narrow then UDim2.fromOffset(38, 9) else UDim2.fromOffset(38, 3)
-                    FooterIcon.AnchorPoint = if Tiny then Vector2.new(0.5, 0.5) else Vector2.new(0, 0.5)
-                    FooterIcon.Position = if Tiny then UDim2.new(0.5, 0, 0.5, 0) else UDim2.new(0, 8, 0.5, 0)
-                end
-                FooterLayout()
-                local function FooterPaint()
-                    if not Footer.Parent then
-                        return
-                    end
-                    local State = Library.CommunityState
-                    if State and (State.Online or State.Members) then
-                        local function Digits(Value)
-                            if typeof(Value) ~= "number" then
-                                return "?"
-                            end
-                            local Out = string.reverse(tostring(math.floor(Value)))
-                            Out = string.reverse((string.gsub(Out, "(%d%d%d)", "%1,")))
-                            if string.sub(Out, 1, 1) == "," then
-                                Out = string.sub(Out, 2)
-                            end
-                            return Out
-                        end
-                        FooterSub.Text = string.format("%s online \u{00B7} %s members", Digits(State.Online), Digits(State.Members))
-                    end
-                end
-                Library.SidebarDiscordFrame = Footer
-                Library.SidebarDiscord = {
-                    Resize = function(Width)
-                        FooterWidth = Width
-                        Footer.Size = UDim2.new(0, math.max(Width - 8, 16), 0, FooterHeight)
-                        FooterLayout()
-                    end,
-                }
-                Footer.MouseButton1Click:Connect(function()
-                    local Invite = tostring(Library.DiscordInvite or "https://discord.gg/PdQvN2bDCu")
-                    if Library:CopyToClipboard(Invite, false) then
-                        Library:Notify({
-                            Title = "Invite copied",
-                            Description = "Paste it in Discord",
-                            Time = 3,
-                        })
-                    end
-                end)
-                task.delay(2, function()
-                    if Library.Unloaded or not Footer.Parent then
-                        return
-                    end
-                    local Invite = tostring(Library.DiscordInvite or "https://discord.gg/PdQvN2bDCu")
-                    local State = Library.CommunityState
-                    if State and Library.FetchCommunity then
-                        table.insert(State.Listeners, FooterPaint)
-                        FooterPaint()
-                        local _, Code = ParseDiscordInvite(Invite)
-                        Library.FetchCommunity(Code)
-                    end
-                    if not Library.DiscordToastShown then
-                        Library.DiscordToastShown = true
-                        if Library:GetSetting("DiscordAskAgain", true) ~= false then
-                            task.delay(1, function()
-                                while Library.IntroPlaying and not Library.Unloaded do
-                                    task.wait(0.2)
-                                end
-                                if Library.Unloaded then
-                                    return
-                                end
-                                pcall(function()
-                                    Library:ShowDiscordPrompt()
-                                end)
-                                task.spawn(function()
-                                    pcall(function()
-                                        Library:OpenDiscordInvite()
-                                    end)
-                                end)
-                            end)
-                        end
-                    end
-end)
+            	task.delay(2, function()
+            		if Library.Unloaded then
+            			return
+            		end
+            		if not Library.DiscordToastShown then
+            			Library.DiscordToastShown = true
+            			if Library:GetSetting("DiscordAskAgain", true) ~= false then
+            				task.delay(1, function()
+            					while Library.IntroPlaying and not Library.Unloaded do
+            						task.wait(0.2)
+            					end
+            					if Library.Unloaded then
+            						return
+            					end
+            					pcall(function()
+            						Library:ShowDiscordPrompt()
+            					end)
+            					task.spawn(function()
+            						pcall(function()
+            							Library:OpenDiscordInvite()
+            						end)
+            					end)
+            				end)
+            			end
+            		end
+            	end)
             end
             Library.WindowContainer = Container
         end
@@ -21317,7 +21187,7 @@ end)
                 RestoringTo = nil
     
                 if #MinimizeHidden == 0 then
-                    for _, Gui in { TopBar, TopLine, DividerLine, Tabs, Container, BottomBackground, BottomBar, BottomLine, Library.SidebarDiscordFrame } do
+                    for _, Gui in { TopBar, TopLine, DividerLine, Tabs, Container, BottomBackground, BottomBar, BottomLine } do
                         if Gui and Gui.Visible then
                             Gui.Visible = false
                             table.insert(MinimizeHidden, Gui)
@@ -21908,10 +21778,7 @@ end)
     
             TitleHolder.Size = UDim2.new(0, Width, 1, 0)
             RightWrapper.Size = UDim2.new(1, -Width - TopbarRightInset - 8 - 1, 1, -16)
-            Tabs.Size = UDim2.new(0, Width, 1, -100)
-            if Library.SidebarDiscord then
-                Library.SidebarDiscord.Resize(Width)
-            end
+            Tabs.Size = UDim2.new(0, Width, 1, -70)
             Container.Size = UDim2.new(1, -Width - 1, 1, -70)
     
             if WindowInfo.EnableCompacting then
@@ -31993,9 +31860,9 @@ do
 		return total / span * 3600
 	end
 end
--- Driving with the game's own controls. The game's input loop asks PhysicsReplay.sample() every send tick and copies
--- the returned throttle/brake/steer into the normal InputFrame it sends (a Studio replay hook). The hub answers that
--- call while it drives, so the scooter is ridden through the real physics at its real top speed; nothing teleports.
+-- Driving with the game's own controls: the autopilot's throttle/brake/steer go into the same ride input frame the
+-- W/S/A/D keys build (LocalRide.setInput -> rig:setInput), so the scooter is ridden through the real physics at its
+-- real top speed; nothing teleports. See the input layer below for the methods and their fallbacks.
 N.Drive = {
 	active = false,
 	input = { throttle = 0, brake = 0, frontBrake = 0, rearBrake = 0, steer = 0, riderLean = 0 },
@@ -32171,86 +32038,258 @@ do
 		local steer = math.clamp((c.flip or 1) * err * gain * 1.8, -1, 1)
 		return { throttle = throttle, brake = brake, steer = steer, idx = idx, err = err, vmax = vmax, toEnd = toEnd }
 	end
-	-- Forward axis of the scooter: whichever of its part axes matches the travel direction (calibrated once moving).
+	-- Forward direction: the game measures forward speed along PrimaryPart.CFrame.LookVector (Bootstrap), so that is the nose.
 	function N.forwardOf(model, part)
-		local cf = part.CFrame
-		local axes = { look = cf.LookVector, back = -cf.LookVector }
-		if cf.RightVector then
-			axes.right = cf.RightVector
-			axes.left = -cf.RightVector
-		end
-		local key = D.axis[model]
+		local look = part.CFrame.LookVector
 		local vel = N.flat(part.AssemblyLinearVelocity)
-		if vel.Magnitude > 2 / MPS and math.abs(D.input.steer) < 0.25 then
-			local best, bestDot = nil, -2
-			for name, axis in pairs(axes) do
-				local f = N.flat(axis)
-				if f.Magnitude > 0.1 then
-					local dot = f.Unit:Dot(vel.Unit)
-					if dot > bestDot then
-						best, bestDot = name, dot
-					end
-				end
-			end
-			if best and bestDot > 0.8 and best ~= key then
-				D.axis[model] = best
-				log("DRIVE forward axis", best)
-				key = best
-			end
-		end
-		if vel.Magnitude > 3 / MPS then
+		if vel.Magnitude > 3 / MPS and vel:Dot(N.flat(look)) > 0 then
 			return vel
 		end
-		return axes[key or "look"] or cf.LookVector
+		return look
 	end
-	-- PhysicsReplay hook (the game's module table, plus any copy found by getgc).
-	function N.hookReplay()
-		local tables = {}
-		local main = N.mod("VoltlineShared.PhysicsReplay")
-		if type(main) == "table" then
-			table.insert(tables, main)
-		end
-		if type(getgc) == "function" and not D.gcScanned then
-			D.gcScanned = true
+	-- Input layer. The game's control path (dump): PlayerScripts.VoltlineClient.Bootstrap reads W/S/A/D through
+	-- ContextActionService (steer = D - A, throttle W ramped), builds a frame every PreSimulation and calls
+	-- VoltlineShared.Ride.LocalRide.setInput(frame); LocalScript VoltlineClientRide reads LocalRide.input every
+	-- PreSimulation (ignored when older than 0.6 s) and hands it to the scooter rig with rig:setInput. Steering is the
+	-- steer value (A/D), not the camera. Methods, in order:
+	--   localride: wrap LocalRide.setInput and put the autopilot values into every frame the game builds
+	--   rig:       wrap setInput on the active ride's rig (LocalRide.active.rig)
+	--   keys:      VirtualInputManager W/S/A/D (pulsed for part throttle / part steering)
+	--   replay:    PhysicsReplay.sample (the game reads it only on send ticks, about 1 frame in 3: slow)
+	-- A method that keeps the scooter under 3 m/s for 10 s at full throttle is dropped for the next one.
+	N.DriveMethods = { "localride", "rig", "keys", "replay" }
+	D.method = 1
+	D.calls = {}
+	D.proven = {}
+	D.localRides = {}
+	D.rigs = setmetatable({}, { __mode = "k" })
+	D.keys = {}
+	D.slowFor = 0
+	D.methodFor = 0
+	D.logAt = 0
+	function N.driveMethod()
+		return N.DriveMethods[D.method]
+	end
+	local function injecting(name)
+		return D.active and alive() and N.DriveMethods[D.method] == name
+	end
+	local function override(frame)
+		local i = D.input
+		frame.throttle = if i.brake > 0.05 then 0 else i.throttle
+		frame.brake = i.brake
+		frame.frontBrake = 0
+		frame.rearBrake = 0
+		frame.steer = i.steer
+		frame.wheelie = false
+		frame.walkBack = false
+		return frame
+	end
+	local function fullFrame()
+		return override({ riderLean = 0, lookYaw = 0, lookPitch = 0, sequence = 0 })
+	end
+	N.driveFrame = fullFrame
+	-- Tables of a game module: the required one plus copies found by getgc (an executor may get its own require copy).
+	local function gcTables(match)
+		local found = {}
+		if type(getgc) == "function" then
 			pcall(function()
 				for _, value in ipairs(getgc(true)) do
-					if type(value) == "table" and value ~= main and type(rawget(value, "sample")) == "function" and type(rawget(value, "start")) == "function" and rawget(value, "active") ~= nil then
-						table.insert(tables, value)
+					if type(value) == "table" and match(value) then
+						table.insert(found, value)
 					end
 				end
 			end)
 		end
+		return found
+	end
+	local function isLocalRide(t)
+		return type(rawget(t, "setInput")) == "function" and type(rawget(t, "isLocal")) == "function" and rawget(t, "inputAt") ~= nil
+	end
+	local function isReplay(t)
+		return type(rawget(t, "sample")) == "function" and type(rawget(t, "start")) == "function" and rawget(t, "active") ~= nil
+	end
+	local function wrapField(t, key, make)
+		if D.hooked[t] or table.isfrozen(t) then
+			return false
+		end
+		local original = rawget(t, key)
+		if type(original) ~= "function" then
+			return false
+		end
+		D.hooked[t] = { key = key, fn = original }
+		rawset(t, key, make(original))
+		return true
+	end
+	function N.hookReplay()
 		local count = 0
-		for _, t in ipairs(tables) do
-			if not D.hooked[t] and not table.isfrozen(t) then
-				local original = rawget(t, "sample")
-				if type(original) == "function" then
-					D.hooked[t] = original
-					rawset(t, "sample", function(...)
-						if D.active and alive() then
-							rawset(t, "active", true)
-							local i = D.input
-							return { throttle = i.throttle, brake = i.brake, frontBrake = 0, rearBrake = 0, steer = i.steer, riderLean = 0 }
-						end
-						return original(...)
-					end)
-					count += 1
+		local rides = {}
+		local main = N.mod("VoltlineShared.Ride.LocalRide")
+		if type(main) == "table" then
+			table.insert(rides, main)
+		end
+		local replays = {}
+		local rmain = N.mod("VoltlineShared.PhysicsReplay")
+		if type(rmain) == "table" then
+			table.insert(replays, rmain)
+		end
+		if not D.gcScanned then
+			D.gcScanned = true
+			for _, t in ipairs(gcTables(isLocalRide)) do
+				table.insert(rides, t)
+			end
+			for _, t in ipairs(gcTables(isReplay)) do
+				table.insert(replays, t)
+			end
+		end
+		for _, t in ipairs(rides) do
+			local hooked = wrapField(t, "setInput", function(original)
+				D.localRides[t] = original
+				return function(frame, ...)
+					if injecting("localride") then
+						D.calls.localride = (D.calls.localride or 0) + 1
+						frame = override(if type(frame) == "table" then frame else fullFrame())
+					end
+					return original(frame, ...)
 				end
+			end)
+			if hooked then
+				count += 1
+			end
+		end
+		for _, t in ipairs(replays) do
+			local hooked = wrapField(t, "sample", function(original)
+				return function(...)
+					if injecting("replay") then
+						D.calls.replay = (D.calls.replay or 0) + 1
+						rawset(t, "active", true)
+						local i = D.input
+						return { throttle = i.throttle, brake = i.brake, frontBrake = 0, rearBrake = 0, steer = i.steer, riderLean = 0 }
+					end
+					return original(...)
+				end
+			end)
+			if hooked then
+				count += 1
 			end
 		end
 		if count > 0 then
-			log("DRIVE hook installed", count)
+			log("DRIVE hook installed", count, "localride", next(D.localRides) ~= nil)
 		end
 		return next(D.hooked) ~= nil
 	end
+	-- The active ride's rig (VoltlineClientRide calls rig:setInput every PreSimulation).
+	function N.hookRig()
+		local hooked = false
+		for t in pairs(D.localRides) do
+			local ride = rawget(t, "active")
+			local rig = type(ride) == "table" and ride.rig
+			if type(rig) == "table" then
+				if D.rigs[rig] then
+					hooked = true
+				elseif not table.isfrozen(rig) then
+					local own = rawget(rig, "setInput")
+					local original = rig.setInput
+					if type(original) == "function" then
+						D.rigs[rig] = { own = own }
+						rawset(rig, "setInput", function(self, inp, ...)
+							if injecting("rig") then
+								D.calls.rig = (D.calls.rig or 0) + 1
+								local frame = fullFrame()
+								frame.combinedBrake = frame.brake
+								frame.assist = type(inp) == "table" and inp.assist or "ASSIST"
+								inp = frame
+							end
+							return original(self, inp, ...)
+						end)
+						hooked = true
+					end
+				end
+			end
+		end
+		return hooked
+	end
 	function N.unhookReplay()
-		for t, original in pairs(D.hooked) do
+		for t, entry in pairs(D.hooked) do
 			pcall(function()
-				rawset(t, "sample", original)
-				rawset(t, "active", false)
+				rawset(t, entry.key, entry.fn)
+				if entry.key == "sample" then
+					rawset(t, "active", false)
+				end
 			end)
 		end
+		for rig, entry in pairs(D.rigs) do
+			pcall(rawset, rig, "setInput", entry.own)
+		end
 		table.clear(D.hooked)
+		table.clear(D.localRides)
+		N.releaseKeys()
+	end
+	-- keys: VirtualInputManager presses the same keys a player would (W throttle, S brake, A/D steer).
+	local VIM
+	pcall(function()
+		VIM = game:GetService("VirtualInputManager")
+	end)
+	local function setKey(code, down)
+		if (D.keys[code] or false) == down then
+			return
+		end
+		D.keys[code] = down
+		pcall(function()
+			VIM:SendKeyEvent(down, code, false, game)
+		end)
+	end
+	function N.releaseKeys()
+		for code, down in pairs(D.keys) do
+			if down then
+				setKey(code, false)
+			end
+		end
+	end
+	function N.keysStep(dt)
+		if not VIM then
+			return false
+		end
+		D.calls.keys = (D.calls.keys or 0) + 1
+		D.keyPhase = ((D.keyPhase or 0) + dt) % 0.2
+		local i = D.input
+		local duty = D.keyPhase / 0.2
+		setKey(Enum.KeyCode.W, i.brake <= 0.05 and (i.throttle >= 0.9 or duty < i.throttle))
+		setKey(Enum.KeyCode.S, i.brake > 0.3)
+		setKey(Enum.KeyCode.D, i.steer > 0.08 and duty < math.abs(i.steer) * 1.2)
+		setKey(Enum.KeyCode.A, i.steer < -0.08 and duty < math.abs(i.steer) * 1.2)
+		return true
+	end
+	function N.nextMethod(reason)
+		local old = N.driveMethod()
+		log("DRIVE method failed " .. tostring(old), reason)
+		N.releaseKeys()
+		D.method = D.method % #N.DriveMethods + 1
+		D.slowFor, D.methodFor = 0, 0
+		D.flip, D.flips = 1, 0
+		D.calls = {}
+		if N.driveMethod() == "localride" then
+			D.gcScanned = false
+			N.hookReplay()
+		end
+		log("DRIVE method " .. N.driveMethod())
+	end
+	-- Pushes the input through the current method; false when the method cannot reach the game.
+	function N.applyInput(dt)
+		local method = N.driveMethod()
+		if method == "localride" then
+			-- the game sends a frame every PreSimulation while mounted; refresh it if its loop is paused
+			for t, original in pairs(D.localRides) do
+				if os.clock() - (tonumber(rawget(t, "inputAt")) or 0) > 0.1 then
+					pcall(original, fullFrame())
+				end
+			end
+			return next(D.localRides) ~= nil
+		elseif method == "rig" then
+			return N.hookRig()
+		elseif method == "keys" then
+			return N.keysStep(dt)
+		end
+		return next(D.hooked) ~= nil
 	end
 	function N.setInput(throttle, brake, steer)
 		D.input.throttle = throttle
@@ -32335,15 +32374,52 @@ do
 		end
 		return N.flat(goal.target - part.Position).Magnitude
 	end
-	-- One control step (Heartbeat). Writes D.input; the replay hook hands it to the game.
+	-- Speed watchdog: full throttle asked but the scooter stays under 3 m/s for 10 s -> the method does not reach the
+	-- game, try the next one. A method that once went over 5 m/s is kept (then it is a stuck scooter, not the method).
+	function N.driveWatch(dt, out, speed, model, reached)
+		local method = N.driveMethod()
+		D.methodFor += dt
+		if speed > 5 then
+			D.proven[method] = true
+		end
+		if not reached and D.methodFor > 3 then
+			N.nextMethod("cannot reach the game input")
+			return
+		end
+		if method == "localride" and D.methodFor > 3 and (D.calls.localride or 0) == 0 and not D.proven.localride then
+			N.nextMethod("game never called LocalRide.setInput (executor copy of the module)")
+			return
+		end
+		local phase = model:GetAttribute("PowerPhase")
+		local powered = phase == nil or phase == "READY"
+		if powered and not N.isFalling() and out.throttle >= 0.6 and out.vmax >= 5 and speed < 3 then
+			D.slowFor += dt
+		elseif speed >= 3 then
+			D.slowFor = 0
+		end
+		if D.slowFor > 10 then
+			D.slowFor = 0
+			if not D.proven[method] then
+				N.nextMethod("speed under 3 m/s for 10 s")
+			end
+		end
+		D.logAt -= dt
+		if D.logAt <= 0 then
+			D.logAt = 5
+			log(string.format("DRIVE speed=%.1f target=%.1f method=%s", speed, out.vmax, method), "throttle", string.format("%.2f", out.throttle), "steer", string.format("%.2f", out.steer), "calls", D.calls[method] or 0, "power", tostring(phase))
+		end
+	end
+	-- One control step (Heartbeat). Writes D.input and pushes it through the current input method.
 	function N.driveTick(dt)
 		local model = N.mounted()
 		local goal, path = D.goal, D.path
 		if not (model and goal and path and N.farming()) then
 			if D.active then
 				N.setInput(0, if N.speedMps() > 0.4 then 1 else 0, 0)
+				N.applyInput(dt)
 				if N.speedMps() <= 0.4 then
 					D.active = false
+					N.releaseKeys()
 				end
 			end
 			return
@@ -32375,12 +32451,14 @@ do
 		D.idx = out.idx
 		D.vmax = out.vmax
 		N.setInput(out.throttle, out.brake, out.steer)
-		-- steering sign check: a strong correction that keeps making the error worse means the sign is reversed
-		if speed > 2 and math.abs(out.steer) > 0.5 then
+		local reached = N.applyInput(dt)
+		N.driveWatch(dt, out, speed, model, reached)
+		-- steering sign check (A/D: +1 = right): a strong correction that keeps making the error worse means it is reversed
+		if speed > 4 and math.abs(out.steer) > 0.5 then
 			D.flipWatch = (D.flipWatch or 0) + dt
 			D.flipStartErr = D.flipStartErr or math.abs(out.err)
-			if D.flipWatch > 1.6 then
-				if math.abs(out.err) > D.flipStartErr + 0.35 and D.flips < 3 then
+			if D.flipWatch > 2 then
+				if math.abs(out.err) > D.flipStartErr + 0.5 and D.flips < 2 then
 					D.flip = -D.flip
 					D.flips += 1
 					log("DRIVE steering flipped", D.flip)
@@ -32985,6 +33063,80 @@ do
 		end
 		if R.mountTries == 12 then
 			logProblem("Could not get on the scooter after 12 tries")
+		end
+		return false
+	end
+	-- Power on: the game's dashboard buttons (DashboardController.SendManufacturerButton, as the P key / touch Key-power
+	-- button do). Key scooters: IGNITION when IgnitionOn is false. Then POWER: a tap first (G4: PRESS = power on), then a
+	-- 1.3 s hold, then the model's powerHoldSeconds (VSETT: hold 1 s). Checked by the model's PowerPhase (OFF/BOOTING/READY).
+	function N.ensurePower(model)
+		if not model then
+			return false
+		end
+		local phase = model:GetAttribute("PowerPhase")
+		if phase == nil or phase == "READY" then
+			R.powerTries = 0
+			return true
+		end
+		if phase == "BOOTING" or phase == "SHUTTING_DOWN" then
+			setStatus("Scooter is starting")
+			return false
+		end
+		if N.parked("Power on") then
+			return true
+		end
+		if model:GetAttribute("Locked") == true then
+			N.unsupported("Power on", "scooter is locked")
+			return true
+		end
+		if os.clock() - (R.powerAt or -1e9) < 3 then
+			return false
+		end
+		local dash = N.mod("Client.Controllers.DashboardController")
+		if not (dash and type(dash.SendManufacturerButton) == "function") then
+			N.unsupported("Power on", "DashboardController not found")
+			return true
+		end
+		R.powerTries = (R.powerTries or 0) + 1
+		setStatus("Turning the scooter on")
+		local id = model:GetAttribute("ScooterId") or N.scooterId(model)
+		local function press(button, hold)
+			local sent = isolated(dash.SendManufacturerButton, button, "Down", id)
+			task.wait(hold)
+			isolated(dash.SendManufacturerButton, button, "Up", id)
+			return sent
+		end
+		local via = {}
+		if model:GetAttribute("IgnitionOn") == false then
+			press("IGNITION", 0.15)
+			table.insert(via, "IGNITION")
+			waitFor(function()
+				return model:GetAttribute("IgnitionOn") ~= false
+			end, 1.5)
+		end
+		local profileHold = 2
+		pcall(function()
+			local profiles = N.mod("VoltlineShared.ScooterProfiles")
+			local profile = profiles and profiles.get(model:GetAttribute("ScooterId"))
+			profileHold = tonumber(profile and profile.controls and profile.controls.powerHoldSeconds) or profileHold
+		end)
+		local hold = ({ 0.15, 1.3, math.clamp(profileHold, 1, 2.5) + 0.4 })[math.min(R.powerTries, 3)]
+		local sent = press("POWER", hold)
+		table.insert(via, string.format("POWER %.2fs", hold))
+		local ok = waitFor(function()
+			local now = model:GetAttribute("PowerPhase")
+			return now == nil or now == "READY" or now == "BOOTING"
+		end, 3)
+		R.powerAt = os.clock()
+		log("SCOOTER on ok=" .. tostring(ok) .. " via=" .. table.concat(via, "+"), "sent", tostring(sent), "phase", tostring(model:GetAttribute("PowerPhase")), "try", R.powerTries)
+		if ok then
+			R.powerTries = 0
+			return model:GetAttribute("PowerPhase") ~= "BOOTING"
+		end
+		if R.powerTries >= 3 then
+			R.powerTries = 0
+			N.unsupported("Power on", "phase stayed " .. tostring(model:GetAttribute("PowerPhase")))
+			return true
 		end
 		return false
 	end
@@ -33701,7 +33853,7 @@ do
 			),
 			"Status: " .. tostring(Status),
 			"Running: " .. table.concat(Debug.running(), ", "),
-			"Mode: " .. (if N.isOP() then "OP" else "Normal") .. ", drive " .. optionText("DriveStyle", "Legit") .. ", phone live " .. tostring(N.G.phone ~= nil) .. ", nav " .. tostring(N.Nav.status) .. ", replay hook " .. tostring(next(N.Drive.hooked) ~= nil),
+			"Mode: " .. (if N.isOP() then "OP" else "Normal") .. ", drive " .. optionText("DriveStyle", "Legit") .. ", phone live " .. tostring(N.G.phone ~= nil) .. ", nav " .. tostring(N.Nav.status) .. ", input " .. tostring(N.driveMethod()) .. " hooked " .. tostring(next(N.Drive.hooked) ~= nil),
 			"Plan: " .. tostring(N.Plan.text),
 			"Perf: " .. Debug.perfText(),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
@@ -34370,7 +34522,7 @@ do
 		end)
 	end
 	if not N.hookReplay() then
-		logProblem("PhysicsReplay not found: the autopilot cannot steer (DRIVE unsupported)")
+		logProblem("Ride input (LocalRide/PhysicsReplay) not found: the autopilot uses the key fallback")
 	end
 	if not N.phone() then
 		task.spawn(N.loadInitial)
@@ -34383,6 +34535,9 @@ do
 			return "mounting"
 		end
 		local model = N.mounted()
+		if not N.ensurePower(model) then
+			return "power"
+		end
 		N.ensureSport(model)
 		-- ride session: the server's ride session ends after 6 h, remount between deliveries before that
 		if N.Rider.mountedSince and os.clock() - N.Rider.mountedSince > 5.6 * 3600 and not inRun then
@@ -34450,11 +34605,9 @@ do
 						N.setGoal(D.goal.target, { label = D.goal.label, stopRadius = D.goal.stopRadius, replan = true })
 					end
 				end
-				if D.commandedFor > 15 and not D.movedOnce and not D.warnedHook then
+				if D.commandedFor > 60 and not D.movedOnce and not D.warnedHook then
 					D.warnedHook = true
-					N.unsupported("Autopilot", "throttle sent for 15 s but the scooter never moved (replay hook not reaching the game)")
-					D.gcScanned = false
-					N.hookReplay()
+					logProblem("Autopilot: throttle sent for 60 s on every input method but the scooter never moved")
 				end
 			end
 			N.farmStep()
