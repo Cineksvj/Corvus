@@ -23249,15 +23249,12 @@ end,
 local SupportedGames = Info.SupportedGames or {
 	{ Name = "+1 Stone Skipping", PlaceId = 111543903102439 },
 	{ Name = "Anime Dice", PlaceId = 113290951185459 },
-	{ Name = "Bizarre", PlaceId = 135621866300031 },
 	{ Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
 	{ Name = "Loot To Forge", PlaceId = 118805555015549 },
 	{ Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
 	{ Name = "Pets Universe", PlaceId = 74629631798007 },
 	{ Name = "Ride A Pet", PlaceId = 124216119978534 },
-	{ Name = "Steal An Egg", PlaceId = 107778070777162 },
 	{ Name = "Steal From The Rich", PlaceId = 120475074479690 },
-	{ Name = "Voltline Electric Scooters", PlaceId = 118315378611589 },
 	{ Name = "Welcome to Bloxburg", PlaceId = 185655149 },
 }
 local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
@@ -31656,8 +31653,11 @@ function Plan.smart()
 return Plan.on("SmartSpend")
 end
 Plan.touched, Plan.setting = {}, 0
+function Plan.myFilters()
+return Options.FarmMode ~= nil and Options.FarmMode.Value == "My filters"
+end
 function Plan.op()
-return Toggles.AutoFarmOP ~= nil and Toggles.AutoFarmOP.Value == true
+return Toggles.AutoFarmOP ~= nil and Toggles.AutoFarmOP.Value == true and not Plan.myFilters()
 end
 function Plan.touch(name)
 if Plan.setting == 0 then
@@ -32619,6 +32619,43 @@ end
 end
 Plan.farmSet = {}
 end
+Plan.runMap = {
+{ "Auto Steal", "AutoSteal" },
+{ "Auto Place", "AutoPlace" },
+{ "Auto Open", "AutoOpen" },
+{ "Auto Equip Best", "AutoEquipBest" },
+{ "Auto Train (Treadmill)", "AutoTreadmill" },
+{ "Collect Storm Orbs", "AutoOrbs" },
+{ "Thunder (charge crates)", "AutoThunder" },
+{ "Blessing (bless crates)", "AutoBlessing" },
+{ "Event Minigame", "AutoEventGame" },
+{ "Event Hop", "EventHop" },
+{ "Admin Phrases", "AutoAdminPhrases" },
+{ "Auto Friend", "AutoFriend" },
+{ "Free Gift", "AutoFreeGift" },
+{ "Offline Cash", "AutoOffline" },
+{ "Claim Index", "AutoIndex" },
+}
+Plan.runDefault = { "Auto Steal", "Auto Place", "Auto Open", "Event Minigame", "Free Gift", "Offline Cash" }
+function Plan.applyRun()
+local picked = if Options.FarmRun and type(Options.FarmRun.Value) == "table" then Options.FarmRun.Value else {}
+for _, entry in ipairs(Plan.runMap) do
+local toggle = Toggles[entry[2]]
+if toggle then
+if picked[entry[1]] then
+if not toggle.Value then
+Plan.farmSet[entry[2]] = true
+toggle:SetValue(true)
+end
+elseif Plan.farmSet[entry[2]] then
+Plan.farmSet[entry[2]] = nil
+if toggle.Value then
+toggle:SetValue(false)
+end
+end
+end
+end
+end
 function Plan.farmStop()
 if Plan.farmMode == nil then
 return
@@ -32630,13 +32667,25 @@ log("FARM ALL off", mode)
 end
 function Plan.farmOP(value)
 if not value then
-if Plan.farmMode == "op" then
+if Plan.farmMode == "op" or Plan.farmMode == "my" then
 Plan.farmStop()
 end
 return
 end
 if Plan.farmMode ~= nil then
 Plan.farmStop()
+end
+if Plan.myFilters() then
+Plan.farmMode = "my"
+log("MODE", "My filters", "(no planner, no selling, no fusing, no spending)")
+Plan.applyRun()
+local turned = {}
+for name in pairs(Plan.farmSet) do
+table.insert(turned, name)
+end
+table.sort(turned)
+log("FARM MY FILTERS on, switched on:", if #turned > 0 then table.concat(turned, ",") else "nothing new, all were on already")
+return
 end
 Plan.farmMode = "op"
 log("MODE", "OP", "(farm all start)")
@@ -32933,14 +32982,12 @@ Plan.opSilent = true
 Toggles.AutoFarmOP:SetValue(false)
 Plan.opSilent = false
 if os.clock() - Plan.bootAt < 10 then
-if Toggles.RememberOP and Toggles.RememberOP.Value then
-Plan.opApproved = true
-log("OP restored", "(Remember Auto Farm Everything is on)")
-Toggles.AutoFarmOP:SetValue(true)
-else
-Plan.opPending = true
-log("OP not restored", "(Remember Auto Farm Everything is off)")
+log("OP not restored", "(the master toggle is never loaded from a config)")
+return
 end
+if Plan.myFilters() then
+Plan.opApproved = true
+Toggles.AutoFarmOP:SetValue(true)
 return
 end
 if Plan.uiReady and Library.ShowConfirmPrompt then
@@ -32966,19 +33013,45 @@ Plan.opApproved = false
 task.spawn(Plan.farmOP, value)
 end,
 })
-FarmBox:AddToggle("RememberOP", {
-Text = "Remember Auto Farm Everything",
-Default = false,
-Tooltip = "Warning: when on, saved configs switch Auto Farm Everything back on at the next start without asking. " .. AutoDisclaimer .. " Off (default): it always starts off.",
-Callback = function(value)
-if value and Plan.opPending and os.clock() - Plan.bootAt < 10 then
-Plan.opPending = false
-Plan.opApproved = true
-log("OP restored", "(Remember Auto Farm Everything is on)")
-Toggles.AutoFarmOP:SetValue(true)
+FarmBox:AddDropdown("FarmMode", {
+Text = "Mode",
+Values = { "Best value", "My filters" },
+Default = "Best value",
+Multi = false,
+Tooltip = "Best value: the planner decides everything for the most profit. My filters: no planner, no selling, no fusing, no spending, it only runs the loops you pick under Run, with your own Steal filters.",
+Callback = function()
+if Toggles.AutoFarmOP and Toggles.AutoFarmOP.Value then
+Plan.opSilent = true
+Toggles.AutoFarmOP:SetValue(false)
+Plan.opSilent = false
+end
+if Options.FarmRun then
+Options.FarmRun:SetVisible(Plan.myFilters())
 end
 end,
 })
+FarmBox:AddDropdown("FarmRun", {
+Text = "Run",
+Values = (function()
+local labels = {}
+for _, entry in ipairs(Plan.runMap) do
+table.insert(labels, entry[1])
+end
+return labels
+end)(),
+Default = Plan.runDefault,
+Multi = true,
+AllowNull = true,
+Searchable = true,
+Visible = false,
+Tooltip = "Loops that run in My filters mode. Auto Steal uses your own zone, rarity and priority filters from the Steal box. Nothing is sold, fused or bought.",
+Callback = function()
+if Plan.farmMode == "my" then
+Plan.applyRun()
+end
+end,
+})
+Options.FarmRun:SetVisible(Plan.myFilters())
 local exLabels, exDefaults = Plan.opExcludeLabels()
 FarmBox:AddDropdown("OPExclude", {
 Text = "Exclude",
@@ -34622,6 +34695,9 @@ end,
 end)
 end
 end
+pcall(function()
+SaveManager:SetIgnoreIndexes({ "AutoFarmOP" })
+end)
 if Window.AddSettingsTab then
 local ok, tab = pcall(Window.AddSettingsTab, Window, {
 ThemeManager = ThemeManager,
@@ -34640,7 +34716,7 @@ pcall(function()
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
-SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoFarmOP" })
 ThemeManager:SetFolder("Corvus")
 SaveManager:SetFolder("Corvus/StealFromTheRich")
 SaveManager:BuildConfigSection(Tabs.Settings)
@@ -34648,6 +34724,9 @@ ThemeManager:ApplyToTab(Tabs.Settings)
 SaveManager:LoadAutoloadConfig()
 end)
 end
+pcall(function()
+SaveManager:SetIgnoreIndexes({ "AutoFarmOP" })
+end)
 if Window.AddInfoTab then
 local DonateMethods = {
 {
