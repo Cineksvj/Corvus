@@ -24366,6 +24366,7 @@ local BootOk, BootError = xpcall(function()
 						"CorvusConfigName",
 						"CorvusConfigList",
 						"CorvusShareCode",
+							"AutoFarmOP",
 					})
 					SaveManager:SetFolder(Folder)
 					if Info.SubFolder then
@@ -28363,6 +28364,46 @@ local BootOk, BootError = xpcall(function()
 		function Game.opMode()
 			return on("AutoFarmOP")
 		end
+		-- "Exclude from OP" (Options.OPExclude): what the OP planner must never sell, spend or collect
+		Game.OPReserveLabel = "Money reserve (keep 25% of cash)"
+		local OPExcludeLogged = {}
+		function Game.opExclKey(label)
+			return Game.opMode() and selected(Options.OPExclude, label)
+		end
+		function Game.opExcluded(info)
+			local picked = Options.OPExclude and Options.OPExclude.Value
+			if not Game.opMode() or type(info) ~= "table" or type(picked) ~= "table" then
+				return nil
+			end
+			local label
+			if info.kind == "Egg" then
+				label = "Egg: " .. tostring(info.name)
+			else
+				for _, candidate in ipairs({ "Rarity: " .. tostring(info.rarity), "Mutation: " .. tostring(MutationNames[info.mutation] or info.mutation), "Size: " .. tostring(SizeNames[info.size] or info.size) }) do
+					if picked[candidate] == true then
+						label = candidate
+						break
+					end
+				end
+				if not label and picked["Event animals"] == true and not info.special and Game.isEventAnimal(info.type) then
+					label = "Event animals"
+				end
+			end
+			if label and picked[label] == true then
+				if not OPExcludeLogged[label] then
+					OPExcludeLogged[label] = true
+					log("OP exclude", label)
+				end
+				return label
+			end
+			return nil
+		end
+		function Game.opReserve()
+			if Game.opExclKey(Game.OPReserveLabel) then
+				return cash() * 0.25
+			end
+			return 0
+		end
 		function count(t)
 			local n = 0
 			if type(t) == "table" then
@@ -28822,6 +28863,7 @@ local BootOk, BootError = xpcall(function()
 			best = {},
 			goals = {},
 			codes = {},
+			codesBad = {},
 			group = {},
 		}
 		do
@@ -29897,7 +29939,7 @@ local BootOk, BootError = xpcall(function()
 			return 240 - #StarLog
 		end
 		local function sweepStars(wave, mode, speed, keep)
-			if not (on("AutoStars") and starsActive()) then
+			if not (on("AutoStars") and starsActive()) or Game.opExclKey("Stars (event)") then
 				return 0
 			end
 			local stars = starModels()
@@ -30401,7 +30443,7 @@ local BootOk, BootError = xpcall(function()
 			return folder and folder:FindFirstChild("Collect")
 		end
 		onEvent("CollectEventService", "OnPickupsCreated", function(payload)
-			if not (on("AutoStars") or (Game.event ~= nil and Game.event.rush)) or type(payload) ~= "table" or type(payload.events) ~= "table" then
+			if not (on("AutoStars") or (Game.event ~= nil and Game.event.rush)) or Game.opExclKey("Stars (event)") or type(payload) ~= "table" or type(payload.events) ~= "table" then
 				return
 			end
 			for eventId, event in pairs(payload.events) do
@@ -30999,7 +31041,7 @@ local BootOk, BootError = xpcall(function()
 			for key, entity in pairs(data and data.PlacedAnimals or {}) do
 				if type(entity) == "table" and entity.brainrotType then
 					local info = describe("Brainrot", entity.brainrotType, entity.mutation, entity.size, entity.level, entity.traits)
-					if not info.special and (not worstValue or info.value < worstValue) then
+					if not info.special and not Game.opExcluded(info) and (not worstValue or info.value < worstValue) then
 						worstId, worstValue = entity.id or key, info.value
 					end
 				end
@@ -31368,6 +31410,7 @@ local BootOk, BootError = xpcall(function()
 				and entry.innerEntity.locked ~= true
 				and not info.special
 				and not isProtected(info)
+				and not Game.opExcluded(info)
 				and matches(info, "Sell", 0)
 				and (not below or info.value < below)
 				and not (Game.event ~= nil and Game.event.wanted(info))
@@ -31386,7 +31429,7 @@ local BootOk, BootError = xpcall(function()
 					local locked = info ~= nil and entry.innerEntity.locked == true
 					local cap = parseAmount(Options.SellBelow and Options.SellBelow.Value)
 					local mine = info ~= nil and not Game.opMode() and (isProtected(info) or (cap ~= nil and info.value >= cap))
-					if info and not info.special and (not locked or isProtected(info)) and not mine and not (Game.event ~= nil and Game.event.wanted(info)) then
+					if info and not info.special and (not locked or isProtected(info)) and not mine and not Game.opExcluded(info) and not (Game.event ~= nil and Game.event.wanted(info)) then
 						table.insert(smart, { key = key, info = info, kind = entry.itemType, locked = locked })
 					end
 				end
@@ -31434,6 +31477,10 @@ local BootOk, BootError = xpcall(function()
 				task.wait(0.6)
 			end
 			local mode = Options.SellMode and Options.SellMode.Value or "Filtered"
+			if mode == "Sell All Unlocked" and Game.opMode() and type(Options.OPExclude and Options.OPExclude.Value) == "table" and next(Options.OPExclude.Value) ~= nil then
+				-- the game's Sell All cannot skip excluded items: sell one by one instead
+				mode = "Filtered"
+			end
 			local startCash, startCount = cash(), inventoryCount()
 			LastSell = os.clock()
 			if mode == "Sell All Unlocked" then
@@ -31564,8 +31611,8 @@ local BootOk, BootError = xpcall(function()
 		end
 		function spendable()
 			if Game.opMode() then
-				-- the planner decides (Game.plan)
-				return cash()
+				-- the planner decides (Game.plan), minus the "Money reserve" exclusion
+				return math.max(cash() - Game.opReserve(), 0)
 			elseif on("AutoFarmOP") then
 				-- Normal: the planner chooses, but never beyond the player's Spend Up To
 				return cash() * spendFraction()
@@ -32596,7 +32643,11 @@ local BootOk, BootError = xpcall(function()
 			local key = tostring(LocalPlayer.UserId) .. ":" .. string.upper(code)
 			local ok, success, message = call("CodesService", "RedeemCode", code)
 			Saved.codes[key] = true
+			if not (ok and success) then
+				Saved.codesBad[key] = true
+			end
 			SaveDirty = true
+			Game.codesLabel()
 			if ok and success then
 				Session.claimed += 1
 				Track.event("Code", "Code " .. code .. " redeemed", tostring(message or ""), "ticket", "#59cdff")
@@ -32610,14 +32661,68 @@ local BootOk, BootError = xpcall(function()
 			end
 			return ok and success
 		end
-		function codesTick()
-			for _, code in ipairs(KnownCodes) do
-				if not Saved.codes[tostring(LocalPlayer.UserId) .. ":" .. code] then
-					redeemCode(code, false)
-					return true
+		local RemoteCodes, CodesFetchAt = {}, nil
+		function Game.codesLabel()
+			local prefix = tostring(LocalPlayer.UserId) .. ":"
+			local good, bad = 0, 0
+			for key in pairs(Saved.codes) do
+				if string.sub(key, 1, #prefix) == prefix then
+					if Saved.codesBad[key] then
+						bad += 1
+					else
+						good += 1
+					end
 				end
 			end
-			return false
+			if Game.codesText then
+				pcall(Game.codesText.SetText, Game.codesText, "Codes redeemed " .. good .. " / invalid " .. bad)
+			end
+		end
+		-- the code list lives in the hub repo (file "Codes", JSON {game: [codes]}); fetched at start and every 6 h
+		local function fetchCodes()
+			CodesFetchAt = os.clock()
+			local ok, body = pcall(function()
+				return game:HttpGet(HubRepo .. "Codes")
+			end)
+			local decoded
+			if ok and type(body) == "string" then
+				local okJson, value = pcall(HttpService.JSONDecode, HttpService, body)
+				decoded = if okJson then value else nil
+			end
+			local list = type(decoded) == "table" and decoded["Open Sea For Animals"]
+			if type(list) ~= "table" then
+				log("CODES fetch failed or no entry for this game")
+				return
+			end
+			RemoteCodes = {}
+			for _, code in ipairs(list) do
+				if type(code) == "string" and code ~= "" then
+					table.insert(RemoteCodes, code)
+				end
+			end
+			log("CODES fetched", #RemoteCodes)
+		end
+		function codesTick()
+			if CodesFetchAt == nil or os.clock() - CodesFetchAt >= 21600 then
+				fetchCodes()
+			end
+			local prefix = tostring(LocalPlayer.UserId) .. ":"
+			local seen, tried = {}, false
+			for _, list in ipairs({ KnownCodes, RemoteCodes }) do
+				for _, code in ipairs(list) do
+					local upper = string.upper(code)
+					if not seen[upper] and not Saved.codes[prefix .. upper] and alive() and on("AutoCodes") then
+						seen[upper] = true
+						if tried then
+							task.wait(2)
+						end
+						tried = true
+						redeemCode(code, false)
+					end
+				end
+			end
+			Game.codesLabel()
+			return tried
 		end
 		function activePotionTypes()
 			local data = Data()
@@ -32997,6 +33102,10 @@ local BootOk, BootError = xpcall(function()
 			return math.max(target.cost - cash(), 0) / math.max(plan.income, 1e-9)
 		end
 		function Game.spendOk(key, cost)
+			local reserve = Game.opReserve()
+			if reserve > 0 and cash() - cost < reserve then
+				return false
+			end
 			local plan = Game.plan()
 			if not plan then
 				return true
@@ -33012,9 +33121,10 @@ local BootOk, BootError = xpcall(function()
 			return item.payback <= saveEta(plan)
 		end
 		function Game.budget(key)
+			local reserve = Game.opReserve()
 			local plan = Game.plan()
 			if not plan then
-				return cash()
+				return math.max(cash() - reserve, 0)
 			end
 			local item = plan.byKey[key]
 			if not item then
@@ -33022,9 +33132,9 @@ local BootOk, BootError = xpcall(function()
 			end
 			local target = plan.target
 			if not target or target.key == key or item.payback <= saveEta(plan) then
-				return cash()
+				return math.max(cash() - reserve, 0)
 			end
-			return math.max(cash() - target.cost, 0)
+			return math.max(cash() - target.cost - reserve, 0)
 		end
 		-- Event Rush (2026-10-05): the collect event (CollectEventConfig.EVENTS: Stars, Cake) gives 2-3 pickups per plate
 		-- in every wave and the server grants the milestones by itself (150 Cash potion, 350 Train potion, 500 and 1000
@@ -33252,6 +33362,7 @@ local BootOk, BootError = xpcall(function()
 			end)
 		end
 		Tabs.Main = addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+		Tabs.OP = addTab("Auto OP", "zap", "Full automatic planner and what it must never touch")
 		Tabs.Sea = addTab("Sea", "waves-horizontal", "Charge, trips and catch filters")
 		Tabs.Plot = addTab("Plot", "layout-grid", "Animals and eggs on your plot")
 		Tabs.Upgrades = addTab("Upgrades", "trending-up", "Upgrades, staffs, training and rebirth")
@@ -33491,7 +33602,13 @@ local BootOk, BootError = xpcall(function()
 				Searchable = true,
 				Tooltip = "The toggles Auto Farm Everything switches on. Default: everything safe. Selling, hatching, spending and luck hops are off until you pick them.",
 			})
-			SeaBox:AddToggle("AutoFarmOP", {
+			SeaBox:AddLabel({
+				Text = '<font transparency="0.35">Full automatic mode (planner) lives in the </font><font color="#59cdff">Auto OP</font><font transparency="0.35"> tab.</font>',
+				DoesWrap = true,
+			})
+			local OPBox = Tabs.OP:AddLeftGroupbox("Auto Farm Everything OP", "zap")
+			local OPExcludeBox = Tabs.OP:AddRightGroupbox("Exclude from OP", "shield-check")
+			OPBox:AddToggle("AutoFarmOP", {
 				Text = "Auto Farm Everything OP",
 				Default = false,
 				Tooltip = "The planner picks what to catch, sells, spends and trains for max profit and can sell your animals. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
@@ -33510,6 +33627,57 @@ local BootOk, BootError = xpcall(function()
 					end
 					task.spawn(farmApply, "OP", value)
 				end,
+			})
+			OPBox:AddLabel({
+				Text = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
+				DoesWrap = true,
+			})
+			OPBox:AddToggle("RememberOP", {
+				Text = "Remember Auto OP",
+				Default = false,
+				Tooltip = "Off (default): Auto OP always starts off after a rejoin or a config load. On: it comes back by itself after a rejoin (needs the confirmation once). Warning: OP runs unattended and can sell your animals, so turn this on only on an alt you leave AFK.",
+			})
+			OPBox:AddLabel({
+				Text = '<font color="#ff8c3c">Remember Auto OP: when on, OP restarts by itself after every rejoin, without asking. Keep it off on your main account.</font>',
+				DoesWrap = true,
+			})
+			do
+				local excludeValues = {}
+				for _, rarity in ipairs(RarityList) do
+					table.insert(excludeValues, "Rarity: " .. rarity)
+				end
+				for _, label in ipairs(MutationLabels) do
+					table.insert(excludeValues, "Mutation: " .. label)
+				end
+				for _, label in ipairs(SizeLabels) do
+					table.insert(excludeValues, "Size: " .. label)
+				end
+				table.insert(excludeValues, "Event animals")
+				local eggNames = {}
+				for _, cfg in pairs(Eggs) do
+					if type(cfg) == "table" and cfg.name then
+						table.insert(eggNames, "Egg: " .. tostring(cfg.name))
+					end
+				end
+				table.sort(eggNames)
+				for _, label in ipairs(eggNames) do
+					table.insert(excludeValues, label)
+				end
+				table.insert(excludeValues, Game.OPReserveLabel)
+				table.insert(excludeValues, "Stars (event)")
+				OPExcludeBox:AddDropdown("OPExclude", {
+					Text = "Exclude from OP",
+					Values = excludeValues,
+					Default = {},
+					Multi = true,
+					AllowNull = true,
+					Searchable = true,
+					Tooltip = "Auto Farm Everything OP never sells, replaces or spends these: animal rarities, mutations and sizes, event animals, egg types, a 25% cash reserve, and the event stars.",
+				})
+			end
+			OPExcludeBox:AddLabel({
+				Text = '<font transparency="0.35">Picked animals and eggs are never sold or picked up by OP (Smart Sell, plot swaps). The cash reserve keeps 25% of your money out of every purchase. Stars: OP leaves the event stars alone.</font>',
+				DoesWrap = true,
 			})
 			SeaBox:AddToggle("AutoSea", {
 				Text = "Auto Open Sea",
@@ -33988,7 +34156,8 @@ local BootOk, BootError = xpcall(function()
 				end,
 			})
 			local CodeBox = Tabs.Rewards:AddLeftGroupbox("Codes", "ticket")
-			CodeBox:AddToggle("AutoCodes", { Text = "Auto Redeem Known Codes", Default = true })
+			CodeBox:AddToggle("AutoCodes", { Text = "Auto Redeem Known Codes", Default = true, Tooltip = "Fetches the known codes list at start and every 6 hours and redeems each code once per account, 2 seconds apart." })
+			Game.codesText = CodeBox:AddLabel({ Text = "Codes redeemed 0 / invalid 0", DoesWrap = true })
 			CodeBox:AddLabel({
 				Text = '<font transparency="0.35">Known code: </font><font color="#59cdff">ZEUS</font><font transparency="0.35">. New codes get posted in the game community.</font>',
 				DoesWrap = true,
@@ -35643,7 +35812,7 @@ local BootOk, BootError = xpcall(function()
 			ThemeManager:SetLibrary(Library)
 			SaveManager:SetLibrary(Library)
 			SaveManager:IgnoreThemeSettings()
-			SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+			SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoFarmOP" })
 			ThemeManager:SetFolder("Corvus")
 			SaveManager:SetFolder("Corvus/OpenTheSeaForAnimals")
 			SaveManager:BuildConfigSection(Tabs.Settings)
@@ -35669,7 +35838,9 @@ local BootOk, BootError = xpcall(function()
 	-- Auto Farm Everything OP was on last time: back on without asking again (it was confirmed once)
 	task.delay(3.5, function()
 		pcall(function()
-			if Library:GetSetting("OSFA_FarmOP") == true and Library:GetSetting("OSFA_OPConfirmed") == true and Toggles.AutoFarmOP and not Toggles.AutoFarmOP.Value then
+			if Library:GetSetting("OSFA_FarmOP") == true and not (Toggles.RememberOP and Toggles.RememberOP.Value) then
+				log("FARM OP not restored (Remember Auto OP is off)")
+			elseif Library:GetSetting("OSFA_FarmOP") == true and Library:GetSetting("OSFA_OPConfirmed") == true and Toggles.AutoFarmOP and not Toggles.AutoFarmOP.Value then
 				log("FARM OP restored after a rejoin")
 				Game.opSkipCard(true)
 				Toggles.AutoFarmOP:SetValue(true)
