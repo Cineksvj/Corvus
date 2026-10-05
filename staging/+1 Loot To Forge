@@ -23445,14 +23445,10 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                 }
     
                 local ResizeTween
+                local ResizeTarget
                 local CollapseArrowTween
-    
+
                 function Groupbox:Resize()
-                    if ResizeTween then
-                        StopTween(ResizeTween, true)
-                        ResizeTween = nil
-                    end
-    
                     local TopSize = (GroupboxTop.AbsoluteSize.Y / Library.DPIScale)
                     local ContainerSize = (GroupboxList.AbsoluteContentSize.Y / Library.DPIScale) + 14
                     if Groupbox.PoppedOut then
@@ -23462,7 +23458,19 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                     local TargetSize = UDim2.new(1, 0, 0, if Groupbox.Collapsed then TopSize else (TopSize + 1 + ContainerSize))
                     GroupboxContainer.Size = UDim2.new(1, 0, 0, ContainerSize)
                     GroupboxLine.Visible = not Groupbox.Collapsed
-    
+
+                    -- live labels fire AbsoluteContentSize often: keep a running tween to the same size, skip a resize to the current size
+                    if ResizeTween then
+                        if ResizeTarget == TargetSize then
+                            return
+                        end
+                        StopTween(ResizeTween, true)
+                        ResizeTween = nil
+                    elseif GroupboxHolder.Size == TargetSize then
+                        return
+                    end
+                    ResizeTarget = TargetSize
+
                     if Library.Animations and Library.Animations.Groupbox then
                         local TweenInfo = Library.GroupboxTweenInfo or TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
                         local Tween = TweenService:Create(GroupboxHolder, TweenInfo, { Size = TargetSize })
@@ -27680,7 +27688,7 @@ end
                 if Info.AutoLoad ~= false then
                     task.defer(function()
                         pcall(SaveManager.LoadAutoloadConfig, SaveManager)
-                        if Library.OnAutoload then pcall(Library.OnAutoload) end
+                        Library:FireAutoload()
                     end)
                 end
             end
@@ -31427,6 +31435,147 @@ end
 			return Result
 		end
 	end
+	-- CORVUS-STARTLOG: standard owner log lines for every hub. The hub sets Library.LoadLogger (its log function);
+	-- BOOT comes from the hub, START + AUTOLOAD + CLICK come from here unless the hub set its own OnAutoload/OnUserToggle.
+	-- A hub that logs these itself opts out with Library.OnAutoload = false / Library.OnUserToggle = nil.
+	function Library:CorvusLog(Line: string)
+		if typeof(Library.LoadLogger) == "function" then
+			pcall(Library.LoadLogger, tostring(Line))
+		end
+	end
+	local function TogglesOn(): { string }
+		local Names = {}
+		for Name, Toggle in Library.Toggles do
+			if typeof(Name) == "string" and typeof(Toggle) == "table" and Toggle.Value == true then
+				table.insert(Names, Name)
+			end
+		end
+		table.sort(Names)
+		return Names
+	end
+	function Library:LogStart()
+		if Library.StartLogged then
+			return
+		end
+		Library.StartLogged = true
+		local Total, On = 0, #TogglesOn()
+		for Name in Library.Toggles do
+			if typeof(Name) == "string" then
+				Total += 1
+			end
+		end
+		local Shown = CorvusLoadTimes.shown
+		Library:CorvusLog(string.format(
+			"START hub loaded | place %s | toggles %d on of %d | window %ss",
+			tostring(game.PlaceId), On, Total, if Shown then string.format("%.1f", Shown - CorvusLoadT0) else "-"
+		))
+	end
+	function Library:FireAutoload()
+		if Library.AutoloadFired then
+			return
+		end
+		Library.AutoloadFired = true
+		Library:LogStart()
+		local Hook = Library.OnAutoload
+		if Hook == false then
+			return
+		end
+		if typeof(Hook) == "function" then
+			pcall(Hook)
+			return
+		end
+		local Names = TogglesOn()
+		Library:CorvusLog("AUTOLOAD toggles=" .. (if #Names > 0 then table.concat(Names, ",") else "-"))
+	end
+	Library.OnUserToggle = function(Name, Value)
+		Library:CorvusLog("CLICK " .. tostring(Name) .. "=" .. tostring(Value))
+	end
+	do
+		local BaseCreateWindowLog = Library.CreateWindow
+		function Library:CreateWindow(...)
+			local Window = BaseCreateWindowLog(self, ...)
+			if not Library.StartFallback then
+				Library.StartFallback = true
+				task.delay(20, function()
+					if not Library.Unloaded then
+						Library:LogStart()
+					end
+				end)
+			end
+			return Window
+		end
+	end
+	-- Quick Start rule: a second control for an existing toggle in another groupbox. Both stay in sync both ways,
+	-- the original keeps the only callback and the only config key (the mirror is not in Library.Toggles).
+	function Library:MirrorToggle(Idx: string, Box: any, Opts: any?)
+		Opts = if typeof(Opts) == "table" then Opts else {}
+		local Original = Library.Toggles[Idx]
+		if typeof(Original) ~= "table" or typeof(Box) ~= "table" or typeof(Box.AddToggle) ~= "function" then
+			return nil
+		end
+		local Key = {}
+		local Mirror = Box:AddToggle(Key, {
+			Text = Opts.Text or Original.Text,
+			Description = Opts.Description,
+			Tooltip = Opts.Tooltip or Original.Tooltip,
+			DisabledTooltip = Original.DisabledTooltip,
+			Risky = Original.Risky,
+			Default = Original.Value == true,
+		})
+		Library.Toggles[Key] = nil
+		if not Mirror then
+			return nil
+		end
+		Mirror.MirrorOf = Idx
+		local ShowValue = Mirror.SetValue
+		local Syncing = false
+		local function Sync()
+			if Syncing or Mirror.Destroyed then
+				return
+			end
+			Syncing = true
+			if Mirror.Value ~= Original.Value then
+				pcall(ShowValue, Mirror, Original.Value)
+			end
+			Syncing = false
+		end
+		local BaseSet = Original.SetValue
+		Original.SetValue = function(Self, Value)
+			BaseSet(Self, Value)
+			Sync()
+		end
+		local BaseDisabled = Original.SetDisabled
+		if typeof(BaseDisabled) == "function" then
+			Original.SetDisabled = function(Self, Disabled)
+				BaseDisabled(Self, Disabled)
+				if not Mirror.Destroyed then
+					pcall(Mirror.SetDisabled, Mirror, Disabled)
+				end
+			end
+			if Original.Disabled then
+				pcall(Mirror.SetDisabled, Mirror, true)
+			end
+		end
+		-- the mirror's own switch (click, quick bar) drives the original; Sync then repaints the mirror
+		Mirror.SetValue = function(_, Value)
+			Original:SetValue(Value)
+		end
+		local Holder = Mirror.Holder
+		if typeof(Holder) == "Instance" and Holder:IsA("GuiButton") then
+			table.insert(Mirror.Connections, Holder.MouseButton1Click:Connect(function()
+				-- deferred so the value is the one after the click, whatever order the connections fire in
+				task.defer(function()
+					if not Original.Disabled and Library.OnUserToggle then
+						pcall(Library.OnUserToggle, Idx, Original.Value)
+					end
+				end)
+			end))
+			table.insert(Mirror.Connections, Holder.MouseButton2Click:Connect(function()
+				Library:StartQuickBind("Toggle", Idx, tostring(Original.Text))
+			end))
+		end
+		return Mirror
+	end
 	getgenv().CorvusLibrary = Library
     return Library
     end)()
@@ -31944,6 +32093,25 @@ do
 		local option = Options[name]
 		local value = option and option.Value
 		return if type(value) == "string" and value ~= "" then value else default
+	end
+	-- Smart Planner (Main): one normal toggle that runs the profit engine for the whole loop. While it is on, the
+	-- systems below run as the planner decides (it never flips their toggles; each toggle still works on its own).
+	N.PlannerDrives = {
+		AutoStages = true, KillAura = true, AutoSuperLoot = true, AutoTrain = true, AutoTower = true, AutoWorldBoss = true,
+		AutoForge = true, AutoEquip = true, AutoSellGear = true, AutoUpgrade = true, AutoEnhance = true, AutoRebirth = true,
+		AutoClassRoll = true, AutoSeason = true, AutoSeasonLuck = true, AutoSeasonShop = true, AutoPotions = true,
+	}
+	function N.planner()
+		return on("SmartPlanner")
+	end
+	function N.want(name)
+		return on(name) or (N.PlannerDrives[name] == true and on("SmartPlanner"))
+	end
+	-- PLAN lines are the planner's reasoning: written only while Smart Planner is on.
+	function N.planLog(...)
+		if on("SmartPlanner") then
+			log(...)
+		end
 	end
 	-- No master switch: every automation is its own toggle and uses the options exactly as set.
 	function N.opActive()
@@ -32608,7 +32776,7 @@ do
 	end
 	-- The runner worth going for right now (nil when none, or when it is on a stage the run cannot reach yet).
 	function N.superPick()
-		if not on("AutoSuperLoot") then
+		if not N.want("AutoSuperLoot") then
 			return nil
 		end
 		local target = N.stageTarget()
@@ -32728,11 +32896,11 @@ do
 		end
 	end
 	function N.auraStep()
-		if not on("KillAura") or N.dead() or os.clock() - N.Aura.at < math.clamp(optionNumber("AuraSpeed", 0.3), 0.1, 2) then
+		if not N.want("KillAura") or N.dead() or os.clock() - N.Aura.at < math.clamp(optionNumber("AuraSpeed", 0.1), 0.1, 2) then
 			return 0
 		end
 		N.Aura.at = os.clock()
-		local range = math.clamp(optionNumber("AuraRange", 40), 5, 500)
+		local range = math.clamp(optionNumber("AuraRange", 500), 5, 500)
 		-- The tower arena is its own small map: every enemy there counts, wherever you stand.
 		if N.fightMode() == "Dungeon" then
 			range = math.huge
@@ -32741,7 +32909,7 @@ do
 		if not me then
 			return 0
 		end
-		local insta = optionText("AuraMode", "Real damage") == "Insta-kill"
+		local insta = optionText("AuraMode", "Insta-kill") == "Insta-kill"
 		local ids = {}
 		for _, entry in ipairs(N.enemies("EnemyFolder")) do
 			if entry.dist <= range then
@@ -32836,6 +33004,9 @@ do
 			pcall(N.planNoteRun, F.runTarget or F.stage, os.clock() - F.runStartedAt, packNow)
 		end
 		F.lastBank = reason
+		if F.runStartedAt and not on("SmartPlanner") then
+			F.trainUntil = os.clock() + math.min(os.clock() - F.runStartedAt, 600)
+		end
 		F.run = false
 		F.stage = 0
 		F.runTarget = nil
@@ -32909,7 +33080,7 @@ do
 			N.bank(string.format("HP %d%%", math.floor(hp / maxHp * 100)))
 			return
 		end
-		if on("AutoSuperLoot") and N.superStep() then
+		if N.want("AutoSuperLoot") and N.superStep() then
 			return
 		end
 		local packNow, packMax = N.pack()
@@ -33174,8 +33345,8 @@ do
 			end
 			-- When the expected forged item is worth less than the same ores sold, the ores are sold.
 			local choice = autoChoice()
-			if choice and choice.perOre < choice.salePerOre and on("AutoSellGear") then
-				log("PLAN forge", "selling", total, "ores: forged item", formatNumber(choice.perOre), "per ore < sale", formatNumber(choice.salePerOre))
+			if choice and choice.perOre < choice.salePerOre and N.want("AutoSellGear") then
+				N.planLog("PLAN forge", "selling", total, "ores: forged item", formatNumber(choice.perOre), "per ore < sale", formatNumber(choice.salePerOre))
 				for uuid, n in pairs(plan) do
 					fire(N.R.sell, uuid, n)
 					Session.sold += n
@@ -33203,7 +33374,7 @@ do
 				Fo.alternate = if kind == "Weapon" then "Armor" else "Weapon"
 			end
 			if choice then
-				log("PLAN forge", kind, "x" .. total, "value per ore", formatNumber(choice.perOre), "sale per ore", formatNumber(choice.salePerOre))
+				N.planLog("PLAN forge", kind, "x" .. total, "value per ore", formatNumber(choice.perOre), "sale per ore", formatNumber(choice.salePerOre))
 				N.Plan.forge.at = -1e9
 			end
 			-- Wait for the backpack update so the next plan does not reuse the same ores.
@@ -33307,7 +33478,7 @@ do
 	function N.sellStep()
 		forgetGone()
 		local sold = 0
-		if on("AutoSellGear") then
+		if N.want("AutoSellGear") then
 			for _, g in ipairs(N.sellPlan()) do
 				if sold >= 10 then
 					break
@@ -33789,7 +33960,7 @@ do
 		task.wait(0.5)
 	end
 	N.onRemote("WorldBoss/BossDeadRE", function()
-		if not on("AutoWorldBoss") then
+		if not N.want("AutoWorldBoss") then
 			return
 		end
 		task.wait(4.5)
@@ -33937,7 +34108,7 @@ do
 		local key = tostring(best.row.ID)
 		if N.Reward.shopKey ~= key or os.clock() - (N.Reward.shopLogAt or -1e9) > 60 then
 			N.Reward.shopKey, N.Reward.shopLogAt = key, os.clock()
-			log("PLAN", text)
+			N.planLog("PLAN", text)
 		end
 		if coins >= best.price and once("shop" .. best.id, 6) then
 			fire(N.R.seasonShop, best.id)
@@ -33991,13 +34162,13 @@ do
 		if on("AutoIndex") then
 			N.indexStep()
 		end
-		if on("AutoSeason") then
+		if N.want("AutoSeason") then
 			N.seasonStep()
 		end
-		if on("AutoSeasonLuck") then
+		if N.want("AutoSeasonLuck") then
 			N.seasonLuckStep()
 		end
-		if on("AutoSeasonShop") then
+		if N.want("AutoSeasonShop") then
 			N.seasonShopStep()
 		end
 		if on("AutoTowerTicket") then
@@ -34014,7 +34185,7 @@ do
 	-- Potions: keeps one of each picked kind running while you have them.
 	N.PotionNames = { CoinPotion = "Coin", TrainPotion = "Train", LuckPotion = "Luck", DamagePotion = "Damage", HPPotion = "HP" }
 	function N.potionStep()
-		if not on("AutoPotions") or N.keepExcluded("Potions") then
+		if not N.want("AutoPotions") or N.keepExcluded("Potions") then
 			return
 		end
 		local buffs = N.store("Buff")
@@ -34043,7 +34214,7 @@ do
 		return index, class, N.rarityText(N.call(N.G.Class.GetRarity, class))
 	end
 	function N.classStep()
-		if not on("AutoClassRoll") or os.clock() - N.ClassRoll.at < 0.6 then
+		if not N.want("AutoClassRoll") or os.clock() - N.ClassRoll.at < 0.6 then
 			return
 		end
 		local data = N.store("Class")
@@ -34218,7 +34389,6 @@ do
 		Icon = "corvus",
 		Footer = GameName,
 		FooterGame = true,
-		FooterLink = Discord,
 		NotifySide = "Right",
 		ShowCustomCursor = false,
 		ToggleKeybind = Enum.KeyCode.RightControl,
@@ -34251,8 +34421,9 @@ do
 	Tabs.Forge = N.addTab("Forge", "hammer", "Forging, best gear and selling")
 	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Upgrades, rebirth, gear enhance, potions and class rolls")
 	Tabs.Rewards = N.addTab("Rewards", "gift", "Gifts, season, index, quests and codes")
-	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and rates")
-	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts")
+	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress, rates and Discord webhook posts")
+	-- Packed tabs: the webhook settings live in the Stats tab.
+	Tabs.Webhook = Tabs.Stats
 	if Window.AddMiscTab then
 		pcall(function()
 			Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
@@ -34263,19 +34434,54 @@ do
 		local QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "sparkles")
 		-- No master switch: every automation is its own toggle. The list is what Stop Everything switches off.
 		N.AllAutoToggles2 = {
-			"KillAura", "GodMode", "Untouchable", "AutoStages", "AutoSuperLoot", "AutoTrain", "AutoForge", "AutoEquip", "AutoSellGear", "AutoUpgrade",
+			"SmartPlanner", "KillAura", "GodMode", "Untouchable", "AutoStages", "AutoSuperLoot", "AutoTrain", "AutoForge", "AutoEquip", "AutoSellGear", "AutoUpgrade",
 			"AutoEnhance", "AutoRebirth", "AutoTower", "AutoWorldBoss", "AutoOnline", "AutoOffline", "AutoFriend", "AutoIndex", "AutoSeason",
-			"AutoSeasonLuck", "AutoSeasonShop", "AutoTowerTicket", "AutoQuests", "AutoUpdateRewards", "AutoPotions", "AutoClassRoll",
+			"AutoSeasonLuck", "AutoSeasonShop", "AutoTowerTicket", "AutoQuests", "AutoUpdateRewards", "AutoPotions", "AutoClassRoll", "AutoCodes",
 		}
-		-- Protected items: ores, gear, Season Coins and potions picked here are never sold, forged, enhanced or spent by any toggle.
-		QuickBox:AddDropdown("FarmExclude", {
-			Text = "Protected items",
-			Values = N.ExcludeValues,
-			Default = N.ExcludeDefault,
-			Multi = true,
-			AllowNull = true,
-			Tooltip = "Never sold, forged, enhanced or spent by any toggle: ores and gear of the picked tiers, Season Coins (no Season Shop buys) and potions (none used)",
+		QuickBox:AddToggle("SmartPlanner", {
+			Text = "Smart Planner",
+			Default = false,
+			Tooltip = "Runs the whole loop by profit: stage runs, training and rebirths, tower, world boss, forging, best gear, selling weak gear, upgrades, enhance, class rolls and season spending. It compares measured coins per second and keeps your Protected Items safe. Your other toggles are not changed",
 		})
+		-- Quick Start mirrors: the same switch as in its own tab, both ways (the tab toggle is the real one).
+		N.QuickMirrors = {
+			{ "Q_AutoStages", "AutoStages", "Auto Farm Stages" },
+			{ "Q_KillAura", "KillAura", "Kill Aura" },
+			{ "Q_AutoTrain", "AutoTrain", "Auto Train" },
+			{ "Q_AutoForge", "AutoForge", "Auto Forge" },
+			{ "Q_AutoRebirth", "AutoRebirth", "Auto Rebirth" },
+		}
+		for _, pair in ipairs(N.QuickMirrors) do
+			local real = pair[2]
+			QuickBox:AddToggle(pair[1], {
+				Text = pair[3],
+				Default = false,
+				Tooltip = "Same switch as " .. pair[3] .. " in its own tab",
+				Callback = function(v)
+					local t = Toggles[real]
+					if t and t.Value ~= v then
+						t:SetValue(v)
+					end
+				end,
+			})
+			pcall(function()
+				SaveManager.Ignore[pair[1]] = true
+			end)
+		end
+		function N.syncMirrors()
+			for _, pair in ipairs(N.QuickMirrors) do
+				local m, r = Toggles[pair[1]], Toggles[pair[2]]
+				if m and r and m.Value ~= r.Value then
+					m:SetValue(r.Value)
+				end
+			end
+		end
+		task.spawn(function()
+			while alive() do
+				pcall(N.syncMirrors)
+				task.wait(0.25)
+			end
+		end)
 		QuickBox:AddButton({
 			Text = "Stop Everything",
 			Tooltip = "Turns every automation off",
@@ -34291,7 +34497,7 @@ do
 			end,
 		})
 		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">Every automation is its own switch in the other tabs. Nothing turns on by itself.</font>',
+			Text = '<font transparency="0.35">Smart Planner runs everything by profit. Without it every switch works on its own. Nothing turns on by itself.</font>',
 			DoesWrap = true,
 		})
 		-- Reset Hub Options: every toggle, dropdown, slider and input back to the default it was registered with. Saved configs stay.
@@ -34414,16 +34620,16 @@ do
 		AuraBox:AddToggle("KillAura", {
 			Text = "Kill Aura",
 			Default = false,
-			Tooltip = "Hits every enemy around you with your real damage, many times a second, in stages and the tower. Works with weak weapons too",
+			Tooltip = "Hits every enemy in range many times a second, in stages and the tower. Insta-kill by default, works with weak weapons too",
 		})
 		AuraBox:AddDropdown("AuraMode", {
 			Text = "Damage",
-			Values = { "Real damage", "Insta-kill" },
-			Default = "Real damage",
-			Tooltip = "Insta-kill finishes stage and tower enemies at once (they only exist on your screen). Riskier than real damage",
+			Values = { "Insta-kill", "Real damage" },
+			Default = "Insta-kill",
+			Tooltip = "Insta-kill finishes stage and tower enemies at once (they only exist on your screen). Real damage hits with your own weapon damage",
 		})
-		AuraBox:AddSlider("AuraRange", { Text = "Range", Default = 40, Min = 10, Max = 500, Rounding = 0, Suffix = " studs", Tooltip = "500 hits every enemy of the stage you are on" })
-		AuraBox:AddSlider("AuraSpeed", { Text = "Hit Every", Default = 0.3, Min = 0.1, Max = 1, Rounding = 2, Suffix = " s" })
+		AuraBox:AddSlider("AuraRange", { Text = "Range", Default = 500, Min = 10, Max = 500, Rounding = 0, Suffix = " studs", Tooltip = "500 hits every enemy of the stage you are on" })
+		AuraBox:AddSlider("AuraSpeed", { Text = "Hit Every", Default = 0.1, Min = 0.1, Max = 1, Rounding = 2, Suffix = " s" })
 		local MapBox = Tabs.Farm:AddRightGroupbox("Stages For Your Power", "map")
 		Labels.Stages = MapBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
@@ -34466,8 +34672,18 @@ do
 			end,
 		})
 		Labels.Forge = ForgeBox:AddLabel({ Text = "-", DoesWrap = true })
+		-- Protected items: ores, gear, Season Coins and potions picked here are never sold, forged, enhanced or spent by any toggle.
+		local ProtectBox = Tabs.Forge:AddLeftGroupbox("Protected Items", "shield-check")
+		ProtectBox:AddDropdown("FarmExclude", {
+			Text = "Protected items",
+			Values = N.ExcludeValues,
+			Default = N.ExcludeDefault,
+			Multi = true,
+			AllowNull = true,
+			Tooltip = "Never sold, forged, enhanced or spent by any toggle or the Smart Planner: ores and gear of the picked tiers, Season Coins (no Season Shop buys) and potions (none used)",
+		})
 		local GearBox = Tabs.Forge:AddRightGroupbox("Best Gear", "shield")
-		GearBox:AddToggle("AutoEquip", { Text = "Auto Equip Best Gear", Default = true, Tooltip = "Weapon, armor and hat, scored with the game's own stat formula" })
+		GearBox:AddToggle("AutoEquip", { Text = "Auto Equip Best Gear", Default = false, Tooltip = "Weapon, armor and hat, scored with the game's own stat formula" })
 		Labels.Gear = GearBox:AddLabel({ Text = "-", DoesWrap = true })
 		local SellBox = Tabs.Forge:AddRightGroupbox("Selling", "badge-dollar-sign")
 		SellBox:AddToggle("AutoSellGear", {
@@ -34490,7 +34706,7 @@ do
 		TrainBox:AddToggle("AutoTrain", {
 			Text = "Auto Train",
 			Default = false,
-			Tooltip = "Stands in the best training area you unlocked, the game trains by itself there. With Auto Farm Stages on it trains whenever the next rebirth is worth more per second than a stage run",
+			Tooltip = "Stands in the best training area you unlocked, the game trains by itself there. With Auto Farm Stages on it trains after every stage run for as long as that run took. Smart Planner splits the time by profit instead",
 		})
 		local areaNames = { "Best open" }
 		for _, area in ipairs(N.trainAreas()) do
@@ -34555,11 +34771,11 @@ do
 	end
 	do
 		local RewardBox = Tabs.Rewards:AddLeftGroupbox("Rewards", "gift")
-		RewardBox:AddToggle("AutoOnline", { Text = "Claim Online Gifts", Default = true })
+		RewardBox:AddToggle("AutoOnline", { Text = "Claim Online Gifts", Default = false })
 		do
 			local FPlayers = game:GetService("Players")
 			local FTeleport = game:GetService("TeleportService")
-			local F = { on = true, asked = {}, friend = {}, sent = 0, lastSend = -1e9, lastLog = "", lastLogAt = -1e9 }
+			local F = { on = false, asked = {}, friend = {}, sent = 0, lastSend = -1e9, lastLog = "", lastLogAt = -1e9 }
 			local function friendBoost()
 				local v = LocalPlayer:GetAttribute("FriendNumber")
 				if type(v) == "number" then return "+" .. math.floor(v * 10 + 0.5) .. "%" end
@@ -34638,7 +34854,7 @@ do
 			FriendBox:AddToggle("AutoFriend", {
 				Text = "Auto Friend",
 				Tooltip = "Every friend in the server gives +10%. Sends one friend request per 10 s to everyone in the server, once each",
-				Default = true,
+				Default = false,
 				Callback = function(v)
 					F.on = v == true
 				end,
@@ -34650,21 +34866,21 @@ do
 				end,
 			})
 		end
-		RewardBox:AddToggle("AutoOffline", { Text = "Claim Offline Reward", Default = true })
-		RewardBox:AddToggle("AutoIndex", { Text = "Claim Index EXP And Levels", Default = true })
-		RewardBox:AddToggle("AutoSeason", { Text = "Claim Season Rewards", Default = true, Tooltip = "Season pass rewards you reached and the daily season ticket" })
-		RewardBox:AddToggle("AutoTowerTicket", { Text = "Claim Daily Tower Ticket", Default = true })
-		RewardBox:AddToggle("AutoQuests", { Text = "Claim Event Quests", Default = true })
-		RewardBox:AddToggle("AutoUpdateRewards", { Text = "Claim Update And Group Gifts", Default = true, Tooltip = "Update log gifts, and the group gift once you are in the game's group" })
+		RewardBox:AddToggle("AutoOffline", { Text = "Claim Offline Reward", Default = false })
+		RewardBox:AddToggle("AutoIndex", { Text = "Claim Index EXP And Levels", Default = false })
+		RewardBox:AddToggle("AutoSeason", { Text = "Claim Season Rewards", Default = false, Tooltip = "Season pass rewards you reached and the daily season ticket" })
+		RewardBox:AddToggle("AutoTowerTicket", { Text = "Claim Daily Tower Ticket", Default = false })
+		RewardBox:AddToggle("AutoQuests", { Text = "Claim Event Quests", Default = false })
+		RewardBox:AddToggle("AutoUpdateRewards", { Text = "Claim Update And Group Gifts", Default = false, Tooltip = "Update log gifts, and the group gift once you are in the game's group" })
 		Labels.Rewards = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
 		local SeasonBox = Tabs.Rewards:AddRightGroupbox("Season", "ticket")
-		SeasonBox:AddToggle("AutoSeasonLuck", { Text = "Spin Season Luck", Default = true, Tooltip = "Spends the Season Tickets from the daily claim and the pass on the Season Luck wheel (stones, class rolls, scrolls, Season Coins, a weapon). Never spins without tickets, so it never opens a Robux prompt" })
+		SeasonBox:AddToggle("AutoSeasonLuck", { Text = "Spin Season Luck", Default = false, Tooltip = "Spends the Season Tickets from the daily claim and the pass on the Season Luck wheel (stones, class rolls, scrolls, Season Coins, a weapon). Never spins without tickets, so it never opens a Robux prompt" })
 		SeasonBox:AddToggle("AutoSeasonShop", { Text = "Spend Season Coins", Default = false, Tooltip = "Prices every Season Shop item in coins and buys the best value per Season Coin, saving for it when needed" })
 		Labels.Season = SeasonBox:AddLabel({ Text = "-", DoesWrap = true })
 		local CodeBox = Tabs.Rewards:AddLeftGroupbox("Codes", "ticket")
 		CodeBox:AddToggle("AutoCodes", {
 			Text = "Auto redeem known codes",
-			Default = true,
+			Default = false,
 			Tooltip = "Fetches the list of known codes at start and every 6 hours and redeems each one once per account",
 		})
 		Labels.Codes = CodeBox:AddLabel({ Text = "-", DoesWrap = true })
@@ -34885,6 +35101,7 @@ do
 	Log.header = Debug.header
 end
 N.AllAutoToggles = {
+	"SmartPlanner",
 	"KillAura",
 	"GodMode",
 	"Untouchable",
@@ -34902,7 +35119,6 @@ N.AllAutoToggles = {
 	"AutoPotions",
 	"AutoClassRoll",
 }
-log("MODE", N.farmMode())
 do
 	function N.manualRunning()
 		return N.Manual.running
@@ -34932,7 +35148,7 @@ do
 	end
 end
 do
-	local KeepOnTeleport = true
+	local KeepOnTeleport = false
 	local function queueSelf()
 		local queue = queue_on_teleport or (typeof(syn) == "table" and syn.queue_on_teleport) or queueonteleport
 		if type(queue) ~= "function" or INSTANCE.queued then
@@ -34953,7 +35169,7 @@ do
 			local ExecBox = Tabs.Misc:AddRightGroupbox("Auto Execute", "zap")
 			ExecBox:AddToggle("KeepOnTeleport", {
 				Text = "Keep after teleport",
-				Default = true,
+				Default = false,
 				Tooltip = "When the game moves you to another server the hub starts again there",
 				Callback = function(value)
 					KeepOnTeleport = value
@@ -35268,21 +35484,30 @@ end
 do
 	-- Profit engine v2 (CLAUDE.md.txt 8.00). Every time option (training, a stage run at each depth, the tower, the
 	-- world boss) and every money option (upgrades, gear enhance, forge choice, Season Shop, class rolls) is turned
-	-- into one unit: coins of value, per second of time or per coin spent. The horizon is ROLLING: always the next
-	-- 24 h from now (the hub farms forever), so it never counts down.
+	-- into one unit: coins of value, per second of time or per coin spent. Horizon H = 4 h: lump values are what
+	-- they earn in the next 4 h, purchases must pay back within 24 h. Rebirth value only counts the
+	-- farming that really follows it (the training share below), never 24 h of farming that never happens.
+	-- Everything here runs only while "Smart Planner" (Main) is on; the manual toggles keep their own simple rules.
 	--   coins:   income = ore sale price x the game's Coin boost (BalanceUtils.GetStatsBoost "Coin", rebirth CoinBasic
 	--            inside), ore odds from Stage.Loots / Stage.OreLoots with the game's own luck rule (rows <= 1000
 	--            weight get x luck x 1.3, Stage.Helper.GetRandRootID).
-	--   rebirth: worth the extra coin boost on the measured income for 24 h, plus its tower tickets, plus a newly
+	--   rebirth: worth the extra coin boost on the farming that follows within the horizon, plus its tower tickets, plus a newly
 	--            opened training area. Exp to the next rebirth = Level.GetTotalPower(need) - (level exp + Eco.power).
-	--   training speed: x(1+g) on the exp rate gives ln(1+g)/ln(q) more rebirths in 24 h, where q is how much the
+	--   training speed: x(1+g) on the exp rate gives ln(1+g)/ln(q) more rebirths in the horizon, where q is how much the
 	--            next rebirth costs more than this one after its own exp boost (Level and Rebirth configs). Weapons,
 	--            hats, Train upgrades, enhance levels, class rolls and Train potions are valued this way.
 	-- Rates are measured live (moving averages): coins earned per second, exp per second while training, seconds
 	-- per stage clear and per ore pick, the whole run against the model, tower and boss value per second. An option
 	-- that was never measured is tried once ("explore") instead of being guessed.
 	local P = {
-		H = 86400,
+		H = 14400,
+		Payback = 86400, -- purchases must pay back within a day
+		ShareWindow = 3600, -- the measured train/farm split forgets older time over about an hour
+		target = 0.5, -- training share the planner aims for (recomputed every refresh)
+		trainTurn = false,
+		why = "",
+		whyKey = "",
+		whyAt = -1e9,
 		Respawn = 30, -- the game respawns a cleared stage 30 s later (StageManager: RebirthTick = ServerTime + 30)
 		at = -1e9,
 		logAt = -1e9,
@@ -35472,25 +35697,35 @@ do
 			C.earned += coin - C.last
 		end
 		C.last = coin
-		if now - C.windowAt >= 60 then
-			-- The rate is the farm income: a minute spent only training keeps the last farm measurement (it is what
-			-- the rebirth boost applies to), the very first minute always measures.
-			local farmed = P.share.farm - (C.farmMark or 0)
-			if farmed > 5 or C.rate == nil then
-				C.rate = ema(C.rate, C.window / (now - C.windowAt), 0.3)
-			end
-			C.farmMark = P.share.farm
-			C.window = 0
-			C.windowAt = now
-		end
 		local area = tonumber(LocalPlayer:GetAttribute("AutoTrainAreaID"))
 		local mode = N.fightMode()
-		local dt = if P.shareAt then math.min(now - P.shareAt, 5) else 0
+		local raw = if P.shareAt then math.clamp(now - P.shareAt, 0, 60) else 0
+		local dt = math.min(raw, 5)
 		P.shareAt = now
+		-- The split forgets old time (about an hour), so the planner steers the share it is producing now.
+		local keep = math.max(1 - dt / P.ShareWindow, 0)
+		P.share.farm *= keep
+		P.share.train *= keep
 		if mode == "Stage" then
 			P.share.farm += dt
+			C.farmSecs = (C.farmSecs or 0) + raw
 		elseif mode == nil and area then
 			P.share.train += dt
+		else
+			C.farmSecs = (C.farmSecs or 0) + raw -- walking, banking, forging: part of the farm loop
+		end
+		if now - C.windowAt >= 60 then
+			-- Coins per second of FARMING (training seconds are not counted): the same unit on both sides of the
+			-- train/farm choice. A window with almost no farming keeps the last measurement.
+			local farmed = C.farmSecs or 0
+			if farmed >= 20 then
+				C.rate = ema(C.rate, C.window / farmed, 0.3)
+			elseif C.rate == nil and now - C.windowAt >= 60 and farmed > 0 then
+				C.rate = C.window / farmed
+			end
+			C.farmSecs = 0
+			C.window = 0
+			C.windowAt = now
 		end
 		local E = P.exp
 		local power = N.power()
@@ -35521,7 +35756,7 @@ do
 					A.perRun = ema(A.perRun, math.max(value, 0), 0.3)
 					A.secs = ema(A.secs, secs, 0.3)
 					A.n = (A.n or 0) + 1
-					log("PLAN measured", key, "value", math.floor(value), "in", math.floor(secs), "s")
+					N.planLog("PLAN measured", key, "value", math.floor(value), "in", math.floor(secs), "s")
 				end
 			end
 			P.modeSnap = if mode == "Dungeon" or mode == "WorldBoss" then { at = now, earned = C.earned, ores = N.oreValue() } else nil
@@ -35606,15 +35841,21 @@ do
 		end
 		return { need = need1, cost = cost1, left = left, q = math.max(q, 1.01) }
 	end
-	-- Coin value of the next rebirth over the rolling 24 h.
+	-- Coin boost of the next rebirth (+20 % at rebirth 0 shrinks to +2 % at rebirth 10: 0.2 / (1 + 0.2 r)).
+	function N.rebirthBoost()
+		local r = N.rebirth()
+		return coinBasic(r + 1) / math.max(coinBasic(r), 1e-9) - 1
+	end
+	-- Coin value of the next rebirth within the horizon: the boost on the coins of the FARMING that really
+	-- follows (horizon x the planned farm share), not on 24 h of farming the hub would spend training.
 	function N.rebirthValue(math_)
 		math_ = math_ or N.rebirthMath()
 		if not math_ then
 			return 0
 		end
 		local r = N.rebirth()
-		local coinUp = coinBasic(r + 1) / math.max(coinBasic(r), 1e-9) - 1
-		local base = coinUp * N.coinIncome() * P.H
+		local coinUp = N.rebirthBoost()
+		local base = coinUp * N.coinIncome() * P.H * (1 - math.clamp(P.target or 0.5, 0, 0.95))
 		local tickets = num(N.call(N.G.Rebirth.GetDungeonTicket, r + 1), 0)
 		local tower = P.act.tower
 		if tickets > 0 and tower and tower.perRun then
@@ -35624,8 +35865,8 @@ do
 		local extra = if areaUp > 1 then math.log(areaUp) / math.log(math_.q) else 0
 		return base / (1 - math.min(extra, 0.9))
 	end
-	-- Coin value over 24 h of training x(1+g) faster: ln(1+g)/ln(q) more rebirths, never more than g x the rebirths
-	-- that fit in 24 h at today's speed.
+	-- Coin value within the horizon of training x(1+g) faster: ln(1+g)/ln(q) more rebirths, never more than g x the
+	-- rebirths that fit in the planned training time (horizon x training share) at today's speed.
 	function N.trainValue(g)
 		if not g or g <= 0 then
 			return 0
@@ -35635,7 +35876,7 @@ do
 		if not m or not rate or rate <= 0 then
 			return 0
 		end
-		local perDay = P.H / math.max(m.cost / rate, 1)
+		local perDay = P.H * math.clamp(P.target or 0.5, 0.05, 0.95) / math.max(m.cost / rate, 1)
 		local more = math.min(math.log(1 + g) / math.log(m.q), g * perDay)
 		return more * N.rebirthValue(m)
 	end
@@ -35669,42 +35910,146 @@ do
 		end
 		return formatNumber(x)
 	end
+	-- Training share. Over the horizon H the coins earned are (1-s) x H x I x (1+u)^(s x H / T), with s the share of
+	-- time spent training, I the measured coins per FARMING second, u the next rebirth's coin boost and T the
+	-- seconds of training one rebirth takes at the measured exp rate. The best share is s* = 1 - T / (H ln(1+u)),
+	-- 0 when that is negative. I cancels out: time is compared with time (measured exp rate against measured farm
+	-- income), never a hypothetical 24 h rebirth value against a measured coin rate (the old 98 % training bug).
+	-- The share is capped so the farming still earns the coins the next purchases need (those that pay back faster
+	-- than the rebirth), and at 95 % so coins always come in. When no rebirth is left (or none is worth it),
+	-- training only pays while it opens a deeper stage soon enough.
+	local function trainPlan(farmGain)
+		local m = N.rebirthMath()
+		local rate = N.expRate()
+		local r = N.rebirth()
+		local shareNow = 1 - N.farmShare()
+		if not rate or rate <= 0 then
+			if m then
+				return { target = 0.5, turn = true, gain = math.huge, why = "training once to measure the exp rate" }
+			end
+			return { target = 0, turn = false, gain = 0, why = "nothing to train for" }
+		end
+		if m and m.left <= 0 and N.want("AutoRebirth") then
+			return { target = P.target, turn = true, gain = math.huge, eta = 0, why = "rebirth " .. (r + 1) .. " level reached, rebirthing" }
+		end
+		local target, why, eta = 0, nil, nil
+		local farmI = if farmGain and farmGain < math.huge then farmGain else 0
+		local income = math.max(N.coinIncome(), farmI)
+		if m and m.left > 0 then
+			local u = N.rebirthBoost()
+			local T = math.max(m.cost / rate, 1)
+			eta = m.left / rate
+			-- Tower tickets the rebirth gives are extra coins on top of the same farming.
+			local tickets = num(N.call(N.G.Rebirth.GetDungeonTicket, r + 1), 0)
+			local tower = P.act.tower
+			if tickets > 0 and tower and tower.perRun and income > 0 then
+				u += tickets * tower.perRun / (income * P.H * 0.5)
+			end
+			local k = P.H * math.log(1 + math.max(u, 0)) / T
+			target = if k > 1 then 1 - 1 / k else 0
+			local payback = T / math.max(u, 1e-9)
+			local need = 0
+			if N.want("AutoUpgrade") or N.want("AutoEnhance") then
+				for _, o in ipairs(N.spendOptions()) do
+					if o.cost / math.max(o.gain, 1e-12) < payback then
+						need += o.price or o.cost
+					end
+				end
+				need -= N.coin()
+			end
+			local cap = 0.95
+			if need > 0 then
+				cap = if income > 0 then math.clamp(1 - need / income / P.H, 0, 0.95) else 0
+			end
+			target = math.clamp(math.min(target, cap), 0, 0.95)
+			-- Purchases that pay back faster than this rebirth come first: farm their coins now when that is quicker
+			-- than the rebirth's own payback.
+			if need > 0 and income > 0 and need / income < payback and target > 0 then
+				return { target = target, turn = false, gain = 0, eta = eta, why = string.format("farming %s coins first for upgrades that pay back faster than rebirth %d (%s of farming)", formatNumber(need), r + 1, N.longTime(need / income)) }
+			end
+			why = string.format(
+				"rebirth %d gives +%d%% coins for %s of training, paid back after %s of farming%s",
+				r + 1,
+				math.floor(u * 100 + 0.5),
+				N.longTime(T),
+				N.longTime(payback),
+				if need > 0 and cap < 0.95 then ", " .. formatNumber(need) .. " coins needed for upgrades first" else ""
+			)
+		end
+		if target <= 0 then
+			-- No rebirth worth training for: training only pays while it opens the next stage soon enough.
+			local cur = N.stageTargetByPower()
+			local margin = math.clamp(optionNumber("StageMargin", 100), 10, 1000) / 100
+			local _, cap = N.pack()
+			for _, st in ipairs(N.stageList()) do
+				if st.n == cur + 1 and N.pickText("StageMode", "Auto (by power)") == "Auto (by power)" then
+					local need = st.recommend * margin - N.power()
+					local a, b = N.farmValue(cur, cap), N.farmValue(cur + 1, cap)
+					if need > 0 and a and b and b > a then
+						local t = need / rate
+						local payback = t * a / (b - a)
+						if payback < P.H * 0.5 then
+							return { target = 0, turn = true, depth = true, gain = 0, eta = t, why = string.format("training %s to open stage %d (worth %d%% more per run, paid back after %s)", N.longTime(t), st.n, math.floor((b / a - 1) * 100), N.longTime(payback)) }
+						end
+					end
+				end
+			end
+			return { target = 0, turn = false, gain = 0, eta = eta, why = why or (if m then "no rebirth pays back within " .. N.longTime(P.H) else "max rebirth reached, every open stage is farmed") }
+		end
+		-- Hysteresis of 2 %: the turn changes after a stretch, not every refresh.
+		local turn = P.trainTurn
+		if turn and shareNow >= target + 0.02 then
+			turn = false
+		elseif not turn and shareNow < target - 0.02 then
+			turn = true
+		end
+		return { target = target, turn = turn, gain = 0, eta = eta, why = string.format("%s; train %d%% of the time (now %d%%)", why, math.floor(target * 100 + 0.5), math.floor(shareNow * 100 + 0.5)) }
+	end
+	N.trainPlan = trainPlan
 	function N.planOptions()
 		local list = {}
 		local maxStage = N.stageTargetByPower()
-		if on("AutoStages") then
+		local farmGain
+		if N.want("AutoStages") then
 			local _, cap = N.pack()
 			local any = false
 			for d = math.max(1, maxStage - 4), maxStage do
 				local gain, seconds = N.farmValue(d, cap)
 				if gain then
 					any = true
+					farmGain = math.max(farmGain or 0, gain)
 					table.insert(list, { key = "farm" .. d, kind = "farm", stage = d, gain = gain, eta = seconds })
 				end
 			end
 			if not any then
+				farmGain = math.huge
 				table.insert(list, { key = "farm" .. maxStage, kind = "farm", stage = maxStage, gain = math.huge, eta = nil })
 			end
 		end
-		if on("AutoTrain") then
-			local m = N.rebirthMath()
-			local rate = N.expRate()
-			if m and rate and rate > 0 then
-				local eta = m.left / rate
-				-- At the rebirth level more training adds nothing until the rebirth is done (Auto Rebirth does it).
-				local gain = if m.left <= 0 then (if on("AutoRebirth") then math.huge else 0) else N.rebirthValue(m) / math.max(eta, 1)
-				table.insert(list, { key = "train", kind = "train", gain = gain, eta = eta })
-			elseif m then
-				table.insert(list, { key = "train", kind = "train", gain = math.huge, eta = nil })
-			else
-				table.insert(list, { key = "train", kind = "train", gain = 0, eta = nil })
+		P.trainWhy = nil
+		if N.want("AutoTrain") then
+			local tp = trainPlan(farmGain)
+			P.target = tp.target
+			P.trainTurn = tp.turn
+			P.trainWhy = tp.why
+			local gain = tp.gain
+			if gain ~= math.huge then
+				-- Ranked right above or right below the best stage run by the time split (same unit on both sides).
+				if farmGain and farmGain < math.huge then
+					gain = if tp.turn then farmGain * 1.0001 + 1e-9 else farmGain * 0.9999
+				elseif farmGain == nil then
+					gain = if tp.turn then 1 else 0
+				else
+					gain = 0
+				end
 			end
+			table.insert(list, { key = "train", kind = "train", gain = gain, eta = tp.eta, depth = tp.depth })
 		end
-		if on("AutoTower") and N.towerReady() then
+		if N.want("AutoTower") and N.towerReady() then
 			local A = P.act.tower
 			table.insert(list, { key = "tower", kind = "tower", gain = if A and A.perSec then A.perSec else math.huge, eta = A and A.secs })
 		end
-		if on("AutoWorldBoss") and N.bossWanted() then
+		if N.want("AutoWorldBoss") and N.bossWanted() then
 			local A = P.act.boss
 			table.insert(list, { key = "boss", kind = "boss", gain = if A and A.perSec then A.perSec else math.huge, eta = A and A.secs })
 		end
@@ -35716,15 +36061,42 @@ do
 		end)
 		return list
 	end
-	-- The planner only works (and logs) while a toggle that uses its numbers is on.
-	local PlannerToggles = { "AutoTrain", "AutoStages", "AutoTower", "AutoWorldBoss", "AutoForge", "AutoUpgrade", "AutoEnhance", "AutoRebirth", "AutoClassRoll", "AutoSeasonShop", "AutoPotions" }
+	-- The planner works (and logs PLAN lines) only while Smart Planner is on.
 	function N.plannerWanted()
-		for _, name in ipairs(PlannerToggles) do
+		return on("SmartPlanner")
+	end
+	-- Live rates are also sampled for the manual toggles that price things by payback (no PLAN lines then).
+	local MeasureToggles = { "AutoTrain", "AutoStages", "AutoTower", "AutoWorldBoss", "AutoForge", "AutoUpgrade", "AutoEnhance", "AutoClassRoll", "AutoSeasonShop" }
+	function N.measureWanted()
+		if on("SmartPlanner") then
+			return true
+		end
+		for _, name in ipairs(MeasureToggles) do
 			if on(name) then
 				return true
 			end
 		end
 		return false
+	end
+	local function decisionText(best)
+		if not best then
+			return "idle", "nothing to do"
+		end
+		local r = N.rebirth()
+		if best.kind == "train" then
+			if best.depth then
+				return "train", P.trainWhy or "training for power"
+			end
+			return "train", "train toward rebirth " .. (r + 1) .. (if best.eta and best.eta > 0 then " (" .. N.longTime(best.eta) .. " left)" else "") .. ": " .. (P.trainWhy or "")
+		elseif best.kind == "farm" then
+			if best.gain == math.huge then
+				return "farm", "farm stage " .. best.stage .. " once to measure it"
+			end
+			return "farm", "farm stage " .. best.stage .. " for " .. formatNumber(best.gain) .. " coins/s" .. (if P.trainWhy then ": " .. P.trainWhy else "")
+		elseif best.kind == "tower" then
+			return "tower", "run the tower, worth " .. (if best.gain == math.huge then "a first measurement" else formatNumber(best.gain) .. " coins/s") .. ", more than a stage run"
+		end
+		return "boss", "fight the world boss, worth " .. (if best.gain == math.huge then "a first measurement" else formatNumber(best.gain) .. " coins/s")
 	end
 	function N.planRefresh(force)
 		if not N.plannerWanted() then
@@ -35758,18 +36130,29 @@ do
 				if best.eta then N.longTime(best.eta) else "?",
 				if #alt > 0 then table.concat(alt, ",") else "-"
 			)
-			if best.key ~= P.lastKey or now - P.logAt > 60 then
+			-- The raw ranking once a minute (the PLAN decision line below explains every change in words).
+			if now - P.logAt > 60 then
 				P.lastKey = best.key
 				P.logAt = now
-				log("PLAN", P.text)
+				N.planLog("PLAN", P.text)
 			end
 		else
 			P.text = ""
+		end
+		-- The decision in plain words: on every change of what to do, else every 5 minutes.
+		local key, words = decisionText(best)
+		P.why = words
+		if key ~= P.whyKey or now - P.whyAt > 300 then
+			P.whyKey, P.whyAt = key, now
+			N.planLog("PLAN decision " .. key .. ": " .. words)
 		end
 		return best
 	end
 	-- The first of the given kinds in the current ranking (nil when the planner has none of them).
 	function N.planFirst(kinds)
+		if not N.plannerWanted() then
+			return nil
+		end
 		for _, o in ipairs(P.options) do
 			if table.find(kinds, o.kind) then
 				return o.kind
@@ -35778,7 +36161,7 @@ do
 		return nil
 	end
 	function N.planTick()
-		if not N.plannerWanted() then
+		if not N.measureWanted() then
 			return
 		end
 		local ok, err = pcall(sample)
@@ -35919,7 +36302,7 @@ do
 		return best
 	end
 	-- Money options ----------------------------------------------------------------------------------------------
-	-- Every option: dI = coins per second it adds (24 h average for lump values), cost = coins. Bought in falling
+	-- Every option: dI = coins per second it adds (horizon average for lump values), cost = coins. Bought in falling
 	-- dI/cost order; a cheaper one is bought while saving only when it pays back before the saving is done.
 	function N.upgradeGain(nextUp)
 		local levels = N.G.Upgrade[nextUp.kind] or {}
@@ -35996,7 +36379,7 @@ do
 	end
 	function N.spendOptions()
 		local list = {}
-		if on("AutoUpgrade") then
+		if N.want("AutoUpgrade") then
 			for _, kind in ipairs(N.UpgradeKinds) do
 				if allows(Options.UpgradeKinds, N.UpgradeNames[kind]) then
 					local nextUp = N.upgradeNext(kind)
@@ -36010,7 +36393,7 @@ do
 				end
 			end
 		end
-		if on("AutoEnhance") and N.rebirth() >= 6 then
+		if N.want("AutoEnhance") and N.rebirth() >= 6 then
 			local bp = N.backpack()
 			local failLevel = tonumber(N.call(N.G.Enhant.GetFailLevel)) or 6
 			for _, slot in ipairs({ "Weapon", "Hat" }) do
@@ -36030,8 +36413,8 @@ do
 		end
 		local keep = {}
 		for _, o in ipairs(list) do
-			-- Never buy what does not pay back within the rolling 24 h.
-			if o.gain > 0 and o.cost / o.gain <= P.H then
+			-- Never buy what does not pay back within a day (the hub plays 24 h sessions).
+			if o.gain > 0 and o.cost / o.gain <= P.Payback then
 				o.perCoin = o.gain / math.max(o.cost, 1)
 				table.insert(keep, o)
 			end
@@ -36092,7 +36475,7 @@ do
 		local key = best.key .. (if pick then "+" .. pick.key else "")
 		if key ~= P.spendKey then
 			P.spendKey = key
-			log("PLAN", P.spendText)
+			N.planLog("PLAN", P.spendText)
 		end
 		return pick
 	end
@@ -36284,6 +36667,7 @@ do
 	end
 	if Library.AddCommand then
 		pcall(function()
+			toggleCommand("planner", { "smart" }, { "SmartPlanner" }, "Smart Planner")
 			toggleCommand("stages", {}, { "AutoStages" }, "Auto Farm Stages")
 			toggleCommand("superloot", { "super", "runner" }, { "AutoSuperLoot" }, "Super Loot hunting")
 			toggleCommand("enhance", {}, { "AutoEnhance" }, "Auto Enhance Equipped Gear")
@@ -36357,6 +36741,7 @@ do
 	if Library.SetQuickBar then
 		pcall(function()
 			Library:SetQuickBar({
+				{ Toggle = "SmartPlanner", Icon = "sparkles", Label = "Planner" },
 				{ Toggle = "AutoStages", Icon = "swords", Label = "Stages" },
 				{ Toggle = "AutoTrain", Icon = "dumbbell", Label = "Train" },
 				{ Toggle = "AutoForge", Icon = "hammer", Label = "Forge" },
@@ -36396,6 +36781,7 @@ do
 					Required = true,
 					Default = { "stages", "train", "events", "rewards" },
 					Choices = {
+						{ Id = "planner", Title = "Smart Planner", Description = "Runs the whole loop by profit: runs, training, rebirths, forge, gear, upgrades and spending", Icon = "sparkles", Color = "#ffd166" },
 						{ Id = "stages", Title = "Farm stages", Description = "Fights the best stage for your power, picks every ore and banks them safely", Icon = "swords", Color = "#fab428" },
 						{ Id = "train", Title = "Train", Description = "Trains in the best open area when the next rebirth pays more than a run", Icon = "dumbbell", Color = "#3ccf91" },
 						{ Id = "forge", Title = "Forge and gear", Description = "Forges from your strongest ores and equips the best weapon, armor and hat", Icon = "hammer", Color = "#5fb8ff" },
@@ -36408,6 +36794,7 @@ do
 			Finish = function(values)
 				local chosen = type(values.tasks) == "table" and values.tasks or {}
 				local groups = {
+					planner = { "SmartPlanner" },
 					stages = { "AutoStages", "AutoSuperLoot" },
 					train = { "AutoTrain" },
 					forge = { "AutoForge", "AutoEquip" },
@@ -36544,7 +36931,7 @@ end)
 Library.OnAutoload = function()
 	local names = {}
 	for name, toggle in pairs(Toggles) do
-		if toggle.Value == true then
+		if toggle.Value == true and string.sub(name, 1, 2) ~= "Q_" then
 			table.insert(names, name)
 		end
 	end
@@ -36617,8 +37004,8 @@ do
 		end
 		local mode = N.fightMode()
 		if mode == "Stage" then
-			if on("AutoStages") then
-				if on("AutoWorldBoss") and N.bossWanted() and N.Fight.run and N.planFirst({ "boss", "farm" }) ~= "farm" then
+			if N.want("AutoStages") then
+				if N.want("AutoWorldBoss") and N.bossWanted() and N.Fight.run and N.planFirst({ "boss", "farm" }) ~= "farm" then
 					N.bank("world boss is up")
 					return
 				end
@@ -36630,14 +37017,14 @@ do
 			end
 			return
 		elseif mode == "Dungeon" then
-			if on("AutoTower") then
+			if N.want("AutoTower") then
 				N.towerStep()
 			else
 				task.wait(0.5)
 			end
 			return
 		elseif mode == "WorldBoss" then
-			if on("AutoWorldBoss") then
+			if N.want("AutoWorldBoss") then
 				N.bossStep()
 			else
 				task.wait(0.5)
@@ -36648,24 +37035,31 @@ do
 			return
 		end
 		N.Fight.run = false
-		if on("AutoForge") and choreDue("forge", 10) and N.forgePlan(N.forgeKind()) then
+		if N.want("AutoForge") and choreDue("forge", 10) and N.forgePlan(N.forgeKind()) then
 			N.forgeStep(6)
 			return
 		end
 		-- The profit planner (p09_plan) ranks every time option by coins of value per second; the boss and the tower
 		-- go first only when they rank above both a stage run and training (never measured = tried once).
-		if on("AutoWorldBoss") and N.bossWanted() and os.clock() - N.Boss.at > 15 and N.planFirst({ "boss", "farm", "train" }) ~= "farm" and N.planFirst({ "boss", "farm", "train" }) ~= "train" then
+		if N.want("AutoWorldBoss") and N.bossWanted() and os.clock() - N.Boss.at > 15 and N.planFirst({ "boss", "farm", "train" }) ~= "farm" and N.planFirst({ "boss", "farm", "train" }) ~= "train" then
 			N.bossJoin()
 			return
 		end
-		if on("AutoTower") and N.towerReady() and N.planFirst({ "tower", "farm", "train" }) ~= "farm" and N.planFirst({ "tower", "farm", "train" }) ~= "train" then
+		if N.want("AutoTower") and N.towerReady() and N.planFirst({ "tower", "farm", "train" }) ~= "farm" and N.planFirst({ "tower", "farm", "train" }) ~= "train" then
 			N.towerStart()
 			return
 		end
-		local training = on("AutoTrain")
+		local training = N.want("AutoTrain")
 		-- A Super Loot runner is worth more than training (one Legendary+ ore for about 2 s, gone in minutes).
-		local superUp = on("AutoStages") and on("AutoSuperLoot") and N.superPick() ~= nil
-		if on("AutoStages") and (not training or superUp or N.planFirst({ "farm", "train" }) ~= "train") then
+		local superUp = N.want("AutoStages") and N.want("AutoSuperLoot") and N.superPick() ~= nil
+		local trainTurn
+		if N.plannerWanted() then
+			trainTurn = N.planFirst({ "farm", "train" }) == "train"
+		else
+			-- Without Smart Planner: after every stage run the hub trains as long as that run took (half and half).
+			trainTurn = os.clock() < (N.Fight.trainUntil or 0)
+		end
+		if N.want("AutoStages") and (not training or superUp or not trainTurn) then
 			if not N.startRun() then
 				task.wait(1)
 			end
@@ -36683,7 +37077,7 @@ do
 	-- The aura runs on its own, so it also works when you play a stage or the tower yourself.
 	loop("aura", function()
 		local mode = N.fightMode()
-		if on("KillAura") and (mode == "Stage" or mode == "Dungeon") then
+		if N.want("KillAura") and (mode == "Stage" or mode == "Dungeon") then
 			N.auraStep()
 			task.wait(0.05)
 		else
@@ -36697,19 +37091,19 @@ do
 			return
 		end
 		N.planTick()
-		if on("AutoEquip") and choreDue("equip", 3) then
+		if N.want("AutoEquip") and choreDue("equip", 3) then
 			N.equipStep()
 		end
 		if choreDue("sell", 5) then
 			N.sellStep()
 		end
-		if on("AutoUpgrade") and choreDue("upgrade", 2) then
+		if N.want("AutoUpgrade") and choreDue("upgrade", 2) then
 			N.upgradeStep()
 		end
-		if on("AutoRebirth") and choreDue("rebirth", 1) then
+		if N.want("AutoRebirth") and choreDue("rebirth", 1) then
 			N.rebirthStep()
 		end
-		if on("AutoEnhance") and choreDue("enhance", 4) then
+		if N.want("AutoEnhance") and choreDue("enhance", 4) then
 			N.enhanceStep()
 		end
 		if choreDue("rewards", 5) then
@@ -36743,13 +37137,18 @@ do
 			end
 			return "Fight the world boss"
 		end
-		for i = 1, math.min(#Pl.options, 2) do
-			table.insert(next, (if i == 1 then "Now: " else "Then: ") .. describe(Pl.options[i]))
+		if N.plannerWanted() then
+			for i = 1, math.min(#Pl.options, 2) do
+				table.insert(next, (if i == 1 then "Now: " else "Then: ") .. describe(Pl.options[i]))
+			end
+			if Pl.why and Pl.why ~= "" then
+				table.insert(next, "Why: " .. Pl.why)
+			end
 		end
-		if Pl.spendNext and (on("AutoUpgrade") or on("AutoEnhance")) then
+		if Pl.spendNext and (N.want("AutoUpgrade") or N.want("AutoEnhance")) then
 			table.insert(next, Pl.spendNext)
 		end
-		if on("AutoForge") then
+		if N.want("AutoForge") then
 			local kind = N.forgeKind()
 			local per = math.max(N.forgeCount(kind), 1)
 			local usable = 0
@@ -36761,13 +37160,13 @@ do
 			local times = math.floor(usable / per)
 			table.insert(next, if times >= 1 then string.format("Forge %s x%d", string.lower(kind), times) else string.format("Forge %s when %d ores are ready", string.lower(kind), per))
 		end
-		if on("AutoRebirth") then
+		if N.want("AutoRebirth") then
 			local m = N.rebirthMath()
 			if m then
 				table.insert(next, "Rebirth " .. (r + 1) .. " at level " .. tostring(m.need))
 			end
 		end
-		return if #next > 0 then "\u{2022} " .. table.concat(next, "\n\u{2022} ") else "Turn on Auto Farm Stages or Auto Train to get a plan"
+		return if #next > 0 then "\u{2022} " .. table.concat(next, "\n\u{2022} ") else "Turn on Smart Planner (or Auto Farm Stages, Auto Train) to get a plan"
 	end
 	-- Builds every label text here, the draw thread below only copies strings.
 	N.InfoText = {}
@@ -37111,7 +37510,7 @@ do
 
 	if Library.ShowWizard and not N.setupDone() then
 		task.delay(1.5, function()
-			if on("AutoStages") or on("AutoTrain") then
+			if N.want("AutoStages") or N.want("AutoTrain") then
 				N.markSetupDone()
 				return
 			end
