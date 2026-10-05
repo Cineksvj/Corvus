@@ -23271,15 +23271,12 @@ local BootOk, BootError = xpcall(function()
 				local SupportedGames = Info.SupportedGames or {
 					{ Name = "+1 Stone Skipping", PlaceId = 111543903102439 },
 					{ Name = "Anime Dice", PlaceId = 113290951185459 },
-					{ Name = "Bizarre", PlaceId = 135621866300031 },
 					{ Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
 					{ Name = "Loot To Forge", PlaceId = 118805555015549 },
 					{ Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
 					{ Name = "Pets Universe", PlaceId = 74629631798007 },
 					{ Name = "Ride A Pet", PlaceId = 124216119978534 },
-					{ Name = "Steal An Egg", PlaceId = 107778070777162 },
 					{ Name = "Steal From The Rich", PlaceId = 120475074479690 },
-					{ Name = "Voltline Electric Scooters", PlaceId = 118315378611589 },
 					{ Name = "Welcome to Bloxburg", PlaceId = 185655149 },
 				}
 				local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
@@ -28640,8 +28637,12 @@ local BootOk, BootError = xpcall(function()
 			return t ~= nil and t.Value == true
 		end
 		-- OP (Auto Farm Everything OP) = the planner decides; Normal (Auto Farm Everything) only switches on the player's picked toggles
+		function Game.myFilters()
+			local mode = Options.FarmMode
+			return mode ~= nil and mode.Value == "My filters"
+		end
 		function Game.opMode()
-			return on("AutoFarmOP")
+			return on("AutoFarmOP") and not Game.myFilters()
 		end
 		-- "Exclude from OP" (Options.OPExclude): what the OP planner must never sell, spend or collect
 		Game.OPReserveLabel = "Money reserve (keep 25% of cash)"
@@ -30476,7 +30477,7 @@ local BootOk, BootError = xpcall(function()
 		local TS = { state = nil, restarts = 0 }
 		Game.trainSea = TS
 		local function trainAlongside(I)
-			if not (on("AutoFarmOP") and on("AutoTrain")) or TS.state == "no" or (not Game.opMode() and (Options.TrainMode and Options.TrainMode.Value) ~= "Alternate with the sea") then
+			if not (Game.opMode() and on("AutoTrain")) or TS.state == "no" or (not Game.opMode() and (Options.TrainMode and Options.TrainMode.Value) ~= "Alternate with the sea") then
 				return
 			end
 			local now = os.clock()
@@ -30585,7 +30586,7 @@ local BootOk, BootError = xpcall(function()
 			local floor = Game.plotFloor and Game.plotFloor() or 0
 			local anyIndex = false
 			-- the planner (value, index, event rush, lucky blocks) works only with Auto Farm Everything; alone Blatant follows the player's filters and priority
-			local planner = on("AutoFarmOP")
+			local planner = Game.opMode()
 			local rushing = planner and Game.event ~= nil and Game.event.rushing()
 			local evCount = 0
 			for _, item in ipairs(list) do
@@ -31892,15 +31893,12 @@ local BootOk, BootError = xpcall(function()
 			if Game.opMode() then
 				-- the planner decides (Game.plan), minus the "Money reserve" exclusion
 				return math.max(cash() - Game.opReserve(), 0)
-			elseif on("AutoFarmOP") then
-				-- Normal: the planner chooses, but never beyond the player's Spend Up To
-				return cash() * spendFraction()
 			end
 			local reserve = 0
 			if on("SaveForRebirth") and on("AutoRebirth") then
 				reserve = nextRebirthCost() or 0
 				local perHour = Metrics.current("Money")
-				if on("AutoFarmOP") and reserve > 0 and perHour and cash() + perHour / 4 < reserve then
+				if Game.opMode() and reserve > 0 and perHour and cash() + perHour / 4 < reserve then
 					reserve = 0
 				end
 			end
@@ -31935,7 +31933,7 @@ local BootOk, BootError = xpcall(function()
 				local move = Options.SeaMove and Options.SeaMove.Value
 				local useless = id == "MovementSpeed" and (move == "Blatant" or move == "Teleport")
 				if not useless and allows(Options.UpgradeFilter, label) and (UpgradeBackoff[id] or 0) <= os.clock() then
-					local amount = maxBuyable(id, if Game.opMode() then Game.budget(id) elseif on("AutoFarmOP") then math.min(Game.budget(id), spendable()) elseif id == "Carry" then cash() else spendable())
+					local amount = maxBuyable(id, if Game.opMode() then Game.budget(id) elseif id == "Carry" then cash() else spendable())
 					if amount > 0 then
 						local level = upgradeLevel(id)
 						setStatus("Buying " .. label .. " x" .. amount)
@@ -32333,7 +32331,7 @@ local BootOk, BootError = xpcall(function()
 			end
 			local tried = 0
 			for _, key in ipairs(list) do
-				if on("AutoFarmOP") then
+				if Game.opMode() then
 					-- a staff with no more luck (and no longer sea when you walk) is wasted cash
 					local byTime = not Game.opMode() and (Options.StaffPick and Options.StaffPick.Value) == "Longest Time"
 					local betterLuck = not byTime and effectiveLuck(Staffs[key], owned) > ownedLuck
@@ -32432,7 +32430,7 @@ local BootOk, BootError = xpcall(function()
 			end
 			local tried = 0
 			for _, id in ipairs(list) do
-				if on("AutoFarmOP") then
+				if Game.opMode() then
 					if (tonumber(TrainTools[id].gainPerTrain) or 0) <= ownedGain or not Game.spendOk("Dumbbell:" .. id, TrainTools[id].cost) then
 						continue
 					end
@@ -32514,7 +32512,7 @@ local BootOk, BootError = xpcall(function()
 				return false
 			end
 			local cost = nextRebirthCost()
-			if not cost or cash() < cost or (on("AutoFarmOP") and not Game.spendOk("Rebirth", cost)) then
+			if not cost or cash() < cost or (Game.opMode() and not Game.spendOk("Rebirth", cost)) then
 				return false
 			end
 			local before = rebirths()
@@ -32647,7 +32645,7 @@ local BootOk, BootError = xpcall(function()
 			if (Options.TrainMode and Options.TrainMode.Value) ~= "Alternate with the sea" then
 				return false
 			end
-			if on("AutoFarmOP") and Game.trainSea and Game.trainSea.state == "works" and isBlatant() then
+			if Game.opMode() and Game.trainSea and Game.trainSea.state == "works" and isBlatant() then
 				return false
 			end
 			if Game.event and Game.event.rushing() then
@@ -32658,7 +32656,7 @@ local BootOk, BootError = xpcall(function()
 				end
 				return false
 			end
-			local planned = Game.opMode() or (on("AutoFarmOP") and tonumber(Options.SeaMinutes and Options.SeaMinutes.Value) == 10 and tonumber(Options.TrainMinutes and Options.TrainMinutes.Value) == 5)
+			local planned = Game.opMode() or (Game.opMode() and tonumber(Options.SeaMinutes and Options.SeaMinutes.Value) == 10 and tonumber(Options.TrainMinutes and Options.TrainMinutes.Value) == 5)
 			if planned then
 				-- profit engine v2: train only while the next plate bought with sea time (gain/$ of Train) beats the best
 				-- money purchase and pays back inside the horizon (Game.plan, PLAN log)
@@ -33668,11 +33666,13 @@ local BootOk, BootError = xpcall(function()
 			local OPPreset = { SeaMove = "Blatant", SeaCharge = "Perfect (+5s)", SellMode = "Smart", SellAt = 190, TrainMode = "Alternate with the sea", SeaMinutes = 10, TrainMinutes = 3, UpgradeSpend = 100 }
 			local function farmApply(kind, value)
 				local turned = FarmTurned[kind]
-				local settingKey = if kind == "OP" then "OSFA_FarmOP" else "OSFA_FarmAll"
 				if value then
 					table.clear(turned)
 					turned.active = true
 					local list = FarmAllSet
+					if kind == "OP" and Game.myFilters() then
+						list = Game.farmRunToggles()
+					end
 					for _, name in ipairs(list) do
 						local toggle = Toggles[name]
 						if toggle and not toggle.Value then
@@ -33680,8 +33680,8 @@ local BootOk, BootError = xpcall(function()
 							toggle:SetValue(true)
 						end
 					end
-					log("MODE", kind)
-					if kind == "OP" then
+					log("MODE", kind, if Game.myFilters() then "my filters" else "best value")
+					if kind == "OP" and not Game.myFilters() then
 						-- OP: the planner overrides the sea, sell and train settings and the catch, egg and priority picks
 						for name, pair in pairs(OPPreset) do
 							local option = Options[name]
@@ -33717,9 +33717,6 @@ local BootOk, BootError = xpcall(function()
 						end
 					end
 					log("FARM", kind, "on, turned on", #turned, "toggles")
-					pcall(function()
-						Library:SetSetting(settingKey, true)
-					end)
 					local data = Data()
 					if data and data.TutorialFinished ~= true then
 						pcall(skipTutorial)
@@ -33727,7 +33724,7 @@ local BootOk, BootError = xpcall(function()
 				elseif turned.active then
 					-- only a real switch off stops the farm (a config load with it off must not touch your toggles)
 					turned.active = nil
-					local list = if #turned > 0 then turned else (if kind == "OP" then FarmAllMain else {})
+					local list = if #turned > 0 then turned else (if kind == "OP" and not Game.myFilters() then FarmAllMain else {})
 					for _, name in ipairs(list) do
 						if Toggles[name] then
 							Toggles[name]:SetValue(false)
@@ -33735,9 +33732,6 @@ local BootOk, BootError = xpcall(function()
 					end
 					table.clear(turned)
 					log("FARM", kind, "off")
-					pcall(function()
-						Library:SetSetting(settingKey, false)
-					end)
 				end
 			end
 			-- confirmation card for OP: the library modal (Library:ShowModal)
@@ -33779,7 +33773,7 @@ local BootOk, BootError = xpcall(function()
 				Default = false,
 				Tooltip = "Full automatic: the planner picks what to catch, sells, spends and trains for max profit, with the fastest legal path for everything, and can sell your animals. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
 				Callback = function(value)
-					if value and not OPConfirmed and not OPSkipCard then
+					if value and not OPConfirmed and not OPSkipCard and not Game.myFilters() then
 						-- stays off until the player confirms
 						if Toggles.AutoFarmOP then
 							Toggles.AutoFarmOP:SetValue(false)
@@ -33795,13 +33789,73 @@ local BootOk, BootError = xpcall(function()
 				Text = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
 				DoesWrap = true,
 			})
-			OPBox:AddToggle("RememberOP", {
-				Text = "Remember Auto Farm Everything",
-				Default = false,
-				Tooltip = "Off (default): it always starts off after a rejoin or a config load. On: it comes back by itself after a rejoin (needs the confirmation once). Warning: it runs unattended and can sell your animals, so turn this on only on an alt you leave AFK.",
+			OPBox:AddDropdown("FarmMode", {
+				Text = "Mode",
+				Values = { "Best value", "My filters" },
+				Default = "Best value",
+				Tooltip = "Best value: the planner decides what to catch, sell, spend and train for max profit (asks to confirm). My filters: no planner and nothing is sold or spent on its own, it only runs the loops you pick in Run, with your own Catch Filters, Catch First and sell lists.",
+				Callback = function()
+					local mode = Options.FarmMode
+					if Options.FarmRun then
+						Options.FarmRun:SetVisible(mode ~= nil and mode.Value == "My filters")
+					end
+					if Toggles.AutoFarmOP and Toggles.AutoFarmOP.Value then
+						-- the mode changed while it ran: stop what it started, switch it on again for the new mode (Best value asks to confirm)
+						task.spawn(function()
+							Toggles.AutoFarmOP:SetValue(false)
+							notify("Auto Farm Everything", "Mode changed, switch Auto Farm Everything on again", 4)
+						end)
+					end
+				end,
 			})
+			local RunValues = {
+				["Auto Sea"] = { "AutoSea" },
+				["Auto Train"] = { "AutoTrain", "AutoBonus", "AutoEquipDumbbell" },
+				["Smart Sell"] = { "AutoSell" },
+				["Event Rush / Stars"] = { "AutoStars", "EventRush" },
+				["Lucky Blocks"] = { "AutoLucky" },
+				["Luck Hop"] = { "LuckHop" },
+				["Rewards and codes"] = { "AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoCodes", "AutoAd" },
+				["Equip Best and offline cash"] = { "AutoEquipBest", "AutoEquipStaff", "AutoOffline" },
+				["Place and Hatch Eggs"] = { "AutoPlaceEggs", "AutoHatch" },
+				["Upgrades"] = { "AutoUpgrade", "AutoBuyStaff", "AutoBuyDumbbell" },
+				["Rebirth"] = { "AutoRebirth" },
+				["Potions"] = { "AutoPotions" },
+			}
+			local RunOrder = {
+				"Auto Sea", "Auto Train", "Smart Sell", "Event Rush / Stars", "Lucky Blocks", "Luck Hop", "Rewards and codes",
+				"Equip Best and offline cash", "Place and Hatch Eggs", "Upgrades", "Rebirth", "Potions",
+			}
+			function Game.farmRunToggles()
+				local out, seen = {}, {}
+				local picked = Options.FarmRun and Options.FarmRun.Value
+				if type(picked) == "table" then
+					for _, label in ipairs(RunOrder) do
+						if picked[label] then
+							for _, name in ipairs(RunValues[label]) do
+								if not seen[name] then
+									seen[name] = true
+									table.insert(out, name)
+								end
+							end
+						end
+					end
+				end
+				return out
+			end
+			OPBox:AddDropdown("FarmRun", {
+				Text = "Run",
+				Values = RunOrder,
+				Default = { "Auto Sea", "Auto Train", "Event Rush / Stars", "Lucky Blocks", "Rewards and codes", "Equip Best and offline cash" },
+				Multi = true,
+				AllowNull = true,
+				Tooltip = "My filters only: the loops Auto Farm Everything switches on. Nothing is sold or spent unless you pick Smart Sell, Place and Hatch Eggs, Upgrades, Rebirth or Potions. Catch Filters, Catch First and the sell lists stay yours.",
+			})
+			if Options.FarmRun then
+				Options.FarmRun:SetVisible(false)
+			end
 			OPBox:AddLabel({
-				Text = '<font color="#ff8c3c">Remember: when on, Auto Farm Everything restarts by itself after every rejoin, without asking. Keep it off on your main account.</font>',
+				Text = '<font color="#ff8c3c">Best value is full automatic and can sell your animals. My filters runs only what you pick in Run.</font>',
 				DoesWrap = true,
 			})
 			OPBox:AddButton({
@@ -36003,19 +36057,6 @@ local BootOk, BootError = xpcall(function()
 			end)
 		end)
 	end
-	-- Auto Farm Everything OP was on last time: back on without asking again (it was confirmed once)
-	task.delay(3.5, function()
-		pcall(function()
-			if Library:GetSetting("OSFA_FarmOP") == true and not (Toggles.RememberOP and Toggles.RememberOP.Value) then
-				log("FARM OP not restored (Remember Auto OP is off)")
-			elseif Library:GetSetting("OSFA_FarmOP") == true and Library:GetSetting("OSFA_OPConfirmed") == true and Toggles.AutoFarmOP and not Toggles.AutoFarmOP.Value then
-				log("FARM OP restored after a rejoin")
-				Game.opSkipCard(true)
-				Toggles.AutoFarmOP:SetValue(true)
-				Game.opSkipCard(false)
-			end
-		end)
-	end)
 	-- one time after the update: the farm split
 	task.delay(8, function()
 		pcall(function()
@@ -36303,7 +36344,7 @@ local BootOk, BootError = xpcall(function()
 					Labels.Status:SetText(Status)
 				end)
 				group(function()
-					if not on("AutoFarmOP") then
+					if not Game.opMode() then
 						Labels.UpNext:SetText("Switch on Auto Farm Everything to see the plan")
 						return
 					end
@@ -36419,7 +36460,7 @@ local BootOk, BootError = xpcall(function()
 							)
 						)
 					end
-					local plan = on("AutoFarmOP") and Game.lastPlan
+					local plan = Game.opMode() and Game.lastPlan
 				if plan and plan.target then
 					table.insert(upgradeLines, string.format('<font color="#60d696">Saving for %s ($%s), pays back in %s</font>', plan.target.name, formatNumber(plan.target.cost), clockText(plan.target.payback)))
 				end
