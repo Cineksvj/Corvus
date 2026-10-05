@@ -5600,11 +5600,12 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         if Library.ConfirmPrompt and Library.ConfirmPrompt.Parent then
             return
         end
+        local Extra = if Opts.Warning then 64 else 0
         local Root = New("Frame", {
             AnchorPoint = Vector2.new(1, 1),
             BackgroundTransparency = 1,
             Position = UDim2.new(1, 340, 1, -12),
-            Size = UDim2.fromOffset(320, 232),
+            Size = UDim2.fromOffset(320, 232 + Extra),
             ZIndex = 60,
             Parent = Library.ScreenGui,
         })
@@ -5670,13 +5671,29 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             ZIndex = 63,
             Parent = Content,
         })
+        if Opts.Warning then
+        	New("TextLabel", {
+        		BackgroundTransparency = 1,
+        		FontFace = GetBoldFont,
+        		Position = UDim2.fromOffset(14, 166),
+        		Size = UDim2.new(1, -28, 0, 60),
+        		Text = tostring(Opts.Warning),
+        		TextColor3 = Color3.fromRGB(255, 140, 60),
+        		TextSize = 12,
+        		TextWrapped = true,
+        		TextXAlignment = Enum.TextXAlignment.Left,
+        		TextYAlignment = Enum.TextYAlignment.Top,
+        		ZIndex = 63,
+        		Parent = Content,
+        	})
+        end
         local Confirm = New("TextButton", {
             AutoButtonColor = false,
             BackgroundColor3 = "AccentColor",
             FontFace = GetBoldFont,
-            Position = UDim2.fromOffset(12, 182),
+            Position = UDim2.fromOffset(12, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
-            Text = tostring(Opts.ConfirmText or "Confirm"),
+            Text = tostring(Opts.ConfirmText or "Confirm"), TextWrapped = true,
             TextColor3 = "BackgroundColor",
             TextSize = 14,
             ZIndex = 63,
@@ -5687,7 +5704,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             AutoButtonColor = false,
             BackgroundColor3 = "BackgroundColor",
             FontFace = GetBoldFont,
-            Position = UDim2.new(0.5, 4, 0, 182),
+            Position = UDim2.new(0.5, 4, 0, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
             Text = tostring(Opts.CancelText or "Cancel"),
             TextColor3 = "FontColor",
@@ -31435,7 +31452,7 @@ do
 		DeliveryRequest = { START_SHIFT = true, RESUME_SHIFT = true, ACCEPT = true, DECLINE = true, ARRIVE = true, PICKUP = true, DROPOFF = true, CANCEL = true },
 		GarageRequest = { SELECT = true, SPAWN_SELECTED_AT_GARAGE = true, UNPLUG_CHARGER = true },
 		MarketRequest = { CHECKOUT = true },
-		MaintenanceRequest = { SERVICE = true },
+		MaintenanceRequest = { SERVICE = true, BUY_PROTECTION = true },
 		RideRecoveryRequest = { GET_UP = true, RIGHT_SCOOTER = true, DISMOUNT_STUCK = true, BRING_LAST_SCOOTER = true, BRING_SCOOTER = true, RELEASE_SCOOTER = true },
 	}
 	N.AllowedCommand = AllowedCommand
@@ -31578,6 +31595,11 @@ local Session = {
 	wanted = 0,
 	refused = 0,
 	bought = 0,
+	meters = 0,
+	stuck = 0,
+	spentCents = 0,
+	damageRepairs = 0,
+	deliverySeconds = 0,
 }
 N.InfoText = {}
 N.Unhooks = {}
@@ -31946,6 +31968,12 @@ do
 		local nav = graph and N.mod("Client.PhoneOS.DirectedNavigation")
 		local route = nav and isolated(nav.routeToPoint, graph, { x = from.X, y = from.Y, z = from.Z }, { x = to.X, y = to.Y, z = to.Z })
 		if type(route) == "table" and type(route.geometry) == "table" and #route.geometry >= 2 then
+			-- the graph route starts on the nearest road node; the leg from here to it is part of the route (owner log:
+			-- "off route 64 studs" every 4 s because that leg was missing)
+			local g1 = route.geometry[1]
+			if N.flat(Vector3.new(g1.x, g1.y, g1.z) - from).Magnitude > 8 then
+				table.insert(points, { p = from, route = g1.routeId })
+			end
 			for _, p in ipairs(route.geometry) do
 				table.insert(points, { p = Vector3.new(p.x, p.y, p.z), route = p.routeId })
 			end
@@ -32038,14 +32066,61 @@ do
 		local steer = math.clamp((c.flip or 1) * err * gain * 1.8, -1, 1)
 		return { throttle = throttle, brake = brake, steer = steer, idx = idx, err = err, vmax = vmax, toEnd = toEnd }
 	end
-	-- Forward direction: the game measures forward speed along PrimaryPart.CFrame.LookVector (Bootstrap), so that is the nose.
-	function N.forwardOf(model, part)
-		local look = part.CFrame.LookVector
-		local vel = N.flat(part.AssemblyLinearVelocity)
-		if vel.Magnitude > 3 / MPS and vel:Dot(N.flat(look)) > 0 then
-			return vel
+	-- Rotate a ground vector by angle a (radians, positive = to the right, same sign as N.sideAngle).
+	function N.rotateY(v, a)
+		local f = N.flat(v)
+		if f.Magnitude < 1e-6 then
+			return f
 		end
-		return look
+		f = f.Unit
+		local right = Vector3.new(-f.Z, 0, f.X)
+		return f * math.cos(a) + right * math.sin(a)
+	end
+	-- Shortest distance (studs, ground plane) from pos to the route segments around idx.
+	function N.distToPath(pos, path, idx)
+		local best = math.huge
+		local p = N.flat(pos)
+		for i = math.max((idx or 1) - 1, 1), math.min((idx or 1) + 4, #path - 1) do
+			local a, b = N.flat(path[i].p), N.flat(path[i + 1].p)
+			local ab = b - a
+			local len2 = ab:Dot(ab)
+			local t = if len2 > 1e-6 then math.clamp((p - a):Dot(ab) / len2, 0, 1) else 0
+			best = math.min(best, (a + ab * t - p).Magnitude)
+		end
+		if #path == 1 then
+			best = (N.flat(path[1].p) - p).Magnitude
+		end
+		return best
+	end
+	-- Heading: the game measures forward speed along PrimaryPart.CFrame.LookVector (Bootstrap 23454), the rig steers the
+	-- chassis LookVector. While moving the velocity direction is the truth; it also calibrates D.headingOffset (angle from
+	-- LookVector to the real nose) in case the model's PrimaryPart is not the chassis. Owner log 2026-10-05: steer stayed at
+	-- -1.00 for 90 s while the distance grew, so the heading is now measured, not assumed.
+	D.headingOffset = 0
+	function N.forwardOf(model, part)
+		local look = N.flat(part.CFrame.LookVector)
+		if look.Magnitude < 0.05 then
+			look = Vector3.new(0, 0, -1)
+		end
+		local vel = N.flat(part.AssemblyLinearVelocity)
+		if vel.Magnitude * MPS > 1.5 and not D.reversing then
+			return vel.Unit, look.Unit
+		end
+		return N.rotateY(look, D.headingOffset or 0), look.Unit
+	end
+	function N.calibrateHeading(look, vel, speed, throttle)
+		if speed < 2 or throttle < 0.3 or D.reversing then
+			return
+		end
+		local a = N.sideAngle(look, vel)
+		local diff = a - (D.headingOffset or 0)
+		diff = (diff + math.pi) % (2 * math.pi) - math.pi
+		D.headingOffset = (D.headingOffset or 0) + diff * 0.15
+		D.headingOffset = (D.headingOffset + math.pi) % (2 * math.pi) - math.pi
+		if math.abs(D.headingOffset) > 0.35 and not D.offsetLogged then
+			D.offsetLogged = true
+			log(string.format("DRIVE heading offset %d deg (the model's LookVector is not its nose, corrected)", math.floor(math.deg(D.headingOffset))))
+		end
 	end
 	-- Input layer. The game's control path (dump): PlayerScripts.VoltlineClient.Bootstrap reads W/S/A/D through
 	-- ContextActionService (steer = D - A, throttle W ramped), builds a frame every PreSimulation and calls
@@ -32081,7 +32156,8 @@ do
 		frame.rearBrake = 0
 		frame.steer = i.steer
 		frame.wheelie = false
-		frame.walkBack = false
+		-- walkBack = the rider pushes the scooter backwards (the game's S key while stopped, Bootstrap 23094-23101)
+		frame.walkBack = i.walkBack == true and i.throttle <= 0.01 and i.brake <= 0.05
 		return frame
 	end
 	local function fullFrame()
@@ -32266,6 +32342,7 @@ do
 		D.method = D.method % #N.DriveMethods + 1
 		D.slowFor, D.methodFor = 0, 0
 		D.flip, D.flips = 1, 0
+		D.steerOk = false
 		D.calls = {}
 		if N.driveMethod() == "localride" then
 			D.gcScanned = false
@@ -32291,10 +32368,11 @@ do
 		end
 		return next(D.hooked) ~= nil
 	end
-	function N.setInput(throttle, brake, steer)
+	function N.setInput(throttle, brake, steer, walkBack)
 		D.input.throttle = throttle
 		D.input.brake = brake
 		D.input.steer = steer
+		D.input.walkBack = walkBack == true
 	end
 	-- Traffic ahead (the game's traffic cars) and police distance, every 0.25 s.
 	function N.scanTraffic(pos, fwd)
@@ -32328,14 +32406,23 @@ do
 	end
 	-- Speed cap for the next stretch: obey limits (Normal default), or OP: legal only when police are near or you are wanted.
 	N.PoliceRange = 750
+	-- Blatant glide: only when the player picks it in Drive Style (opt-in, never turned on by OP). Off for the rest of
+	-- the session after any SecurityNotice from the game.
+	N.BlatantSpeed = 28.5
+	function N.blatantMove()
+		if (D.blatantOffUntil or 0) > os.clock() then
+			return false
+		end
+		return optionText("DriveStyle", "Safe") == "Blatant"
+	end
 	function N.speedCap(routeId, top)
 		local wanted = (tonumber(LocalPlayer:GetAttribute("TrafficWantedLevel")) or 0) > 0
 		local obey = on("ObeyLimits")
 		if N.isOP() then
 			obey = false
 		end
-		local blatant = optionText("DriveStyle", "Legit") == "Blatant"
-		local fast = if blatant then 28.5 else (top or 30)
+		local blatant = N.blatantMove()
+		local fast = if blatant then N.BlatantSpeed else (top or 30)
 		if obey or wanted or D.policeDist < N.PoliceRange then
 			return math.min(N.legalCap(routeId), fast)
 		end
@@ -32354,11 +32441,15 @@ do
 			return
 		end
 		local path, kind, meters = N.planRoute(part.Position, target)
+		if not opts.replan or not goal then
+			-- a new destination: fresh stuck counters (a replan keeps them so recovery can escalate)
+			D.stuckFor = 0
+			D.stuck = { phase = nil, t = 0, cycles = 0 }
+		end
 		D.goal = { target = target, label = opts.label or "?", stopRadius = opts.stopRadius or 14, since = os.clock() }
 		D.path = path
 		D.idx = 1
 		D.planAt = os.clock()
-		D.stuckFor = 0
 		log("ROUTE", D.goal.label, kind, #path, "points", string.format("%.0fm", meters))
 	end
 	function N.clearGoal()
@@ -32379,7 +32470,8 @@ do
 	function N.driveWatch(dt, out, speed, model, reached)
 		local method = N.driveMethod()
 		D.methodFor += dt
-		if speed > 5 then
+		if speed > 2.5 and out.throttle > 0.2 then
+			-- the method moved the scooter: later slow phases are a stuck scooter (stuck recovery), not the method
 			D.proven[method] = true
 		end
 		if not reached and D.methodFor > 3 then
@@ -32392,7 +32484,9 @@ do
 		end
 		local phase = model:GetAttribute("PowerPhase")
 		local powered = phase == nil or phase == "READY"
-		if powered and not N.isFalling() and out.throttle >= 0.6 and out.vmax >= 5 and speed < 3 then
+		-- full throttle and still slow (any target speed: a sharp heading error caps the target at 3 m/s, the old check
+		-- needed >= 5 and never counted)
+		if powered and not N.isFalling() and out.throttle >= 0.6 and speed < 3 then
 			D.slowFor += dt
 		elseif speed >= 3 then
 			D.slowFor = 0
@@ -32406,14 +32500,120 @@ do
 		D.logAt -= dt
 		if D.logAt <= 0 then
 			D.logAt = 5
-			log(string.format("DRIVE speed=%.1f target=%.1f method=%s", speed, out.vmax, method), "throttle", string.format("%.2f", out.throttle), "steer", string.format("%.2f", out.steer), "calls", D.calls[method] or 0, "power", tostring(phase))
+			log(
+				string.format("DRIVE speed=%.1f target=%.1f method=%s", speed, out.vmax, method),
+				"throttle",
+				string.format("%.2f", out.throttle),
+				"steer",
+				string.format("%.2f", out.steer),
+				string.format("err=%ddeg off=%ddeg flip=%d", math.floor(math.deg(out.err or 0) + 0.5), math.floor(math.deg(D.headingOffset or 0) + 0.5), D.flip),
+				"calls",
+				D.calls[method] or 0,
+				"power",
+				tostring(phase),
+				if D.stuck and D.stuck.phase then "stuck " .. D.stuck.phase else ""
+			)
 		end
+	end
+	-- Steering sign check by the scooter's real yaw (not by the error): with |steer| > 0.4 and speed > 1.2 m/s for 1 s the
+	-- nose must turn the same way as the steer sign (+1 = right, the rig turns steering.C0 by -steer, dump 131273). If it
+	-- turns the other way the sign is flipped (max 3 times); once it turns the right way it is confirmed.
+	function N.steerCheck(dt, look, speed, steer)
+		local prev = D.prevLook
+		D.prevLook = look
+		if D.steerOk or D.flips >= 3 then
+			return
+		end
+		if not prev or speed < 1.2 or math.abs(steer) < 0.4 or D.reversing then
+			D.turnSum, D.turnTime = 0, 0
+			return
+		end
+		local yaw = N.sideAngle(prev, look)
+		-- intended turn = sign(steer) * flip (the controller already applied the flip to steer)
+		D.turnSum = (D.turnSum or 0) + yaw * (if steer > 0 then 1 else -1) * D.flip
+		D.turnTime = (D.turnTime or 0) + dt
+		if D.turnTime < 1 then
+			return
+		end
+		if D.turnSum < -0.25 then
+			D.flip = -D.flip
+			D.flips += 1
+			log("DRIVE steering flipped", D.flip, string.format("the nose turned %d deg the other way", math.floor(math.deg(-D.turnSum))))
+		elseif D.turnSum > 0.25 then
+			D.steerOk = true
+			log("DRIVE steering confirmed", D.flip)
+		end
+		D.turnSum, D.turnTime = 0, 0
+	end
+	-- Stuck recovery (owner log 2026-10-05: speed 0.0 at throttle 1.00 for 60 s and nothing happened). Throttle on and
+	-- under 0.5 m/s for 5 s starts a cycle: release 0.4 s -> walk back 1.2 s (the game's walkBack, steering away) ->
+	-- re-steer 1.5 s (half throttle, full lock towards the target). Cycle 2 also asks the game to right the scooter,
+	-- cycle 3 re-plans from where it stands, cycle 4 summons it (BRING_SCOOTER) and the count starts over. Log STUCK.
+	D.stuck = { phase = nil, t = 0, cycles = 0 }
+	N.StuckPhases = { release = 0.4, reverse = 1.2, resteer = 1.5 }
+	function N.stuckStep(dt, speed, out, throttleWanted)
+		local S = D.stuck
+		if S.phase == nil then
+			if throttleWanted and speed < 0.5 and not N.isFalling() then
+				D.stuckFor += dt
+			elseif speed > 1.5 then
+				D.stuckFor = 0
+				D.movingFor = (D.movingFor or 0) + dt
+				if D.movingFor > 8 then
+					S.cycles = 0
+				end
+			end
+			if D.stuckFor < 5 then
+				return nil
+			end
+			D.stuckFor = 0
+			D.movingFor = 0
+			S.cycles += 1
+			S.phase, S.t = "release", 0
+			S.side = if (out.err or 0) >= 0 then 1 else -1
+			Session.stuck = (Session.stuck or 0) + 1
+			log("STUCK cycle", S.cycles, string.format("err=%ddeg speed=%.1f", math.floor(math.deg(out.err or 0) + 0.5), speed))
+			local model = N.mounted()
+			if S.cycles == 2 then
+				N.command("RideRecoveryRequest", { action = "RIGHT_SCOOTER", scooterId = N.scooterId(model) })
+			elseif S.cycles == 3 and D.goal then
+				log("STUCK replanning from here")
+				N.setGoal(D.goal.target, { label = D.goal.label, stopRadius = D.goal.stopRadius, replan = true })
+			elseif S.cycles >= 4 then
+				log("STUCK summoning the scooter")
+				N.command("RideRecoveryRequest", { action = "BRING_SCOOTER", scooterId = N.scooterId(model) })
+				S.cycles = 0
+			end
+		end
+		S.t += dt
+		if S.phase == "release" then
+			D.reversing = false
+			if S.t >= N.StuckPhases.release then
+				S.phase, S.t = "reverse", 0
+			end
+			return { throttle = 0, brake = 0, steer = 0 }
+		elseif S.phase == "reverse" then
+			D.reversing = true
+			if S.t >= N.StuckPhases.reverse then
+				S.phase, S.t = "resteer", 0
+				D.reversing = false
+			end
+			return { throttle = 0, brake = 0, steer = -S.side * D.flip, walkBack = true }
+		elseif S.phase == "resteer" then
+			D.reversing = false
+			if S.t >= N.StuckPhases.resteer or speed > 2 then
+				S.phase, S.t = nil, 0
+			end
+			return { throttle = 0.5, brake = 0, steer = S.side * D.flip }
+		end
+		return nil
 	end
 	-- One control step (Heartbeat). Writes D.input and pushes it through the current input method.
 	function N.driveTick(dt)
 		local model = N.mounted()
 		local goal, path = D.goal, D.path
 		if not (model and goal and path and N.farming()) then
+			D.blatant = nil
 			if D.active then
 				N.setInput(0, if N.speedMps() > 0.4 then 1 else 0, 0)
 				N.applyInput(dt)
@@ -32430,7 +32630,7 @@ do
 		end
 		D.active = true
 		local pos = part.Position
-		local fwd = N.forwardOf(model, part)
+		local fwd, look = N.forwardOf(model, part)
 		local speed = part.AssemblyLinearVelocity.Magnitude * MPS
 		D.scanAt = (D.scanAt or 0) - dt
 		if D.scanAt <= 0 then
@@ -32450,46 +32650,33 @@ do
 		local out = N.driveControl({ path = path, idx = D.idx, pos = pos, fwd = fwd, speed = speed, cap = cap, flip = D.flip, obstacle = D.obstacle, stopRadius = goal.stopRadius })
 		D.idx = out.idx
 		D.vmax = out.vmax
+		D.err = out.err
+		N.calibrateHeading(look, N.flat(part.AssemblyLinearVelocity), speed, D.input.throttle)
+		local recovery = N.stuckStep(dt, speed, out, out.throttle > 0.3)
+		if recovery then
+			N.setInput(recovery.throttle, recovery.brake, recovery.steer, recovery.walkBack)
+			N.applyInput(dt)
+			return
+		end
 		N.setInput(out.throttle, out.brake, out.steer)
 		local reached = N.applyInput(dt)
 		N.driveWatch(dt, out, speed, model, reached)
-		-- steering sign check (A/D: +1 = right): a strong correction that keeps making the error worse means it is reversed
-		if speed > 4 and math.abs(out.steer) > 0.5 then
-			D.flipWatch = (D.flipWatch or 0) + dt
-			D.flipStartErr = D.flipStartErr or math.abs(out.err)
-			if D.flipWatch > 2 then
-				if math.abs(out.err) > D.flipStartErr + 0.5 and D.flips < 2 then
-					D.flip = -D.flip
-					D.flips += 1
-					log("DRIVE steering flipped", D.flip)
-				end
-				D.flipWatch, D.flipStartErr = 0, nil
-			end
-		else
-			D.flipWatch, D.flipStartErr = 0, nil
-		end
-		-- stuck: throttle on, no movement
+		N.steerCheck(dt, look, speed, out.steer)
 		if out.throttle > 0.3 then
 			D.commandedFor += dt
 		end
 		if speed > 1 then
 			D.movedOnce = true
 		end
-		if out.throttle > 0.3 and speed < 0.4 then
-			D.stuckFor += dt
-		elseif speed > 1.5 then
-			D.stuckFor = 0
-		end
-		-- Blatant glide (opt-in): push the scooter along the route at up to 28.5 m/s (the delivery check allows 31)
-		if optionText("DriveStyle", "Legit") == "Blatant" and D.stuckFor < 2 then
-			local look = path[math.min(D.idx + 1, #path)].p
-			local dir = N.flat(look - pos)
+		-- Blatant glide (opt-in Drive Style, unchanged from fe9d090): push the scooter along the route
+		if N.blatantMove() and D.stuckFor < 2 then
+			local look2 = path[math.min(D.idx + 1, #path)].p
+			local dir = N.flat(look2 - pos)
 			if dir.Magnitude > 1 then
 				local want = math.min(out.vmax, cap) / MPS
 				local current = part.AssemblyLinearVelocity
 				local flatV = N.flat(current)
-				local desired = dir.Unit * want
-				local delta = desired - flatV
+				local delta = dir.Unit * want - flatV
 				local maxStep = 14 / MPS * dt
 				if delta.Magnitude > maxStep then
 					delta = delta.Unit * maxStep
@@ -32607,7 +32794,8 @@ do
 		Dash.cycleStart = os.clock()
 		Dash.runId = nil
 		Dash.arrivedAt = nil
-		log("RATE delivery", string.format("%.2f c/s this run (%s in %s), average %.2f c/s", rate, N.money(reward), N.longTime(cycle), Dash.rate))
+		Session.deliverySeconds += cycle
+		log("DELIVERY", "#" .. Session.deliveries, N.money(reward), "earned in", N.longTime(cycle), string.format("(%s/h this run, average %s/h)", N.money(rate * 3600), N.money(Dash.rate * 3600)))
 	end
 	-- Average moving speed while riding (m/s), for offer times.
 	function N.speedSample(speed, dt)
@@ -32835,13 +33023,20 @@ do
 		P.pending = { key = option.key, sku = option.sku, at = os.clock() }
 		P.buyAt = os.clock()
 		Session.bought += 1
+		Session.spentCents = (Session.spentCents or 0) + option.price
 		log("BUY", option.name, N.money(option.price), "gain/$", string.format("%.3g", option.ratio), "payback", N.longTime(option.payback), "sent", tostring(sent))
 		return true
 	end
 	-- Every few seconds from the info thread; buys only with "Buy Faster Scooter" on (or OP) and outside a delivery.
 	function N.planTick(inRun)
 		local ctx = N.planContext()
-		local options = N.planOptions(ctx)
+		local options = {}
+		for _, option in ipairs(N.planOptions(ctx)) do
+			-- "Exclude from OP": an excluded scooter is not a candidate while OP runs
+			if not (N.isOP() and N.opExcluded("Buy " .. option.name)) then
+				table.insert(options, option)
+			end
+		end
 		local pick = N.planPick(options, P.H)
 		local alt = {}
 		for i = 1, math.min(3, #options) do
@@ -32855,7 +33050,7 @@ do
 				P.logAt = os.clock()
 				log("PLAN best=" .. pick.name, string.format("gain/$=%.3g eta=%ds payback=%ds", pick.ratio, math.floor(math.min(eta, 9e6)), math.floor(pick.payback)), "alt=" .. table.concat(alt, "; "))
 			end
-			local allowed = on("AutoBuyScooter") or N.isOP()
+			local allowed = (on("AutoBuyScooter") or N.isOP()) and N.opAllows("Buy " .. pick.name, pick.price)
 			if allowed and eta == 0 and not inRun and not P.pending and os.clock() - P.buyAt > 300 then
 				N.buyScooter(pick)
 			end
@@ -33184,6 +33379,7 @@ do
 			local step = N.flat(part.Position - B.lastPos).Magnitude * 0.28
 			if step < 400 then
 				B.meters += step
+				Session.meters += step
 			end
 			if B.lastSoc and soc < B.lastSoc then
 				B.used += B.lastSoc - soc
@@ -33385,6 +33581,9 @@ do
 			for key, value in pairs(node) do
 				if type(value) == "number" and ServiceFor[key] then
 					found[key] = math.max(found[key] or 0, value)
+				elseif type(value) == "number" and key == "damageMilliPercent" then
+					-- MaintenanceSnapshot keeps damage as damageMilliPercent next to wear{} (ScooterCarePage serviceQuote)
+					found.damage = math.max(found.damage or 0, value)
 				elseif type(value) == "table" then
 					walk(value, depth + 1)
 				end
@@ -33413,26 +33612,145 @@ do
 		end
 		return ServiceFor[due[1]], due
 	end
+	-- Prices and the repair cover plan from MaintenanceContracts (dump 120681-120773).
+	N.ServicePrice = { TIRE_SERVICE = 3500, BRAKE_SERVICE = 4200, DRIVETRAIN_SERVICE = 5800, BATTERY_SERVICE = 9500, FULL_SERVICE = 18500, DAMAGE_REPAIR = 24000 }
+	N.CoverPlus = { planId = "VOLTCARE_PLUS", premium = 18000, claims = 2, coverage = 0.6, deductible = 2000, maxBenefit = 40000, days = 30 }
+	function N.coverActive(maint)
+		local p = type(maint) == "table" and maint.protection
+		return type(p) == "table" and p.planId ~= nil and p.planId ~= "NONE" and (tonumber(p.expiresUnix) or 0) > os.time() and (tonumber(p.claimsRemaining) or 0) >= 1
+	end
+	-- Cents a claim saves (the game's serviceQuote: benefit = min(max, cost * coverage), you pay at least the deductible).
+	function N.coverSaving(cost, plan)
+		plan = plan or N.CoverPlus
+		local benefit = math.min(plan.maxBenefit, math.floor(cost * plan.coverage))
+		local pay = math.min(cost, math.max(plan.deductible, cost - benefit))
+		return cost - pay
+	end
+	-- Worth it when the repairs expected in the plan's 30 days (this one + measured repair rate) save more than it costs.
+	function N.coverWorth(repairsPerHour, cost, plan)
+		plan = plan or N.CoverPlus
+		local expected = math.min(plan.claims, 1 + repairsPerHour * plan.days * 24)
+		return expected * N.coverSaving(cost, plan) > plan.premium, expected
+	end
+	-- Returns true while it is busy (stopping to step off), so the farm waits.
 	function N.serviceStep()
 		if not (on("AutoService") or N.isOP()) or N.parked("Service") then
-			return
+			return false
 		end
 		local st = N.state()
-		local wear = N.wearOf(st.maint)
+		local maint = st.maint
+		local wear = N.wearOf(maint)
 		local service, due = N.serviceNeeded(wear, LocalPlayer:GetAttribute("VoltlineTireWarning"))
 		if not service or os.clock() - (N.Service.at[service] or -1e9) < 600 then
-			return
+			return false
 		end
-		N.Service.at[service] = os.clock()
+		local price = N.ServicePrice[service] or 0
 		local id = N.selectedId()
 		local pc = N.phone()
+		local useCover = false
+		if service == "DAMAGE_REPAIR" then
+			if N.coverActive(maint) then
+				useCover = true
+			elseif on("AutoCover") or N.isOP() then
+				local hours = math.max((os.clock() - Session.started) / 3600, 0.25)
+				local worth, expected = N.coverWorth((Session.damageRepairs or 0) / hours, price)
+				local allowed, why = N.opAllows("Repair Cover", N.CoverPlus.premium + price)
+				if worth and allowed and N.cashCents() >= N.CoverPlus.premium + price then
+					if pc and type(pc.BuyProtection) == "function" then
+						isolated(pc.BuyProtection, N.CoverPlus.planId, id)
+					else
+						N.command("MaintenanceRequest", { action = "BUY_PROTECTION", planId = N.CoverPlus.planId, scooterId = id })
+					end
+					Session.spentCents = (Session.spentCents or 0) + N.CoverPlus.premium
+					log("COVER buy", N.CoverPlus.planId, N.money(N.CoverPlus.premium), string.format("expected claims %.1f save %s each", expected, N.money(N.coverSaving(price))))
+					useCover = true
+					task.wait(1.5)
+				else
+					log("COVER skip", string.format("expected claims %.1f", expected), tostring(why or (if worth then "cash" else "not worth it")))
+				end
+			end
+		end
+		local pay = if useCover then price - N.coverSaving(price) else price
+		local allowed, why = N.opAllows("Service", pay)
+		if not allowed or N.cashCents() < pay then
+			N.Service.at[service] = os.clock()
+			log("SERVICE waits", service, N.money(pay), tostring(why or "cash"))
+			return false
+		end
+		-- the game refuses service while riding (SCOOTER_IN_USE "Park and dismount before service")
+		if N.mounted() then
+			if N.speedMps() > 0.5 then
+				N.clearGoal()
+				setStatus("Stopping for a service")
+				return true
+			end
+			N.fireEvent("RequestDismount")
+			waitFor(function()
+				return N.mounted() == nil
+			end, 4)
+		end
+		N.Service.at[service] = os.clock()
 		if pc and type(pc.RequestService) == "function" then
-			isolated(pc.RequestService, service, id, false)
+			isolated(pc.RequestService, service, id, useCover)
 		else
-			N.command("MaintenanceRequest", { action = "SERVICE", serviceId = service, scooterId = id, useProtection = false })
+			N.command("MaintenanceRequest", { action = "SERVICE", serviceId = service, scooterId = id, useProtection = useCover })
 		end
 		Session.services += 1
-		log("SERVICE", service, "for", table.concat(due, ","), "wear", wear)
+		Session.spentCents = (Session.spentCents or 0) + pay
+		if service == "DAMAGE_REPAIR" then
+			Session.damageRepairs = (Session.damageRepairs or 0) + 1
+		end
+		log("SERVICE", service, N.money(pay), if useCover then "with cover" else "", "for", table.concat(due, ","), "wear", wear)
+		return false
+	end
+	-- Bought scooters arrive boxed at your garage court (VoltlineGarageDeliveryPosition): ride there between deliveries,
+	-- step off and open/collect the package (the game's own prompts). Busy = true.
+	N.Pkg = { at = -1e9 }
+	function N.packageStep(inRun)
+		local pending = N.Plan.pending
+		if inRun or not pending or not (on("AutoPackages") or N.isOP()) or N.parked("Packages") then
+			return false
+		end
+		if os.clock() - pending.at < 45 or os.clock() - N.Pkg.at < 120 then
+			return false
+		end
+		local spot = LocalPlayer:GetAttribute("VoltlineGarageDeliveryPosition")
+		if typeof(spot) ~= "Vector3" then
+			N.unsupported("Packages", "garage delivery position unknown")
+			return false
+		end
+		local model = N.mounted()
+		local here = N.partOf(model) or N.root()
+		if not here then
+			return false
+		end
+		if N.flat(spot - here.Position).Magnitude > 40 then
+			N.setGoal(spot, { label = "packages", stopRadius = 10 })
+			setStatus(string.format("Riding to the garage for a package, %.0f m", N.distToGoal() * 0.28))
+			return true
+		end
+		if model and N.speedMps() > 0.5 then
+			N.clearGoal()
+			return true
+		end
+		N.clearGoal()
+		if model then
+			N.fireEvent("RequestDismount")
+			waitFor(function()
+				return N.mounted() == nil
+			end, 4)
+		end
+		N.Pkg.at = os.clock()
+		local count = N.collectPackages()
+		log("PACKAGES collected", count)
+		if count == 0 then
+			N.Pkg.misses = (N.Pkg.misses or 0) + 1
+			if N.Pkg.misses >= 3 then
+				N.Pkg.misses = 0
+				N.unsupported("Packages", "no package prompt at the garage")
+			end
+		end
+		return false
 	end
 	-- Ride the owned scooter with the best usable speed (G4 70 km/h beats the VSETT 9+ and the ES80).
 	function N.bestOwned(cap)
@@ -33449,7 +33767,7 @@ do
 		return best
 	end
 	function N.selectBestStep(inRun)
-		if inRun or not (on("AutoSelectBest") or N.isOP()) or os.clock() - R.selectAt < 60 then
+		if inRun or not (on("AutoSelectBest") or N.isOP()) or os.clock() - R.selectAt < 60 or not N.opAllows("Switch scooter") then
 			return
 		end
 		local best = N.bestOwned(N.Plan.capEff or 30)
@@ -33513,6 +33831,7 @@ do
 		end)
 	end
 	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+	Tabs.OP = N.addTab("Auto OP", "zap", "Auto Farm Everything OP, its warning and limits")
 	Tabs.Dash = N.addTab("VoltDash", "bike", "Deliveries, offers and riding pay")
 	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Faster scooter, service and the profit plan")
 	Tabs.Player = N.addTab("Player", "user", "Driving style, speed limits, battery")
@@ -33532,8 +33851,10 @@ do
 		{ key = "AutoRecover", label = "Auto Recover", safe = true },
 		{ key = "AutoSport", label = "Sport Mode", safe = true },
 		{ key = "AutoSelectBest", label = "Ride Best Scooter", safe = true },
+		{ key = "AutoPackages", label = "Collect Garage Packages", safe = true },
 		{ key = "AutoService", label = "Auto Service (spends)", safe = false },
 		{ key = "AutoBuyScooter", label = "Buy Faster Scooter (spends)", safe = false },
+		{ key = "AutoCover", label = "Repair Cover (spends)", safe = false },
 	}
 	N.FarmTurnedOn = {}
 	local function farmLabels(safeOnly)
@@ -33590,7 +33911,8 @@ do
 		end
 		return keys
 	end
-	-- OP needs a confirmation card first (it may spend money and break speed limits when no police is near).
+	-- OP needs a confirmation card first (owner rule 2026-10-05: ban-risk warning, primary button "I understand, enable OP").
+	N.OPWarning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
 	function N.confirmOP(onYes)
 		if not Library.ShowWizard then
 			onYes()
@@ -33598,17 +33920,17 @@ do
 		end
 		Library:ShowWizard({
 			SkipText = "Cancel",
-			FinishText = "Confirm",
+			FinishText = "I understand, enable OP",
 			Steps = {
 				{
 					Id = "op",
 					Title = "Enable Auto Farm Everything OP?",
-					Description = "OP lets the planner decide everything: it can spend your cash (scooter purchases, service) and rides above the speed limit when no police car is near (arrests cost a fine).",
+					Description = "WARNING: " .. N.OPWarning,
 					Multi = false,
 					Required = true,
-					Default = "cancel",
+					Default = "enable",
 					Choices = {
-						{ Id = "enable", Title = "Enable OP", Description = "Max profit, the planner overrides your picks", Icon = "zap", Color = "#fab428" },
+						{ Id = "enable", Title = "I understand, enable OP", Description = "The planner decides everything: spends cash (scooters, service, repair cover) except what you excluded, ignores speed limits when no police is near", Icon = "triangle-alert", Color = "#ff7a45" },
 						{ Id = "cancel", Title = "Cancel", Description = "Keep the normal farm", Icon = "x", Color = "#8a8f98" },
 					},
 				},
@@ -33620,12 +33942,38 @@ do
 			end,
 		})
 	end
+	-- "Exclude from OP": things OP must never spend on, plus a cash floor. Enforced in every OP purchase (N.opAllows).
+	N.ExcludeChoices = { "Service", "Repair Cover", "Switch scooter" }
+	for _, key in ipairs({ "DUALTRON_X_LIMITED", "VSETT_9PLUS_48V21AH_CENTER_DISPLAY", "KUKIRIN_G4_2024", "AOVOPRO_ES80" }) do
+		local info = N.Fleet[key]
+		if info then
+			table.insert(N.ExcludeChoices, "Buy " .. info.name)
+		end
+	end
+	function N.opExcluded(choice)
+		local value = Options.ExcludeOP and Options.ExcludeOP.Value
+		return type(value) == "table" and value[choice] == true
+	end
+	-- May OP (or a spending farm) spend `cost` cents on `choice`? Outside OP only the cash floor of OP does not apply.
+	function N.opAllows(choice, cost)
+		if not N.isOP() then
+			return true
+		end
+		if N.opExcluded(choice) then
+			return false, "excluded from OP"
+		end
+		local reserve = optionNumber("OPReserve", 0) * 100
+		if cost and N.cashCents() - cost < reserve then
+			return false, "keeps the " .. N.money(reserve) .. " cash reserve"
+		end
+		return true
+	end
 	do
 		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
 		QuickBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "Turns on exactly the farms picked below with your own settings (offer filter, speed limits, battery). Nothing spends money unless you pick it. Turning it off turns those farms off again",
+			Tooltip = "Turns on exactly the farms picked below with your own settings (offer filter, speed limits, battery). Real riding, nothing spends money unless you pick it. Turning it off turns those farms off again",
 			Callback = function(value)
 				task.defer(function()
 					N.applyFarm(if value then N.farmSetKeys() else {}, value, "AutoFarmBest")
@@ -33644,15 +33992,69 @@ do
 			Multi = true,
 			Tooltip = "The farms Auto Farm Everything turns on. Default: everything that never spends money",
 		})
-		QuickBox:AddToggle("AutoFarmOP", {
+		QuickBox:AddButton({
+			Text = "Recommended Settings",
+			Func = function()
+				N.applyRecommended()
+			end,
+		})
+		QuickBox:AddLabel({
+			Text = '<font transparency="0.35">Normal farm = only your picks, real riding inside the speed limits. The OP farm is in the Auto OP tab.</font>',
+			DoesWrap = true,
+		})
+		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		StatusBox:AddButton({
+			Text = "Stop Everything",
+			Func = function()
+				N.stopAll()
+			end,
+		})
+	end
+	-- Recommended Settings: the values the profit math and the safety rules pick for a normal (non OP) farm.
+	function N.applyRecommended()
+		local set = {}
+		for _, label in ipairs(farmLabels(true)) do
+			set[label] = true
+		end
+		pcall(function()
+			Options.FarmSet:SetValue(set)
+			Options.OfferFilter:SetValue("Best $/s (auto)")
+			Options.DriveStyle:SetValue("Safe")
+			Toggles.ObeyLimits:SetValue(true)
+			Toggles.KeepDrivingUnfocused:SetValue(true)
+			Options.ChargeAt:SetValue(20)
+			Options.ChargeTo:SetValue(95)
+		end)
+		log("RECOMMENDED applied")
+		notify("Recommended Settings", "Best $/s offers, Safe riding inside the limits, charge at 20% to 95%", 5)
+	end
+	do
+		local OPBox = Tabs.OP:AddLeftGroupbox("Auto Farm Everything OP", "zap")
+		OPBox:AddToggle("AutoFarmOP", {
 			Text = "Auto Farm Everything OP",
 			Default = false,
-			Tooltip = "The planner does everything for max profit: picks offers by $/s, buys a faster scooter when it pays back in 24 h, services the scooter, rides above the limit when no police is near. It CAN spend your cash and get fined. Asks to confirm first",
+			Tooltip = N.OPWarning .. " The planner picks offers by $/s, buys a faster scooter when it pays back in 24 h, services, buys repair cover and rides above the limit when no police is near. Asks to confirm first",
 			Callback = function(value)
 				if N.opSetting then
 					return
 				end
+				-- captured now: the config autoload is running while this callback fires
+				local fromConfig = N.Autoloading == true
 				task.defer(function()
+					if value and fromConfig and not on("RememberOP") then
+						-- autoload never restores OP unless the player asked for it
+						N.opSetting = true
+						Toggles.AutoFarmOP:SetValue(false)
+						N.opSetting = false
+						log("OP not restored from the config (Remember Auto OP is off)")
+						return
+					end
+					if value and fromConfig then
+						N.OPConfirmed = true
+						log("OP restored from the config (Remember Auto OP)")
+					end
 					if value and not N.OPConfirmed then
 						N.opSetting = true
 						Toggles.AutoFarmOP:SetValue(false)
@@ -33670,19 +34072,33 @@ do
 				end)
 			end,
 		})
-		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">Normal farm = only your picks, never spends unless you pick a spending farm. OP = the planner decides everything and may spend cash.</font>',
+		OPBox:AddToggle("RememberOP", {
+			Text = "Remember Auto OP",
+			Default = false,
+			Tooltip = "Off: a saved config never turns OP back on by itself. On: OP starts again with your autoload config without asking. " .. N.OPWarning,
+		})
+		OPBox:AddLabel({
+			Text = '<font color="#ff7a45">' .. N.OPWarning .. "</font>",
 			DoesWrap = true,
 		})
-		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
-		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
-		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		StatusBox:AddButton({
-			Text = "Stop Everything",
-			Func = function()
-				N.stopAll()
-			end,
+		local LimitBox = Tabs.OP:AddRightGroupbox("OP Limits", "shield")
+		LimitBox:AddDropdown("ExcludeOP", {
+			Text = "Exclude from OP",
+			Values = N.ExcludeChoices,
+			Default = {},
+			Multi = true,
+			Tooltip = "OP never spends on what you pick here (a scooter purchase, service, repair cover) and never switches your scooter when 'Switch scooter' is picked",
 		})
+		LimitBox:AddSlider("OPReserve", {
+			Text = "Keep cash (OP never spends below)",
+			Default = 0,
+			Min = 0,
+			Max = 5000,
+			Rounding = 0,
+			Prefix = "$",
+			Tooltip = "OP purchases that would take your cash under this amount wait",
+		})
+		Labels.OP = LimitBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
 		local DashBox = Tabs.Dash:AddLeftGroupbox("Deliveries", "package")
@@ -33721,7 +34137,17 @@ do
 		UpBox:AddToggle("AutoService", {
 			Text = "Auto Service (spends)",
 			Default = false,
-			Tooltip = "Pays for a service when a part reaches the game's service-due wear (60%) or the scooter is damaged",
+			Tooltip = "Pays for a service when a part reaches the game's service-due wear (60%) or the scooter is damaged (parks and steps off first, the game refuses service while riding)",
+		})
+		UpBox:AddToggle("AutoCover", {
+			Text = "Repair Cover (spends)",
+			Default = false,
+			Tooltip = "Buys VoltCare Plus ($180, 30 days, 2 claims, 60% of a repair) right before a structural repair when the measured crash rate says a second repair will come, then uses the cover on the repair",
+		})
+		UpBox:AddToggle("AutoPackages", {
+			Text = "Collect Garage Packages",
+			Default = false,
+			Tooltip = "A bought scooter arrives boxed at your garage: rides there between deliveries and opens/collects it",
 		})
 		local PlanBox = Tabs.Upgrades:AddRightGroupbox("Profit Plan", "calculator")
 		Labels.Plan = PlanBox:AddLabel({ Text = "-", DoesWrap = true })
@@ -33730,9 +34156,14 @@ do
 		local DriveBox = Tabs.Player:AddLeftGroupbox("Driving", "gauge")
 		DriveBox:AddDropdown("DriveStyle", {
 			Text = "Drive Style",
-			Values = { "Legit", "Blatant" },
-			Default = "Legit",
-			Tooltip = "Legit rides with the game's controls at the scooter's real speed. Blatant also pushes the scooter along the road at up to 28.5 m/s (the server's delivery check allows 31): faster, may look odd and can crash on corners",
+			Values = { "Safe", "Blatant" },
+			Default = "Safe",
+			Tooltip = "Safe (default) rides with the game's own controls at the scooter's real speed. Blatant also pushes the scooter along the road (opt-in, never turned on by OP): the game's anticheat MAY BAN this account, use an alt",
+			Callback = function(value)
+				if value == "Blatant" then
+					notify("Blatant driving", "Opt-in: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.", 8)
+				end
+			end,
 		})
 		DriveBox:AddToggle("ObeyLimits", {
 			Text = "Obey Speed Limits",
@@ -33787,6 +34218,12 @@ do
 	N.StatRows.Offers = statRow(WorkBox, "badge-check", "Offers taken / declined", 22)
 	N.StatRows.Ride = statRow(WorkBox, "bike", "Riding pay", 22)
 	N.StatRows.Care = statRow(WorkBox, "battery-charging", "Charges / services / falls", 22)
+	N.StatRows.PerDelivery = statRow(WorkBox, "receipt", "Average delivery", 22)
+	local RideBox = Tabs.Stats:AddLeftGroupbox("Riding", "gauge")
+	N.StatRows.Distance = statRow(RideBox, "route", "Distance ridden", 22)
+	N.StatRows.Speed = statRow(RideBox, "gauge", "Average moving speed", 22)
+	N.StatRows.Stuck = statRow(RideBox, "life-buoy", "Stuck recoveries", 22)
+	N.StatRows.Spent = statRow(RideBox, "wallet", "Spent (scooters, service, cover)", 22)
 	function N.drawStats()
 		local S = N.InfoText.stats or {}
 		N.StatRows.Money.set(S.money or "-")
@@ -33797,6 +34234,11 @@ do
 		N.StatRows.Offers.set(formatNumber(Session.accepted) .. " / " .. formatNumber(Session.declined))
 		N.StatRows.Ride.set(N.money(Session.rideCents))
 		N.StatRows.Care.set(string.format("%d / %d / %d", Session.charges, Session.services, Session.crashes))
+		N.StatRows.PerDelivery.set(if Session.deliveries > 0 then string.format("%s in %s", N.money(Session.deliveryCents / Session.deliveries), N.longTime(Session.deliverySeconds / Session.deliveries)) else "-")
+		N.StatRows.Distance.set(string.format("%.1f km", Session.meters / 1000))
+		N.StatRows.Speed.set(string.format("%.1f m/s", N.Dash.speedAvg or 0))
+		N.StatRows.Stuck.set(formatNumber(Session.stuck))
+		N.StatRows.Spent.set(N.money(Session.spentCents))
 	end
 end
 local Debug = {}
@@ -33853,7 +34295,7 @@ do
 			),
 			"Status: " .. tostring(Status),
 			"Running: " .. table.concat(Debug.running(), ", "),
-			"Mode: " .. (if N.isOP() then "OP" else "Normal") .. ", drive " .. optionText("DriveStyle", "Legit") .. ", phone live " .. tostring(N.G.phone ~= nil) .. ", nav " .. tostring(N.Nav.status) .. ", input " .. tostring(N.driveMethod()) .. " hooked " .. tostring(next(N.Drive.hooked) ~= nil),
+			"Mode: " .. (if N.isOP() then "OP" else "Normal") .. ", drive " .. optionText("DriveStyle", "Safe") .. ", phone live " .. tostring(N.G.phone ~= nil) .. ", nav " .. tostring(N.Nav.status) .. ", input " .. tostring(N.driveMethod()) .. " hooked " .. tostring(next(N.Drive.hooked) ~= nil),
 			"Plan: " .. tostring(N.Plan.text),
 			"Perf: " .. Debug.perfText(),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
@@ -33863,7 +34305,7 @@ do
 	end
 	Log.header = Debug.header
 end
-N.AllAutoToggles = { "AutoFarmBest", "AutoFarmOP", "AutoDeliver", "AutoRide", "AutoCharge", "AutoRecover", "AutoSport", "AutoSelectBest", "AutoService", "AutoBuyScooter" }
+N.AllAutoToggles = { "AutoFarmBest", "AutoFarmOP", "AutoDeliver", "AutoRide", "AutoCharge", "AutoRecover", "AutoSport", "AutoSelectBest", "AutoService", "AutoBuyScooter", "AutoCover", "AutoPackages" }
 N.Manual = { running = false }
 do
 	function N.manualRunning()
@@ -34194,10 +34636,12 @@ do
 			connect(notice.OnClientEvent, function(payload)
 				local code = type(payload) == "table" and tostring(payload.code) or "?"
 				logProblem("SECURITY notice " .. code .. " " .. tostring(type(payload) == "table" and payload.message or ""))
-				if optionText("DriveStyle", "Legit") == "Blatant" and Options.DriveStyle then
+				-- the server noticed something: no Blatant movement for the rest of the session (OP included)
+				N.Drive.blatantOffUntil = math.huge
+				if optionText("DriveStyle", "Safe") == "Blatant" and Options.DriveStyle then
 					-- the server noticed something: back to legit driving
 					UIQueue.push(function()
-						Options.DriveStyle:SetValue("Legit")
+						Options.DriveStyle:SetValue("Safe")
 					end)
 					log("SECURITY Blatant switched off")
 				end
@@ -34368,7 +34812,7 @@ do
 					Default = { "farm" },
 					Choices = {
 						{ Id = "farm", Title = "Auto Farm Everything", Description = "Turns on what you ticked in Farm Everything includes (deliveries, riding pay, charging, falls, Sport mode by default). Never spends money", Icon = "sparkles", Color = "#60d696" },
-						{ Id = "op", Title = "OP", Description = "Full automatic: best offers, buys a faster scooter and service when it pays, speeds when no police is near. Asks you to confirm first", Icon = "zap", Color = "#ff6b6b" },
+						{ Id = "op", Title = "OP", Description = "Full automatic, ban risk (the game's anticheat MAY BAN this account, use an alt). Asks you to confirm first", Icon = "zap", Color = "#ff6b6b" },
 						{ Id = "deliver", Title = "Deliveries only", Description = "VoltDash orders with your own offer filter and speed limits", Icon = "package", Color = "#fab428" },
 					},
 				},
@@ -34396,9 +34840,16 @@ if Window.AddSettingsTab then
 		SaveManager = SaveManager,
 		Folder = "VoltlineElectricScooters",
 		MenuKeybind = "RightControl",
+		AutoLoad = false,
 	})
 	if ok and tab then
 		Tabs.Settings = tab
+		-- the hub loads the autoload config itself so the OP toggle knows it comes from a config (Remember Auto OP)
+		task.defer(function()
+			N.Autoloading = true
+			pcall(SaveManager.LoadAutoloadConfig, SaveManager)
+			N.Autoloading = false
+		end)
 	else
 		Tabs.Settings = N.addTab("Settings", "settings", "Menu and configs")
 	end
@@ -34413,7 +34864,9 @@ else
 		SaveManager:SetFolder("Corvus/VoltlineElectricScooters")
 		SaveManager:BuildConfigSection(Tabs.Settings)
 		ThemeManager:ApplyToTab(Tabs.Settings)
-		SaveManager:LoadAutoloadConfig()
+		N.Autoloading = true
+		pcall(SaveManager.LoadAutoloadConfig, SaveManager)
+		N.Autoloading = false
 	end)
 end
 if Window.AddInfoTab then
@@ -34557,8 +35010,13 @@ do
 			end
 		end
 		if not inRun then
-			N.serviceStep()
+			if N.serviceStep() then
+				return "service"
+			end
 			N.selectBestStep(inRun)
+			if N.packageStep(inRun) then
+				return "packages"
+			end
 		end
 		if on("AutoDeliver") or N.isOP() then
 			local state = N.deliverStep()
@@ -34587,21 +35045,15 @@ do
 		end
 		if N.farming() then
 			wasFarming = true
-			-- off-route or stuck: plan the route again
+			-- off the route (distance to the route segments, not to its points): plan again from here. Stuck scooters are
+			-- handled by the drive's stuck recovery (p04 N.stuckStep), not by re-planning.
 			local D = N.Drive
-			if D.goal and D.path and os.clock() - (D.planAt or 0) > 4 then
+			if D.goal and D.path and os.clock() - (D.planAt or 0) > 6 and not (D.stuck and D.stuck.phase) then
 				local part = N.partOf(N.mounted())
 				if part then
-					local near = math.huge
-					for i = math.max(D.idx - 1, 1), math.min(D.idx + 3, #D.path) do
-						near = math.min(near, N.flat(D.path[i].p - part.Position).Magnitude)
-					end
-					if near > 45 or D.stuckFor > 4 then
-						log("ROUTE replan", if near > 45 then string.format("off route %.0f studs", near) else "stuck")
-						if D.stuckFor > 10 then
-							D.stuckFor = 0
-							N.command("RideRecoveryRequest", { action = "RIGHT_SCOOTER", scooterId = N.scooterId(N.mounted()) })
-						end
+					local near = N.distToPath(part.Position, D.path, D.idx)
+					if near > 45 then
+						log("ROUTE replan", string.format("off route %.0f studs", near))
 						N.setGoal(D.goal.target, { label = D.goal.label, stopRadius = D.goal.stopRadius, replan = true })
 					end
 				end
@@ -34656,6 +35108,20 @@ do
 					local board = type(st.board) == "table" and st.board or {}
 					N.InfoText.run = if board.shift and board.shift.online then "Online, no order" else "Offline"
 				end
+				local excluded = {}
+				for _, choice in ipairs(N.ExcludeChoices or {}) do
+					if N.opExcluded(choice) then
+						table.insert(excluded, choice)
+					end
+				end
+				N.InfoText.op = string.format(
+					"OP is <b>%s</b>%s\nExcluded: %s\nCash floor %s  \u{00B7}  spent this session %s",
+					if N.isOP() then "on" else "off",
+					if N.isOP() and on("RememberOP") then " (remembered)" else "",
+					if #excluded > 0 then table.concat(excluded, ", ") else "nothing",
+					N.money(optionNumber("OPReserve", 0) * 100),
+					N.money(Session.spentCents)
+				)
 				N.InfoText.battery = string.format("%.0f%%, uses %.3f%% per km, charges %d", N.soc(), N.percentPerMeter() * 1000, Session.charges)
 			end)
 			if not ok then
@@ -34686,6 +35152,11 @@ do
 				group(function()
 					Labels.Status:SetText(Status)
 					Labels.Info:SetText(N.InfoText.info or "-")
+				end)
+			end
+			if shown(Tabs.OP) then
+				group(function()
+					Labels.OP:SetText(N.InfoText.op or "-")
 				end)
 			end
 			if shown(Tabs.Dash) then
