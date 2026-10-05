@@ -35127,6 +35127,7 @@ do
 			log(line)
 		end
 		P.lastPick = pick
+		P.pickRate = pickC and pickC.E or nil
 		P.text = string.format("Plan: <b>%s</b> %s/h%s", tostring(pick), pickC and money(pickC.E) or "?", if mode == "explore" then " (measuring)" else "") .. (if school then "\nSchool: " .. school.text else "")
 		return pick
 	end
@@ -36356,6 +36357,25 @@ do
 		log("NEEDS done", "eff=" .. tostring(eff), N.moodText(), "took", math.floor(os.clock() - started), "s", "money", N.money())
 		setStatus("Needs done, back to work")
 	end
+	-- the need that reaches the safety floor first: name, minutes (Hunger only when meals may be bought)
+	function N.needsEta()
+		local values, rates = N.moods()
+		if not values then
+			return nil
+		end
+		local floorPct = optionNumber("NeedFloor", 25)
+		local bestName, bestMin
+		for _, name in ipairs(Q.names) do
+			local v = values[name]
+			if v and (name ~= "Hunger" or (N.spendOk and N.spendOk())) then
+				local m = math.max(v - floorPct, 0) / decayOf(name, rates)
+				if not bestMin or m < bestMin then
+					bestName, bestMin = name, m
+				end
+			end
+		end
+		return bestName, bestMin
+	end
 	function N.needsStatus()
 		local line = N.moodText()
 		if Q.active then
@@ -36408,10 +36428,9 @@ do
 			})
 		end)
 	end
-	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything, what is next and session stats")
 	Tabs.Jobs = N.addTab("Jobs", "briefcase", "Job farms: pick a job, speed and see the pay")
 	Tabs.Build = N.addTab("Build", "hammer", "Copy a plot's house onto your own plot")
-	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and pay")
 	if Window.AddMiscTab then
 		pcall(function()
 			Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
@@ -36420,33 +36439,41 @@ do
 	Labels = {}
 	do
 		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
-		-- Normal = the toggles ticked in "Farm Everything includes" with the player's own picks; OP = full automatic.
-		local F = { turned = {}, saved = {} }
-		local O = { turned = {}, saved = {} }
-		N.FarmN, N.FarmO = F, O
-		N.FarmEntries = { "Auto Work", "Auto Needs", "Buy quick meals", "Best Pay job switching", "Build saved layout" }
-		local EntryToggle = { ["Auto Work"] = "AutoJob", ["Auto Needs"] = "AutoNeeds", ["Buy quick meals"] = "NeedsFood" }
-		local function farmPicked(name)
-			local v = Options.FarmSet and Options.FarmSet.Value
-			return type(v) == "table" and v[name] == true
+		-- ONE switch: full automatic. Best Pay job switching, Blatant job speed, Auto Needs (meals, breaks, daily
+		-- objectives) and a one-time build of the saved plot, minus whatever the player excluded.
+		local S = { turned = {}, saved = {} }
+		N.Farm = { built = false, confirmed = false, building = false }
+		local StateFile = "Corvus/WTB_farm_state.txt"
+		local function writeState(v)
+			if not on("RememberFarm") then
+				return
+			end
+			pcall(function()
+				if makefolder and isfolder and not isfolder("Corvus") then
+					makefolder("Corvus")
+				end
+				writefile(StateFile, if v then "1" else "0")
+			end)
 		end
-		local function turnOn(S, name)
+		local function turnOn(name)
 			local t = Toggles[name]
 			if t and not t.Value then
 				table.insert(S.turned, name)
 				t:SetValue(true)
 			end
 		end
-		local function setSaved(S, key, value)
+		local function setSaved(key, value)
 			local o = Options[key]
 			if o and o.Value ~= value then
-				S.saved[key] = o.Value
+				if S.saved[key] == nil then
+					S.saved[key] = o.Value
+				end
 				pcall(function()
 					o:SetValue(value)
 				end)
 			end
 		end
-		local function stopState(S)
+		local function stopState()
 			for _, name in ipairs(S.turned) do
 				local t = Toggles[name]
 				if t and t.Value then
@@ -36463,120 +36490,126 @@ do
 			end
 			S.saved = {}
 		end
-		local function buildSaved()
+		-- Exclude list: "Building", "Food purchases". Every enforced block leaves `EXCLUDE <item>` in the log.
+		local ExcludeAt = {}
+		function N.excluded(item, why)
+			local v = Options.FarmExclude and Options.FarmExclude.Value
+			local hit = type(v) == "table" and v[item] == true
+			if hit and os.clock() - (ExcludeAt[item] or -1e9) > 60 then
+				ExcludeAt[item] = os.clock()
+				log("EXCLUDE", item, why or "")
+			end
+			return hit
+		end
+		function N.reserve()
+			return optionNumber("MoneyReserve", 0)
+		end
+		-- spending on food: Buy quick meals (manual) or Auto Farm Everything, never when excluded or under the reserve
+		function N.spendOk()
+			if not (on("AutoFarmBest") or on("NeedsFood")) then
+				return false
+			end
+			if N.excluded("Food purchases", "no quick meals bought") then
+				return false
+			end
+			local reserve = N.reserve()
+			if reserve > 0 and N.money() < reserve + 15 then
+				if os.clock() - (ExcludeAt.reserve or -1e9) > 60 then
+					ExcludeAt.reserve = os.clock()
+					log("EXCLUDE", "Money reserve", "no meal, money " .. N.money() .. " < reserve " .. reserve)
+				end
+				return false
+			end
+			return true
+		end
+		local function buildOnce()
 			local name = optionText("LayoutPick", "")
-			if name == "" then
-				notify("Corvus", "Pick a saved layout in the Build tab to let Farm Everything build it", 6)
-			elseif N.Build.running then
+			if N.Farm.built or N.Build.running then
 				return
-			else
-				log("FARM build", name)
-				task.spawn(N.runManual, N.buildLayout, name, { shell = on("BuildShell"), items = on("BuildItems") })
+			end
+			if N.excluded("Building", "saved plot not built") then
+				return
+			end
+			if name == "" then
+				log("FARM build", "skipped, no saved layout picked")
+				return
+			end
+			if N.reserve() > 0 and N.money() <= N.reserve() then
+				log("EXCLUDE", "Money reserve", "no build, money " .. N.money() .. " <= reserve " .. N.reserve())
+				return
+			end
+			N.Farm.built, N.Farm.building = true, true
+			log("FARM build", name)
+			task.spawn(function()
+				N.runManual(function()
+					if N.goHome() then
+						N.buildLayout(name, { shell = on("BuildShell"), items = on("BuildItems") })
+					end
+				end)
+				N.Farm.building = false
+			end)
+		end
+		function N.farmStop()
+			stopState()
+			if N.Farm.building then
+				N.Build.stop = true
 			end
 		end
-		-- spending (food, building) only when OP is on or the player ticked/enabled that item himself
-		function N.spendOk()
-			return on("AutoFarmOP") or on("NeedsFood")
-		end
-		function N.farmStopNormal()
-			stopState(F)
-		end
-		function N.farmStopOP()
-			stopState(O)
-		end
-		function N.farmStartNormal()
-			stopState(F)
-			local picked = {}
-			for _, entry in ipairs(N.FarmEntries) do
-				if farmPicked(entry) then
-					table.insert(picked, entry)
-					if EntryToggle[entry] then
-						turnOn(F, EntryToggle[entry])
-					elseif entry == "Best Pay job switching" then
-						setSaved(F, "JobPick", "Best Pay (auto)")
+		function N.farmStart()
+			stopState()
+			turnOn("AutoJob")
+			turnOn("AutoNeeds")
+			setSaved("JobPick", "Best Pay (auto)")
+			setSaved("JobSpeed", "Blatant")
+			buildOnce()
+			log("FARM on", "excluded=" .. (function()
+				local v, names = Options.FarmExclude and Options.FarmExclude.Value, {}
+				for k, on_ in pairs(type(v) == "table" and v or {}) do
+					if on_ then
+						table.insert(names, k)
 					end
 				end
-			end
-			if farmPicked("Build saved layout") then
-				buildSaved()
-			end
-			log("FARM normal on", table.concat(picked, ", "))
+				table.sort(names)
+				return #names > 0 and table.concat(names, "/") or "none"
+			end)(), "reserve=" .. N.reserve())
 		end
-		function N.farmStartOP()
-			stopState(O)
-			turnOn(O, "AutoJob")
-			turnOn(O, "AutoNeeds")
-			setSaved(O, "JobPick", "Best Pay (auto)")
-			setSaved(O, "JobSpeed", "Blatant")
-			buildSaved()
-			log("FARM OP on")
-		end
-		local OPConfirmed = false
 		QuickBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "Turns on the toggles ticked below with your own picks (job, speed, needs). Turning it off switches them off again. The Jobs tab still lets you pick a job and a speed",
-			Callback = function(value)
-				task.defer(function()
-					if value then
-						if on("AutoFarmOP") then
-							N.farmStopOP()
-							Toggles.AutoFarmOP:SetValue(false)
-						end
-						N.farmStartNormal()
-					else
-						N.farmStopNormal()
-					end
-				end)
-			end,
-		})
-		QuickBox:AddDropdown("FarmSet", {
-			Text = "Farm Everything includes",
-			Values = N.FarmEntries,
-			Default = { "Auto Work", "Auto Needs" },
-			Multi = true,
-			AllowNull = true,
-			Tooltip = "What Auto Farm Everything switches on. Daily objectives run inside Auto Needs (the breaks). Buy quick meals, Best Pay job switching and Build saved layout are off by default because they spend money or change your job",
-		})
-		QuickBox:AddToggle("AutoFarmOP", {
-			Text = "Auto Farm Everything OP",
-			Default = false,
-			Tooltip = "Picks the best paying job, Blatant speed, builds/spends for max profit and can spend your money. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
+			Tooltip = "Full automatic: switches to the best paying job, works at Blatant speed, keeps your needs up (buys meals), takes breaks, does daily objectives and builds your saved plot once. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
 			Callback = function(value)
 				task.defer(function()
 					if not value then
-						N.farmStopOP()
+						N.farmStop()
+						writeState(false)
 						return
 					end
-					if OPConfirmed then
-						OPConfirmed = false
-						if on("AutoFarmBest") then
-							N.farmStopNormal()
-							Toggles.AutoFarmBest:SetValue(false)
-						end
-						N.farmStartOP()
+					if N.Farm.confirmed then
+						N.Farm.confirmed = false
+						N.farmStart()
+						writeState(true)
 						return
 					end
 					-- not confirmed yet: back to off, ask first
-					Toggles.AutoFarmOP:SetValue(false)
+					Toggles.AutoFarmBest:SetValue(false)
 					local okDialog = Window.AddDialog and pcall(function()
-						Window:AddDialog("CorvusOP", {
-							Title = "Enable Auto Farm Everything OP?",
-							Description = "WARNING: Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.\n\nThe planner picks the best paying job, Blatant speed, builds/spends for max profit. It can spend your money (food, your saved layout).",
+						Window:AddDialog("CorvusFarm", {
+							Title = "Enable Auto Farm Everything?",
+							Description = "WARNING: Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.\n\nCorvus picks the best paying job, works at Blatant speed, buys meals, takes breaks and builds your saved plot once. It can spend your money: use Exclude and Money reserve to limit that.",
 							DescriptionColor = Color3.fromRGB(255, 140, 60),
 							AutoDismiss = true,
 							OutsideClickDismiss = true,
 							FooterButtons = {
 								Cancel = { Title = "Cancel", Variant = "Secondary", Order = 1 },
 								Enable = {
-									Title = "I understand, enable OP",
+									Title = "I understand, enable",
 									Variant = "Primary",
 									Order = 2,
 									Callback = function()
-										log("OP confirmed")
-										OPConfirmed = true
+										log("FARM confirmed")
+										N.Farm.confirmed = true
 										task.defer(function()
-											Toggles.AutoFarmOP:SetValue(true)
+											Toggles.AutoFarmBest:SetValue(true)
 										end)
 									end,
 								},
@@ -36584,19 +36617,68 @@ do
 						})
 					end)
 					if not okDialog then
-						notify("Corvus", "Could not open the confirmation, OP stays off", 5)
+						notify("Corvus", "Could not open the confirmation, Auto Farm Everything stays off", 5)
 					end
 				end)
 			end,
 		})
-		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">Normal uses your own toggles. OP decides everything itself and can spend money.</font>',
-			DoesWrap = true,
-		})
-		QuickBox:AddToggle("AutoJob", {
-			Text = "Auto Work",
+		QuickBox:AddToggle("RememberFarm", {
+			Text = "Remember Auto Farm Everything",
 			Default = false,
-			Tooltip = "Goes to work, starts the shift and does the job for you, all day. The job and speed come from the Jobs tab",
+			Tooltip = "Starts Auto Farm Everything again by itself the next time you run Corvus, if it was on when you left. Off = it always starts switched off",
+			Callback = function(value)
+				if value then
+					-- a config restoring this switch must not overwrite the remembered "on" before the start reads it
+					if on("AutoFarmBest") then
+						writeState(true)
+					end
+				else
+					pcall(function()
+						writefile(StateFile, "0")
+					end)
+				end
+			end,
+		})
+		QuickBox:AddDropdown("FarmExclude", {
+			Text = "Exclude",
+			Values = { "Building", "Food purchases" },
+			Default = {},
+			Multi = true,
+			AllowNull = true,
+			Tooltip = "Never spend money on these. Building = the one-time build of your saved plot. Food purchases = quick meals for Hunger",
+		})
+		QuickBox:AddSlider("MoneyReserve", {
+			Text = "Money reserve",
+			Default = 0,
+			Min = 0,
+			Max = 50000,
+			Rounding = 0,
+			Prefix = "$",
+			Tooltip = "Auto Farm Everything and Buy quick meals never spend while your money is at or under this. 0 = no reserve",
+		})
+		QuickBox:AddButton({
+			Text = "Recommended Settings",
+			Func = function()
+				local function set(key, value)
+					if Options[key] then
+						pcall(function()
+							Options[key]:SetValue(value)
+						end)
+					end
+				end
+				set("NeedFloor", 25)
+				set("EffFloor", 70)
+				set("WorkSessionMax", 210)
+				set("BreakMinutes", 20)
+				set("MoneyReserve", 0)
+				set("FarmExclude", {})
+				set("WebhookReport", 30)
+				if Toggles.AutoNeeds then
+					Toggles.AutoNeeds:SetValue(true)
+				end
+				log("RECOMMENDED applied")
+				notify("Corvus", "Recommended settings applied", 4)
+			end,
 		})
 	end
 	local JobBox = Tabs.Jobs:AddLeftGroupbox("Job Farm", "briefcase")
@@ -36616,6 +36698,11 @@ do
 		Text = '<font color="#ff6b6b">Blatant has a high ban risk in Bloxburg.</font> <font transparency="0.35">Use Legit or Fast on an account you care about.</font>',
 		DoesWrap = true,
 	})
+	JobBox:AddToggle("AutoJob", {
+		Text = "Auto Work",
+		Default = false,
+		Tooltip = "Works the job above all day, without the rest of Auto Farm Everything. Auto Farm Everything turns it on by itself",
+	})
 	JobBox:AddButton({
 		Text = "End Shift",
 		Func = function()
@@ -36625,6 +36712,8 @@ do
 	local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 	Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 	Labels.Job = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+	StatusBox:AddDivider()
+	Labels.Next = StatusBox:AddLabel({ Text = "Up next: switch on Auto Farm Everything", DoesWrap = true })
 	StatusBox:AddButton({
 		Text = "Stop Everything",
 		Func = function()
@@ -36637,12 +36726,12 @@ do
 	NeedsBox:AddToggle("AutoNeeds", {
 		Text = "Auto Needs",
 		Default = true,
-		Tooltip = "Part of Auto Work: keeps Energy, Hunger, Hygiene and Fun up with your own bed, fridge, shower and TV. Low moods lower the shift efficiency (your pay) and at 0% you cannot work. Goes home only when the lost pay would cost more than the trip, or when a floor below is hit",
+		Tooltip = "Keeps Energy, Hunger, Hygiene and Fun up with your own bed, fridge, shower and TV. Low moods lower the shift efficiency (your pay) and at 0% you cannot work. Goes home only when the lost pay would cost more than the trip, or when a floor below is hit",
 	})
 	NeedsBox:AddToggle("NeedsFood", {
 		Text = "Buy quick meals",
 		Default = false,
-		Tooltip = "Lets Auto Needs pay for a quick meal at the fridge to restore Hunger (a few dollars each time). Off = Hunger is never restored by buying food. Auto Farm Everything OP buys food anyway",
+		Tooltip = "Lets Auto Needs pay for a quick meal at the fridge to restore Hunger (a few dollars each time). Off = Hunger is never restored by buying food. Auto Farm Everything buys food anyway (unless excluded)",
 	})
 	NeedsBox:AddLabel({
 		Text = '<font transparency="0.35">Needs a bed, a fridge, a shower and a TV on your plot (cheapest: Standard Single Bed $200, Icebox Fridge $500, Hygienic Shower $340, NYX VintageView TV $400). Quick meals cost their price.</font>',
@@ -36742,12 +36831,12 @@ do
 			end,
 		}
 	end
-	local MoneyBox = Tabs.Stats:AddLeftGroupbox("Money", "coins")
+	local MoneyBox = Tabs.Main:AddLeftGroupbox("Money", "coins")
 	N.StatRows.Money = statRow(MoneyBox, "wallet", "Money", 28)
 	N.StatRows.Earned = statRow(MoneyBox, "trending-up", "Earned this session", 22)
 	N.StatRows.Rate = statRow(MoneyBox, "activity", "Per hour", 22, "FontColor")
 	N.StatRows.Time = statRow(MoneyBox, "clock", "Session", 22, "FontColor")
-	local WorkBox = Tabs.Stats:AddRightGroupbox("Work", "briefcase")
+	local WorkBox = Tabs.Main:AddRightGroupbox("Work", "briefcase")
 	N.StatRows.Done = statRow(WorkBox, "check", "Customers done", 28)
 	N.StatRows.Correct = statRow(WorkBox, "badge-check", "Correct / wrong", 22)
 	N.StatRows.Shifts = statRow(WorkBox, "briefcase", "Shifts started", 22)
@@ -36826,7 +36915,6 @@ do
 end
 N.AllAutoToggles = {
 	"AutoFarmBest",
-	"AutoFarmOP",
 	"AutoJob",
 }
 do
@@ -37165,7 +37253,6 @@ do
 	if Library.AddCommand then
 		pcall(function()
 			toggleCommand("farmall", { "farmbest", "all", "farm", "work", "job" }, { "AutoFarmBest" }, "Auto Farm Everything")
-			toggleCommand("farmop", { "op" }, { "AutoFarmOP" }, "Auto Farm Everything OP")
 			Library:AddCommand({
 				Name = "stop",
 				Aliases = { "alloff" },
@@ -37253,8 +37340,7 @@ do
 					Required = true,
 					Default = { "farm" },
 					Choices = {
-						{ Id = "farm", Title = "Auto Farm Everything", Description = "Turns on the toggles you ticked in Farm Everything includes (Auto Work and Auto Needs by default), with your own job and speed", Icon = "sparkles", Color = "#60d696" },
-						{ Id = "op", Title = "OP", Description = "Full automatic: best paying job, Blatant speed, builds and spends for max profit. Asks you to confirm first", Icon = "zap", Color = "#ff6b6b" },
+						{ Id = "farm", Title = "Auto Farm Everything", Description = "Full automatic: best paying job, Blatant speed, needs and meals, breaks, daily objectives, one-time build of your saved plot. Asks you to confirm first", Icon = "sparkles", Color = "#60d696" },
 						{ Id = "work", Title = "Work one job", Description = "Goes to work and does the job you pick in the Jobs tab", Icon = "briefcase", Color = "#fab428" },
 					},
 				},
@@ -37263,12 +37349,11 @@ do
 				local chosen = type(values.tasks) == "table" and values.tasks or {}
 				local groups = { work = { "AutoJob" } }
 				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] and not chosen.farm and not chosen.op then "on" else "off" })
+					setToggles(names, { if chosen[id] and not chosen.farm then "on" else "off" })
 				end
 				N.markSetupDone()
-				setToggles({ "AutoFarmBest" }, { if chosen.farm and not chosen.op then "on" else "off" })
-				if chosen.op then
-					setToggles({ "AutoFarmOP" }, { "on" })
+				if chosen.farm then
+					setToggles({ "AutoFarmBest" }, { "on" })
 				end
 				notify("Quick setup done", "Change anything in the tabs any time", 5)
 			end,
@@ -37279,6 +37364,15 @@ do
 		})
 	end
 end
+-- Auto Farm Everything is never restored by a saved config (only by Remember Auto Farm Everything)
+pcall(function()
+	SaveManager:SetIgnoreIndexes({ "AutoFarmBest" })
+end)
+pcall(function()
+	if type(SaveManager.Ignore) == "table" then
+		SaveManager.Ignore["AutoFarmBest"] = true
+	end
+end)
 if Window.AddSettingsTab then
 	local ok, tab = pcall(Window.AddSettingsTab, Window, {
 		ThemeManager = ThemeManager,
@@ -37462,7 +37556,7 @@ do
 		if wasWorking then
 			-- Auto Work was turned off: clock out so nothing keeps running
 			wasWorking = false
-			log("WORK stop", "Auto Work is off, clocking out of", tostring(N.currentJob()), "| farm=" .. tostring(on("AutoFarmBest")), "op=" .. tostring(on("AutoFarmOP")))
+			log("WORK stop", "Auto Work is off, clocking out of", tostring(N.currentJob()), "| farm=" .. tostring(on("AutoFarmBest")))
 			leaveJob()
 		end
 		setStatus("Idle")
@@ -37470,13 +37564,13 @@ do
 	end)
 	-- Every change of the main toggles is logged with the others' state, so a silent stop has a visible reason.
 	task.spawn(function()
-		local names = { "AutoJob", "AutoNeeds", "AutoFarmBest", "AutoFarmOP", "NeedsFood" }
+		local names = { "AutoJob", "AutoNeeds", "AutoFarmBest", "NeedsFood" }
 		local last = {}
 		while alive() do
 			for _, name in ipairs(names) do
 				local v = on(name)
 				if last[name] ~= nil and last[name] ~= v then
-					log("TOGGLE", name, tostring(v), "| work=" .. tostring(on("AutoJob")), "needs=" .. tostring(on("AutoNeeds")), "farm=" .. tostring(on("AutoFarmBest")), "op=" .. tostring(on("AutoFarmOP")), "job=" .. tostring(N.currentJob()), "status=" .. tostring(Status))
+					log("TOGGLE", name, tostring(v), "| work=" .. tostring(on("AutoJob")), "needs=" .. tostring(on("AutoNeeds")), "farm=" .. tostring(on("AutoFarmBest")), "job=" .. tostring(N.currentJob()), "status=" .. tostring(Status))
 				end
 				last[name] = v
 			end
@@ -37528,7 +37622,8 @@ do
 					end
 				end
 				N.InfoText.needs = N.needsStatus()
-				N.InfoText.pay = N.payText() .. (if N.Plan.text ~= "" then "\n\n" .. N.Plan.text else "")
+				N.InfoText.pay = N.payText()
+				N.InfoText.next = N.upNextText()
 				local job = N.currentJob()
 				N.InfoText.job = if job == "" then "not working" else job
 				N.InfoText.jobText = string.format(
@@ -37546,6 +37641,61 @@ do
 				reportError("info", err)
 			end
 			task.wait(1)
+		end
+	end)
+	-- "Up next": plain words, 3-5 lines, built from the planner and the needs model
+	local NeedVerb = { Energy = "Sleep", Hunger = "Eat", Hygiene = "Shower", Fun = "Free time" }
+	function N.upNextText()
+		local Q = N.Needs
+		local lines = {}
+		local farm, working = on("AutoFarmBest"), on("AutoJob")
+		if not (farm or working) then
+			return "Switch on Auto Farm Everything and the plan for the next hours shows up here"
+		end
+		if Q.active then
+			table.insert(lines, if Q.reason == "break" then "Now: break at home" else "Now: restoring needs at home")
+		end
+		local pick = optionText("JobPick", "Hairdresser")
+		if pick == "Best Pay (auto)" then
+			local P = N.Plan
+			if P.lastPick and P.pickRate and P.pickRate > 0 then
+				table.insert(lines, string.format("Work %s (best pay $%s/h)", P.lastPick, formatNumber(math.floor(P.pickRate))))
+			else
+				table.insert(lines, "Work: measuring which job pays best")
+			end
+		else
+			table.insert(lines, "Work " .. pick)
+		end
+		if on("AutoNeeds") and not Q.active then
+			local name, minutes = N.needsEta()
+			if name then
+				table.insert(lines, if minutes <= 1 then NeedVerb[name] .. " now" else string.format("%s in ~%s", NeedVerb[name], N.longTime(minutes * 60)))
+			end
+			local maxWork = optionNumber("WorkSessionMax", 210) * 60
+			if maxWork > 0 then
+				table.insert(lines, string.format("Break at %s of work (in %s)", N.longTime(maxWork), N.longTime(maxWork - Q.workSeconds)))
+			end
+		end
+		local excl = Options.FarmExclude and Options.FarmExclude.Value
+		if farm and not N.Farm.built and not N.Farm.building and optionText("LayoutPick", "") ~= "" and not (type(excl) == "table" and excl.Building) then
+			table.insert(lines, "Build your saved plot (once)")
+		end
+		while #lines > 5 do
+			table.remove(lines)
+		end
+		return table.concat(lines, "\n")
+	end
+	-- Remember Auto Farm Everything: only then does a saved "on" come back after a restart
+	task.delay(3, function()
+		if not alive() or not on("RememberFarm") or on("AutoFarmBest") then
+			return
+		end
+		local ok, state = pcall(readfile, "Corvus/WTB_farm_state.txt")
+		if ok and state == "1" then
+			log("FARM remembered", "starting again")
+			N.Farm.confirmed = true
+			Toggles.AutoFarmBest:SetValue(true)
+			notify("Corvus", "Auto Farm Everything started again (Remember is on)", 5)
 		end
 	end)
 	local function shown(tab)
@@ -37570,6 +37720,8 @@ do
 				group(function()
 					Labels.Status:SetText(Status)
 					Labels.Job:SetText(N.InfoText.jobText or "-")
+					Labels.Next:SetText(N.InfoText.next or "-")
+					N.drawStats()
 				end)
 			end
 			if shown(Tabs.Jobs) then
@@ -37583,9 +37735,6 @@ do
 					local pick = optionText("LayoutPick", "")
 					Labels.Build:SetText(N.Build.status .. (if pick ~= "" and not N.Build.running then "\n" .. N.layoutInfo(pick) else ""))
 				end)
-			end
-			if shown(Tabs.Stats) then
-				group(N.drawStats)
 			end
 			if Labels.Perf and shown(Tabs.Misc) then
 				group(function()
@@ -37631,9 +37780,9 @@ do
 	pcall(function()
 		Tabs.Main:Show()
 	end)
-	log("MODE", "Normal = your toggles, OP = full automatic (off until confirmed)")
+	log("MODE", "Auto Farm Everything = one full automatic switch (off until confirmed)")
 	do
-		local flag = "Corvus/WTB_farm_v2.txt"
+		local flag = "Corvus/WTB_farm_v3.txt"
 		local seen = false
 		pcall(function()
 			seen = isfile(flag)
@@ -37646,14 +37795,14 @@ do
 				writefile(flag, "1")
 			end)
 			task.delay(3, function()
-				notify("Corvus", "Auto Farm Everything is now on Main. Normal = your toggles, OP = full automatic.", 9)
+				notify("Corvus", "Auto Farm Everything is on Main: one switch, full automatic. Use Exclude to limit spending.", 9)
 			end)
 		end
 	end
 	notify("Corvus", if Library.IsMobile then "Loaded and ready. The round Corvus button opens and closes the hub." else "Loaded. Press RightControl to hide or show the menu.", 5)
 	if Library.ShowWizard and not N.setupDone() then
 		task.delay(1.5, function()
-			if on("AutoJob") or on("AutoFarmBest") or on("AutoFarmOP") then
+			if on("AutoJob") or on("AutoFarmBest") then
 				N.markSetupDone()
 				return
 			end
