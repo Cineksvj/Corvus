@@ -31539,9 +31539,9 @@ do
 		local value = option and option.Value
 		return if type(value) == "string" and value ~= "" then value else default
 	end
-	-- OP (Auto Farm Everything OP, confirmed by the player) = the planner overrides every pick and may spend money.
+	-- Auto Farm Everything (confirmed by the player) = the planner runs every farm and may spend money (N.opAllows).
 	function N.isOP()
-		return on("AutoFarmOP")
+		return on("AutoFarmBest")
 	end
 	-- Driving is allowed while one of the riding farms runs.
 	function N.farming()
@@ -32406,7 +32406,7 @@ do
 	end
 	-- Speed cap for the next stretch: obey limits (Normal default), or OP: legal only when police are near or you are wanted.
 	N.PoliceRange = 750
-	-- Blatant glide: only when the player picks it in Drive Style (opt-in, never turned on by OP). Off for the rest of
+	-- Blatant glide: only when the player picks it in Drive Style (opt-in, never turned on by Auto Farm Everything). Off for the rest of
 	-- the session after any SecurityNotice from the game.
 	N.BlatantSpeed = 28.5
 	function N.blatantMove()
@@ -32418,9 +32418,6 @@ do
 	function N.speedCap(routeId, top)
 		local wanted = (tonumber(LocalPlayer:GetAttribute("TrafficWantedLevel")) or 0) > 0
 		local obey = on("ObeyLimits")
-		if N.isOP() then
-			obey = false
-		end
 		local blatant = N.blatantMove()
 		local fast = if blatant then N.BlatantSpeed else (top or 30)
 		if obey or wanted or D.policeDist < N.PoliceRange then
@@ -33032,12 +33029,13 @@ do
 		local ctx = N.planContext()
 		local options = {}
 		for _, option in ipairs(N.planOptions(ctx)) do
-			-- "Exclude from OP": an excluded scooter is not a candidate while OP runs
+			-- "Exclude": an excluded scooter is not a candidate while Auto Farm Everything runs
 			if not (N.isOP() and N.opExcluded("Buy " .. option.name)) then
 				table.insert(options, option)
 			end
 		end
 		local pick = N.planPick(options, P.H)
+		P.pick = pick
 		local alt = {}
 		for i = 1, math.min(3, #options) do
 			local o = options[i]
@@ -33830,42 +33828,32 @@ do
 			})
 		end)
 	end
-	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
-	Tabs.OP = N.addTab("Auto OP", "zap", "Auto Farm Everything OP, its warning and limits")
-	Tabs.Dash = N.addTab("VoltDash", "bike", "Deliveries, offers and riding pay")
-	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Faster scooter, service and the profit plan")
-	Tabs.Player = N.addTab("Player", "user", "Driving style, speed limits, battery")
-	Tabs.Stats = N.addTab("Stats", "chart-column", "Session money, deliveries and rates")
-	Tabs.Webhook = N.addTab("Webhook", "webhook", "Timed reports to your Discord")
+	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus does next")
+	Tabs.Dash = N.addTab("Farm", "bike", "Deliveries, scooter upgrades, driving and battery")
+	Tabs.Upgrades = Tabs.Dash
+	Tabs.Player = Tabs.Dash
+	Tabs.Stats = N.addTab("Stats", "chart-column", "Session money, rates and Discord reports")
+	Tabs.Webhook = Tabs.Stats
 	if Window.AddMiscTab then
 		pcall(function()
 			Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
 		end)
 	end
 	Labels = {}
-	-- Every main farm switch. Safe = nothing that spends money (Auto Service and Buy Faster Scooter spend).
+	-- Every farm switch Auto Farm Everything turns on (the planner decides the spending ones through N.opAllows).
 	N.FarmToggles = {
-		{ key = "AutoDeliver", label = "VoltDash Deliveries", safe = true },
-		{ key = "AutoRide", label = "Ride For Distance Pay", safe = true },
-		{ key = "AutoCharge", label = "Auto Charge", safe = true },
-		{ key = "AutoRecover", label = "Auto Recover", safe = true },
-		{ key = "AutoSport", label = "Sport Mode", safe = true },
-		{ key = "AutoSelectBest", label = "Ride Best Scooter", safe = true },
-		{ key = "AutoPackages", label = "Collect Garage Packages", safe = true },
-		{ key = "AutoService", label = "Auto Service (spends)", safe = false },
-		{ key = "AutoBuyScooter", label = "Buy Faster Scooter (spends)", safe = false },
-		{ key = "AutoCover", label = "Repair Cover (spends)", safe = false },
+		{ key = "AutoDeliver" },
+		{ key = "AutoRide" },
+		{ key = "AutoCharge" },
+		{ key = "AutoRecover" },
+		{ key = "AutoSport" },
+		{ key = "AutoSelectBest" },
+		{ key = "AutoPackages" },
+		{ key = "AutoService" },
+		{ key = "AutoBuyScooter" },
+		{ key = "AutoCover" },
 	}
 	N.FarmTurnedOn = {}
-	local function farmLabels(safeOnly)
-		local list = {}
-		for _, item in ipairs(N.FarmToggles) do
-			if not safeOnly or item.safe then
-				table.insert(list, item.label)
-			end
-		end
-		return list
-	end
 	-- Turn a set of farm toggles on (remembering which ones this switch turned on) or back off.
 	function N.applyFarm(keys, value, owner)
 		N.FarmTurnedOn[owner] = N.FarmTurnedOn[owner] or {}
@@ -33881,28 +33869,12 @@ do
 		else
 			for key in pairs(mine) do
 				local toggle = Toggles[key]
-				local otherOwner = false
-				for name, set in pairs(N.FarmTurnedOn) do
-					if name ~= owner and set[key] and on(name) then
-						otherOwner = true
-					end
-				end
-				if toggle and toggle.Value and not otherOwner then
+				if toggle and toggle.Value then
 					toggle:SetValue(false)
 				end
 			end
 			table.clear(mine)
 		end
-	end
-	function N.farmSetKeys()
-		local keys = {}
-		local value = Options.FarmSet and Options.FarmSet.Value or {}
-		for _, item in ipairs(N.FarmToggles) do
-			if type(value) == "table" and value[item.label] then
-				table.insert(keys, item.key)
-			end
-		end
-		return keys
 	end
 	function N.allFarmKeys()
 		local keys = {}
@@ -33911,38 +33883,38 @@ do
 		end
 		return keys
 	end
-	-- OP needs a confirmation card first (owner rule 2026-10-05: ban-risk warning, primary button "I understand, enable OP").
-	N.OPWarning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
-	function N.confirmOP(onYes)
+	-- Auto Farm Everything needs a confirmation card first (ban-risk warning, primary button "I understand, enable it").
+	N.AFEWarning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
+	function N.confirmAFE(onYes)
 		if not Library.ShowWizard then
 			onYes()
 			return
 		end
 		Library:ShowWizard({
 			SkipText = "Cancel",
-			FinishText = "I understand, enable OP",
+			FinishText = "I understand, enable it",
 			Steps = {
 				{
-					Id = "op",
-					Title = "Enable Auto Farm Everything OP?",
-					Description = "WARNING: " .. N.OPWarning,
+					Id = "afe",
+					Title = "Enable Auto Farm Everything?",
+					Description = "WARNING: " .. N.AFEWarning,
 					Multi = false,
 					Required = true,
 					Default = "enable",
 					Choices = {
-						{ Id = "enable", Title = "I understand, enable OP", Description = "The planner decides everything: spends cash (scooters, service, repair cover) except what you excluded, ignores speed limits when no police is near", Icon = "triangle-alert", Color = "#ff7a45" },
-						{ Id = "cancel", Title = "Cancel", Description = "Keep the normal farm", Icon = "x", Color = "#8a8f98" },
+						{ Id = "enable", Title = "I understand, enable it", Description = "Deliveries, riding for cash, charging, repairs and upgrades run by themselves. It spends cash (scooters, service, repair cover) except what you excluded", Icon = "triangle-alert", Color = "#ff7a45" },
+						{ Id = "cancel", Title = "Cancel", Description = "Keep everything off", Icon = "x", Color = "#8a8f98" },
 					},
 				},
 			},
 			Finish = function(values)
-				if values.op == "enable" then
+				if values.afe == "enable" then
 					onYes()
 				end
 			end,
 		})
 	end
-	-- "Exclude from OP": things OP must never spend on, plus a cash floor. Enforced in every OP purchase (N.opAllows).
+	-- "Exclude": things Auto Farm Everything must never spend on. Enforced in every purchase (N.opAllows).
 	N.ExcludeChoices = { "Service", "Repair Cover", "Switch scooter" }
 	for _, key in ipairs({ "DUALTRON_X_LIMITED", "VSETT_9PLUS_48V21AH_CENTER_DISPLAY", "KUKIRIN_G4_2024", "AOVOPRO_ES80" }) do
 		local info = N.Fleet[key]
@@ -33951,46 +33923,85 @@ do
 		end
 	end
 	function N.opExcluded(choice)
-		local value = Options.ExcludeOP and Options.ExcludeOP.Value
+		local value = Options.ExcludeAFE and Options.ExcludeAFE.Value
 		return type(value) == "table" and value[choice] == true
 	end
-	-- May OP (or a spending farm) spend `cost` cents on `choice`? Outside OP only the cash floor of OP does not apply.
+	-- May Auto Farm Everything (or a spending farm) spend `cost` cents on `choice`? Outside it only the cash floor does not apply.
 	function N.opAllows(choice, cost)
 		if not N.isOP() then
 			return true
 		end
 		if N.opExcluded(choice) then
-			return false, "excluded from OP"
+			return false, "excluded"
 		end
-		local reserve = optionNumber("OPReserve", 0) * 100
+		local reserve = optionNumber("KeepCash", 0) * 100
 		if cost and N.cashCents() - cost < reserve then
 			return false, "keeps the " .. N.money(reserve) .. " cash reserve"
 		end
 		return true
 	end
 	do
-		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
+		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm Everything", "sparkles")
 		QuickBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "Turns on exactly the farms picked below with your own settings (offer filter, speed limits, battery). Real riding, nothing spends money unless you pick it. Turning it off turns those farms off again",
+			Tooltip = N.AFEWarning .. " Deliveries, riding for cash, charging, repairs and upgrades by the profit plan, real riding inside the speed limits. Asks to confirm first",
 			Callback = function(value)
+				if N.opSetting then
+					return
+				end
+				-- captured now: the config autoload is running while this callback fires
+				local fromConfig = N.Autoloading == true
 				task.defer(function()
-					N.applyFarm(if value then N.farmSetKeys() else {}, value, "AutoFarmBest")
-					log("FARM", if value then "on: " .. table.concat(N.farmSetKeys(), ",") else "off")
+					if value and fromConfig and not on("RememberAFE") then
+						-- autoload never restores it unless the player asked for it
+						N.opSetting = true
+						Toggles.AutoFarmBest:SetValue(false)
+						N.opSetting = false
+						log("AFE not restored from the config (Remember Auto Farm Everything is off)")
+						return
+					end
+					if value and fromConfig then
+						N.AFEConfirmed = true
+						log("AFE restored from the config (Remember Auto Farm Everything)")
+					end
+					if value and not N.AFEConfirmed then
+						N.opSetting = true
+						Toggles.AutoFarmBest:SetValue(false)
+						N.opSetting = false
+						N.confirmAFE(function()
+							N.AFEConfirmed = true
+							log("AFE confirmed")
+							Toggles.AutoFarmBest:SetValue(true)
+						end)
+						return
+					end
+					N.AFEConfirmed = value and N.AFEConfirmed or false
+					N.applyFarm(if value then N.allFarmKeys() else {}, value, "AutoFarmBest")
+					log("FARM", if value then "on" else "off")
 				end)
 			end,
 		})
-		local safeDefault = {}
-		for _, label in ipairs(farmLabels(true)) do
-			safeDefault[label] = true
-		end
-		QuickBox:AddDropdown("FarmSet", {
-			Text = "Farm Everything includes",
-			Values = farmLabels(false),
-			Default = safeDefault,
+		QuickBox:AddToggle("RememberAFE", {
+			Text = "Remember Auto Farm Everything",
+			Default = false,
+			Tooltip = "Off: a saved config never turns Auto Farm Everything back on by itself. On: it starts again with your autoload config without asking. " .. N.AFEWarning,
+		})
+		QuickBox:AddDropdown("ExcludeAFE", {
+			Text = "Exclude",
+			Values = N.ExcludeChoices,
+			Default = {},
 			Multi = true,
-			Tooltip = "The farms Auto Farm Everything turns on. Default: everything that never spends money",
+			Tooltip = "Auto Farm Everything never spends on what you pick here (a scooter purchase, service, repair cover) and never switches your scooter when 'Switch scooter' is picked",
+		})
+		QuickBox:AddSlider("KeepCash", {
+			Text = "Keep cash (never spends below)",
+			Default = 0,
+			Min = 0,
+			Max = 5000,
+			Rounding = 0,
+			Prefix = "$",
+			Tooltip = "Purchases that would take your cash under this amount wait",
 		})
 		QuickBox:AddButton({
 			Text = "Recommended Settings",
@@ -33998,28 +34009,25 @@ do
 				N.applyRecommended()
 			end,
 		})
-		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">Normal farm = only your picks, real riding inside the speed limits. The OP farm is in the Auto OP tab.</font>',
-			DoesWrap = true,
-		})
-		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
-		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
-		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		StatusBox:AddButton({
+		QuickBox:AddButton({
 			Text = "Stop Everything",
 			Func = function()
 				N.stopAll()
 			end,
 		})
+		QuickBox:AddLabel({
+			Text = '<font color="#ff7a45">' .. N.AFEWarning .. "</font>",
+			DoesWrap = true,
+		})
+		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		local NextBox = Tabs.Main:AddRightGroupbox("Up next", "list-todo")
+		Labels.Next = NextBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
-	-- Recommended Settings: the values the profit math and the safety rules pick for a normal (non OP) farm.
+	-- Recommended Settings: the values the profit math and the safety rules pick.
 	function N.applyRecommended()
-		local set = {}
-		for _, label in ipairs(farmLabels(true)) do
-			set[label] = true
-		end
 		pcall(function()
-			Options.FarmSet:SetValue(set)
 			Options.OfferFilter:SetValue("Best $/s (auto)")
 			Options.DriveStyle:SetValue("Safe")
 			Toggles.ObeyLimits:SetValue(true)
@@ -34029,76 +34037,6 @@ do
 		end)
 		log("RECOMMENDED applied")
 		notify("Recommended Settings", "Best $/s offers, Safe riding inside the limits, charge at 20% to 95%", 5)
-	end
-	do
-		local OPBox = Tabs.OP:AddLeftGroupbox("Auto Farm Everything OP", "zap")
-		OPBox:AddToggle("AutoFarmOP", {
-			Text = "Auto Farm Everything OP",
-			Default = false,
-			Tooltip = N.OPWarning .. " The planner picks offers by $/s, buys a faster scooter when it pays back in 24 h, services, buys repair cover and rides above the limit when no police is near. Asks to confirm first",
-			Callback = function(value)
-				if N.opSetting then
-					return
-				end
-				-- captured now: the config autoload is running while this callback fires
-				local fromConfig = N.Autoloading == true
-				task.defer(function()
-					if value and fromConfig and not on("RememberOP") then
-						-- autoload never restores OP unless the player asked for it
-						N.opSetting = true
-						Toggles.AutoFarmOP:SetValue(false)
-						N.opSetting = false
-						log("OP not restored from the config (Remember Auto OP is off)")
-						return
-					end
-					if value and fromConfig then
-						N.OPConfirmed = true
-						log("OP restored from the config (Remember Auto OP)")
-					end
-					if value and not N.OPConfirmed then
-						N.opSetting = true
-						Toggles.AutoFarmOP:SetValue(false)
-						N.opSetting = false
-						N.confirmOP(function()
-							N.OPConfirmed = true
-							log("OP confirmed")
-							Toggles.AutoFarmOP:SetValue(true)
-						end)
-						return
-					end
-					N.OPConfirmed = value and N.OPConfirmed or false
-					N.applyFarm(if value then N.allFarmKeys() else {}, value, "AutoFarmOP")
-					log("FARM OP", if value then "on" else "off")
-				end)
-			end,
-		})
-		OPBox:AddToggle("RememberOP", {
-			Text = "Remember Auto OP",
-			Default = false,
-			Tooltip = "Off: a saved config never turns OP back on by itself. On: OP starts again with your autoload config without asking. " .. N.OPWarning,
-		})
-		OPBox:AddLabel({
-			Text = '<font color="#ff7a45">' .. N.OPWarning .. "</font>",
-			DoesWrap = true,
-		})
-		local LimitBox = Tabs.OP:AddRightGroupbox("OP Limits", "shield")
-		LimitBox:AddDropdown("ExcludeOP", {
-			Text = "Exclude from OP",
-			Values = N.ExcludeChoices,
-			Default = {},
-			Multi = true,
-			Tooltip = "OP never spends on what you pick here (a scooter purchase, service, repair cover) and never switches your scooter when 'Switch scooter' is picked",
-		})
-		LimitBox:AddSlider("OPReserve", {
-			Text = "Keep cash (OP never spends below)",
-			Default = 0,
-			Min = 0,
-			Max = 5000,
-			Rounding = 0,
-			Prefix = "$",
-			Tooltip = "OP purchases that would take your cash under this amount wait",
-		})
-		Labels.OP = LimitBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
 		local DashBox = Tabs.Dash:AddLeftGroupbox("Deliveries", "package")
@@ -34116,7 +34054,7 @@ do
 			Text = "Offers",
 			Values = { "Best $/s (auto)", "Accept all", "Minimum pay" },
 			Default = "Best $/s (auto)",
-			Tooltip = "Best $/s: declines offers clearly worse than your average (at most 2 in a row). OP always uses Best $/s",
+			Tooltip = "Best $/s: declines offers clearly worse than your average (at most 2 in a row). Auto Farm Everything always uses Best $/s",
 		})
 		DashBox:AddSlider("MinPay", { Text = "Minimum pay", Default = 20, Min = 15, Max = 300, Rounding = 0, Prefix = "$" })
 		local RunBox = Tabs.Dash:AddRightGroupbox("Current Delivery", "map-pin")
@@ -34149,8 +34087,6 @@ do
 			Default = false,
 			Tooltip = "A bought scooter arrives boxed at your garage: rides there between deliveries and opens/collects it",
 		})
-		local PlanBox = Tabs.Upgrades:AddRightGroupbox("Profit Plan", "calculator")
-		Labels.Plan = PlanBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
 		local DriveBox = Tabs.Player:AddLeftGroupbox("Driving", "gauge")
@@ -34158,7 +34094,7 @@ do
 			Text = "Drive Style",
 			Values = { "Safe", "Blatant" },
 			Default = "Safe",
-			Tooltip = "Safe (default) rides with the game's own controls at the scooter's real speed. Blatant also pushes the scooter along the road (opt-in, never turned on by OP): the game's anticheat MAY BAN this account, use an alt",
+			Tooltip = "Safe (default) rides with the game's own controls at the scooter's real speed. Blatant also pushes the scooter along the road (opt-in, never turned on by Auto Farm Everything): the game's anticheat MAY BAN this account, use an alt",
 			Callback = function(value)
 				if value == "Blatant" then
 					notify("Blatant driving", "Opt-in: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.", 8)
@@ -34168,7 +34104,7 @@ do
 		DriveBox:AddToggle("ObeyLimits", {
 			Text = "Obey Speed Limits",
 			Default = true,
-			Tooltip = "Keeps under each road's limit (police fine speeding). OP ignores this and slows down only near police",
+			Tooltip = "Keeps under each road's limit (police fine speeding). Also used by Auto Farm Everything",
 		})
 		DriveBox:AddToggle("KeepDrivingUnfocused", {
 			Text = "Keep Driving When Unfocused",
@@ -34305,7 +34241,7 @@ do
 	end
 	Log.header = Debug.header
 end
-N.AllAutoToggles = { "AutoFarmBest", "AutoFarmOP", "AutoDeliver", "AutoRide", "AutoCharge", "AutoRecover", "AutoSport", "AutoSelectBest", "AutoService", "AutoBuyScooter", "AutoCover", "AutoPackages" }
+N.AllAutoToggles = { "AutoFarmBest", "AutoDeliver", "AutoRide", "AutoCharge", "AutoRecover", "AutoSport", "AutoSelectBest", "AutoService", "AutoBuyScooter", "AutoCover", "AutoPackages" }
 N.Manual = { running = false }
 do
 	function N.manualRunning()
@@ -34725,7 +34661,6 @@ do
 	if Library.AddCommand then
 		pcall(function()
 			toggleCommand("farmall", { "farmbest", "all", "farm" }, { "AutoFarmBest" }, "Auto Farm Everything")
-			toggleCommand("farmop", { "op" }, { "AutoFarmOP" }, "Auto Farm Everything OP")
 			toggleCommand("deliver", { "dash", "voltdash" }, { "AutoDeliver" }, "VoltDash Deliveries")
 			toggleCommand("ride", { "cruise" }, { "AutoRide" }, "Ride For Distance Pay")
 			Library:AddCommand({
@@ -34811,20 +34746,16 @@ do
 					Required = true,
 					Default = { "farm" },
 					Choices = {
-						{ Id = "farm", Title = "Auto Farm Everything", Description = "Turns on what you ticked in Farm Everything includes (deliveries, riding pay, charging, falls, Sport mode by default). Never spends money", Icon = "sparkles", Color = "#60d696" },
-						{ Id = "op", Title = "OP", Description = "Full automatic, ban risk (the game's anticheat MAY BAN this account, use an alt). Asks you to confirm first", Icon = "zap", Color = "#ff6b6b" },
+						{ Id = "farm", Title = "Auto Farm Everything", Description = "Full automatic: deliveries, riding pay, charging, repairs and upgrades. Ban risk (the game's anticheat MAY BAN this account, use an alt), asks you to confirm first", Icon = "sparkles", Color = "#60d696" },
 						{ Id = "deliver", Title = "Deliveries only", Description = "VoltDash orders with your own offer filter and speed limits", Icon = "package", Color = "#fab428" },
 					},
 				},
 			},
 			Finish = function(values)
 				local chosen = type(values.tasks) == "table" and values.tasks or {}
-				setToggles({ "AutoDeliver", "AutoRecover" }, { if chosen.deliver and not chosen.farm and not chosen.op then "on" else "off" })
+				setToggles({ "AutoDeliver", "AutoRecover" }, { if chosen.deliver and not chosen.farm then "on" else "off" })
 				N.markSetupDone()
-				setToggles({ "AutoFarmBest" }, { if chosen.farm and not chosen.op then "on" else "off" })
-				if chosen.op then
-					setToggles({ "AutoFarmOP" }, { "on" })
-				end
+				setToggles({ "AutoFarmBest" }, { if chosen.farm then "on" else "off" })
 				notify("Quick setup done", "Change anything in the tabs any time", 5)
 			end,
 			Skipped = function()
@@ -34844,7 +34775,7 @@ if Window.AddSettingsTab then
 	})
 	if ok and tab then
 		Tabs.Settings = tab
-		-- the hub loads the autoload config itself so the OP toggle knows it comes from a config (Remember Auto OP)
+		-- the hub loads the autoload config itself so the Auto Farm Everything toggle knows it comes from a config (Remember Auto Farm Everything)
 		task.defer(function()
 			N.Autoloading = true
 			pcall(SaveManager.LoadAutoloadConfig, SaveManager)
@@ -35037,6 +34968,49 @@ do
 		N.clearGoal()
 		return "idle"
 	end
+	-- "Up next": 3 to 5 plain-word lines (the raw planner text stays in the PLAN log lines).
+	function N.upNext(run, st)
+		local lines = {}
+		local function add(text)
+			if #lines < 5 then
+				table.insert(lines, "\u{2022} " .. text)
+			end
+		end
+		if not N.farming() then
+			return "\u{2022} Turn on Auto Farm Everything to start\n\u{2022} It delivers, rides for cash, charges and upgrades by itself"
+		end
+		if type(run) == "table" and run.runId then
+			local pay = N.money(run.quote and run.quote.guaranteedPayCents or 0)
+			if string.find(string.upper(tostring(run.status)), "PICK", 1, true) and run.pickupLabel then
+				add("Pick up at " .. tostring(run.pickupLabel))
+			end
+			add("Deliver to " .. tostring(run.dropoffLabel or "the customer") .. " (" .. pay .. ")")
+		else
+			local board = type(st.board) == "table" and st.board or {}
+			add(if board.shift and board.shift.online then "Take the best offer by $ per second" else "Go online in VoltDash")
+		end
+		local soc = N.soc()
+		local chargeAt = optionNumber("ChargeAt", 20)
+		if soc <= chargeAt + 15 then
+			add(string.format("Charge at the garage (%.0f %%)", soc))
+		else
+			add(string.format("Charge at the garage when under %.0f %% (now %.0f %%)", chargeAt, soc))
+		end
+		local pick = N.Plan.pick
+		if pick then
+			if N.cashCents() >= pick.price then
+				add("Buy " .. pick.name .. " now (" .. N.money(pick.price) .. ")")
+			else
+				add("Buy " .. pick.name .. " when " .. N.money(pick.price))
+			end
+		else
+			add("Keep saving, no scooter pays back yet")
+		end
+		if on("AutoRide") or N.isOP() then
+			add("Ride for distance pay between orders")
+		end
+		return table.concat(lines, "\n")
+	end
 	local wasFarming = false
 	loop("main loop", function()
 		if N.manualRunning() then
@@ -35108,20 +35082,7 @@ do
 					local board = type(st.board) == "table" and st.board or {}
 					N.InfoText.run = if board.shift and board.shift.online then "Online, no order" else "Offline"
 				end
-				local excluded = {}
-				for _, choice in ipairs(N.ExcludeChoices or {}) do
-					if N.opExcluded(choice) then
-						table.insert(excluded, choice)
-					end
-				end
-				N.InfoText.op = string.format(
-					"OP is <b>%s</b>%s\nExcluded: %s\nCash floor %s  \u{00B7}  spent this session %s",
-					if N.isOP() then "on" else "off",
-					if N.isOP() and on("RememberOP") then " (remembered)" else "",
-					if #excluded > 0 then table.concat(excluded, ", ") else "nothing",
-					N.money(optionNumber("OPReserve", 0) * 100),
-					N.money(Session.spentCents)
-				)
+				N.InfoText.next = N.upNext(run, st)
 				N.InfoText.battery = string.format("%.0f%%, uses %.3f%% per km, charges %d", N.soc(), N.percentPerMeter() * 1000, Session.charges)
 			end)
 			if not ok then
@@ -35152,25 +35113,12 @@ do
 				group(function()
 					Labels.Status:SetText(Status)
 					Labels.Info:SetText(N.InfoText.info or "-")
-				end)
-			end
-			if shown(Tabs.OP) then
-				group(function()
-					Labels.OP:SetText(N.InfoText.op or "-")
+					Labels.Next:SetText(N.InfoText.next or "-")
 				end)
 			end
 			if shown(Tabs.Dash) then
 				group(function()
 					Labels.Run:SetText(N.InfoText.run or "-")
-				end)
-			end
-			if shown(Tabs.Upgrades) then
-				group(function()
-					Labels.Plan:SetText(N.Plan.text ~= "" and N.Plan.text or "-")
-				end)
-			end
-			if shown(Tabs.Player) then
-				group(function()
 					Labels.Battery:SetText(N.InfoText.battery or "-")
 				end)
 			end
@@ -35225,7 +35173,7 @@ do
 	notify("Corvus", if Library.IsMobile then "Loaded and ready. The round Corvus button opens and closes the hub." else "Loaded. Press RightControl to hide or show the menu.", 5)
 	if Library.ShowWizard and not N.setupDone() then
 		task.delay(1.5, function()
-			if on("AutoFarmBest") or on("AutoFarmOP") or on("AutoDeliver") then
+			if on("AutoFarmBest") or on("AutoDeliver") then
 				N.markSetupDone()
 				return
 			end
