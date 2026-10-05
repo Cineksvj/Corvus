@@ -31966,8 +31966,8 @@ do
 		if not N.canEscape(name) then
 			return false
 		end
-		-- Normal mode keeps the player's pick, OP lets the planner use every area it can escape.
-		if N.farmMode() ~= "OP" or not on("AutoFarmBest") then
+		-- Manual mode keeps the player's pick, Auto Farm Everything lets the planner use every area it can escape.
+		if not N.isOP() then
 			local pick = Options.AreaPick and Options.AreaPick.Value
 			if type(pick) == "table" and next(pick) ~= nil then
 				return pick[name] == true
@@ -32734,12 +32734,12 @@ N.Farm = {
 }
 do
 	local F = N.Farm
-	-- Farm Everything (Normal) keeps the player's picks; Farm Everything OP lets the planner decide everything.
+	-- Auto Farm Everything: the planner decides everything (inside the Safe Mode limits); off = manual toggles.
 	function N.farmMode()
-		return if on("AutoFarmOP") then "OP" else "Normal"
+		return if on("AutoFarmBest") then "Auto" else "Manual"
 	end
 	function N.isOP()
-		return on("AutoFarmOP")
+		return on("AutoFarmBest")
 	end
 	-- Steal prompt hold: the game holds 1.2 s (0.25 s while the server sets FastEggPickupTime). Blatant (no hold) was
 	-- removed after the anticheat kick. Safe Mode always holds like a player (Legit).
@@ -33134,7 +33134,7 @@ do
 	end
 	-- Farm Everything OP never touches what the player put on the "Exclude from OP" list (Auto OP tab).
 	function N.opBlocks(label)
-		return N.isOP() and selected(Options.ExcludeOP, label)
+		return N.isOP() and selected(Options.ExcludeFarm, label)
 	end
 	function N.eventPet(category)
 		local asset = N.asset(category)
@@ -33144,7 +33144,7 @@ do
 		if not N.isOP() then
 			return false
 		end
-		local pick = Options.ExcludeOP and Options.ExcludeOP.Value
+		local pick = Options.ExcludeFarm and Options.ExcludeFarm.Value
 		if type(pick) ~= "table" then
 			return false
 		end
@@ -34314,7 +34314,7 @@ do
 		end
 	end
 end
-local Window, Tabs, Labels, StatusBox
+local Window, Tabs, Labels
 do
 	do
 		local setIdentity = setthreadidentity or set_thread_identity or setidentity or (syn and syn.set_thread_identity)
@@ -34357,11 +34357,10 @@ do
 			})
 		end)
 	end
-	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
-	Tabs.AutoOP = N.addTab("Auto OP", "zap", "The profit planner runs everything, with your exclude list")
+	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything, what is next and recommended settings")
 	Tabs.Eggs = N.addTab("Eggs", "egg", "Stealing eggs in the guarded areas")
-	Tabs.Plot = N.addTab("Plot", "layout-grid", "Eggs on the plot, the pen and the treadmill")
-	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Pen tiers, treadmills and trails")
+	Tabs.Plot = N.addTab("Plot", "layout-grid", "Eggs on the plot, the pen, the treadmill and upgrades")
+	Tabs.Upgrades = Tabs.Plot
 	Tabs.Rewards = N.addTab("Rewards", "gift", "Index, offline cash, group, quests, boss mastery and friends")
 	Tabs.Items = N.addTab("Items", "backpack", "Selling, protecting and fusing pets and eggs")
 	Tabs.Player = N.addTab("Player", "user", "Travel, speed and ESP")
@@ -34374,8 +34373,7 @@ do
 	end
 	Labels = {}
 	N.areas()
-	-- Every main farm toggle. Safe ones (nothing sold, used up or spent) are the default of Farm Everything.
-	-- Labels are the toggles' visible names.
+	-- Every main farm toggle. Auto Farm Everything turns these on (never the player-filter sellers).
 	N.FarmToggles = {
 		{ key = "AutoSteal", label = "Steal Eggs", safe = true },
 		{ key = "OnlyBetter", label = "Only Better Than My Weakest Pet", safe = true },
@@ -34399,25 +34397,7 @@ do
 		{ key = "AutoTreadmillUpgrade", label = "Treadmills", safe = false },
 		{ key = "AutoTrail", label = "Trails", safe = false },
 	}
-	N.FarmLabels, N.FarmSafe, N.FarmByLabel = {}, {}, {}
-	for _, row in ipairs(N.FarmToggles) do
-		table.insert(N.FarmLabels, row.label)
-		N.FarmByLabel[row.label] = row.key
-		if row.safe then
-			table.insert(N.FarmSafe, row.label)
-		end
-	end
-	N.NormalOn, N.OPOn = {}, {}
-	function N.farmSetKeys()
-		local list = {}
-		local value = Options.FarmSet and Options.FarmSet.Value
-		for _, row in ipairs(N.FarmToggles) do
-			if type(value) == "table" and value[row.label] then
-				table.insert(list, row.key)
-			end
-		end
-		return list
-	end
+	N.OPOn = {}
 	local function switch(names, value, memory)
 		N.farmSetting = true
 		for _, name in ipairs(names) do
@@ -34439,7 +34419,7 @@ do
 		table.clear(memory)
 		switch(names, false, {})
 	end
-	N.OPWarning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account (it already kicked the owner once). Use at your own risk, preferably on an alt."
+	N.OPWarning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
 	-- OP confirmation card (same look as the library's Discord card): the toggle stays off until "I understand, enable OP".
 	function N.confirmOP(onYes)
 		N.OPPending = function()
@@ -34448,7 +34428,7 @@ do
 		end
 		local gui = Library.ScreenGui
 		if not gui then
-			notify("Farm Everything OP", "Confirm in the card to enable", 5)
+			notify("Auto Farm Everything", "Confirm in the card to enable", 5)
 			return
 		end
 		pcall(function()
@@ -34461,7 +34441,7 @@ do
 			local font = scheme.FontColor or Color3.new(1, 1, 1)
 			local back = scheme.BackgroundColor or Color3.fromRGB(15, 15, 15)
 			local card = Instance.new("Frame")
-			card.Name = "CorvusOPConfirm"
+			card.Name = "CorvusFarmConfirm"
 			card.AnchorPoint = Vector2.new(1, 1)
 			card.Position = UDim2.new(1, -12, 1, -12)
 			card.Size = UDim2.fromOffset(320, 236)
@@ -34485,7 +34465,7 @@ do
 			title.Position = UDim2.fromOffset(12, 14)
 			title.Size = UDim2.new(1, -24, 0, 20)
 			title.Font = Enum.Font.GothamBold
-			title.Text = "Enable Farm Everything OP?"
+			title.Text = "Enable Auto Farm Everything?"
 			title.TextColor3 = font
 			title.TextSize = 16
 			title.TextXAlignment = Enum.TextXAlignment.Left
@@ -34496,7 +34476,7 @@ do
 			body.Position = UDim2.fromOffset(12, 38)
 			body.Size = UDim2.new(1, -24, 0, 56)
 			body.Font = Enum.Font.Gotham
-			body.Text = "The planner decides everything for max profit. It can SELL and FUSE pets, sell eggs and SPEND your cash on upgrades. Your Exclude list is kept."
+			body.Text = "The planner decides everything for max profit, inside Safe Mode limits. It can SELL and FUSE pets, sell eggs and SPEND your cash on upgrades. Your Exclude list is kept."
 			body.TextColor3 = font
 			body.TextTransparency = 0.25
 			body.TextSize = 13
@@ -34540,91 +34520,93 @@ do
 					fn()
 				end)
 			end
-			button("I understand, enable OP", 0, true, function()
+			button("I understand, enable", 0, true, function()
 				if N.OPPending then
 					N.OPPending()
 				end
 			end)
 			button("Cancel", 0.5, false, function()
 				N.OPPending = nil
-				log("OP cancelled")
+				log("FARM ALL cancelled")
 			end)
 			card.Parent = gui
 			N.OPCard = card
 		end)
 	end
 	do
-		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
-		QuickBox:AddToggle("AutoFarmBest", {
+		local FarmBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
+		FarmBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "Turns on exactly the farms picked below, with your own settings in the other tabs. Off turns them off again",
+			Tooltip = N.OPWarning .. " It steals, places, hatches, trains, buys upgrades, fuses and sells spare pets by itself (Safe Mode limits stay on)",
 			Callback = function(value)
 				if N.farmSwitching then
 					return
 				end
-				task.defer(function()
-					if value then
-						if on("AutoFarmOP") then
-							-- Normal and OP never run together
-							N.farmSwitching = true
-							Toggles.AutoFarmOP:SetValue(false)
-							N.farmSwitching = false
-							switchOff(N.OPOn)
-							N.saveOPFlag()
-						end
-						N.applyFarmSet()
-						log("FARM ALL on", table.concat(N.farmSetKeys(), ","))
-					else
-						switchOff(N.NormalOn)
-						log("FARM ALL off")
-					end
-				end)
+				if value then
+					N.farmSwitching = true
+					Toggles.AutoFarmBest:SetValue(false)
+					N.farmSwitching = false
+					N.confirmOP(function()
+						N.startOP("confirmed")
+					end)
+				else
+					switchOff(N.OPOn)
+					log("FARM ALL off")
+					N.saveOPFlag()
+				end
 			end,
 		})
-		-- Turns on exactly the picked toggles; ones it turned on earlier and are no longer picked go off.
-		function N.applyFarmSet()
+		-- Full automatic: the planner turns on every farm toggle except the ones that follow the player's own
+		-- filters (Sell By Rarity, Sell Weak Pets, Sell Unwanted Eggs). The Exclude list is checked in every action.
+		function N.startOP(reason)
+			log("FARM ALL on " .. tostring(reason or "on"))
+			N.farmSwitching = true
+			Toggles.AutoFarmBest:SetValue(true)
+			N.farmSwitching = false
 			local keys = {}
-			for _, key in ipairs(N.farmSetKeys()) do
-				keys[key] = true
-			end
-			local drop = {}
-			for name in pairs(N.NormalOn) do
-				if not keys[name] then
-					table.insert(drop, name)
-					N.NormalOn[name] = nil
+			for _, row in ipairs(N.FarmToggles) do
+				if not row.player then
+					table.insert(keys, row.key)
 				end
 			end
-			switch(drop, false, {})
-			switch(N.farmSetKeys(), true, N.NormalOn)
+			switch(keys, true, N.OPOn)
+			N.saveOPFlag()
 		end
-		QuickBox:AddDropdown("FarmSet", {
-			Text = "Farm Everything includes",
-			Values = N.FarmLabels,
-			Default = N.FarmSafe,
+		FarmBox:AddToggle("RememberAutoFarm", {
+			Text = "Remember Auto Farm Everything",
+			Default = false,
+			Tooltip = "Off: it always starts off, saved configs never switch it on. On: it comes back on by itself next time you start the hub. " .. N.OPWarning,
+			Callback = function()
+				N.saveOPFlag()
+			end,
+		})
+		N.ExcludeFixed = { "Mutated pets", "Event pets", "Big pets (size 3+)", "Fusing", "Upgrades (keep cash)" }
+		local values = table.clone(N.ExcludeFixed)
+		for _, rarity in ipairs(N.RarityOrder) do
+			table.insert(values, rarity)
+		end
+		local default = { "Mutated pets", "Event pets", "Big pets (size 3+)" }
+		local secret = table.find(N.RarityOrder, "Secret")
+		for i = secret or math.max(#N.RarityOrder - 2, 1), #N.RarityOrder do
+			table.insert(default, N.RarityOrder[i])
+		end
+		FarmBox:AddDropdown("ExcludeFarm", {
+			Text = "Exclude (never sold, fused or used)",
+			Values = values,
+			Default = default,
 			Multi = true,
 			AllowNull = true,
 			Searchable = true,
-			Tooltip = "Which toggles Auto Farm Everything turns on. The default only farms and claims. Selling, fusing and buying are left out unless you add them",
-			Callback = function()
-				if on("AutoFarmBest") then
-					task.defer(N.applyFarmSet)
-				end
-			end,
+			Tooltip = "Pets and eggs of these rarities, mutated, event (not from field eggs) or size 3+ pets are never sold or fused. Fusing = never fuses. Upgrades = never spends cash. Equipped, favourite and protected pets (Items tab) are always kept",
 		})
-		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">Farm Everything = your picks, nothing sold or spent unless you add it. The planner that decides everything is in the Auto OP tab.</font>',
+		FarmBox:AddLabel({
+			Text = '<font color="#ff7846"><b>Ban risk:</b> ' .. N.OPWarning .. '</font>\n<font transparency="0.3">It also sells spare pets and eggs, fuses and spends cash on pen tiers, treadmills and trails. With Remember on it starts right after you join, without asking.</font>',
 			DoesWrap = true,
 		})
-		QuickBox:AddToggle("AutoSteal", {
-			Text = "Steal Eggs",
-			Default = false,
-			Tooltip = "Steals the best egg in the areas your speed can escape from and brings it home",
-		})
-		StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		Labels.Doing = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 		StatusBox:AddButton({
 			Text = "Go Home",
 			Func = function()
@@ -34640,6 +34622,8 @@ do
 				end
 			end,
 		})
+		local NextBox = Tabs.Main:AddRightGroupbox("Up next", "list-checks")
+		Labels.UpNext = NextBox:AddLabel({ Text = "-", DoesWrap = true })
 		-- Recommended settings: the values the profit math and the anticheat notes (8.17) were tuned for.
 		N.Recommended = {
 			toggles = { SafeMode = true, OnlyBetter = true, SellKeepMutated = true, IgnoreGuards = false },
@@ -34678,92 +34662,12 @@ do
 		})
 	end
 	do
-		-- Farm Everything OP: the planner turns on every farm toggle except the ones that follow the player's own
-		-- filters (Sell By Rarity, Sell Weak Pets, Sell Unwanted Eggs). The Exclude list is checked in every OP action.
-		function N.startOP(reason)
-			log("OP " .. tostring(reason or "on"))
-			N.opSetting = true
-			Toggles.AutoFarmOP:SetValue(true)
-			N.opSetting = false
-			if on("AutoFarmBest") then
-				N.farmSwitching = true
-				Toggles.AutoFarmBest:SetValue(false)
-				N.farmSwitching = false
-				switchOff(N.NormalOn)
-			end
-			local keys = {}
-			for _, row in ipairs(N.FarmToggles) do
-				if not row.player then
-					table.insert(keys, row.key)
-				end
-			end
-			switch(keys, true, N.OPOn)
-			N.saveOPFlag()
-		end
-		local OPBox = Tabs.AutoOP:AddLeftGroupbox("Auto Farm Everything OP", "zap")
-		OPBox:AddToggle("AutoFarmOP", {
-			Text = "Auto Farm Everything OP",
-			Default = false,
-			Tooltip = N.OPWarning .. " It can sell pets and eggs, fuse spare pets and spend your cash on upgrades",
-			Callback = function(value)
-				if N.opSetting or N.farmSwitching then
-					return
-				end
-				if value then
-					N.opSetting = true
-					Toggles.AutoFarmOP:SetValue(false)
-					N.opSetting = false
-					N.confirmOP(function()
-						N.startOP("confirmed")
-					end)
-				else
-					switchOff(N.OPOn)
-					log("OP off")
-					N.saveOPFlag()
-				end
-			end,
-		})
-		OPBox:AddToggle("RememberAutoOP", {
-			Text = "Remember Auto OP",
-			Default = false,
-			Tooltip = "Off: OP always starts off, saved configs never switch it on. On: OP comes back on by itself next time you start the hub. " .. N.OPWarning,
-			Callback = function()
-				N.saveOPFlag()
-			end,
-		})
-		OPBox:AddLabel({
-			Text = '<font color="#ff7846"><b>Ban risk:</b> ' .. N.OPWarning .. '</font>\n<font transparency="0.3">OP sells surplus pets and eggs, fuses spare pets and spends cash on pen tiers, treadmills and trails. With Remember Auto OP on it also does that right after you join, without asking.</font>',
-			DoesWrap = true,
-		})
-		Labels.OP = OPBox:AddLabel({ Text = "-", DoesWrap = true })
-		local ExcludeBox = Tabs.AutoOP:AddRightGroupbox("Exclude from OP", "shield")
-		N.ExcludeFixed = { "Mutated pets", "Event pets", "Big pets (size 3+)", "Fusing", "Upgrades (keep cash)" }
-		local values = table.clone(N.ExcludeFixed)
-		for _, rarity in ipairs(N.RarityOrder) do
-			table.insert(values, rarity)
-		end
-		local default = { "Mutated pets", "Event pets", "Big pets (size 3+)" }
-		local secret = table.find(N.RarityOrder, "Secret")
-		for i = secret or math.max(#N.RarityOrder - 2, 1), #N.RarityOrder do
-			table.insert(default, N.RarityOrder[i])
-		end
-		ExcludeBox:AddDropdown("ExcludeOP", {
-			Text = "OP never sells, fuses or uses",
-			Values = values,
-			Default = default,
-			Multi = true,
-			AllowNull = true,
-			Searchable = true,
-			Tooltip = "Pets and eggs of these rarities, mutated, event (not from field eggs) or size 3+ pets are never sold or fused by OP. Fusing = OP never fuses. Upgrades = OP never spends cash",
-		})
-		ExcludeBox:AddLabel({
-			Text = '<font transparency="0.35">Equipped, favourite and protected pets (Items tab) are always kept, in every mode. This list only adds to that while OP runs.</font>',
-			DoesWrap = true,
-		})
-		Labels.Exclude = ExcludeBox:AddLabel({ Text = "-", DoesWrap = true })
-	end
-	do
 		local StealBox = Tabs.Eggs:AddLeftGroupbox("Steal", "egg")
+		StealBox:AddToggle("AutoSteal", {
+			Text = "Steal Eggs",
+			Default = false,
+			Tooltip = "Steals the best egg in the areas your speed can escape from and brings it home",
+		})
 		StealBox:AddDropdown("AreaPick", {
 			Text = "Areas (none = best I can escape)",
 			Values = N.World.areaLabels,
@@ -35408,19 +35312,19 @@ do
 		end
 		return have, total
 	end
-	-- Remember Auto OP: the config never stores AutoFarmOP (ignored in SaveManager). With "Remember Auto OP" on,
-	-- the OP state is kept in its own file and switched on again at the next start.
+	-- Remember Auto Farm Everything: the config never stores AutoFarmBest (ignored in SaveManager). With "Remember" on,
+	-- the state is kept in its own file and switched on again at the next start.
 	N.OPFlag = "Corvus/SAE_op_" .. tostring(LocalPlayer.UserId) .. ".txt"
 	function N.saveOPFlag()
 		pcall(function()
 			if makefolder and isfolder and not isfolder("Corvus") then
 				makefolder("Corvus")
 			end
-			writefile(N.OPFlag, if on("RememberAutoOP") and on("AutoFarmOP") then "on" else "off")
+			writefile(N.OPFlag, if on("RememberAutoFarm") and on("AutoFarmBest") then "on" else "off")
 		end)
 	end
 	function N.restoreOP()
-		if not on("RememberAutoOP") or on("AutoFarmOP") or on("AutoFarmBest") then
+		if not on("RememberAutoFarm") or on("AutoFarmBest") then
 			return false
 		end
 		local ok, text = pcall(readfile, N.OPFlag)
@@ -35594,7 +35498,7 @@ do
 				Session.sold,
 				Session.bought
 			),
-			"Status: " .. tostring(Status) .. "  |  mode " .. N.farmMode() .. "  |  OP exclude: " .. table.concat(picked(Options.ExcludeOP), ",") .. "  |  fused " .. Session.fused .. ", locked " .. Session.favorited,
+			"Status: " .. tostring(Status) .. "  |  mode " .. N.farmMode() .. "  |  exclude: " .. table.concat(picked(Options.ExcludeFarm), ",") .. "  |  fused " .. Session.fused .. ", locked " .. Session.favorited,
 			"Running: " .. table.concat(Debug.running(), ", "),
 			string.format(
 				"Game: cash %s, income %s/s, speed %s, pen tier %d (%d slots), treadmill %d, trail %s, top area %s",
@@ -35619,7 +35523,6 @@ do
 end
 N.AllAutoToggles = {
 	"AutoFarmBest",
-	"AutoFarmOP",
 	"AutoSteal",
 	"AutoPlaceEggs",
 	"AutoHatch",
@@ -36224,8 +36127,7 @@ do
 	end
 	if Library.AddCommand then
 		pcall(function()
-			toggleCommand("farmall", { "farmbest", "all", "everything", "bestfarm", "fa", "afe" }, { "AutoFarmBest" }, "Auto Farm Everything")
-			toggleCommand("farmop", { "op" }, { "AutoFarmOP" }, "Auto Farm Everything OP (asks to confirm)")
+			toggleCommand("farmall", { "farmbest", "all", "everything", "bestfarm", "fa", "afe", "op" }, { "AutoFarmBest" }, "Auto Farm Everything (asks to confirm)")
 			toggleCommand("steal", { "eggs", "farm" }, { "AutoSteal" }, "Steal Eggs")
 			toggleCommand("train", { "treadmill" }, { "AutoTrain" }, "Auto Train")
 			toggleCommand("hatch", { "place" }, { "AutoPlaceEggs", "AutoHatch" }, "Place and hatch eggs")
@@ -36374,8 +36276,7 @@ do
 					Required = true,
 					Default = { "farm" },
 						Choices = {
-							{ Id = "farm", Title = "Auto Farm Everything", Description = "One switch for the toggles you pick under Farm Everything includes (safe ones by default, nothing sold or bought)", Icon = "sparkles", Color = "#60d696" },
-							{ Id = "op", Title = "Auto Farm Everything OP", Description = "Full automatic: the planner steals, trains, buys upgrades, fuses and sells surplus pets for max profit. Keeps your Exclude list. Asks you to confirm", Icon = "zap", Color = "#ff5d8f" },
+							{ Id = "farm", Title = "Auto Farm Everything", Description = "Full automatic: the planner steals, trains, buys upgrades, fuses and sells surplus pets for max profit. Keeps your Exclude list. Asks you to confirm", Icon = "sparkles", Color = "#60d696" },
 							{ Id = "eggs", Title = "Steal eggs", Description = "Steals the best egg in the areas your speed can escape and brings it home", Icon = "egg", Color = "#fab428" },
 							{ Id = "hatch", Title = "Place and hatch", Description = "Puts eggs on your plot, hatches them and equips the best pets", Icon = "layout-grid", Color = "#c77dff" },
 							{ Id = "train", Title = "Train speed", Description = "Uses your treadmill, speed opens new areas", Icon = "footprints", Color = "#5fb8ff" },
@@ -36401,9 +36302,6 @@ do
 				local chosen = type(values.tasks) == "table" and values.tasks or {}
 				if chosen.farm then
 					setToggles({ "AutoFarmBest" }, { "on" })
-				elseif chosen.op then
-					-- shows the confirmation card, the toggle stays off until the player confirms
-					setToggles({ "AutoFarmOP" }, { "on" })
 				end
 					local groups = {
 						eggs = { "AutoSteal" },
@@ -36413,7 +36311,7 @@ do
 						rewards = { "AutoIndex", "AutoOffline", "AutoQuests", "AutoBossMastery" },
 						protect = { "AutoFavorite" },
 				}
-				for id, names in pairs(if chosen.farm or chosen.op then {} else groups) do
+				for id, names in pairs(if chosen.farm then {} else groups) do
 					setToggles(names, { if chosen[id] then "on" else "off" })
 				end
 				if values.safe == "on" or values.safe == "off" then
@@ -36436,9 +36334,9 @@ if Window.AddSettingsTab then
 		Folder = "StealAnEgg",
 		MenuKeybind = "RightControl",
 	})
-	-- Configs never store Auto Farm Everything OP (Remember Auto OP in the Auto OP tab keeps it on purpose).
+	-- Configs never store Auto Farm Everything (Remember Auto Farm Everything on the Main tab keeps it on purpose).
 	pcall(function()
-		SaveManager:SetIgnoreIndexes({ "AutoFarmOP" })
+		SaveManager:SetIgnoreIndexes({ "AutoFarmBest" })
 	end)
 	if ok and tab then
 		Tabs.Settings = tab
@@ -36451,7 +36349,7 @@ else
 		ThemeManager:SetLibrary(Library)
 		SaveManager:SetLibrary(Library)
 		SaveManager:IgnoreThemeSettings()
-		SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoFarmOP" })
+		SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoFarmBest" })
 		ThemeManager:SetFolder("Corvus")
 		SaveManager:SetFolder("Corvus/StealAnEgg")
 		SaveManager:BuildConfigSection(Tabs.Settings)
@@ -36696,7 +36594,7 @@ do
 					equipped,
 					N.capacity(),
 					N.farmMode()
-				) .. "\n" .. tostring(N.Plan.summary or "")
+				)
 				local best, score = N.chooseEgg()
 				I.eggs = if best
 					then string.format("Next egg: <b>%s %s</b> $%s/s in %s", best.rarity, N.displayName(best.category), formatNumber(best.value), best.area)
@@ -36732,7 +36630,7 @@ do
 					formatNumber(N.Plan.trailMult(trail)),
 					if N.Train.startedAt then '<font color="#60d696">Training now</font>' else "Plan: " .. tostring(N.Plan.activity)
 				)
-				local shopLines = { tostring(N.Plan.summary or "") }
+				local shopLines = {}
 				local cost = N.baseCost(N.baseLevel() + 1)
 				table.insert(shopLines, if cost then "Next pen tier $" .. formatNumber(cost) else "Pen is maxed")
 				local nextTread = N.Plan.treadmills()[N.treadmillLevel() + 1]
@@ -36749,21 +36647,6 @@ do
 					formatNumber(Session.soldCash)
 				)
 				local plan = N.Plan
-				I.doing = string.format(
-					"Doing: <b>%s</b>%s\nSafe Mode <b>%s</b>  \u{00B7}  %s",
-					if plan.activity == "train" then "train to " .. formatNumber(plan.trainTarget or 0) .. " speed" else "farm " .. tostring(plan.base and plan.base.area or "-"),
-					if plan.pick then "  \u{00B7}  next buy " .. plan.pick.label else "",
-					if N.safeMode() then "on" else '<font color="#ff6b6b">off</font>',
-					tostring(plan.summary or "")
-				)
-				local excluded = picked(Options.ExcludeOP)
-				I.op = string.format(
-					"OP is <b>%s</b>%s  \u{00B7}  remember <b>%s</b>",
-					if N.isOP() then '<font color="#60d696">on</font>' else "off",
-					if N.isOP() then "  \u{00B7}  " .. tostring(plan.summary or "") else "",
-					if on("RememberAutoOP") then "on" else "off"
-				)
-				I.exclude = if #excluded > 0 then "Never touched by OP: <b>" .. table.concat(excluded, ", ") .. "</b>" else '<font color="#fab428">Nothing excluded: OP may sell or fuse any spare pet</font>'
 				local planRows = {}
 				for i, option in ipairs(plan.valid or {}) do
 					if i > 6 then
@@ -36779,6 +36662,43 @@ do
 					Session.fused,
 					N.Fuse.last
 				)
+				-- "Up next": the planner's next steps in plain words (the raw PLAN stays in the log)
+				if on("AutoFarmBest") then
+					local ups = {}
+					local function add(text)
+						if #ups < 5 then
+							table.insert(ups, "\u{2022} " .. text)
+						end
+					end
+					if plan.activity == "train" and plan.trainTarget then
+						add("Train to " .. formatNumber(plan.trainTarget) .. " speed")
+					elseif best then
+						add(string.format("Steal %s %s egg in %s", best.rarity, N.displayName(best.category), best.area))
+					end
+					local room = N.maxPlaced() - placed
+					if #eggs - placed > 0 and room > 0 then
+						local n = math.min(#eggs - placed, room)
+						add("Place " .. n .. (if n == 1 then " egg" else " eggs"))
+					end
+					if placed > 0 then
+						add("Hatch when grown")
+					end
+					if plan.activity == "train" and best then
+						add(string.format("Steal %s %s egg in %s", best.rarity, N.displayName(best.category), best.area))
+					end
+					if plan.pick then
+						add("Buy " .. tostring(plan.pick.label))
+					end
+					if fusePlan then
+						add("Fuse 3 " .. N.displayName(fusePlan.category))
+					end
+					if #assets + #sellEggs > 0 then
+						add("Sell " .. (#assets + #sellEggs) .. " spare items")
+					end
+					I.upnext = if #ups > 0 then table.concat(ups, "\n") else '<font transparency="0.4">Waiting for the next egg or reset</font>'
+				else
+					I.upnext = '<font transparency="0.4">Turn on Auto Farm Everything to see the plan</font>'
+				end
 				local have, total = N.indexProgress()
 				local bestPet = pets[1]
 				I.pets = string.format(
@@ -36839,13 +36759,7 @@ do
 					group(function()
 						Labels.Status:SetText(Status)
 						Labels.Info:SetText(I.info or "-")
-						Labels.Doing:SetText(I.doing or "-")
-					end)
-				end
-				if shown(Tabs.AutoOP) then
-					group(function()
-						Labels.OP:SetText(I.op or "-")
-						Labels.Exclude:SetText(I.exclude or "-")
+						Labels.UpNext:SetText(I.upnext or "-")
 					end)
 				end
 				if shown(Tabs.Webhook) and Labels.Card then
@@ -36864,6 +36778,8 @@ do
 						Labels.Plot:SetText(I.plot or "-")
 						Labels.Pen:SetText(I.pen or "-")
 						Labels.Train:SetText(I.train or "-")
+						Labels.Shop:SetText(I.shop or "-")
+						Labels.Plan:SetText(I.plan or "-")
 					end)
 				end
 				if shown(Tabs.Items) then
@@ -36871,12 +36787,6 @@ do
 						Labels.Sell:SetText(I.sell or "-")
 						Labels.Fuse:SetText(I.fuse or "-")
 						Labels.Pets:SetText(I.pets or "-")
-					end)
-				end
-				if shown(Tabs.Upgrades) then
-					group(function()
-						Labels.Shop:SetText(I.shop or "-")
-						Labels.Plan:SetText(I.plan or "-")
 					end)
 				end
 				if shown(Tabs.Rewards) then
@@ -36961,7 +36871,7 @@ do
 			5
 		)
 	end
-	-- Remember Auto OP: switched on again only after the config autoload ran (AutoFarmOP itself is never in a config).
+	-- Remember Auto Farm Everything: switched on again only after the config autoload ran (AutoFarmBest itself is never in a config).
 	task.delay(4, function()
 		if alive() then
 			pcall(N.restoreOP)
