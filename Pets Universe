@@ -1,3 +1,5 @@
+-- Whole hub in xpcall: a start error is shown, copied and kept for the loader's error report
+local CorvusBootOk, CorvusBootError = xpcall(function()
     local Boot = getgenv()
     if Boot.CorvusBooting and os.clock() - Boot.CorvusBooting < 90 then
     	return
@@ -43229,3 +43231,19 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	pcall(Auto.openWizard)
     end)
     Boot.CorvusBooting = nil
+end, debug.traceback)
+if not CorvusBootOk then
+	local report = "[Corvus] Pets Universe failed to start:\n" .. tostring(CorvusBootError)
+	warn(report)
+	local env = getgenv()
+	env.CorvusBooting = nil
+	env.CorvusLastError = report
+	local copied = pcall(setclipboard, report)
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("SendNotification", {
+			Title = "Corvus error",
+			Text = if copied then "Hub failed to start. The error is copied, paste it to Cinek." else "Hub failed to start. Press F9 and send the red [Corvus] line.",
+			Duration = 20,
+		})
+	end)
+end
