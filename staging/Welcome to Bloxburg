@@ -27279,6 +27279,7 @@ end
                     "CorvusConfigList",
                     "CorvusShareCode",
                     "CorvusAutoSave",
+                    "FarmAll",
                 })
                 SaveManager:SetFolder(Folder)
                 if Info.SubFolder then
@@ -32092,11 +32093,66 @@ do
 					end
 				end
 				log("HAIR customers=" .. npcs, "seated=" .. seated, "stations=" .. #stations, table.concat(parts, " "))
+				-- stuck: customers wait in the shop but none sits for 2 min while the moods are fine -> details for the fix
+				N.Hair.waitSince = N.Hair.waitSince or os.clock()
+				local values = N.moods and N.moods()
+				local low = false
+				for _, v in pairs(values or {}) do
+					low = low or v <= 50
+				end
+				if seated == 0 and npcs > 0 and not low and os.clock() - N.Hair.waitSince >= 120 and os.clock() - (N.Hair.stuckLogAt or -1e9) >= 120 then
+					N.Hair.stuckLogAt = os.clock()
+					local info = {}
+					for i, child in ipairs(spawned and spawned:GetChildren() or {}) do
+						if child.Name == "StylezHairStudioCustomer" and #info < 3 then
+							local hum = child:FindFirstChildOfClass("Humanoid")
+							local hrp = child:FindFirstChild("HumanoidRootPart")
+							local kids = {}
+							for _, k in ipairs(child:GetChildren()) do
+								if not k:IsA("BasePart") and not k:IsA("Accessory") then
+									table.insert(kids, k.Name)
+								end
+							end
+							table.insert(info, string.format("npc%d pos=%s sit=%s state=%s attrs=%s kids=%s", i, brief(hrp and hrp.Position), tostring(hum and hum.Sit), tostring(hum and hum:GetState()), brief(child:GetAttributes()), table.concat(kids, ",")))
+						end
+					end
+					log("HAIR stuck", math.floor(os.clock() - N.Hair.waitSince), "s seated=0 with moods over 50%", "me", brief(root.Position), "claimed", tostring(N.Hair.claimed and N.Hair.claimed.Name), table.concat(info, " | "))
+				end
+			end
+			-- Customers sit at a chair a hairdresser has taken: stand at the nearest free station (within the 7.9 studs
+			-- the game's ShiftLoop checks) and send UseWorkstation (the packet the style arrows send) so InUse = you.
+			local root2 = N.root()
+			local claim, claimDist
+			for _, station in ipairs(N.hairStations()) do
+				local use = station:FindFirstChild("InUse")
+				local free = not (use and use.Value and use.Value ~= LocalPlayer)
+				local pos = free and stationPos(station)
+				if pos and root2 then
+					local d = (pos - root2.Position).Magnitude
+					if not claimDist or d < claimDist then
+						claim, claimDist = station, d
+					end
+				end
+			end
+			if claim then
+				if claimDist > 5 then
+					N.walkTo(stationPos(claim), 4, 8)
+				end
+				local use = claim:FindFirstChild("InUse")
+				if (not use or use.Value ~= LocalPlayer) and os.clock() - (N.Hair.claimAt or -1e9) >= 20 then
+					N.Hair.claimAt = os.clock()
+					N.Hair.claimed = claim
+					N.jobFire({ Type = "UseWorkstation", Workstation = claim })
+					task.delay(1, function()
+						log("HAIR claim", claim.Name, "inUse=" .. tostring(use and use.Value), "dist", math.floor(claimDist))
+					end)
+				end
 			end
 			setStatus(string.format("Hairdresser: waiting for customers (%d done, %d correct)", Session.done, Session.correct))
 			task.wait(0.3)
 			return
 		end
+		N.Hair.waitSince = nil
 		table.sort(list, function(a, b)
 			return a.dist < b.dist
 		end)
@@ -32794,6 +32850,124 @@ do
 		end
 		log("BUILD done", name, "placed", done, "failed", failed, "stopped", tostring(stopped))
 		notify("Corvus", N.Build.status, 6)
+	end
+
+	-- Auto Needs (Auto Farm Everything only): buys ONE item for a missing need and places it on YOUR plot with the
+	-- normal build packets (EnterBuild, PlaceObject {Name, Pos, Rot, TargetModel}, ExitBuild), paid with your money.
+	-- Spot: a free floor point near you or near your furniture (5+ studs from every object, 2.5+ from walls, same
+	-- floor height); the server checks each spot like a manual place, a refused spot just moves on (max 10 tries).
+	local CollectionService = game:GetService("CollectionService")
+	local function plotParts(plot)
+		local list = {}
+		for _, d in ipairs(plot:GetDescendants()) do
+			if d:IsA("BasePart") and CollectionService:HasTag(d, "PlotObject") then
+				table.insert(list, d)
+			end
+		end
+		return list
+	end
+	local function wallDist(house, pos)
+		local walls = house and house:FindFirstChild("Walls")
+		local best = math.huge
+		for _, wall in ipairs(walls and walls:GetChildren() or {}) do
+			local a, b = poleOf(wall, "FPole"), poleOf(wall, "BPole")
+			if a and b then
+				local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+				local ap = Vector3.new(pos.X - a.X, 0, pos.Z - a.Z)
+				local t = math.clamp(ap:Dot(ab) / math.max(ab:Dot(ab), 1e-6), 0, 1)
+				best = math.min(best, (ap - ab * t).Magnitude)
+			end
+		end
+		return best
+	end
+	function N.buyPlace(itemName, price)
+		local plot, ground = N.myPlot()
+		local root = N.root()
+		if not (plot and ground and root) then
+			return false, "your plot was not found"
+		end
+		if N.plotAt(root.Position) ~= plot then
+			return false, "not on your plot"
+		end
+		if N.money() < price then
+			return false, "not enough money"
+		end
+		local house = plot:FindFirstChild("House")
+		local objects = plotParts(plot)
+		local anchors = { root.Position }
+		for _, part in ipairs(objects) do
+			if #anchors >= 7 then
+				break
+			end
+			if math.abs(part.Position.Y - root.Position.Y) < 6 then
+				table.insert(anchors, part.Position)
+			end
+		end
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Include
+		params.FilterDescendantsInstances = { plot }
+		local spots = {}
+		for _, anchor in ipairs(anchors) do
+			for _, radius in ipairs({ 6, 9, 13 }) do
+				for i = 0, 7 do
+					local angle = i * math.pi / 4
+					local probe = anchor + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+					local hit = workspace:Raycast(probe + Vector3.new(0, 4, 0), Vector3.new(0, -10, 0), params)
+					if hit and math.abs(hit.Position.Y - anchor.Y) < 3 then
+						local free = wallDist(house, hit.Position) >= 2.5
+						for _, part in ipairs(objects) do
+							if not free then
+								break
+							end
+							local d = Vector3.new(part.Position.X - hit.Position.X, 0, part.Position.Z - hit.Position.Z).Magnitude
+							if d < 5 and math.abs(part.Position.Y - hit.Position.Y) < 6 then
+								free = false
+							end
+						end
+						local target = free and surfaceAt(plot, house, hit.Position)
+						local onObject = target and target.Parent and (target.Parent.Name == "Objects" or target.Parent.Name == "Counters")
+						if target and not onObject then
+							table.insert(spots, { pos = hit.Position, target = target })
+						end
+					end
+				end
+			end
+			if #spots >= 10 then
+				break
+			end
+		end
+		if #spots == 0 then
+			return false, "no free floor spot found near you or your furniture"
+		end
+		N.taxiRelease()
+		N.bbLeave()
+		N.cookLeave()
+		N.endShift()
+		local entered, enterResult = N.buildInvoke({ Type = "EnterBuild", Plot = plot })
+		log("NEEDS buy enter build", tostring(entered), brief(enterResult))
+		task.wait(1)
+		local before = N.money()
+		local placed, last = false, "refused"
+		for i = 1, math.min(#spots, 10) do
+			local spot = spots[i]
+			local ok, result, extra = N.buildInvoke({ Type = "PlaceObject", Name = itemName, Pos = spot.pos, Rot = 0, TargetModel = spot.target })
+			log("NEEDS buy try", i, itemName, "at", brief(spot.pos), "on", brief(spot.target), "->", tostring(ok), brief(result), brief(extra))
+			if ok and result then
+				placed = true
+				break
+			end
+			last = brief(result)
+			task.wait(placeDelay())
+		end
+		task.wait(1)
+		N.buildExit()
+		task.wait(1.5)
+		local spent = before - N.money()
+		if placed then
+			log("NEEDS bought", itemName, "$" .. price, "money spent", spent)
+			return true
+		end
+		return false, "the game refused " .. math.min(#spots, 10) .. " spots (last answer " .. tostring(last) .. ")"
 	end
 end
 -- Ben's Ice Cream: TakeIceCreamCup at Interior.TableObjects.IceCreamCups, AddIceCreamScoop {Taste, Ball = cup.Ball1 /
@@ -33602,6 +33776,36 @@ do
 			return eff.Value, eff:GetAttribute("ToolTipIndex")
 		end)
 		return tonumber(value), tip
+	end
+	-- The reason in words: the game's own tooltip text "T_EfficiencyTooltipText<index>" (the client shows it on the
+	-- efficiency circle, JobHandler line 396; the strings are not in the dump, so they are read live). needs = the
+	-- text talks about moods/needs, so restoring them comes before any work.
+	local ReasonCache = {}
+	local MoodWords = { "mood", "need", "hungry", "hunger", "tired", "energy", "sleep", "hygiene", "fun", "bored", "stinky", "starving", "exhausted", "happy" }
+	function N.effReason(tip)
+		tip = tonumber(tip)
+		if not tip then
+			return "?", false
+		end
+		if ReasonCache[tip] == nil then
+			local jh = N.jobHandler()
+			local text = isolated(function()
+				return jh.Modules.TranslationHandler:Format(("T_EfficiencyTooltipText%d"):format(tip))
+			end)
+			text = if type(text) == "string" and text ~= "" then string.gsub(text, "<[^>]+>", "") else nil
+			ReasonCache[tip] = text or false
+		end
+		local text = ReasonCache[tip]
+		if not text then
+			return "reason " .. tip .. " (text unreadable)", false
+		end
+		local lower = string.lower(text)
+		for _, word in ipairs(MoodWords) do
+			if string.find(lower, word, 1, true) then
+				return text, true
+			end
+		end
+		return text, false
 	end
 end
 
@@ -35646,6 +35850,7 @@ N.Needs = {
 	fails = {},
 	backoff = {},
 	missingAt = {},
+	missingWhy = {},
 	model = { k = 0.15, n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0 },
 	active = false,
 	reason = nil,
@@ -35835,10 +36040,12 @@ do
 		end
 		local jh = N.jobHandler()
 		local root = N.root()
+		local tags = game:GetService("CollectionService")
 		local found = isolated(function()
 			local list = {}
+			-- placed items are Parts tagged PlotObject (dump: House.Objects."Standard Single Bed" [Part]), not Models
 			for _, model in ipairs(house:GetDescendants()) do
-				if model:IsA("Model") then
+				if model:IsA("BasePart") and tags:HasTag(model, "PlotObject") then
 					local ok, item = pcall(function()
 						return jh.Items:GetItemFromObject(model)
 					end)
@@ -35872,6 +36079,74 @@ do
 			end
 		end
 		return best
+	end
+
+	-- What a missing need costs to fix: the cheapest money item of that type (dump ReplicatedStorage.Items: "Old
+	-- Television" $220 Fun 3 (same Fun as "NYX VintageView TV" $400), "Standard Single Bed" $200 Comfort 5 (sleeps
+	-- 3.5/min vs "Old Mattress" $50 at 2.3/min), "Hygienic Shower" $340, "Icebox Fridge" $500). Checked live: the
+	-- item must exist, cost money (no Blockbux) and not be hidden or locked for you.
+	local BuyList = {
+		Energy = { { "Standard Single Bed", 200 } },
+		Hygiene = { { "Hygienic Shower", 340 } },
+		Fun = { { "Old Television", 220 }, { "NYX VintageView TV", 400 } },
+		Hunger = { { "Icebox Fridge", 500 } },
+	}
+	local NeedThing = { Energy = "a bed", Hygiene = "a shower", Fun = "a TV", Hunger = "a fridge" }
+	local BuyCache = {}
+	local function buyChoice(need)
+		if BuyCache[need] ~= nil then
+			return BuyCache[need] or nil
+		end
+		local jh = N.jobHandler()
+		local pick
+		for _, entry in ipairs(BuyList[need]) do
+			local info = isolated(function()
+				local item = jh.Items:GetItem(entry[1])
+				if type(item) ~= "table" then
+					return nil
+				end
+				local okH, hidden = pcall(item.IsHidden, item, LocalPlayer)
+				local okL, locked = pcall(item.IsLocked, item, LocalPlayer)
+				return { price = tonumber(item.Price), bs = item.BSPrice or item.ECPrice, hidden = okH and hidden, locked = okL and locked }
+			end)
+			if type(info) == "table" and info.price and not info.bs and not info.hidden and not info.locked then
+				pick = { name = entry[1], price = info.price }
+				break
+			end
+		end
+		-- item data unreadable: keep the dump's first choice so the plan still names it
+		BuyCache[need] = pick or false
+		return pick or { name = BuyList[need][1][1], price = BuyList[need][1][2], guess = true }
+	end
+	-- Buying is part of Auto Farm Everything (never in the manual mode): returns ok and the blocker in words.
+	local function buyOk(need)
+		local choice = buyChoice(need)
+		if not on("AutoFarmBest") then
+			return false, choice, "turn on Auto Farm Everything to buy " .. choice.name .. " $" .. choice.price .. ", or place " .. NeedThing[need] .. " yourself"
+		end
+		if N.excluded and N.excluded("Building", "no " .. choice.name .. " bought for " .. need) then
+			return false, choice, "Building is excluded, place " .. NeedThing[need] .. " yourself"
+		end
+		local reserve = (N.reserve and N.reserve()) or 0
+		if N.money() < choice.price + reserve then
+			return false, choice, "money $" .. N.money() .. " under " .. choice.name .. " $" .. choice.price .. " + reserve $" .. reserve
+		end
+		return true, choice
+	end
+	-- what this plot has per need, scanned at most every 2 min (also outside trips, so the plan can name blockers)
+	local function plotHas()
+		if os.clock() - (Q.haveAt or -1e9) < 120 and Q.have then
+			return Q.have
+		end
+		local have = {}
+		local plot = N.myPlot()
+		if plot and plot:FindFirstChild("House") then
+			for _, o in ipairs(plotObjects()) do
+				have[o.need] = true
+			end
+			Q.have, Q.haveAt = have, os.clock()
+		end
+		return Q.have or have
 	end
 
 	-- The interaction list the game's menu would show for this object: index i and raw title of each button.
@@ -36166,13 +36441,36 @@ do
 		local k = Q.model.k
 		local need, floorHit, gain, cost, lines = {}, nil, 0, 0, {}
 		local lowest, lowestV = nil, 101
+		-- what blocks each need, in plain words (nil = it can be restored, maybe after buying the object)
+		local have = plotHas()
+		local haveKnown = Q.have ~= nil -- only after a real scan of your house (not while it is still loading)
+		local blockers, buying = {}, {}
+		local function blockOf(name)
+			local back = Q.backoff[name]
+			if back and now - back < 900 then
+				return string.format("3 restores failed, retry in %dm", math.ceil((900 - (now - back)) / 60))
+			end
+			if name == "Hunger" and not (N.spendOk and N.spendOk()) then
+				return "quick meals cost money: turn on Auto Farm Everything (or Buy quick meals)"
+			end
+			if haveKnown and not have[name] then
+				local failAt = Q.missingAt[name]
+				if failAt and now - failAt < 900 then
+					return string.format("%s, retry in %dm", Q.missingWhy[name] or "could not place one", math.ceil((900 - (now - failAt)) / 60))
+				end
+				local ok, choice, why = buyOk(name)
+				if not ok then
+					return why
+				end
+				buying[name] = "buying " .. choice.name .. " $" .. choice.price
+			end
+			return nil
+		end
 		for _, name in ipairs(Q.names) do
 			local v = values[name]
-			-- a need the plot cannot restore (nothing placed, or 3 failures) does not start trips for 15 min
-			local blocked = now - (Q.missingAt[name] or -1e9) < 900 or now - (Q.backoff[name] or -1e9) < 900
-			-- food costs money: only with Buy quick meals on, or Auto Farm Everything OP
-			if name == "Hunger" and not (N.spendOk and N.spendOk()) then
-				blocked = true
+			local blocked = v and blockOf(name)
+			if blocked then
+				blockers[name] = blocked
 			end
 			if v and not blocked then
 				if v < lowestV then
@@ -36190,34 +36488,55 @@ do
 					table.insert(need, name)
 					gain += lossPerHour * HORIZON_H
 					cost += R * eff * seconds / 3600 + price
-					table.insert(lines, string.format("NEEDS plan %s cost=%ds lossPerHour=$%d value=%d%% decay=%.3f/min", name, math.floor(seconds), math.floor(lossPerHour), v, d))
+					table.insert(lines, string.format("NEEDS plan %s cost=%ds lossPerHour=$%d value=%d%% decay=%.3f/min%s", name, math.floor(seconds), math.floor(lossPerHour), v, d, if buying[name] then " (" .. buying[name] .. ")" else ""))
 				end
 			end
 		end
+		-- the Up next line: the lowest mood under the floor that is blocked or needs a purchase, named in words
+		local blockerName, blockerV = nil, 101
+		for _, name in ipairs(Q.names) do
+			local v = values[name]
+			if v and v <= math.max(floorPct, 25) and (blockers[name] or buying[name]) and v < blockerV then
+				blockerName, blockerV = name, v
+			end
+		end
+		if blockerName then
+			Q.blocker = string.format("Need %s (%s %d%%): %s", NeedThing[blockerName], blockerName, blockerV, blockers[blockerName] or buying[blockerName])
+		else
+			Q.blocker = nil
+		end
+		-- the game's own efficiency reason: when it is about moods, restoring them comes before any work
+		local effWhy, effNeeds = N.effReason(select(2, N.efficiency()))
 		if #need == 0 then
 			local why = {}
 			for _, name in ipairs(Q.names) do
 				if values[name] then
-					local blocked = now - (Q.missingAt[name] or -1e9) < 900 or now - (Q.backoff[name] or -1e9) < 900 or (name == "Hunger" and not (N.spendOk and N.spendOk()))
-					table.insert(why, name .. "=" .. math.floor(values[name]) .. (if blocked then " (skipped: no object/backoff/no food money)" else ""))
+					table.insert(why, name .. "=" .. math.floor(values[name]) .. (if blockers[name] then " (blocked: " .. blockers[name] .. ")" else ""))
 				end
 			end
-			say("nothing to restore", table.concat(why, " "), "eff", tostring(effRaw))
+			if Q.blocker then
+				say(Q.blocker, "| " .. table.concat(why, " "), "eff", tostring(effRaw), "'" .. effWhy .. "'")
+			else
+				say("all moods fine", table.concat(why, " "), "eff", tostring(effRaw))
+			end
 			return nil
 		end
 		cost += R * eff * Q.travel / 3600
-		local effHit = (eff < effFloor or effZero) and lowestV < 60
+		local effHit = (eff < effFloor or effZero) and (lowestV < 60 or effNeeds)
 		Q.plan = need
 		Q.text = string.format("%s low (%d%%), trip worth $%d vs cost $%d", lowest, lowestV, math.floor(gain), math.floor(cost))
+		if Q.blocker then
+			Q.text = Q.blocker .. "\n" .. Q.text
+		end
 		local reason
 		if floorHit then
 			reason = "floor " .. floorHit .. " " .. math.floor(values[floorHit]) .. "%"
 		elseif effHit then
-			reason = string.format("efficiency %.2f < %.2f", eff, effFloor)
+			reason = string.format("efficiency %.2f < %.2f '%s'", if effZero then 0 else eff, effFloor, effWhy)
 		elseif gain > cost then
 			reason = string.format("profit: loss $%d/%dh > cost $%d", math.floor(gain), HORIZON_H, math.floor(cost))
 		end
-		if reason and now - Q.tripAt < 300 and not floorHit then
+		if reason and now - Q.tripAt < 300 and not floorHit and not (effHit and effNeeds) then
 			log("NEEDS plan", "trip held back, last trip under 5 min ago:", reason)
 			reason = nil
 		elseif not reason then
@@ -36307,13 +36626,33 @@ do
 				end
 				if v and v < limit and os.clock() - (Q.backoff[need] or -1e9) > 900 and (need ~= "Hunger" or (N.spendOk and N.spendOk())) then
 					local object = bestObject(objects, need)
-					if not object then
-						if os.clock() - (Q.missingAt[need] or -1e9) > 900 then
-							Q.missingAt[need] = os.clock()
-							log("NEEDS missing", need, "no", table.concat(Types[need], "/"), "on your plot (cheapest: " .. ({ Energy = "Standard Single Bed $200", Hygiene = "Hygienic Shower $340", Fun = "NYX VintageView TV $400", Hunger = "Icebox Fridge $500" })[need] .. ")")
-							notify("Corvus", "Your plot has nothing for " .. need .. ". Place a cheap " .. ({ Energy = "bed", Hygiene = "shower", Fun = "TV", Hunger = "fridge" })[need] .. " so Auto Needs can keep your pay up.", 8)
+					if not object and os.clock() - (Q.missingAt[need] or -1e9) > 900 then
+						-- nothing on the plot: Auto Farm Everything buys and places the cheapest one, else name the blocker
+						local ok, choice, why = buyOk(need)
+						if ok then
+							log("NEEDS buy", choice.name, "$" .. choice.price, "for", need, "at", math.floor(v) .. "%", "money", N.money())
+							setStatus("Needs: buying " .. choice.name .. " $" .. choice.price)
+							local bought, err = N.buyPlace(choice.name, choice.price)
+							if bought then
+								Q.haveAt = -1e9
+								waitFor(function()
+									objects = plotObjects()
+									return bestObject(objects, need) ~= nil
+								end, 6)
+								object = bestObject(objects, need)
+								log("NEEDS buy done", choice.name, "found on plot", tostring(object ~= nil))
+							else
+								why = "could not place " .. choice.name .. ": " .. tostring(err)
+							end
 						end
-					else
+						if not object then
+							Q.missingAt[need] = os.clock()
+							Q.missingWhy[need] = why or ("no " .. NeedThing[need] .. " on your plot")
+							log("NEEDS missing", need, "no", table.concat(Types[need], "/"), "on your plot:", Q.missingWhy[need], "| retry in 15m")
+							notify("Corvus", "Need " .. NeedThing[need] .. " for " .. need .. ": " .. Q.missingWhy[need], 8)
+						end
+					end
+					if object then
 						local ok = restoreNeed(need, object, deadline)
 						if ok then
 							Q.fails[need] = 0
@@ -37608,7 +37947,8 @@ do
 					end
 					if N.currentJob() ~= "" then
 						local eff, tip = N.efficiency()
-						log("EFF", N.currentJob(), "efficiency", eff, "reason", tostring(tip), "level", N.Levels[N.currentJob()], "shift pay", N.shiftEarnings())
+						local why, needsRelated = N.effReason(tip)
+						log("EFF", N.currentJob(), "efficiency", eff, "reason", tostring(tip), "'" .. why .. "'", if needsRelated then "(needs)" else "", "level", N.Levels[N.currentJob()], "shift pay", N.shiftEarnings())
 					end
 				end
 				N.planTick()
@@ -37654,6 +37994,10 @@ do
 		end
 		if Q.active then
 			table.insert(lines, if Q.reason == "break" then "Now: break at home" else "Now: restoring needs at home")
+		end
+		-- a mood that cannot be restored is named first, with what blocks it ("Need a bed: buying ...")
+		if on("AutoNeeds") and Q.blocker and Q.blocker ~= "" then
+			table.insert(lines, Q.blocker)
 		end
 		local pick = optionText("JobPick", "Hairdresser")
 		if pick == "Best Pay (auto)" then
