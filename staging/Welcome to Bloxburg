@@ -5300,6 +5300,14 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         end
         local Url = if typeof(Code) == "string" and Code ~= "" then "https://discord.gg/" .. Code else Invite
 
+        local Copied = false
+        do
+            local Setter = setclipboard or toclipboard or (Clipboard and Clipboard.set)
+            if typeof(Setter) == "function" then
+                Copied = pcall(Setter, Url)
+            end
+        end
+
         local RequestFunction = GetRequestFunction()
         if typeof(RequestFunction) == "function" and typeof(Code) == "string" and Code ~= "" then
             for Port = 6463, 6472 do
@@ -5319,7 +5327,8 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 })
                 if Success and typeof(Response) == "table" then
                     local Status = tonumber(Response.StatusCode)
-                    if (Status and Status >= 200 and Status < 300) or Response.Success == true then
+                    local BodyText = tostring(Response.Body or "")
+                    if ((Status and Status >= 200 and Status < 300) or Response.Success == true) and not string.find(BodyText, '"evt":"ERROR"', 1, true) then
                         print("[Corvus] discord invite: rpc")
                         return true
                     end
@@ -5327,15 +5336,20 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             end
         end
 
-        local Opened = pcall(function()
+        -- OpenBrowserWindow is a silent no-op on most executors, so its result is never trusted
+        pcall(function()
             game:GetService("GuiService"):OpenBrowserWindow(Url)
         end)
-        if Opened then
-            print("[Corvus] discord invite: browser")
-            return true
-        end
 
-        Library:CopyToClipboard(Invite, "Invite copied")
+        if Copied then
+            Library:Notify({
+                Title = "Invite copied",
+                Description = "Paste it in your browser: " .. Url,
+                Time = 8,
+            })
+        else
+            Library:CopyToClipboard(Url, "Invite copied")
+        end
         print("[Corvus] discord invite: clipboard")
         return false
     end
@@ -11696,7 +11710,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                     return
                 end
     
-                Num = math.clamp(Num, Slider.Min, Slider.Max)
+                Num = math.clamp(Num, math.min(Slider.Min, Slider.Max), math.max(Slider.Min, Slider.Max))
     
                 Slider.Value = Num
                 Slider:Display()
@@ -21980,7 +21994,7 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         end
     
         function Window:SetSidebarWidth(Width)
-            Width = math.clamp(Width, 48, MainFrame.Size.X.Offset - WindowInfo.MinContainerWidth - 1)
+            Width = math.clamp(Width, 48, math.max(48, MainFrame.Size.X.Offset - WindowInfo.MinContainerWidth - 1))
     
             DividerLine.Position = UDim2.fromOffset(Width, 0)
     
@@ -32135,11 +32149,32 @@ do
 		end)
 		return if ok and type(value) == "string" then value else ""
 	end
-	-- Walks with the humanoid (Bloxburg does not like teleports), tries again a few times when stuck.
-	function N.walkTo(pos, near, timeout)
+	-- Roblox asset name of an image id (MarketplaceService:GetProductInfo, cached): the order icons of the jobs are
+	-- named after what they show ("HairAfro", "MeatPatty_Done_Icon", "Pomefrites_Menue_Icon").
+	N.AssetNames = {}
+	function N.assetName(image)
+		local id = tonumber(string.match(tostring(image or ""), "(%d+)"))
+		if not id then
+			return nil
+		end
+		local cached = N.AssetNames[id]
+		if cached ~= nil then
+			return cached or nil
+		end
+		local ok, info = pcall(function()
+			return game:GetService("MarketplaceService"):GetProductInfo(id, Enum.InfoType.Asset)
+		end)
+		local name = ok and type(info) == "table" and info.Name and tostring(info.Name) or false
+		N.AssetNames[id] = name
+		return name or nil
+	end
+	-- Walks with the humanoid straight to the point. When the straight line is blocked (counters, walls: owner
+	-- 2026-10-05 "it does not avoid obstacles") it switches to N.pathWalk (pathfinding, doors, short hops).
+	function N.walkTo(pos, near, timeout, straightOnly)
 		near = near or 3
 		local deadline = os.clock() + (timeout or 12)
 		local lastIssue, best, bestAt = -1e9, math.huge, os.clock()
+		local stuck = 0
 		while alive() and os.clock() < deadline do
 			local root, hum = N.root(), N.humanoid()
 			if not root or not hum or hum.Health <= 0 then
@@ -32153,6 +32188,11 @@ do
 			if flat < best - 0.3 then
 				best, bestAt = flat, os.clock()
 			elseif os.clock() - bestAt > 1.2 then
+				stuck += 1
+				if stuck >= 2 and not straightOnly and N.pathWalk then
+					log("WALK straight line blocked at", string.format("(%d,%d,%d)", root.Position.X, root.Position.Y, root.Position.Z), "dist", math.floor(flat), "-> pathfinding")
+					return N.pathWalk(pos, near, math.max(deadline - os.clock(), 6) + 6, nil, true)
+				end
 				hum.Jump = true
 				bestAt = os.clock()
 				lastIssue = -1e9
@@ -32300,7 +32340,23 @@ do
 		return if #info.text > 0 or #info.words > 0 then info else nil
 	end
 	N.bubbleOrder = bubbleOrder
-	N.HairLearn = { file = "Corvus/WTB_hair_icons.json", map = {}, wrong = {} }
+	-- order bubble style icon -> StylezHairAssets.Styles name. Source: the Roblox asset names of these image ids
+	-- (economy API, creator Coeptus): 2134784092 HairAfro, 2134784330 HairBun, 2134784513 HairCharming,
+	-- 2134784889 HairHeadband, 2134785130 HairLong, 2134785777 HairMessy, 2134785997 HairPigtails,
+	-- 2134786236 HairSideswept, 2134922767 HairCombed. Curly is resolved live by N.assetName.
+	local HairIcons = {
+		[2134784092] = "Afro",
+		[2134784330] = "Bun",
+		[2134784513] = "Charming",
+		[2134784889] = "Headband",
+		[2134785130] = "Long",
+		[2134785777] = "Messy",
+		[2134785997] = "Pigtails",
+		[2134786236] = "Sideswept",
+		[2134922767] = "Combed",
+	}
+	N.HairIcons = HairIcons
+	N.HairLearn ={ file = "Corvus/WTB_hair_icons.json", map = {}, wrong = {} }
 	pcall(function()
 		if isfile and isfile(N.HairLearn.file) then
 			local data = HttpService:JSONDecode(readfile(N.HairLearn.file))
@@ -32381,9 +32437,10 @@ do
 				end
 			end
 			local bestDiff = 0.06
+			local colorSource
 			for _, child in ipairs(colors and colors:GetChildren() or {}) do
 				if wordSet[child.Name] then
-					color = child.Name
+					color, colorSource = child.Name, "bubble word"
 					break
 				end
 				local ok, brick = pcall(function()
@@ -32394,19 +32451,58 @@ do
 						local diff = math.abs(c.R - brick.R) + math.abs(c.G - brick.G) + math.abs(c.B - brick.B)
 						if diff < bestDiff then
 							bestDiff, color = diff, child.Name
+							colorSource = string.format("tint %.2f", diff)
 						end
+					end
+				end
+			end
+			local source = if style then "bubble word" else nil
+			-- the style icon's asset id: the Roblox asset names are "Hair<Style>" (owner log 2026-10-05: 23 of 28
+			-- orders were wrong while the hub guessed styles by trial)
+			if not style then
+				for _, image in ipairs(order.images) do
+					local id = tonumber(string.match(tostring(image), "(%d+)"))
+					local s = id and HairIcons[id]
+					if s and (not styles or styles:FindFirstChild(s)) then
+						style, source = s, "icon " .. id
+						break
+					end
+				end
+			end
+			-- an icon we do not know yet (Curly, or a new style): ask Roblox for the asset's name
+			if not style and N.assetName then
+				for _, image in ipairs(order.images) do
+					local name = N.assetName(image)
+					local s = name and string.match(name, "^[Hh]air[_ ]?(%a+)")
+					if s and styles and styles:FindFirstChild(s) then
+						local id = tonumber(string.match(tostring(image), "(%d+)"))
+						if id then
+							HairIcons[id] = s
+						end
+						style, source = s, "asset name " .. name
+						break
 					end
 				end
 			end
 			if not style and color then
 				local key = styleKey(order)
 				style = N.HairLearn.map[key]
+				source = if style then "learned" else nil
 				if not style and key ~= "" then
-					local names = {}
+					local names, known = {}, {}
+					for _, s in pairs(HairIcons) do
+						known[s] = true
+					end
 					for _, child in ipairs(styles and styles:GetChildren() or {}) do
 						table.insert(names, child.Name)
 					end
-					table.sort(names)
+					-- styles without a known icon first (only Curly today)
+					table.sort(names, function(a, b)
+						if (known[a] == true) ~= (known[b] == true) then
+							return not known[a]
+						end
+						return a < b
+					end)
 					local wrong = N.HairLearn.wrong[key] or {}
 					for _, name in ipairs(names) do
 						if not wrong[name] then
@@ -32415,12 +32511,14 @@ do
 						end
 					end
 					if style then
+						source = "guess"
 						log("HAIR learning icon", key, "trying", style)
 					end
 				end
 				N.Hair.key = key
 			end
 			if style and color then
+				log("HAIR order " .. style .. "/" .. color .. " from icon", "style by " .. tostring(source), "color by " .. tostring(colorSource))
 				return style, color
 			end
 			if not N.Hair.dumped then
@@ -34679,18 +34777,64 @@ do
 		N.BB.imageMap = map
 		return map
 	end
+	-- The order icons are Roblox images named after what they show (asset names, owner log 2026-10-05:
+	-- 14358866788 MeatPatty_Done_Icon, 14358880695 SliceOfCheese_Icon, 14358886220 VeggiePatty_Done_Icon,
+	-- 14467423053 Pomefrites_Menue_Icon). Asset name -> the cashier's item word.
+	local IconWords = {
+		{ "meatpatty", "Meat Patty" },
+		{ "veggiepatty", "Plantbased Patty" },
+		{ "plantpatty", "Plantbased Patty" },
+		{ "plantbased", "Plantbased Patty" },
+		{ "onionring", "Onion Rings" },
+		{ "cheese", "Cheese" },
+		{ "lettuce", "Lettuce" },
+		{ "salad", "Lettuce" },
+		{ "tomato", "Tomato" },
+		{ "onion", "Onion" },
+		{ "pomefrites", "Fries" },
+		{ "frites", "Fries" },
+		{ "fries", "Fries" },
+		{ "mozzarella", "Mozarella Sticks" },
+		{ "mozarella", "Mozarella Sticks" },
+		{ "milkshake", "Vanilla Milkshake" },
+		{ "shake", "Vanilla Milkshake" },
+		{ "juice", "FruityFruit Juice" },
+		{ "fruity", "FruityFruit Juice" },
+		{ "fountain", "Fountain Drink" },
+		{ "soda", "Fountain Drink" },
+		{ "cola", "Fountain Drink" },
+		{ "small", "Small" },
+		{ "medium", "Medium" },
+		{ "large", "Large" },
+	}
+	local function iconWord(image)
+		local name = N.assetName and N.assetName(image)
+		if not name then
+			return nil, nil
+		end
+		local lower = string.lower(name)
+		for _, pair in ipairs(IconWords) do
+			if string.find(lower, pair[1], 1, true) then
+				return pair[2], name
+			end
+		end
+		return nil, name
+	end
+	N.bbIconWord = iconWord
 	-- every name a frame shows: instance names, texts, attributes and icons the cashier screen uses
 	local function frameWords(frame)
 		local words = {}
 		local map = imageMap()
-		local function add(text, count)
+		local function add(text, count, icon)
 			if type(text) == "string" and text ~= "" then
-				table.insert(words, { text = text, count = count or 1 })
+				table.insert(words, { text = text, count = count or 1, icon = icon })
 			end
 		end
 		for _, d in ipairs(frame:GetDescendants()) do
 			local count = 1
-			local label = d:FindFirstChildWhichIsA("TextLabel")
+			local isImage = d:IsA("ImageLabel") or d:IsA("ImageButton")
+			-- the amount ("x2") sits under the icon's Amount badge: search the whole icon
+			local label = d:FindFirstChildWhichIsA("TextLabel", isImage)
 			local n = label and tonumber(string.match(label.Text, "(%d+)"))
 			if n and n > 0 and n < 10 then
 				count = n
@@ -34699,8 +34843,9 @@ do
 			if d:IsA("TextLabel") then
 				add(d.Text)
 			end
-			if d:IsA("ImageLabel") or d:IsA("ImageButton") then
+			if isImage then
 				add(map[d.Image .. "|" .. tostring(d.ImageRectOffset)] or map[d.Image], count)
+				add((iconWord(d.Image)), count, true)
 			end
 			for key, value in pairs(d:GetAttributes()) do
 				add(tostring(value))
@@ -34778,7 +34923,18 @@ do
 		-- no 3D model: count the ingredient names the frame shows
 		local t = { 0, 0, 0, 0, 0, 2 }
 		local meat, plant = 0, 0
-		for _, w in ipairs(frameWords(frame)) do
+		local all = frameWords(frame)
+		-- the icons' asset names are exact: when any icon was recognised, count only those
+		local words = {}
+		for _, w in ipairs(all) do
+			if w.icon then
+				table.insert(words, w)
+			end
+		end
+		if #words == 0 then
+			words = all
+		end
+		for _, w in ipairs(words) do
 			local text = w.text
 			if string.find(text, "Meat Patty") then
 				meat += w.count
@@ -34816,6 +34972,10 @@ do
 				text ..= "='" .. inst.Text .. "'"
 			elseif inst:IsA("ImageLabel") or inst:IsA("ImageButton") then
 				text ..= "=" .. inst.Image .. "@" .. tostring(inst.ImageRectOffset)
+				local _, assetName = iconWord(inst.Image)
+				if assetName then
+					text ..= "~" .. assetName
+				end
 			end
 			local attrs = {}
 			for k, v in pairs(inst:GetAttributes()) do
@@ -35614,6 +35774,10 @@ do
 			if w.n >= 2 and entry.money <= 0 and entry.fail ~= TAG then
 				entry.fail = TAG
 				log("PLAN drop", NameOf[key] or key, "earned $0 in", math.floor(entry.seconds), "s of shift")
+			elseif entry.fail and entry.money > 0 then
+				-- it pays now (owner log 2026-10-05: Hairdresser $407 earned but still dropped, Best Pay took Cashier)
+				entry.fail = nil
+				log("PLAN undrop", NameOf[key] or key, "earned $" .. math.floor(entry.money), "in", math.floor(entry.seconds), "s")
 			end
 		end
 	end
@@ -35677,6 +35841,9 @@ do
 		for _, name in ipairs(Explore) do
 			local key = N.JobKeys[name]
 			local entry = N.Pay.jobs[key]
+			if entry and entry.fail and (entry.money or 0) > 0 then
+				entry.fail = nil
+			end
 			if entry and entry.fail and entry.fail ~= TAG then
 				N.Pay.jobs[key] = { money = 0, seconds = 0 }
 				entry = nil
@@ -36653,7 +36820,10 @@ do
 			return best
 		end
 		local elapsed = math.max(os.clock() - Session.started, 60)
-		return Session.earned / elapsed * 3600
+		local session = Session.earned / elapsed * 3600
+		-- nothing measured yet (owner log 2026-10-05: "trip worth $0", lossPerHour=$0 at 0 % moods): assume a
+		-- beginner job's $1000/h so the mood loss is never valued at zero
+		return if session > 0 then session else 1000
 	end
 	N.payRate = payRate
 
@@ -36927,6 +37097,101 @@ do
 	local function posText(p)
 		return string.format("(%d,%d,%d)", p.X, p.Y, p.Z)
 	end
+	-- The real door fix (owner log 2026-10-05: every path stopped at the same spot (1227,31,1071) in front of a door,
+	-- "I keep walking into doors"). A closed door's hitbox collides (dump ObjectInteractions: Parent.CanCollide =
+	-- not IsOpen.Value); PassThrough only made the path go through it. The game opens a door with its "I_Open"
+	-- interaction (dump 267848: ObjectData.IsOpen = not IsOpen, permission OpenCloseDoors, the owner has it), sent
+	-- as Interact {Target = door, Path = index} like every other object, from up to 30 studs. Doors with a sensor
+	-- (AutomaticDoor / DoorSensor) open by themselves and have no I_Open.
+	local Opened = setmetatable({}, { __mode = "k" })
+	local NoOpen = setmetatable({}, { __mode = "k" })
+	local function openDoorsNear(maxDist)
+		local plot, root = N.myPlot(), N.root()
+		local house = plot and plot:FindFirstChild("House")
+		if not (house and root) then
+			return 0
+		end
+		local opened = 0
+		local list = {}
+		pcall(function()
+			for _, data in ipairs(house:GetDescendants()) do
+				if data.Name == "ObjectData" then
+					local obj = data.Parent
+					local isOpen = data:FindFirstChild("IsOpen")
+					local name = string.lower(obj and obj.Name or "")
+					if isOpen and isOpen:IsA("BoolValue") and not isOpen.Value and (string.find(name, "door", 1, true) or string.find(name, "gate", 1, true)) then
+						local okPos, pivot = pcall(obj.GetPivot, obj)
+						local d = okPos and (pivot.Position - root.Position).Magnitude or 1e9
+						if d <= maxDist and not NoOpen[obj] then
+							table.insert(list, { obj = obj, isOpen = isOpen, d = d })
+						end
+					end
+				end
+			end
+		end)
+		table.sort(list, function(a, b)
+			return a.d < b.d
+		end)
+		for i, e in ipairs(list) do
+			if i > 6 then
+				break
+			end
+			local sent = interact(e.obj, { "I_Open" })
+			local ok = sent and waitFor(function()
+				return e.isOpen.Value == true
+			end, 1.5)
+			if ok then
+				Opened[e.obj] = e.isOpen
+				opened += 1
+			elseif not sent then
+				-- no I_Open button (automatic door, sensor): do not ask again
+				NoOpen[e.obj] = true
+			end
+			log("WALK door open", e.obj.Name, "dist", math.floor(e.d), "ok=" .. tostring(ok == true))
+		end
+		return opened
+	end
+	N.openDoorsNear = openDoorsNear
+	-- closes the doors the walk opened (privacy), from where you stand (30 studs, the server's interaction range)
+	function N.closeOpenedDoors()
+		local root = N.root()
+		if not root then
+			return
+		end
+		for obj, isOpen in pairs(Opened) do
+			local okPos, pivot = pcall(obj.GetPivot, obj)
+			if obj.Parent and isOpen.Value and okPos and (pivot.Position - root.Position).Magnitude <= 28 then
+				interact(obj, { "I_Close" })
+				Opened[obj] = nil
+			end
+		end
+	end
+	-- Last resort on your own plot (and inside a job building): short CFrame hops straight to the goal. notes.md
+	-- Anticheat: no position/speed check and no teleport kick exist in the dump; the game itself teleports you
+	-- (ToPlot, GoToWork). Hops of 3 studs every 0.03 s.
+	function N.hopTo(goal, why)
+		local root = N.root()
+		if not root then
+			return false
+		end
+		local start = root.Position
+		local target = Vector3.new(goal.X, math.max(goal.Y, start.Y - 6), goal.Z)
+		log("WALK hop", tostring(why), "from", posText(start), "to", posText(target), "dist", math.floor((target - start).Magnitude))
+		local steps = math.max(1, math.ceil((target - start).Magnitude / 3))
+		for i = 1, steps do
+			root = N.root()
+			if not root then
+				return false
+			end
+			local p = start:Lerp(target, i / steps)
+			root.CFrame = CFrame.new(p) * (root.CFrame - root.CFrame.Position)
+			pcall(function()
+				root.AssemblyLinearVelocity = Vector3.zero
+			end)
+			task.wait(0.03)
+		end
+		return true
+	end
 	-- distance from a point to the object's box (0 inside), else to its position
 	local function boxDist(object, pos, p)
 		if typeof(object) == "Instance" and object:IsA("BasePart") then
@@ -37027,15 +37292,26 @@ do
 		end
 		return done(true)
 	end
-	function N.pathWalk(pos, near, timeout, object)
+	-- jobMode = called by N.walkTo inside a job building: no ToPlot fallback, hop only for short distances.
+	function N.pathWalk(pos, near, timeout, object, jobMode)
 		near = near or 6
 		local deadline = os.clock() + (timeout or 45)
 		local function arrived()
 			local root = N.root()
-			return root ~= nil and boxDist(object, pos, root.Position) < near
+			if root == nil then
+				return false
+			end
+			if object then
+				return boxDist(object, pos, root.Position) < near
+			end
+			return Vector3.new(pos.X - root.Position.X, 0, pos.Z - root.Position.Z).Magnitude <= near
 		end
 		passDoors()
-		local fails, teleported = 0, false
+		local plot = N.myPlot()
+		local function onMyPlot(p)
+			return plot ~= nil and N.plotAt and N.plotAt(p) == plot
+		end
+		local fails, teleported, hopped = 0, false, false
 		while alive() and os.clock() < deadline do
 			local root = N.root()
 			if not root then
@@ -37043,6 +37319,22 @@ do
 			end
 			if arrived() then
 				return true
+			end
+			if onMyPlot(root.Position) then
+				openDoorsNear(if fails == 0 then 28 else 14)
+			end
+			-- after 2 failed paths: hop on your own plot (or a short hop inside a job building)
+			if fails >= 2 and not hopped then
+				local goal = approachPoints(object, pos, root.Position)[1]
+				local dist = (goal - root.Position).Magnitude
+				if (onMyPlot(root.Position) and onMyPlot(goal)) or (jobMode and dist <= 40) then
+					hopped = true
+					N.hopTo(goal, if jobMode then "job building, path blocked" else "your plot, path blocked")
+					task.wait(0.2)
+					if arrived() then
+						return true
+					end
+				end
 			end
 			local path, status, goal
 			for _, g in ipairs(approachPoints(object, pos, root.Position)) do
@@ -37055,7 +37347,7 @@ do
 			if path then
 				log("WALK path", "waypoints=" .. #path:GetWaypoints(), "status=" .. status, "to", posText(goal), "dist", math.floor(boxDist(object, pos, root.Position)))
 				if followPath(path, deadline) then
-					N.walkTo(goal, 1.5, 3)
+					N.walkTo(goal, 1.5, 3, true)
 					if arrived() then
 						return true
 					end
@@ -37065,9 +37357,10 @@ do
 			end
 			fails += 1
 			if fails >= 3 then
-				if teleported then
+				if teleported or jobMode then
 					break
 				end
+				hopped = false
 				teleported, fails = true, 0
 				log("WALK fallback", "3 failed paths, the game's ToPlot teleport and again")
 				N.goHome(true)
@@ -37656,6 +37949,7 @@ do
 		Q.active = false
 		Q.objMeal = false
 		Q.manual = false
+		pcall(N.closeOpenedDoors)
 		local eff = N.efficiency()
 		log("NEEDS done", reason, "eff=" .. tostring(eff), N.moodText(), "took", math.floor(os.clock() - started), "s", "money", N.money())
 		setStatus(if N.workOn() then "Needs done, back to work" else "Needs done")
