@@ -4253,26 +4253,140 @@ local BootOk, BootError = xpcall(function()
 			Library.GameName = Name
 			return Name
 		end
-		function Library:OpenDiscordInvite(Code: string): boolean
-			local RequestFunction = GetRequestFunction()
-			if typeof(RequestFunction) ~= "function" or typeof(Code) ~= "string" or Code == "" then
-				return false
+		function Library:OpenDiscordInvite(Code: string?): boolean
+			local Invite = tostring(Library.DiscordInvite or "https://discord.gg/PdQvN2bDCu")
+			if typeof(Code) ~= "string" or Code == "" then
+				Code = string.match(Invite, "([%w%-]+)/?$")
 			end
-			local Success, Response = pcall(RequestFunction, {
-				Url = "http://127.0.0.1:6463/rpc?v=1",
-				Method = "POST",
-				Headers = {
-					["Content-Type"] = "application/json",
-					["Origin"] = "https://discord.com",
-				},
-				Body = HttpService:JSONEncode({
-					cmd = "INVITE_BROWSER",
-					nonce = HttpService:GenerateGUID(false),
-					args = { code = Code },
-				}),
-			})
-			return Success and typeof(Response) == "table" and (Response.StatusCode == 200 or Response.Success == true)
+			local Url = if typeof(Code) == "string" and Code ~= "" then "https://discord.gg/" .. Code else Invite
+
+			local RequestFunction = GetRequestFunction()
+			if typeof(RequestFunction) == "function" and typeof(Code) == "string" and Code ~= "" then
+				for Port = 6463, 6472 do
+					local Success, Response = pcall(RequestFunction, {
+						Url = "http://127.0.0.1:" .. Port .. "/rpc?v=1",
+						Method = "POST",
+						Headers = {
+							["Content-Type"] = "application/json",
+							["Origin"] = "https://discord.com",
+						},
+						Body = HttpService:JSONEncode({
+							cmd = "INVITE_BROWSER",
+							nonce = HttpService:GenerateGUID(false),
+							args = { code = Code },
+						}),
+						Timeout = 1,
+					})
+					if Success and typeof(Response) == "table" then
+						local Status = tonumber(Response.StatusCode)
+						if (Status and Status >= 200 and Status < 300) or Response.Success == true then
+							print("[Corvus] discord invite: rpc")
+							return true
+						end
+					end
+				end
+			end
+
+			local Opened = pcall(function()
+				game:GetService("GuiService"):OpenBrowserWindow(Url)
+			end)
+			if Opened then
+				print("[Corvus] discord invite: browser")
+				return true
+			end
+
+			Library:CopyToClipboard(Invite, "Invite copied")
+			print("[Corvus] discord invite: clipboard")
+			return false
 		end
+
+		function Library:ShowDiscordPrompt()
+			if Library.DiscordPrompt and Library.DiscordPrompt.Parent then
+				return
+			end
+			local Card = New("Frame", {
+				AnchorPoint = Vector2.new(0.5, 1),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundColor3 = "MainColor",
+				Position = UDim2.new(0.5, 0, 1, -24),
+				Size = UDim2.fromOffset(300, 0),
+				ZIndex = 60,
+				Parent = Library.ScreenGui,
+			})
+			Library.DiscordPrompt = Card
+			table.insert(
+				Library.Corners,
+				New("UICorner", {
+					CornerRadius = UDim.new(0, Library.CornerRadius),
+					Parent = Card,
+				})
+			)
+			Library:AddOutline(Card)
+			New("UIListLayout", {
+				Padding = UDim.new(0, 6),
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Parent = Card,
+			})
+			New("UIPadding", {
+				PaddingBottom = UDim.new(0, 10),
+				PaddingLeft = UDim.new(0, 10),
+				PaddingRight = UDim.new(0, 10),
+				PaddingTop = UDim.new(0, 10),
+				Parent = Card,
+			})
+			New("TextLabel", {
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				LayoutOrder = 1,
+				Size = UDim2.new(1, 0, 0, 0),
+				Text = "Join our Discord for updates, codes and support",
+				TextColor3 = "FontColor",
+				TextSize = 14,
+				TextWrapped = true,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				ZIndex = 61,
+				Parent = Card,
+			})
+			local function Close()
+				if Card.Parent then
+					Card:Destroy()
+				end
+			end
+			local function AddPromptButton(Order, Text, Color, Func)
+				local Button = New("TextButton", {
+					AutoButtonColor = true,
+					BackgroundColor3 = Color,
+					LayoutOrder = Order,
+					Size = UDim2.new(1, 0, 0, 28),
+					Text = Text,
+					TextColor3 = "FontColor",
+					TextSize = 13,
+					ZIndex = 61,
+					Parent = Card,
+				})
+				table.insert(
+					Library.Corners,
+					New("UICorner", {
+						CornerRadius = UDim.new(0, Library.CornerRadius),
+						Parent = Button,
+					})
+				)
+				Button.MouseButton1Click:Connect(function()
+					Close()
+					task.spawn(function()
+						pcall(Func)
+					end)
+				end)
+			end
+			AddPromptButton(2, "Open Discord", "AccentColor", function()
+				Library:OpenDiscordInvite()
+			end)
+			AddPromptButton(3, "I'm already in, don't ask again", "BackgroundColor", function()
+				Library:SetSetting("DiscordAskAgain", false)
+			end)
+			task.delay(45, Close)
+		end
+
 		Library.CorvusThemes = {
 			["Corvus Night"] = {
 				0.1,
@@ -18105,12 +18219,26 @@ local BootOk, BootError = xpcall(function()
 						end
 						if not Library.DiscordToastShown then
 							Library.DiscordToastShown = true
-							Library:Notify({
-								Title = "Corvus",
-								Description = "Join our Discord for updates, codes and support: " .. Invite,
-								Time = 6,
-							})
+							if Library:GetSetting("DiscordAskAgain", true) ~= false then
+								task.delay(1, function()
+									while Library.IntroPlaying and not Library.Unloaded do
+										task.wait(0.2)
+									end
+									if Library.Unloaded then
+										return
+									end
+									pcall(function()
+										Library:ShowDiscordPrompt()
+									end)
+									task.spawn(function()
+										pcall(function()
+											Library:OpenDiscordInvite()
+										end)
+									end)
+								end)
+							end
 						end
+
 					end)
 				end
 				Library.WindowContainer = Container
@@ -22879,6 +23007,23 @@ local BootOk, BootError = xpcall(function()
 							Avatar = Info.DiscordAvatar,
 							Banner = Info.DiscordBanner,
 						})
+						Community:AddButton({
+							Text = "Open Discord invite",
+							Func = function()
+								task.spawn(function()
+									Library:OpenDiscordInvite()
+								end)
+							end,
+						})
+						Community:AddToggle("CorvusDiscordAsk", {
+							Text = "Ask me on start",
+							Description = "Show the Discord invite when the hub starts",
+							Default = Library:GetSetting("DiscordAskAgain", true) ~= false,
+							Callback = function(Value)
+								Library:SetSetting("DiscordAskAgain", Value == true)
+							end,
+						})
+
 					end
 					if typeof(Socials) == "table" then
 						for _, Social in Socials do
