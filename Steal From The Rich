@@ -27281,6 +27281,98 @@ do
 local slotData = safeRequire("Shared.Data.SlotUpgradesData")
 SlotPrices = type(slotData) == "table" and type(slotData.Prices) == "table" and slotData.Prices or nil
 end
+local Admin = { kinds = { "Money", "Speed", "CrateSpeed", "Treadmill" }, key = "", lastActiveAt = -1e9, luckOn = false, loggedAt = -1e9, label = nil }
+function Admin.get(kind)
+local system = ReplicatedStorage:FindFirstChild("AdminSystem")
+if not system then
+return 1
+end
+local mult = tonumber(system:GetAttribute(kind .. "Multiplier")) or 1
+if mult <= 1 then
+return 1
+end
+local ends = tonumber(system:GetAttribute(kind .. "MultiplierEndsAt")) or 0
+if ends > 0 and ends <= os.time() then
+return 1
+end
+return math.min(mult, 100)
+end
+function Admin.left(kind)
+if Admin.get(kind) <= 1 then
+return 0
+end
+local system = ReplicatedStorage:FindFirstChild("AdminSystem")
+local ends = system and tonumber(system:GetAttribute(kind .. "MultiplierEndsAt")) or 0
+if ends <= 0 then
+return math.huge
+end
+return math.max(ends - os.time(), 0)
+end
+function Admin.mutationLuck()
+if type(ServerLuck) ~= "table" then
+return 1
+end
+local luck = tonumber(ServerLuck.AdminGlobalMutationLuck) or 1
+local ends = tonumber(ServerLuck.AdminGlobalMutationEndTime)
+if luck > 1 and (not ends or ends <= 0 or ends > os.time()) then
+return luck
+end
+return 1
+end
+function Admin.luckLeft()
+local ends = type(ServerLuck) == "table" and tonumber(ServerLuck.AdminGlobalMutationEndTime) or nil
+if not ends or ends <= 0 then
+return math.huge
+end
+return math.max(ends - os.time(), 0)
+end
+function Admin.stage()
+local stage = workspace:GetAttribute("AdminAbuseStage")
+return if type(stage) == "string" then stage else nil
+end
+function Admin.describe()
+local parts, left = {}, math.huge
+for _, kind in ipairs(Admin.kinds) do
+local mult = Admin.get(kind)
+if mult > 1 then
+table.insert(parts, kind .. " x" .. tostring(mult))
+left = math.min(left, Admin.left(kind))
+end
+end
+local luck = Admin.mutationLuck()
+if luck > 1 then
+table.insert(parts, "MutationLuck x" .. tostring(luck))
+left = math.min(left, Admin.luckLeft())
+end
+local stage = Admin.stage()
+if stage then
+table.insert(parts, "Stage " .. stage)
+end
+return table.concat(parts, ","), left
+end
+function Admin.active()
+return Admin.describe() ~= ""
+end
+function Admin.tick()
+local text, left = Admin.describe()
+local now = os.clock()
+if text ~= "" then
+Admin.lastActiveAt = now
+end
+local luck = Admin.mutationLuck() > 1
+local luckStarted = luck and not Admin.luckOn
+Admin.luckOn = luck
+if text ~= Admin.key or (text ~= "" and now - Admin.loggedAt >= 300) then
+Admin.key = text
+Admin.loggedAt = now
+if text ~= "" then
+log("ADMIN", "mult=" .. text, "until=" .. (if left == math.huge then "?" else tostring(math.floor(left)) .. "s"))
+else
+log("ADMIN", "mult=none, the admin boost is over")
+end
+end
+return luckStarted
+end
 local Areas = {}
 do
 local list = AreaData and AreaData.Areas
@@ -30061,7 +30153,7 @@ end
 function thunderReady()
 local config = stormConfig()
 return Remotes.rf_THUNDER_MACHINE ~= nil
-and os.clock() >= ThunderNext
+and (os.clock() >= ThunderNext or (Admin.mutationLuck() > 1 and ThunderNext - os.clock() <= 45))
 and (tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0) >= chargeTarget(config)
 end
 local function tierRank(tier)
@@ -30737,8 +30829,14 @@ return { free = free, min = incomes[1] or 0, used = used, cap = cap }
 end
 function V.item(income, appraise)
 local plot = V.plot
-local left = math.max(Plan.horizon() - (appraise or 0), 0)
-local sell = income * SellSeconds
+local wait = appraise or 0
+local crateSpeed = Admin.get("CrateSpeed")
+if crateSpeed > 1 and wait > 0 then
+local fast = math.min(Admin.left("CrateSpeed"), wait / crateSpeed)
+wait = fast + math.max(wait - fast * crateSpeed, 0)
+end
+local left = math.max(Plan.horizon() - wait, 0)
+local sell = income * SellSeconds * (if wait <= Admin.left("Money") then Admin.get("Money") else 1)
 local keep = 0
 if plot.free > 0 then
 keep = income * left
@@ -30823,6 +30921,12 @@ end
 local cap = SpeedData and tonumber(SpeedData.MAX_WALK_SPEED)
 if cap then
 speed = math.min(speed, cap)
+end
+if Admin.get("Speed") > 1 and math.floor(tonumber(level) or 0) == math.floor(tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0) then
+local hum = humanoid()
+if hum and hum.WalkSpeed > speed then
+speed = hum.WalkSpeed
+end
 end
 return math.max(speed, 1)
 end
@@ -30993,6 +31097,11 @@ end
 local ok, charged, cell = pcall(config.chances, points)
 if not ok or not charged then
 return nil
+end
+local luck = Admin.mutationLuck()
+if luck > 1 then
+charged = math.min((tonumber(charged) or 0) * luck, 1)
+cell = math.min((tonumber(cell) or 0) * luck, 1)
 end
 local mults = ItemData and type(ItemData.StormMutations) == "table" and ItemData.StormMutations or {}
 local three, six = tonumber(mults.Supercharged) or 3, tonumber(mults.Supercell) or 6
@@ -31312,6 +31421,10 @@ formatNumber(cashRate),
 V.calib,
 H // 3600
 )
+local adminText = Admin.describe()
+if adminText ~= "" then
+Sched.info ..= " | admin " .. adminText
+end
 local text = string.format(
 "best=%s gain/$=%s eta=%s alt=%s | %s",
 if best then best.kind .. ":" .. best.name .. " $" .. formatNumber(best.cost) else "none (save cash)",
@@ -31379,6 +31492,8 @@ Plan.farmNames = {
 "SmartZones",
 "SmartSpend",
 "SmartSchedule",
+"AutoEventGame",
+"AutoAdminPhrases",
 }
 Plan.farmSet = {}
 function Plan.farmAll(value)
@@ -31674,7 +31789,7 @@ local FarmBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "rocket")
 FarmBox:AddToggle("FarmAll", {
 Text = "Auto Farm Everything",
 Default = false,
-Tooltip = "One switch for the whole farm: steal in every zone you can escape, place, open, sell, upgrades, trails, orbs, Thunder Machine, Archangel Blessing and treadmill. It splits your time between stealing and training by calculation.",
+Tooltip = "One switch for the whole farm: steal in every zone you can escape, place, open, sell, upgrades, trails, orbs, Thunder Machine, Archangel Blessing, treadmill, the admin minigame and admin chat phrases. It splits your time between stealing and training by calculation.",
 Callback = function(value)
 task.spawn(Plan.farmAll, value)
 end,
@@ -31858,6 +31973,24 @@ Tooltip = "While an admin event boosts the Admin Treadmill (and nobody is on it)
 })
 local IndexBox = Tabs.Rewards:AddLeftGroupbox("Index", "book-open")
 IndexBox:AddToggle("AutoIndex", { Text = "Auto Claim Index", Default = false, Tooltip = "Claims every finished index reward" })
+local AdminBox = Tabs.Rewards:AddLeftGroupbox("Admin Events", "crown")
+AdminBox:AddToggle("AutoEventGame", {
+Text = "Auto Event Minigame",
+Default = true,
+Tooltip = "When an admin runs the MisterTrippleT minigame: hits him with the bat, carries his Secret Crate (Admin Throne, billions per second) to the safe zone, then picks up the admin crates and brings them to your plot.",
+})
+AdminBox:AddToggle("EventHop", {
+Text = "Event Hop",
+Default = false,
+Tooltip = "No admin boost or event on this server for the minutes below: hops to another public server and looks again. Never on private servers, never while carrying a crate.",
+})
+AdminBox:AddSlider("HopAfterMinutes", { Text = "Hop after", Min = 3, Max = 60, Default = 10, Rounding = 0, Suffix = " min" })
+AdminBox:AddToggle("AutoAdminPhrases", {
+Text = "Auto Type Admin Phrases",
+Default = false,
+Tooltip = "When an admin announcement or system message says type / say / write WORD, sends that word in chat once (60 s per word).",
+})
+Admin.label = AdminBox:AddLabel({ Text = "Admin boosts: none", DoesWrap = true })
 local RewardBox = Tabs.Rewards:AddRightGroupbox("Free Rewards", "gift")
 RewardBox:AddToggle(
 "AutoOffline",
@@ -32522,6 +32655,9 @@ local AllAutoToggles = {
 "AutoThunder",
 "AutoBlessing",
 "AutoFuse",
+"AutoEventGame",
+"EventHop",
+"AutoAdminPhrases",
 }
 if Library.AddCommand then
 pcall(function()
@@ -32539,6 +32675,9 @@ toggleCommand("thunder", { "charge" }, { "AutoThunder" }, "Auto Charge Crates")
 toggleCommand("fuse", { "autofuse" }, { "AutoFuse" }, "Auto Fuse")
 toggleCommand("farmall", { "farm", "autofarm", "everything", "afk" }, { "FarmAll" }, "Auto Farm Everything")
 toggleCommand("bless", { "blessing", "archangel" }, { "AutoBlessing" }, "Auto Bless Crates")
+toggleCommand("eventgame", { "minigame", "event" }, { "AutoEventGame" }, "Auto Event Minigame")
+toggleCommand("hop", { "eventhop", "serverhop" }, { "EventHop" }, "Event Hop")
+toggleCommand("phrases", { "adminphrases", "autotype" }, { "AutoAdminPhrases" }, "Auto Type Admin Phrases")
 Library:AddCommand({
 Name = "freegift",
 Aliases = { "gift" },
@@ -33255,6 +33394,408 @@ local function on(name)
 local t = Toggles[name]
 return t ~= nil and t.Value == true
 end
+local Hop, EventGame, AdminChat = { nextTry = 0, busy = false, started = false }, { backoffUntil = 0, stepFails = 0, stage = nil }, { typed = {} }
+do
+local TeleportService = game:GetService("TeleportService")
+local TextChatService = game:GetService("TextChatService")
+local EventSpawn = Vector3.new(1542.9, 1.5, -934.9)
+local function httpJson(url)
+local requester = (syn and syn.request) or (http and http.request) or http_request or request
+local body
+if type(requester) == "function" then
+local ok, response = pcall(requester, { Url = url, Method = "GET" })
+if ok and type(response) == "table" and (response.StatusCode == 200 or response.Success == true) then
+body = response.Body
+end
+end
+if type(body) ~= "string" or body == "" then
+local ok, result = pcall(game.HttpGet, game, url)
+if ok then
+body = result
+end
+end
+if type(body) ~= "string" or body == "" then
+return nil
+end
+local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
+return if ok then data else nil
+end
+local function eventPrompt(model, action)
+if not model then
+return nil
+end
+for _, child in ipairs(model:GetDescendants()) do
+if child:IsA("ProximityPrompt") and child.Enabled and (action == nil or child.ActionText == action) then
+return child
+end
+end
+return nil
+end
+local function carryCount()
+return tonumber(LocalPlayer:GetAttribute("MineGame2Carrying")) or 0
+end
+local function eventLog(step, ok, extra)
+log("EVENTGAME", "step=" .. step, "ok=" .. tostring(ok), extra or "")
+end
+local function eventStep(step, ok, extra)
+eventLog(step, ok, extra)
+if ok then
+EventGame.stepFails = 0
+return
+end
+EventGame.stepFails += 1
+if EventGame.stepFails >= 3 then
+EventGame.stepFails = 0
+EventGame.backoffUntil = os.clock() + 600
+log("EVENTGAME unsupported, step", step, "failed 3 times, backing off for 10 minutes")
+end
+end
+function EventGame.active()
+local stage = Admin.stage()
+if stage ~= "MineGame1" and stage ~= "MineGame2" then
+if EventGame.stage then
+log("EVENTGAME stage", EventGame.stage, "ended, points", tostring(LocalPlayer:GetAttribute("MineGame2Points")))
+EventGame.stage = nil
+EventGame.stepFails = 0
+end
+return false
+end
+if stage ~= EventGame.stage then
+EventGame.stage = stage
+EventGame.stepFails = 0
+log("EVENTGAME stage", stage, "started, auto minigame", if on("AutoEventGame") then "on" else "off")
+end
+return os.clock() >= EventGame.backoffUntil
+end
+local function batTool()
+local backpack = LocalPlayer:FindFirstChild("Backpack")
+for _, holder in ipairs({ character(), backpack }) do
+for _, tool in ipairs(holder and holder:GetChildren() or {}) do
+if tool:IsA("Tool") and (tool:FindFirstChild("BatClient", true) or string.find(string.lower(tool.Name), "bat", 1, true)) then
+return tool
+end
+end
+end
+return nil
+end
+local LegacyBridge = nil
+local function swingBat()
+local tool = batTool()
+local hum = humanoid()
+if tool and hum and tool.Parent ~= character() then
+pcall(hum.EquipTool, hum, tool)
+task.wait(0.1)
+end
+if tool and tool.Parent == character() and pcall(tool.Activate, tool) then
+return
+end
+if NetFolder and NetFolder:FindFirstChild("rev_BAT_SWING") then
+fire("BAT_SWING")
+return
+end
+if LegacyBridge == nil then
+LegacyBridge = safeRequire("Client.LegacyBridge") or false
+end
+if type(LegacyBridge) == "table" and type(LegacyBridge.FireServer) == "function" then
+pcall(LegacyBridge.FireServer, "BAT_SWING")
+end
+end
+function EventGame.mine1()
+if carrying() then
+setStatus("Carrying MisterTrippleT's crate to the safe zone")
+travel(safeSpot(), { keepGoing = carrying, arrive = 3 })
+waitFor(function()
+return not carrying()
+end, 4)
+eventStep("carry", not carrying(), "safe zone " .. tostring(LocalPlayer:GetAttribute("InSafeZone")))
+return true
+end
+local crate = workspace:FindFirstChild("MisterTrippleTCrate")
+local prompt = eventPrompt(crate, "Steal")
+if prompt then
+local position = promptPosition(prompt) or crate:GetPivot().Position
+setStatus("Grabbing MisterTrippleT's crate")
+travel(position, {
+keepGoing = function()
+return prompt.Parent ~= nil and prompt.Enabled
+end,
+arrive = 2,
+timeout = 40,
+})
+if not (prompt.Parent and prompt.Enabled) then
+eventLog("grab", false, "someone else took it first")
+return true
+end
+local ok = triggerPrompt(prompt, carrying) or carrying()
+eventStep("grab", ok, PromptIssue or "")
+return true
+end
+local npc = workspace:FindFirstChild("MisterTrippleT")
+local npcRoot = npc and npc:FindFirstChild("HumanoidRootPart")
+if npcRoot and npc:GetAttribute("BatTarget") ~= false then
+local progress = tonumber(npc:GetAttribute("Progress")) or 0
+if progress >= 100 then
+setStatus("MisterTrippleT is down, waiting for his crate")
+task.wait(0.5)
+return true
+end
+setStatus(string.format("Hitting MisterTrippleT (%d%%)", progress))
+keepSlowModeOff()
+local me = rootPart()
+if me and (me.Position - npcRoot.Position).Magnitude > 7 then
+travel(npcRoot.Position, {
+keepGoing = function()
+return npc.Parent ~= nil
+end,
+arrive = 5,
+timeout = 6,
+})
+end
+me = rootPart()
+if not (me and (me.Position - npcRoot.Position).Magnitude <= 9) then
+return true
+end
+local before = tonumber(npc:GetAttribute("Progress")) or 0
+for _ = 1, 3 do
+me = rootPart()
+if not (npc.Parent and me and (me.Position - npcRoot.Position).Magnitude <= 9) then
+break
+end
+swingBat()
+task.wait(0.8)
+end
+local after = tonumber(npc:GetAttribute("Progress")) or 0
+eventStep("hit", after > before, string.format("progress %.0f -> %.0f", before, after))
+return true
+end
+setStatus("Waiting for MisterTrippleT")
+local me = rootPart()
+if me and (me.Position - EventSpawn).Magnitude > 30 then
+travel(EventSpawn, { arrive = 20, timeout = 25 })
+end
+task.wait(0.5)
+return true
+end
+local function adminCrate()
+local best, bestPrompt, bestDist
+local me = rootPart()
+for _, child in ipairs(workspace:GetChildren()) do
+if child:IsA("Model") and string.match(child.Name, "^Admin%s*%d+$") then
+local prompt = eventPrompt(child, "Pick up")
+if prompt then
+local dist = if me then (child:GetPivot().Position - me.Position).Magnitude else 0
+if not best or dist < bestDist then
+best, bestPrompt, bestDist = child, prompt, dist
+end
+end
+end
+end
+return best, bestPrompt
+end
+function EventGame.mine2()
+local count = carryCount()
+local floor = myFloor()
+local crate, prompt = adminCrate()
+local started = tonumber(workspace:GetAttribute("AdminAbuseStageStartedAt"))
+local left = if started then started + 300 - workspace:GetServerTimeNow() else 300
+local me = rootPart()
+local level = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
+local back = if floor and me then (floor.Position - me.Position).Magnitude / Plan.V.walk(level) + 5 else 20
+if count > 0 and (count >= 5 or not crate or left < back + 15) then
+if not floor then
+eventStep("bank", false, "no plot found")
+return true
+end
+setStatus("Bringing " .. count .. " admin crate(s) to the plot")
+travel(floor.Position + Vector3.new(0, floor.Size.Y / 2 + 3, 0), {
+keepGoing = function()
+return carryCount() > 0
+end,
+arrive = 4,
+})
+waitFor(function()
+return carryCount() == 0
+end, 4)
+local ok = carryCount() == 0
+eventStep("bank", ok, "points " .. tostring(LocalPlayer:GetAttribute("MineGame2Points")) .. " returned " .. tostring(LocalPlayer:GetAttribute("MineGame2Returned")))
+if not ok then
+task.wait(0.5)
+end
+return true
+end
+if crate and prompt then
+local position = promptPosition(prompt) or crate:GetPivot().Position
+setStatus("Picking up an admin crate (" .. count .. "/5)")
+travel(position, {
+keepGoing = function()
+return prompt.Parent ~= nil and prompt.Enabled
+end,
+arrive = 2.5,
+timeout = 40,
+})
+if not (prompt.Parent and prompt.Enabled) then
+return true
+end
+local before = carryCount()
+local ok = triggerPrompt(prompt, function()
+return carryCount() > before
+end) or carryCount() > before
+eventStep("pickup", ok, PromptIssue or "")
+return true
+end
+setStatus("Waiting for admin crates")
+if me and (me.Position - EventSpawn).Magnitude > 40 then
+travel(EventSpawn, { arrive = 25, timeout = 25 })
+end
+task.wait(0.5)
+return true
+end
+function EventGame.once()
+local stage = Admin.stage()
+if stage == "MineGame1" then
+return EventGame.mine1()
+elseif stage == "MineGame2" then
+return EventGame.mine2()
+end
+return false
+end
+function Hop.tick()
+if not on("EventHop") then
+return
+end
+local now = os.clock()
+if not Hop.started then
+Hop.started = true
+local text = Admin.describe()
+log("HOP", "reason=arrived", "found=" .. tostring(text ~= ""), text)
+end
+if game.PrivateServerId ~= "" then
+logEvery("hopprivate", 3600, "HOP reason=private server, hopping is off here, found=false")
+return
+end
+if Admin.active() or Hop.busy or now < Hop.nextTry then
+return
+end
+local minutes = tonumber(Options.HopAfterMinutes and Options.HopAfterMinutes.Value) or 10
+local idle = now - math.max(Admin.lastActiveAt, Session.started)
+if idle < minutes * 60 then
+return
+end
+if carrying() or carryCount() > 0 or manualRunning() then
+return
+end
+Hop.busy = true
+Hop.nextTry = now + 90
+task.spawn(function()
+local ok, err = pcall(function()
+local data = httpJson(string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true", game.PlaceId))
+if not (type(data) == "table" and type(data.data) == "table") then
+Hop.nextTry = os.clock() + 300
+log("HOP reason=no server list (rate limit or no http), retry in 5 min, found=false")
+return
+end
+local list = {}
+for _, server in ipairs(data.data) do
+local playing, maximum = tonumber(server.playing), tonumber(server.maxPlayers)
+if type(server) == "table" and type(server.id) == "string" and server.id ~= game.JobId and playing and maximum and playing < maximum and playing >= 1 then
+table.insert(list, server)
+end
+end
+table.sort(list, function(a, b)
+return (tonumber(a.playing) or 0) > (tonumber(b.playing) or 0)
+end)
+if #list == 0 then
+Hop.nextTry = os.clock() + 300
+log("HOP reason=no other public server, retry in 5 min, found=false")
+return
+end
+local pick = list[math.random(1, math.min(#list, 8))]
+log("HOP", string.format("reason=no admin event for %d min, found=false, teleporting to a server with %s players", math.floor(idle / 60), tostring(pick.playing)))
+Log.flush(true)
+TeleportService:TeleportToPlaceInstance(game.PlaceId, pick.id, LocalPlayer)
+end)
+if not ok then
+logEvery("hoperr", 120, "HOP error", err)
+end
+Hop.busy = false
+end)
+end
+local StopWords = { of = true, the = true, a = true, an = true, ["in"] = true, your = true, it = true, this = true, something = true, to = true, ["and"] = true, ["or"] = true, me = true, what = true, is = true, anything = true, here = true, now = true }
+local function phraseFrom(text)
+text = string.gsub(tostring(text or ""), "<[^>]->", " ")
+local lower = string.lower(text)
+for _, verb in ipairs({ "type", "say", "write" }) do
+local _, _, first, word, last = string.find(lower, "%f[%a]" .. verb .. "%s+[\"'\u{201C}]?()([%w_%-!?]+)()")
+if word and #word >= 2 and not StopWords[word] then
+return string.sub(text, first, last - 1)
+end
+end
+return nil
+end
+local function sendChat(word)
+local sent = false
+pcall(function()
+local channels = TextChatService:FindFirstChild("TextChannels")
+local general = channels and channels:FindFirstChild("RBXGeneral")
+if general then
+general:SendAsync(word)
+sent = true
+end
+end)
+if not sent then
+pcall(function()
+local events = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+local say = events and events:FindFirstChild("SayMessageRequest")
+if say then
+say:FireServer(word, "All")
+sent = true
+end
+end)
+end
+return sent
+end
+function AdminChat.handle(text, source)
+if not on("AutoAdminPhrases") then
+return
+end
+local word = phraseFrom(text)
+if not word then
+return
+end
+local key = string.lower(word)
+local now = os.clock()
+if (AdminChat.typed[key] or -1e9) + 60 > now then
+return
+end
+AdminChat.typed[key] = now
+local sent = sendChat(word)
+log("ADMIN", "msg=" .. string.sub((string.gsub(tostring(text), "%s+", " ")), 1, 80), "typed=" .. word, "sent=" .. tostring(sent), "via " .. tostring(source))
+end
+onNet("PlayMessage", function(text)
+AdminChat.handle(text, "announce")
+end)
+task.spawn(function()
+pcall(function()
+local system = ReplicatedStorage:WaitForChild("AdminSystem", 30)
+local remotes = system and system:WaitForChild("Remotes", 30)
+local signal = remotes and remotes:FindFirstChild("ClientSignal")
+if signal and signal:IsA("RemoteEvent") then
+signal.OnClientEvent:Connect(function(data)
+if type(data) == "table" and data.kind == "announce" then
+AdminChat.handle(data.text, "admin " .. tostring(data.from))
+end
+end)
+end
+end)
+pcall(function()
+TextChatService.MessageReceived:Connect(function(message)
+if message and message.TextSource == nil then
+AdminChat.handle(message.Text, "system")
+end
+end)
+end)
+end)
+end
 Log.header = function()
 local out = {}
 local function add(text)
@@ -33326,6 +33867,7 @@ end)()
 add("best buy: " .. (if Plan.target then string.format("%s %s for $%s (gain/$ %.3g, eta %ds)", Plan.target.kind, Plan.target.name, formatNumber(Plan.target.cost), Plan.target.ratio, math.floor(Plan.target.eta)) else "none, saving"))
 add("schedule: " .. Sched.info .. " | now " .. (if Sched.training then "training" else "stealing"))
 add("storm: " .. (if stormActive() then "ON" else "off") .. " | storm points " .. formatNumber(tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0))
+add("admin: " .. (if Admin.describe() ~= "" then Admin.describe() else "none") .. " | event game " .. tostring(on("AutoEventGame")) .. " | hop " .. tostring(on("EventHop")) .. " | phrases " .. tostring(on("AutoAdminPhrases")))
 add(string.rep("-", 70))
 return table.concat(out, "\n")
 end
@@ -33359,6 +33901,11 @@ return
 end
 if manualRunning() then
 return
+end
+if on("AutoEventGame") and EventGame.active() then
+if EventGame.once() then
+return
+end
 end
 if carrying() and on("AutoSteal") then
 returnToSafety()
@@ -33419,7 +33966,11 @@ if claimFreeGift(false) then
 return
 end
 end
-if on("AutoSell") and os.clock() - LastSell >= (Options.SellInterval and Options.SellInterval.Value or 30) then
+local sellEvery = Options.SellInterval and Options.SellInterval.Value or 30
+if Admin.get("Money") > 1 then
+sellEvery = math.min(sellEvery, 45)
+end
+if on("AutoSell") and os.clock() - LastSell >= sellEvery then
 LastSell = os.clock()
 if sellNow(false) then
 return
@@ -33497,6 +34048,10 @@ pcall(function()
 local now = os.clock()
 local floor = myFloor()
 Sched.update()
+if Admin.tick() then
+Bless.next = 0
+end
+Hop.tick()
 if on("AutoIndex") and now - last.index > 10 then
 last.index = now
 fire("INDEX_CLAIM_ALL")
@@ -33610,6 +34165,10 @@ end
 StormLabel:SetText(stormText .. "\nStorm points: " .. formatNumber(tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0))
 if BlessLabel then
 BlessLabel:SetText("Blessing points: " .. (if Bless.points then formatNumber(Bless.points) else "not known yet") .. " | blessed: " .. formatNumber(Bless.count))
+end
+if Admin.label then
+local adminText, adminLeft = Admin.describe()
+Admin.label:SetText(if adminText == "" then "Admin boosts: none" else "Admin boosts: " .. adminText .. (if adminLeft == math.huge then "" else string.format(", %dm %02ds left", adminLeft // 60, adminLeft % 60)))
 end
 StatRows.Claimed.set(formatNumber(Session.claimed))
 StatRows.Bought.set(formatNumber(Session.bought))
