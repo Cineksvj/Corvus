@@ -29083,6 +29083,17 @@ private = private ~= nil,
 breakSeconds = N.breakSeconds(name),
 }
 end
+-- Eggs the hub cannot read or skips as already claimed are written to the log once each (with their attributes),
+-- so a new egg kind (like Solaris) that does not show up can be traced.
+local EggDiag = {}
+local function eggAttrs(cfg)
+local parts = {}
+for key, value in pairs(cfg:GetAttributes()) do
+table.insert(parts, key .. "=" .. string.sub(tostring(value), 1, 40))
+end
+table.sort(parts)
+return table.concat(parts, " ")
+end
 function N.worldEggs()
 local folder = activeEggsFolder()
 local list = {}
@@ -29090,6 +29101,13 @@ for _, cfg in ipairs(folder and folder:GetChildren() or {}) do
 local info = eggInfo(cfg)
 if info and not eggClaimed(cfg, info.name) then
 table.insert(list, info)
+elseif not EggDiag[cfg] then
+EggDiag[cfg] = true
+if info then
+log("EGG skipped as already claimed this cycle", info.name, "cycle", tostring(cfg:GetAttribute("Cycle")), "claimed", tostring(claimedCycles()[info.name]))
+else
+log("EGG unreadable", cfg.Name, eggAttrs(cfg))
+end
 end
 end
 return list
