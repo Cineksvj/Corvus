@@ -30095,6 +30095,214 @@ end
 return true
 end
 end
+local Bless = { next = 0, points = nil, min = nil, max = nil, open = nil, results = {}, count = 0 }
+do
+task.spawn(onNet, "BLESSING_POINTS", function(gain, total)
+Bless.points = tonumber(total) or Bless.points
+Bless.next = math.min(Bless.next, os.clock() + 5)
+log("BLESS points", tostring(gain), "total", tostring(total))
+end)
+task.spawn(onNet, "blessinginteractionresult", function(id, data)
+if type(data) ~= "table" then
+return
+end
+if data.action == "open" and data.ok then
+Bless.open = data
+Bless.points = tonumber(data.points) or Bless.points
+end
+if id ~= nil then
+Bless.results[id] = data
+end
+end)
+local function blessRank(tier)
+tier = string.lower(tostring(tier or ""))
+for index, name in ipairs(CrateRarities.list) do
+if string.lower(name) == tier then
+return index
+end
+end
+return 0
+end
+local function crateTierOf(uid)
+for _, tool in ipairs(toolsWith("CrateUid")) do
+if tool:GetAttribute("CrateUid") == uid then
+return tool:GetAttribute("CrateTier")
+end
+end
+return nil
+end
+local function pickCrate(rows)
+local bestUid, bestTier, bestScore
+for _, row in ipairs(type(rows) == "table" and rows or {}) do
+if type(row) == "table" then
+local uid = row.Uid or row.uid
+if uid ~= nil and row.Blocked ~= true then
+local tier = row.Tier or crateTierOf(uid)
+local score = blessRank(tier) * 1e6 + (tonumber(row.kg or row.Kg) or 0)
+if not bestScore or score > bestScore then
+bestUid, bestTier, bestScore = uid, tier, score
+end
+end
+end
+end
+return bestUid, bestTier
+end
+local function altarPrompt()
+for _, descendant in ipairs(workspace:GetDescendants()) do
+if descendant:IsA("ProximityPrompt") and descendant.Name == "ArchangelPrompt" then
+return descendant
+end
+end
+return nil
+end
+local function altarPosition(prompt)
+local parent = prompt.Parent
+if parent and parent:IsA("BasePart") then
+return parent.Position
+end
+if parent and parent:IsA("Attachment") then
+return parent.WorldPosition
+end
+local ok, position = pcall(function()
+return parent:GetPivot().Position
+end)
+return ok and position or nil
+end
+function Bless.ready()
+if os.clock() < Bless.next then
+return false
+end
+return ReplicatedStorage:FindFirstChild("rf_ARCHANGEL_BLESSING") ~= nil
+or (NetFolder ~= nil and NetFolder:FindFirstChild("rev_blessinginteractionrequest") ~= nil)
+end
+local function blessDone(tier, mutation)
+Bless.count += 1
+Session.bought += 1
+log("BLESS ok", tostring(tier), tostring(mutation))
+Track.event("Bless", tostring(tier or "Crate") .. " crate blessed", tostring(mutation or "Blessed"), "sparkles", "#ffd85a")
+setStatus("Archangel Blessing: " .. tostring(mutation or "done"))
+end
+function Bless.once()
+local now = os.clock()
+Bless.next = now + 900
+local rf = ReplicatedStorage:FindFirstChild("rf_ARCHANGEL_BLESSING")
+local state
+if rf then
+state = invokeWithTimeout(rf, 8, "state")
+if type(state) == "table" and state.ok then
+Bless.points = tonumber(state.points) or Bless.points
+Bless.min = tonumber(state.min) or Bless.min
+Bless.max = tonumber(state.max) or Bless.max
+else
+state = nil
+end
+end
+if Bless.points == nil then
+Bless.next = now + 1200
+logEvery("blessunknown", 3600, "BLESS points unknown, waiting for the first BLESSING_POINTS event")
+return false
+end
+if Bless.points < (Bless.min or 30) then
+Bless.next = now + 600
+return false
+end
+local prompt = altarPrompt()
+local position = prompt and altarPosition(prompt)
+if not position then
+Bless.next = now + 300
+logEvery("blessaltar", 1800, "BLESS no Archangel altar in the world, points", tostring(Bless.points))
+return false
+end
+setStatus("Going to the Archangel altar")
+travel(position + Vector3.new(0, 1, 0), { arrive = 5 })
+if state then
+local uid, tier = pickCrate(state.crates)
+if not uid then
+Bless.next = now + 600
+log("BLESS no crate to bless")
+return true
+end
+local spend = math.floor(math.min(Bless.points, Bless.max or 90))
+log("BLESS try (remote)", tostring(tier), "spend", spend)
+local result = invokeWithTimeout(rf, 10, "bless", uid, spend)
+if type(result) == "table" and result.ok then
+blessDone(tier, result.message)
+else
+log("BLESS refused", tostring(type(result) == "table" and result.message or "no answer"))
+end
+return true
+end
+local blessReq = NetFolder and NetFolder:FindFirstChild("rev_blessinginteractionrequest")
+if not blessReq then
+log("BLESS no usable blessing remote")
+Bless.next = now + 1800
+return true
+end
+Bless.open = nil
+triggerPrompt(prompt, function()
+return Bless.open ~= nil
+end)
+waitFor(function()
+return Bless.open ~= nil
+end, 3)
+local open = Bless.open
+if not open then
+log("BLESS the altar did not open")
+return true
+end
+local function ask(action, ...)
+local id = HttpService:GenerateGUID(false)
+Bless.results[id] = nil
+blessReq:FireServer(id, action, ...)
+waitFor(function()
+return Bless.results[id] ~= nil
+end, 12)
+local answer = Bless.results[id]
+Bless.results[id] = nil
+return answer
+end
+local points = tonumber(open.points) or Bless.points
+local uid, tier = pickCrate(open.crates)
+if not uid then
+Bless.next = now + 600
+log("BLESS no crate to bless")
+return true
+end
+local quote = ask("quote", "mutation", uid, 0)
+if not (type(quote) == "table" and quote.ok) then
+log("BLESS quote refused", tostring(type(quote) == "table" and quote.reason or "no answer"))
+return true
+end
+local base = (tonumber(quote.cost) or 0) - (tonumber(quote.extraspend) or 0)
+if points < base then
+log("BLESS not enough points", tostring(points), "need", tostring(base))
+return true
+end
+local extra = math.max(0, math.floor(math.min(tonumber(open.maximumextra) or 0, points - base)))
+if extra > 0 then
+task.wait(5.3)
+local better = ask("quote", "mutation", uid, extra)
+if type(better) == "table" and better.ok then
+quote = better
+end
+end
+log("BLESS try (quote)", tostring(tier), "cost", tostring(quote.cost), "extra", extra)
+local done = ask("submit", quote.quoteid)
+if type(done) == "table" and done.pending then
+task.wait(1.5)
+done = ask("submit", quote.quoteid)
+end
+if type(done) == "table" and done.ok and done.status == "committed" then
+local receipt = type(done.receipt) == "table" and done.receipt or {}
+Bless.points = tonumber(receipt.balance) or Bless.points
+blessDone(tier, receipt.mutation)
+else
+log("BLESS not committed", tostring(type(done) == "table" and (done.reason or done.status) or "no answer"))
+end
+Bless.open = nil
+return true
+end
+end
 local fuseOnce, FuseNext
 do
 local FuseFeeSeconds =
@@ -30347,6 +30555,7 @@ Plan.farmNames = {
 "AutoTrails",
 "AutoOrbs",
 "AutoThunder",
+"AutoBlessing",
 "SmartZones",
 "SmartSpend",
 "SmartSchedule",
@@ -30666,34 +30875,41 @@ DiscordDescription = "Keyless scripts, updates and support",
 })
 end)
 end
-Tabs.Main = addTab("Main", "swords", "Auto steal and auto sell")
-Tabs.Plot = addTab("Plot", "house", "Crates, upgrades and the treadmill")
-Tabs.Storm = addTab("Storm", "cloud-lightning", "Storm orbs, Thunder Machine and Fuse Machine")
-Tabs.Meta = addTab("Meta", "sparkles", "Index, trails and free rewards")
-Tabs.Stats = addTab("Stats", "chart-column", "Session and all-time progress")
-Tabs.Analytics = addTab("Analytics", "chart-spline", "Live rates, trends and goals")
+Tabs.Main = addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+Tabs.Storm = addTab("Storm", "cloud-lightning", "Storm orbs, Thunder Machine and Archangel Blessing")
+Tabs.Plot = addTab("Plot", "layout-grid", "Place and open crates, best items on the plot")
+Tabs.Upgrades = addTab("Upgrades", "trending-up", "Smart Spending, trails and the treadmill")
+Tabs.Rewards = addTab("Rewards", "gift", "Index, offline cash and the Free Gift")
+Tabs.Items = addTab("Items", "backpack", "Selling and the Fuse Machine")
+Tabs.Player = addTab("Player", "user", "Movement")
+Tabs.Stats = addTab("Stats", "chart-column", "Session and all-time progress, analytics at the bottom")
+Tabs.Webhook = addTab("Webhook", "webhook", "Discord posts")
 if Window.AddMiscTab then
 pcall(function()
 Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
 end)
 end
-local StatusBox, StatusLabel, StormLabel
+local StatusBox, StatusLabel, StormLabel, BlessLabel
 do
 local FarmBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "rocket")
 FarmBox:AddToggle("FarmAll", {
 Text = "Auto Farm Everything",
 Default = false,
-Tooltip = "One switch for the whole farm: steal in every zone you can escape, place, open, sell, upgrades, trails, orbs and treadmill. It splits your time between stealing and training by calculation.",
+Tooltip = "One switch for the whole farm: steal in every zone you can escape, place, open, sell, upgrades, trails, orbs, Thunder Machine, Archangel Blessing and treadmill. It splits your time between stealing and training by calculation.",
 Callback = function(value)
 task.spawn(Plan.farmAll, value)
 end,
 })
-local StealBox = Tabs.Main:AddLeftGroupbox("Steal", "hand")
-StealBox:AddToggle("AutoSteal", {
+FarmBox:AddLabel({
+Text = '<font transparency="0.35">One switch for the whole farm. Everything below still works if you want to fine tune it.</font>',
+DoesWrap = true,
+})
+FarmBox:AddToggle("AutoSteal", {
 Text = "Auto Steal",
 Default = false,
 Tooltip = "Steals crates that match your filters and brings them back to the safe zone",
 })
+local StealBox = Tabs.Main:AddLeftGroupbox("Steal", "hand")
 StealBox:AddDropdown("StealZones", {
 Text = "Zone Filter",
 Values = ZoneLabels,
@@ -30727,7 +30943,15 @@ Func = function()
 task.spawn(runManual, travel, safeSpot())
 end,
 })
-local MoveBox = Tabs.Main:AddLeftGroupbox("Movement", "footprints")
+StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+StatusLabel = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+StatusBox:AddButton({
+Text = "Stop Everything",
+Func = function()
+Plan.stopAll()
+end,
+})
+local MoveBox = Tabs.Player:AddLeftGroupbox("Movement", "footprints")
 MoveBox:AddLabel({
 Text = '<font transparency="0.35">Corvus maps the whole level once and runs the shortest free way around houses and walls at your own speed. The server undoes teleports, so walking is what keeps every steal.</font>',
 DoesWrap = true,
@@ -30750,7 +30974,7 @@ end
 end)
 end,
 })
-local SellBox = Tabs.Main:AddRightGroupbox("Sell", "banknote")
+local SellBox = Tabs.Items:AddLeftGroupbox("Sell", "banknote")
 SellBox:AddToggle("AutoSell", { Text = "Auto Sell", Default = false, Tooltip = "Sells your items every interval" })
 SellBox:AddToggle("SellTeleport", { Text = "Teleport to Seller while Selling", Default = true })
 SellBox:AddToggle(
@@ -30792,19 +31016,23 @@ Func = function()
 task.spawn(runManual, sellNow, true)
 end,
 })
-StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
-StatusLabel = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+local FuseBox = Tabs.Items:AddRightGroupbox("Fuse Machine", "combine")
+FuseBox:AddToggle("AutoFuse", {
+Text = "Auto Fuse",
+Default = false,
+Tooltip = "Fuses 3 copies of the same item into one stronger item when you can afford the fee. Runs before selling. Not part of Auto Farm Everything: the fee can cost more than the stronger item earns.",
+})
+FuseBox:AddDropdown("FuseTiers", {
+Text = "Fuse Rarities",
+Values = RarityList,
+Default = RarityList,
+Multi = true,
+AllowNull = true,
+})
 local PlotBox = Tabs.Plot:AddLeftGroupbox("Plot", "house")
 PlotBox:AddToggle("AutoPlace", { Text = "Auto Place", Default = false, Tooltip = "Places stolen crates on your plot" })
 PlotBox:AddToggle("AutoOpen", { Text = "Auto Open", Default = false, Tooltip = "Opens crates on your plot when they are ready" })
 PlotBox:AddToggle("AutoEquipBest", { Text = "Auto Equip Best", Default = false, Tooltip = "Keeps your best items on the plot" })
-PlotBox:AddToggle("AutoBuySlot", { Text = "Auto Buy +1 Equip", Default = false, Tooltip = "Buys extra item slots with cash" })
-PlotBox:AddToggle("AutoUpgradePlot", { Text = "Auto Upgrade Plot", Default = false })
-PlotBox:AddToggle("SmartSpend", {
-Text = "Smart Spending",
-Default = true,
-Tooltip = "Buys the upgrade with the best payback first: slots by the income of your spare items, trails and treadmill tiers by speed gain per dollar. Cheap buys never starve the better one.",
-})
 PlotBox:AddButton({
 Text = "Go To Plot",
 Func = function()
@@ -30814,7 +31042,25 @@ task.spawn(runManual, travel, floor.Position + Vector3.new(0, floor.Size.Y / 2 +
 end
 end,
 })
-local TreadBox = Tabs.Plot:AddRightGroupbox("Treadmill", "gauge")
+local SpendBox = Tabs.Upgrades:AddLeftGroupbox("Smart Spending", "coins")
+SpendBox:AddToggle("SmartSpend", {
+Text = "Smart Spending",
+Default = true,
+Tooltip = "Buys the upgrade with the best payback first: slots by the income of your spare items, trails and treadmill tiers by speed gain per dollar. Cheap buys never starve the better one.",
+})
+SpendBox:AddToggle("AutoBuySlot", { Text = "Auto Buy +1 Equip", Default = false, Tooltip = "Buys extra item slots with cash" })
+SpendBox:AddToggle("AutoUpgradePlot", { Text = "Auto Upgrade Plot", Default = false })
+local TrailBox = Tabs.Upgrades:AddLeftGroupbox("Trails and Bats", "sparkles")
+TrailBox:AddToggle(
+"AutoTrails",
+{ Text = "Auto Buy Trails", Default = false, Tooltip = "Buys the next trail as soon as you can afford it" }
+)
+TrailBox:AddToggle("AutoEquipTrail", { Text = "Auto Equip Best Trail", Default = true })
+TrailBox:AddToggle(
+"AutoEquipBat",
+{ Text = "Auto Equip Best Bat", Default = true, Tooltip = "Equips the strongest bat your index unlocked" }
+)
+local TreadBox = Tabs.Upgrades:AddRightGroupbox("Treadmill", "gauge")
 TreadBox:AddToggle("AutoTreadmill", {
 Text = "Auto Go On Treadmill",
 Default = false,
@@ -30831,18 +31077,9 @@ Text = "Use Admin Treadmill In Events",
 Default = true,
 Tooltip = "While an admin event boosts the Admin Treadmill (and nobody is on it) trains there instead",
 })
-local MetaBox = Tabs.Meta:AddLeftGroupbox("Meta", "sparkles")
-MetaBox:AddToggle("AutoIndex", { Text = "Auto Claim Index", Default = false, Tooltip = "Claims every finished index reward" })
-MetaBox:AddToggle(
-"AutoTrails",
-{ Text = "Auto Buy Trails", Default = false, Tooltip = "Buys the next trail as soon as you can afford it" }
-)
-MetaBox:AddToggle("AutoEquipTrail", { Text = "Auto Equip Best Trail", Default = true })
-MetaBox:AddToggle(
-"AutoEquipBat",
-{ Text = "Auto Equip Best Bat", Default = true, Tooltip = "Equips the strongest bat your index unlocked" }
-)
-local RewardBox = Tabs.Meta:AddRightGroupbox("Free Rewards", "gift")
+local IndexBox = Tabs.Rewards:AddLeftGroupbox("Index", "book-open")
+IndexBox:AddToggle("AutoIndex", { Text = "Auto Claim Index", Default = false, Tooltip = "Claims every finished index reward" })
+local RewardBox = Tabs.Rewards:AddRightGroupbox("Free Rewards", "gift")
 RewardBox:AddToggle(
 "AutoOffline",
 { Text = "Auto Claim Offline Cash", Default = true, Tooltip = "Claims the offline earnings popup as soon as it shows" }
@@ -30901,19 +31138,13 @@ Func = function()
 task.spawn(runManual, travel, thunderSpot())
 end,
 })
-local FuseBox = Tabs.Storm:AddRightGroupbox("Fuse Machine", "combine")
-FuseBox:AddToggle("AutoFuse", {
-Text = "Auto Fuse",
+local BlessBox = Tabs.Storm:AddLeftGroupbox("Archangel Blessing", "sparkles")
+BlessBox:AddToggle("AutoBlessing", {
+Text = "Auto Bless Crates",
 Default = false,
-Tooltip = "Fuses 3 copies of the same item into one stronger item when you can afford the fee. Runs before selling.",
+Tooltip = "Spends Blessing Points (earned in Archangel events, they have no other use) at the Archangel altar on your best crate for a Blessed, Heavenly or Seraphic mutation. Spends the extra points too, they raise the odds. Walks to the altar only when you have enough points.",
 })
-FuseBox:AddDropdown("FuseTiers", {
-Text = "Fuse Rarities",
-Values = RarityList,
-Default = RarityList,
-Multi = true,
-AllowNull = true,
-})
+BlessLabel = BlessBox:AddLabel({ Text = "Blessing points: -", DoesWrap = true })
 end
 local StatRows = {}
 do
@@ -31074,7 +31305,7 @@ Analytics.feed = FeedBox:AddFeed("StealFeed", { MaxRows = 7, EmptyText = "Every 
 end
 end)
 pcall(function()
-local RatesBox = Tabs.Analytics:AddLeftGroupbox("Live Rates", "activity")
+local RatesBox = Tabs.Stats:AddLeftGroupbox("Rate Tiles", "activity")
 if RatesBox.AddStatTiles then
 Analytics.tiles = RatesBox:AddStatTiles({
 Tiles = {
@@ -31089,7 +31320,7 @@ RatesBox:AddLabel({
 Text = '<font transparency="0.45">Per hour over the last 5 minutes. Arrows compare with your last hour.</font>',
 DoesWrap = true,
 })
-local TrendBox = Tabs.Analytics:AddLeftGroupbox("Trend", "chart-spline")
+local TrendBox = Tabs.Stats:AddLeftGroupbox("Trend", "chart-spline")
 if TrendBox.AddChart then
 Analytics.chart = TrendBox:AddChart("TrendChart", {
 Metrics = { "Money", "Crates", "Speed", "Sold", "Orbs" },
@@ -31103,7 +31334,7 @@ end
 end,
 })
 end
-local ZoneBox = Tabs.Analytics:AddLeftGroupbox("Crates by Zone", "map")
+local ZoneBox = Tabs.Stats:AddLeftGroupbox("Crates by Zone", "map")
 if ZoneBox.AddBarChart then
 Analytics.zoneBars = ZoneBox:AddBarChart({
 Scopes = { "Session", "All time" },
@@ -31115,7 +31346,7 @@ end
 end,
 })
 end
-local GoalsBox = Tabs.Analytics:AddRightGroupbox("Goals", "target")
+local GoalsBox = Tabs.Stats:AddRightGroupbox("Goals", "target")
 if GoalsBox.AddGoals then
 Analytics.goals = GoalsBox:AddGoals("GoalCards", {
 EmptyText = "No goals yet. Pick one below and Corvus tracks it with a live ETA.",
@@ -31139,7 +31370,7 @@ Func = function()
 Analytics.clearGoals()
 end,
 })
-local RarityBox = Tabs.Analytics:AddRightGroupbox("Crates by Rarity", "gem")
+local RarityBox = Tabs.Stats:AddRightGroupbox("Crates by Rarity", "gem")
 if RarityBox.AddBarChart then
 Analytics.rarityBars = RarityBox:AddBarChart({
 Scopes = { "Session", "All time" },
@@ -31292,7 +31523,7 @@ local index = table.find(ZoneOrder, id) or 1
 return "#" .. Color3.fromHSV(((index - 1) / math.max(#ZoneOrder, 1) * 0.8 + 0.55) % 1, 0.55, 0.95):ToHex()
 end
 function Analytics.draw(force)
-local active = Library.ActiveTab == nil or Library.ActiveTab == Tabs.Analytics
+local active = Library.ActiveTab == nil or Library.ActiveTab == Tabs.Stats
 if not active and force ~= true then
 return
 end
@@ -31436,7 +31667,7 @@ end)
 end
 end
 pcall(function()
-local TweakBox = (Tabs.Misc or Tabs.Meta):AddLeftGroupbox("Game Tweaks", "wrench")
+local TweakBox = (Tabs.Misc or Tabs.Upgrades):AddLeftGroupbox("Game Tweaks", "wrench")
 TweakBox:AddToggle("BlockIdleRejoin", {
 Text = "Block Idle Rejoin",
 Default = true,
@@ -31495,7 +31726,6 @@ return text .. (if setToggles(names, args) then " on" else " off")
 end,
 })
 end
-local FarmToggles = { "AutoSteal", "AutoPlace", "AutoOpen", "AutoEquipBest", "AutoIndex" }
 local AllAutoToggles = {
 "FarmAll",
 "AutoSteal",
@@ -31511,6 +31741,7 @@ local AllAutoToggles = {
 "AutoTrails",
 "AutoOrbs",
 "AutoThunder",
+"AutoBlessing",
 "AutoFuse",
 }
 if Library.AddCommand then
@@ -31524,11 +31755,11 @@ toggleCommand("treadmill", { "tm", "train" }, { "AutoTreadmill" }, "Auto Treadmi
 toggleCommand("upgrades", { "upgrade" }, { "AutoUpgradePlot", "AutoUpgradeTreadmill", "AutoBuySlot" }, "Auto upgrades")
 toggleCommand("index", { "autoindex" }, { "AutoIndex" }, "Auto Claim Index")
 toggleCommand("trails", { "autotrails" }, { "AutoTrails" }, "Auto Buy Trails")
-toggleCommand("farm", { "autofarm" }, FarmToggles, "The full farm (steal, place, open, equip best, index)")
 toggleCommand("orbs", { "storm" }, { "AutoOrbs" }, "Auto Collect Storm Orbs")
 toggleCommand("thunder", { "charge" }, { "AutoThunder" }, "Auto Charge Crates")
 toggleCommand("fuse", { "autofuse" }, { "AutoFuse" }, "Auto Fuse")
-toggleCommand("farmall", { "everything", "afk" }, { "FarmAll" }, "Auto Farm Everything")
+toggleCommand("farmall", { "farm", "autofarm", "everything", "afk" }, { "FarmAll" }, "Auto Farm Everything")
+toggleCommand("bless", { "blessing", "archangel" }, { "AutoBlessing" }, "Auto Bless Crates")
 Library:AddCommand({
 Name = "freegift",
 Aliases = { "gift" },
@@ -31551,6 +31782,11 @@ local left = nextStormIn()
 return if left then string.format("Next storm in %dm %02ds", left // 60, left % 60) else "Storm time unknown"
 end,
 })
+function Plan.stopAll()
+setToggles(AllAutoToggles, { "off" })
+log("STOP everything")
+notify("Corvus", "Everything is off", 3)
+end
 Library:AddCommand({
 Name = "stop",
 Aliases = { "alloff" },
@@ -31719,8 +31955,15 @@ Title = "What should Corvus do for you?",
 Description = "Pick everything you want running. Tap again to unpick.",
 Multi = true,
 Required = true,
-Default = { "steal", "plot", "meta", "storm" },
+Default = { "all", "steal", "plot", "meta", "storm" },
 Choices = {
+{
+Id = "all",
+Title = "Auto Farm Everything",
+Description = "One switch for the whole farm: every automation below, with the best spending order calculated",
+Icon = "rocket",
+Color = "#f0c040",
+},
 {
 Id = "steal",
 Title = "Steal crates",
@@ -31803,7 +32046,7 @@ Color = "#9085e9",
 },
 },
 Visible = function(state)
-return type(state.tasks) == "table" and state.tasks.steal == true
+return type(state.tasks) == "table" and (state.tasks.steal == true or state.tasks.all == true)
 end,
 },
 },
@@ -31816,13 +32059,16 @@ sell = { "AutoSell" },
 upgrades = { "AutoUpgradePlot", "AutoBuySlot", "AutoUpgradeTreadmill" },
 meta = { "AutoIndex", "AutoTrails", "AutoEquipTrail" },
 treadmill = { "AutoTreadmill" },
-storm = { "AutoOrbs", "AutoThunder" },
+storm = { "AutoOrbs", "AutoThunder", "AutoBlessing" },
 fuse = { "AutoFuse" },
 }
 for id, names in pairs(groups) do
 setToggles(names, { if picked[id] then "on" else "off" })
 end
-if picked.steal and values.zones == "escape" then
+if picked.all then
+setToggles({ "FarmAll" }, { "on" })
+end
+if (picked.steal or picked.all) and values.zones == "escape" then
 local all = {}
 for _, label in ipairs(ZoneLabels) do
 all[label] = true
@@ -32039,9 +32285,9 @@ timestamp = DateTime.now():ToIsoDate(),
 notify("Feedback", if ok then "Thanks! Cinek got your message." else "Could not send, try again later", 5)
 end)
 end
-if Tabs.Misc then
+if Tabs.Webhook then
 pcall(function()
-local HookBox = Tabs.Misc:AddLeftGroupbox("Discord Webhook", "webhook")
+local HookBox = Tabs.Webhook:AddLeftGroupbox("Discord Webhook", "webhook")
 HookBox:AddToggle(
 "WebhookOn",
 { Text = "Post to Discord", Default = false, Tooltip = "Posts good crates, sales and a timed report to your own webhook" }
@@ -32197,7 +32443,7 @@ Color = "#f0b90b",
 Note = "Only send on BNB Smart Chain (BEP20)",
 },
 }
-for _, tab in ipairs({ Tabs.Info, Tabs.Main, Tabs.Plot, Tabs.Storm, Tabs.Meta, Tabs.Stats, Tabs.Analytics, Tabs.Misc, Tabs.Settings }) do
+for _, tab in ipairs({ Tabs.Info, Tabs.Main, Tabs.Storm, Tabs.Plot, Tabs.Upgrades, Tabs.Rewards, Tabs.Items, Tabs.Player, Tabs.Stats, Tabs.Webhook, Tabs.Misc, Tabs.Settings }) do
 pcall(function()
 local left = tab == Tabs.Info and tab.Groupboxes.Community or nil
 if left then
@@ -32374,6 +32620,11 @@ end
 end
 if on("AutoThunder") and thunderReady() then
 if chargeCrate() then
+return
+end
+end
+if on("AutoBlessing") and Bless.ready() then
+if Bless.once() then
 return
 end
 end
@@ -32575,6 +32826,9 @@ local left = nextStormIn()
 stormText = if left then string.format("Next storm in %dm %02ds", left // 60, left % 60) else "Storm time unknown"
 end
 StormLabel:SetText(stormText .. "\nStorm points: " .. formatNumber(tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0))
+if BlessLabel then
+BlessLabel:SetText("Blessing points: " .. (if Bless.points then formatNumber(Bless.points) else "not known yet") .. " | blessed: " .. formatNumber(Bless.count))
+end
 StatRows.Claimed.set(formatNumber(Session.claimed))
 StatRows.Bought.set(formatNumber(Session.bought))
 end)
