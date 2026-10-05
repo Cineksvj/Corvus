@@ -27274,6 +27274,7 @@ end
 local AreaData = safeRequire("Shared.Data.AreaData")
 local TrailData = safeRequire("Shared.Data.TrailData")
 local Balance = safeRequire("LBTHClient.Services.ClientBalanceService")
+local ServerLuck = safeRequire("LBTHClient.Services.ServerLuckClient")
 local SpeedData = safeRequire("Shared.Data.SpeedData")
 local SlotPrices = nil
 do
@@ -29207,6 +29208,9 @@ Track.stolen(LastStealRarity, LastStealArea, StealStartedAt and os.clock() - Ste
 if Plan.endTrip then
 Plan.endTrip(StealStartedAt and os.clock() - StealStartedAt)
 end
+if Plan.guardEvent then
+Plan.guardEvent(LastStealArea, false)
+end
 log(
 "STEAL ok",
 LastStealRarity,
@@ -29244,6 +29248,7 @@ end
 ReturnFails = 0
 setStatus("Dropped the crate, it could not be brought home")
 log("STEAL dropped crate, could not reach the safe zone", LastStealRarity, LastStealArea)
+Plan.guardEvent(LastStealArea, true)
 end
 elseif bankedCrates() > before or LocalPlayer:GetAttribute("InSafeZone") == true then
 ReturnFails = 0
@@ -29256,6 +29261,7 @@ ZoneBackoff[LastStealArea] = os.clock() + 90
 end
 setStatus("The guard took the crate back")
 log("STEAL guard took the crate back", LastStealRarity, LastStealArea)
+Plan.guardEvent(LastStealArea, true)
 end
 end
 local function stealOnce()
@@ -30451,7 +30457,7 @@ end
 do
 local HORIZON = 86400
 local SellSeconds = ItemData and type(ItemData.Sell) == "table" and tonumber(ItemData.Sell.ItemSeconds) or 1200
-local V = { dists = {}, values = {}, present = {}, plot = { free = 1, min = 0, used = 0 }, calib = 1, calibN = 0, zones = {}, pos = nil, pending = nil }
+local V = { dists = {}, values = {}, present = {}, plot = { free = 1, min = 0, used = 0 }, calib = 1, calibN = 0, zones = {}, pos = nil, pending = nil, guard = {}, guardAll = { ok = 0, lost = 0 }, rareLogged = {} }
 Plan.V = V
 Plan.list, Plan.best, Plan.time, Plan.ready = {}, nil, nil, false
 Plan.orbSec, Plan.orbPts, Plan.pointValue, Plan.planKey = 0, 0, 0, nil
@@ -30637,10 +30643,71 @@ end
 end
 end
 end
+if not isRarity and type(ItemData.ODDS_SPECIAL_PER_CRATE) == "table" then
+local specials = {}
+for name, odds in pairs(ItemData.ODDS_SPECIAL_PER_CRATE) do
+local p = type(odds) == "table" and tonumber(odds[id]) or nil
+local mult = type(ItemData.SpecialMultipliers) == "table" and tonumber(ItemData.SpecialMultipliers[name]) or nil
+if p and p > 0 and mult and mult > 1 then
+table.insert(specials, { name = tostring(name), p = p, mult = mult })
+end
+end
+table.sort(specials, function(a, b)
+return a.mult < b.mult
+end)
+out.specials = specials
+end
 list = out
 end)
 V.dists[key] = list
 return list or nil
+end
+function V.luck(areaId)
+local luck = 1
+pcall(function()
+local every = 5
+if type(ItemData.GetLuckEvery) == "function" then
+every = tonumber(ItemData.GetLuckEvery(ItemData, canonicalArea(areaId))) or every
+end
+luck = 1 + ((tonumber(ItemData.LUCK_MULT) or 3) - 1) / math.max(every, 1)
+if type(ServerLuck) == "table" then
+local now = os.time()
+for _, pair in ipairs({ { "Luck", "EndTime" }, { "GlobalLuck", "GlobalEndTime" }, { "AdminGlobalLuck", "AdminGlobalEndTime" } }) do
+local v = tonumber(ServerLuck[pair[1]]) or 1
+local ends = tonumber(ServerLuck[pair[2]])
+if v > 1 and (not ends or ends > now) then
+luck *= v
+end
+end
+end
+end)
+return math.max(luck, 1)
+end
+function Plan.guardLoss(id)
+local all = V.guardAll
+local prior = if all.ok + all.lost > 0 then all.lost / (all.ok + all.lost) else 0
+local zone = V.guard[id]
+if not zone or zone.ok + zone.lost == 0 then
+return prior
+end
+return (zone.lost + prior * 4) / (zone.ok + zone.lost + 4)
+end
+function Plan.guardEvent(id, lost)
+if not id then
+return
+end
+local zone = V.guard[id] or { ok = 0, lost = 0 }
+V.guard[id] = zone
+if lost then
+zone.lost += 1
+V.guardAll.lost += 1
+else
+zone.ok += 1
+V.guardAll.ok += 1
+end
+if lost then
+log("GUARD", string.format("loss=%.2f zone=%s (%d/%d, all %d/%d)", Plan.guardLoss(id), tostring(id), zone.lost, zone.ok + zone.lost, V.guardAll.lost, V.guardAll.ok + V.guardAll.lost))
+end
 end
 function V.plotState()
 local floor = myFloor()
@@ -30690,13 +30757,56 @@ local list = V.dist(areaId, tier, size)
 if not list then
 return nil, nil
 end
-local value, income = 0, 0
-for _, entry in ipairs(list) do
-value += entry.p * V.item(entry.income, entry.time)
-income += entry.p * entry.income
+local value, income, rare = 0, 0, {}
+local specials = list.specials or {}
+local pSum, luck = 0, V.luck(areaId)
+for _, s in ipairs(specials) do
+pSum += s.p * luck
 end
-V.values[key] = { value, income }
+local scale = if pSum > 0.9 then 0.9 / pSum else 1
+pSum *= scale
+for _, entry in ipairs(list) do
+local baseP = entry.p * (1 - pSum)
+value += baseP * V.item(entry.income, entry.time)
+income += baseP * entry.income
+for _, s in ipairs(specials) do
+local p = entry.p * s.p * luck * scale
+local v = V.item(entry.income * s.mult, entry.time)
+value += p * v
+income += p * entry.income * s.mult
+local info = rare[s.name] or { p = s.p * luck * scale, value = 0 }
+info.value += p * v
+rare[s.name] = info
+end
+end
+V.values[key] = { value, income, rare }
 return value, income
+end
+function V.logRare(area)
+local id = area.Id
+if V.rareLogged[id] then
+return
+end
+V.rareLogged[id] = true
+local tiers = type(area.CrateTiers) == "table" and area.CrateTiers or {}
+local sums, count = {}, 0
+for _, tier in ipairs(tiers) do
+local key = tostring(id) .. "|" .. tostring(tier) .. "|STANDARD"
+if V.crate(id, tier, "STANDARD") and V.values[key] then
+count += 1
+for name, info in pairs(V.values[key][3] or {}) do
+local sum = sums[name] or { p = 0, value = 0 }
+sum.p += info.p
+sum.value += info.value
+sums[name] = sum
+end
+end
+end
+for name, sum in pairs(sums) do
+if count > 0 then
+log("RARE", string.format("tier=%s p=%.5f value=$%s zone=%s", name, sum.p / count, formatNumber(sum.value / count), tostring(id)))
+end
+end
 end
 function V.walk(level)
 local speed
@@ -30812,7 +30922,7 @@ trip = V.trip(V.raw(dist, dist, "STANDARD", level))
 else
 return nil, nil
 end
-return value / math.max(trip, 0.5), income
+return value * (1 - Plan.guardLoss(id)) / math.max(trip, 0.5), income
 end
 function Plan.zoneWanted(id)
 if not (Options.StealZones and type(Options.StealZones.Value) == "table") then
@@ -30833,7 +30943,7 @@ return nil
 end
 local pos = crate:GetPivot().Position
 local level = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
-return value / V.trip(V.raw((pos - root.Position).Magnitude, (pos - safe).Magnitude, size, level))
+return value * (1 - Plan.guardLoss(area)) / V.trip(V.raw((pos - root.Position).Magnitude, (pos - safe).Magnitude, size, level))
 end
 function Plan.startTrip(target)
 V.pending = nil
@@ -31061,6 +31171,9 @@ local cashRate = if spent >= 30 then (Sched.trainMoney + Sched.otherMoney) / spe
 cashRate = math.max(cashRate, 1e-6)
 local nowRate, nowArea, nowIncome = 0, nil, 0
 for _, area in ipairs(Areas) do
+V.logRare(area)
+end
+for _, area in ipairs(Areas) do
 if Plan.zoneWanted(area.Id) and (area.RecommendedSpeed or 0) <= level then
 local rate, income = V.zoneRate(area, level)
 if rate and rate > nowRate then
@@ -31216,7 +31329,7 @@ logEvery("plan", 120, "PLAN", text)
 end
 local zones = {}
 for id, zone in pairs(V.zones) do
-table.insert(zones, string.format("%s $%s/s trip %.0fs n%d", id, formatNumber(zone.rate or 0), zone.dist / V.walk(level), zone.n))
+table.insert(zones, string.format("%s $%s/s trip %.0fs n%d loss %.0f%%", id, formatNumber((zone.rate or 0) * (1 - Plan.guardLoss(id))), zone.dist / V.walk(level), zone.n, Plan.guardLoss(id) * 100))
 end
 if #zones > 0 then
 table.sort(zones)
