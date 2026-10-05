@@ -27350,13 +27350,15 @@ local Allowed = {
 ["Game/RadarState"] = true,
 ["Game/FusionAction"] = true,
 ["Game/ClaimEventReward"] = true,
+["Game/PlayerActivity"] = true,
+["Game/EggTimerPause"] = true,
 ["Plot/Nests"] = true,
 ["Plot/Upgrades"] = true,
 ["Net/VolcanoDip"] = true,
 ["Dialogue/DialogueSelect"] = true,
 ["Dialogue/DialogueTypingDone"] = true,
 }
-local Quiet = { ["Game/PetCollect"] = true, ["Game/RadarState"] = true, ["Game/ShopStock"] = true }
+local Quiet = { ["Game/PlayerActivity"] = true, ["Game/PetCollect"] = true, ["Game/RadarState"] = true, ["Game/ShopStock"] = true }
 local function remoteOf(path)
 local root, name = string.match(path, "^(%w+)/(.+)$")
 local getter = root and RemoteRoots[root]
@@ -29238,6 +29240,9 @@ Farm.skip[id] = nil
 return false
 end
 function N.eggWanted(info)
+if on("FarmAll") and N.weatherEggMult and N.weatherEggMult(info) and not (on("SkipMazeEggs") and info.maze) then
+return true
+end
 if not allows(Options.FarmRarities, info.rarity) then
 return false
 end
@@ -29278,6 +29283,14 @@ end
 return sum
 end
 function N.eggScore(info, from)
+local weatherScore = N.weatherEggScore and N.weatherEggScore(info)
+if
+weatherScore
+and not (on("AdminFirst") and (info.admin or info.spotlight))
+and not (on("RadarFirst") and from and nearRadar(info.pos))
+then
+return weatherScore
+end
 local chance = N.targetChance(info.name)
 if chance > 0 then
 -- with Target Pets the best chance wins
@@ -31557,6 +31570,7 @@ return a.left < b.left
 end)
 return list
 end
+N.activeWeathers = activeWeathers
 function N.weatherText()
 local list = activeWeathers()
 if #list == 0 then
@@ -31718,6 +31732,11 @@ FarmBox:AddToggle(
 { Text = "Event Eggs First", Default = true, Tooltip = "Admin spawned and spotlight eggs are grabbed before anything else" }
 )
 FarmBox:AddToggle("WaitOnPlot", { Text = "Wait On Plot Between Spawns", Default = true })
+FarmBox:AddToggle("PauseEggTimer", {
+Text = "Pause Egg Timer",
+Default = true,
+Tooltip = "Asks the server to pause the break timer of the eggs in your basket while you carry them away from your plot (the same call the game sends during cutscenes). Checks itself and stops if the server ignores it.",
+})
 FarmBox:AddButton({
 Text = "Grab Best Egg",
 Func = function()
@@ -34635,6 +34654,169 @@ for _, job in ipairs(Jobs) do
 if on(job[1]) and (home or not job[5]) and every(job[2], job[3]) then
 runJob(job[2], job[4])
 end
+end
+end
+task.wait(0.5)
+end
+end)
+N.Weather = { list = {}, at = -1e9, seen = {} }
+function N.weatherState()
+local W = N.Weather
+local clock = os.clock()
+if clock - W.at < 1 then
+return W.list
+end
+W.at = clock
+local list = {}
+for _, entry in ipairs(N.activeWeathers and N.activeWeathers() or {}) do
+local mutation
+for name, cfg in pairs(N.MutationData) do
+if type(cfg) == "table" and cfg.WeatherName == entry.name then
+mutation = name
+break
+end
+end
+table.insert(list, {
+name = entry.name,
+mutation = mutation,
+mult = if mutation then N.mutationFactor(mutation) else 1,
+left = entry.left,
+})
+end
+W.list = list
+return list
+end
+-- Eggs that carry a storm mutation while a storm runs are the prize (only eggs spawned in the weather get it).
+function N.weatherEggMult(info)
+local mutation = info.mutation
+local cfg = mutation and N.MutationData[mutation]
+if type(cfg) ~= "table" or not cfg.WeatherName then
+return nil
+end
+for _, w in ipairs(N.weatherState()) do
+if w.mutation then
+return N.mutationFactor(mutation)
+end
+end
+return nil
+end
+-- Value per second of a weather egg (mutation multiplier included), above every normal pick but below radar and event eggs.
+function N.weatherEggScore(info)
+local mult = N.weatherEggMult(info)
+if not mult then
+return nil
+end
+local value = info.luck * mult * N.mutationFactor(info.spawnMutation) * math.max(info.weight, 0.5)
+return 1e27 + value / ((info.toEgg or 0) + (info.back or 0) + 1)
+end
+function N.weatherTick()
+local W = N.Weather
+local active = {}
+for _, w in ipairs(N.weatherState()) do
+active[w.name] = true
+if not W.seen[w.name] then
+W.seen[w.name] = true
+log("WEATHER", w.name, string.format("mult=%.4g until=%ds", w.mult, math.floor(w.left)))
+if w.mutation and (on("AutoFarm") or on("FarmAll")) then
+log("WEATHER prioritise eggs")
+end
+end
+end
+for name in pairs(W.seen) do
+if not active[name] then
+W.seen[name] = nil
+log("WEATHER", name, "ended")
+end
+end
+end
+N.Activity = { at = -1e9, logged = false }
+-- The game's own ActivityReporter fires PlayerActivity (no arguments) on input at most every 3 s.
+function N.activityTick()
+local A = N.Activity
+local running = false
+for _, name in ipairs(N.AllAutoToggles) do
+if on(name) then
+running = true
+break
+end
+end
+if not running or os.clock() - A.at < 3 then
+return
+end
+A.at = os.clock()
+if fire("Game/PlayerActivity") and not A.logged then
+A.logged = true
+log("ACTIVITY on")
+end
+end
+N.Pause = { sent = false, checkAt = nil, before = nil, fails = 0, dead = false, verified = false }
+function N.pauseRemaining()
+local best
+for _, child in ipairs(N.basketItems()) do
+local at = tonumber(child:GetAttribute("BreakAt"))
+if at then
+local left = at - (tonumber(child:GetAttribute("BreakPausedAt")) or serverNow())
+if not best or left < best then
+best = left
+end
+end
+end
+return best
+end
+function N.pausedAny()
+for _, child in ipairs(N.basketItems()) do
+if child:GetAttribute("BreakPausedAt") ~= nil then
+return true
+end
+end
+return false
+end
+function N.pauseTick()
+local P = N.Pause
+local active = not P.dead and on("PauseEggTimer") and (on("AutoFarm") or on("FarmAll"))
+local root = rootPart()
+local home = root ~= nil and N.onPlot(root.Position, 4)
+local want = active and #N.basketItems() > 0 and not home
+local clock = os.clock()
+if want and not P.sent then
+P.before = N.pauseRemaining()
+P.sent = true
+P.checkAt = if P.verified then nil else clock + 1.5
+fire("Game/EggTimerPause", true)
+elseif P.sent and not want then
+P.sent = false
+P.checkAt = nil
+fire("Game/EggTimerPause", false)
+elseif P.sent and P.checkAt and clock >= P.checkAt then
+P.checkAt = nil
+local after = N.pauseRemaining()
+local ok = N.pausedAny() and P.before ~= nil and after ~= nil and after >= P.before - 1
+local function fmt(v)
+return if v then string.format("%.1f", v) else "nil"
+end
+log(string.format("PAUSE sent ok=%s timerBefore=%s timerAfter=%s", tostring(ok), fmt(P.before), fmt(after)))
+if ok then
+P.fails = 0
+P.verified = true
+else
+P.fails += 1
+P.sent = false
+fire("Game/EggTimerPause", false)
+if P.fails >= 3 then
+P.dead = true
+log("PAUSE unsupported")
+end
+end
+end
+end
+N.TickErr = {}
+task.spawn(function()
+while alive() do
+for name, fn in pairs({ activity = N.activityTick, weather = N.weatherTick, pause = N.pauseTick }) do
+local ok, err = pcall(fn)
+if not ok and not N.TickErr[name] then
+N.TickErr[name] = true
+log("ERROR", name, tostring(err))
 end
 end
 task.wait(0.5)
