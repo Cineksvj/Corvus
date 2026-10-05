@@ -23436,14 +23436,10 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                 }
     
                 local ResizeTween
+                local ResizeTarget
                 local CollapseArrowTween
-    
+
                 function Groupbox:Resize()
-                    if ResizeTween then
-                        StopTween(ResizeTween, true)
-                        ResizeTween = nil
-                    end
-    
                     local TopSize = (GroupboxTop.AbsoluteSize.Y / Library.DPIScale)
                     local ContainerSize = (GroupboxList.AbsoluteContentSize.Y / Library.DPIScale) + 14
                     if Groupbox.PoppedOut then
@@ -23453,7 +23449,19 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                     local TargetSize = UDim2.new(1, 0, 0, if Groupbox.Collapsed then TopSize else (TopSize + 1 + ContainerSize))
                     GroupboxContainer.Size = UDim2.new(1, 0, 0, ContainerSize)
                     GroupboxLine.Visible = not Groupbox.Collapsed
-    
+
+                    -- live labels fire AbsoluteContentSize often: keep a running tween to the same size, skip a resize to the current size
+                    if ResizeTween then
+                        if ResizeTarget == TargetSize then
+                            return
+                        end
+                        StopTween(ResizeTween, true)
+                        ResizeTween = nil
+                    elseif GroupboxHolder.Size == TargetSize then
+                        return
+                    end
+                    ResizeTarget = TargetSize
+
                     if Library.Animations and Library.Animations.Groupbox then
                         local TweenInfo = Library.GroupboxTweenInfo or TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
                         local Tween = TweenService:Create(GroupboxHolder, TweenInfo, { Size = TargetSize })
@@ -27671,7 +27679,7 @@ end
                 if Info.AutoLoad ~= false then
                     task.defer(function()
                         pcall(SaveManager.LoadAutoloadConfig, SaveManager)
-                        if Library.OnAutoload then pcall(Library.OnAutoload) end
+                        Library:FireAutoload()
                     end)
                 end
             end
@@ -31418,6 +31426,147 @@ end
 			return Result
 		end
 	end
+	-- CORVUS-STARTLOG: standard owner log lines for every hub. The hub sets Library.LoadLogger (its log function);
+	-- BOOT comes from the hub, START + AUTOLOAD + CLICK come from here unless the hub set its own OnAutoload/OnUserToggle.
+	-- A hub that logs these itself opts out with Library.OnAutoload = false / Library.OnUserToggle = nil.
+	function Library:CorvusLog(Line: string)
+		if typeof(Library.LoadLogger) == "function" then
+			pcall(Library.LoadLogger, tostring(Line))
+		end
+	end
+	local function TogglesOn(): { string }
+		local Names = {}
+		for Name, Toggle in Library.Toggles do
+			if typeof(Name) == "string" and typeof(Toggle) == "table" and Toggle.Value == true then
+				table.insert(Names, Name)
+			end
+		end
+		table.sort(Names)
+		return Names
+	end
+	function Library:LogStart()
+		if Library.StartLogged then
+			return
+		end
+		Library.StartLogged = true
+		local Total, On = 0, #TogglesOn()
+		for Name in Library.Toggles do
+			if typeof(Name) == "string" then
+				Total += 1
+			end
+		end
+		local Shown = CorvusLoadTimes.shown
+		Library:CorvusLog(string.format(
+			"START hub loaded | place %s | toggles %d on of %d | window %ss",
+			tostring(game.PlaceId), On, Total, if Shown then string.format("%.1f", Shown - CorvusLoadT0) else "-"
+		))
+	end
+	function Library:FireAutoload()
+		if Library.AutoloadFired then
+			return
+		end
+		Library.AutoloadFired = true
+		Library:LogStart()
+		local Hook = Library.OnAutoload
+		if Hook == false then
+			return
+		end
+		if typeof(Hook) == "function" then
+			pcall(Hook)
+			return
+		end
+		local Names = TogglesOn()
+		Library:CorvusLog("AUTOLOAD toggles=" .. (if #Names > 0 then table.concat(Names, ",") else "-"))
+	end
+	Library.OnUserToggle = function(Name, Value)
+		Library:CorvusLog("CLICK " .. tostring(Name) .. "=" .. tostring(Value))
+	end
+	do
+		local BaseCreateWindowLog = Library.CreateWindow
+		function Library:CreateWindow(...)
+			local Window = BaseCreateWindowLog(self, ...)
+			if not Library.StartFallback then
+				Library.StartFallback = true
+				task.delay(20, function()
+					if not Library.Unloaded then
+						Library:LogStart()
+					end
+				end)
+			end
+			return Window
+		end
+	end
+	-- Quick Start rule: a second control for an existing toggle in another groupbox. Both stay in sync both ways,
+	-- the original keeps the only callback and the only config key (the mirror is not in Library.Toggles).
+	function Library:MirrorToggle(Idx: string, Box: any, Opts: any?)
+		Opts = if typeof(Opts) == "table" then Opts else {}
+		local Original = Library.Toggles[Idx]
+		if typeof(Original) ~= "table" or typeof(Box) ~= "table" or typeof(Box.AddToggle) ~= "function" then
+			return nil
+		end
+		local Key = {}
+		local Mirror = Box:AddToggle(Key, {
+			Text = Opts.Text or Original.Text,
+			Description = Opts.Description,
+			Tooltip = Opts.Tooltip or Original.Tooltip,
+			DisabledTooltip = Original.DisabledTooltip,
+			Risky = Original.Risky,
+			Default = Original.Value == true,
+		})
+		Library.Toggles[Key] = nil
+		if not Mirror then
+			return nil
+		end
+		Mirror.MirrorOf = Idx
+		local ShowValue = Mirror.SetValue
+		local Syncing = false
+		local function Sync()
+			if Syncing or Mirror.Destroyed then
+				return
+			end
+			Syncing = true
+			if Mirror.Value ~= Original.Value then
+				pcall(ShowValue, Mirror, Original.Value)
+			end
+			Syncing = false
+		end
+		local BaseSet = Original.SetValue
+		Original.SetValue = function(Self, Value)
+			BaseSet(Self, Value)
+			Sync()
+		end
+		local BaseDisabled = Original.SetDisabled
+		if typeof(BaseDisabled) == "function" then
+			Original.SetDisabled = function(Self, Disabled)
+				BaseDisabled(Self, Disabled)
+				if not Mirror.Destroyed then
+					pcall(Mirror.SetDisabled, Mirror, Disabled)
+				end
+			end
+			if Original.Disabled then
+				pcall(Mirror.SetDisabled, Mirror, true)
+			end
+		end
+		-- the mirror's own switch (click, quick bar) drives the original; Sync then repaints the mirror
+		Mirror.SetValue = function(_, Value)
+			Original:SetValue(Value)
+		end
+		local Holder = Mirror.Holder
+		if typeof(Holder) == "Instance" and Holder:IsA("GuiButton") then
+			table.insert(Mirror.Connections, Holder.MouseButton1Click:Connect(function()
+				-- deferred so the value is the one after the click, whatever order the connections fire in
+				task.defer(function()
+					if not Original.Disabled and Library.OnUserToggle then
+						pcall(Library.OnUserToggle, Idx, Original.Value)
+					end
+				end)
+			end))
+			table.insert(Mirror.Connections, Holder.MouseButton2Click:Connect(function()
+				Library:StartQuickBind("Toggle", Idx, tostring(Original.Text))
+			end))
+		end
+		return Mirror
+	end
 	getgenv().CorvusLibrary = Library
     return Library
     end)()
@@ -31690,7 +31839,7 @@ do
 	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true, TakeOil = true, TakeWheel = true, TakePainter = true, FixBike = true, DeliverPizza = true, ExitWorkstation = true, BurgerChoppingMinigameFinished = true, UseFishingRod = true, UseHatchet = true }
 	local AllowedJobInvoke = { CleanSchoolJanitorObject = true, TakePizzaBox = true, MineBlock = true, TeacherJob_TaskComplete = true, TeacherJob_GetHallPass = true, TeacherJob_StartLectureStudent = true, TeacherJob_UseBoard = true, RequestCashierRole = true, ConfirmOrderCashier = true, RequestStationRole = true, RequestIngredientSpawn = true, DragDropObject = true }
 	-- Build mode on YOUR OWN plot only, paid with your own money (the normal build packets the game's build menu sends).
-	local AllowedBuild = { EnterBuild = true, PlaceObject = true, PlaceWall = true, PlaceFloor = true, PlacePath = true }
+	local AllowedBuild = { EnterBuild = true, PlaceObject = true, PlaceWall = true, PlaceFloor = true, PlacePath = true, PlaceRoof = true, ColorObject = true }
 	function N.buildInvoke(packet)
 		local jh = N.jobHandler()
 		if not (jh and AllowedBuild[packet.Type]) then
@@ -32723,8 +32872,13 @@ end
 -- named root parts in House.Objects / Counters and in every ItemHolder, with their CFrame) relative to the plot's
 -- _groundCFrame, and saves it to Corvus/WTB_layouts/<name>.json. "Build" places the same things on YOUR plot with the
 -- normal build packets (EnterBuild, PlaceFloor {Points}, PlaceWall {From, To}, PlacePath {From, To}, PlaceObject
--- {Name, Pos, Rot, TargetModel}), paid with your own money. Blockbux and event currency items are never bought.
--- Roofs and paint are not copied yet (their packets need more data). BETA: not tested in game yet.
+-- {Name, Pos, Rot, TargetModel}, PlaceRoof {Points, Settings}), paid with your own money. Blockbux and event currency
+-- items are never bought. Roofs: House.Roof.<roof type> model, PointData Point_N in plot space (Y = wall height + 0.1)
+-- and PropertyData children (Height...) = the build tool's RoofSettings {Type = item name, <property> = value} (dump
+-- BuildUI.Tools.Roof 102504/102929/103186, the game's own quest sends {Points, Settings = {Type}} without Start,
+-- 75479). Paint: ColorService:GetAppearanceData(object) = 4 groups {color int, material id} (dump 244895), applied with
+-- the paint tool's packet ColorObject {Object, Data, Side ("L"/"R" for walls, group 2/1), UseMaterials} (95471).
+-- BETA: not tested in game yet.
 N.Build = { running = false, stop = false, dir = "Corvus/WTB_layouts", index = "Corvus/WTB_layouts/index.json", status = "Stand on a plot, type a name and save its layout.", names = {} }
 do
 	local WALL_HALF = 6
@@ -32829,6 +32983,37 @@ do
 		end)
 		return if type(item) == "table" then item else nil
 	end
+	-- the paint of a placed thing as the paint tool reads it; nil when every group is the default (0)
+	local function appearance(object)
+		local jh = N.jobHandler()
+		local data = isolated(function()
+			return jh.Shared.ColorService:GetAppearanceData(object)
+		end)
+		if type(data) ~= "table" then
+			return nil
+		end
+		local out, any = {}, false
+		for i = 1, 4 do
+			local g = data[i]
+			local c, m = type(g) == "table" and tonumber(g[1]) or 0, type(g) == "table" and tonumber(g[2]) or 0
+			out[i] = { c or 0, m or 0 }
+			if (c or 0) ~= 0 or (m or 0) ~= 0 then
+				any = true
+			end
+		end
+		return if any then out else nil
+	end
+	local function pointsOf(model)
+		local pd = model:FindFirstChild("PointData")
+		local points = {}
+		for i = 1, tonumber(pd and pd.Value) or 0 do
+			local p = pd:FindFirstChild("Point_" .. i)
+			if p and typeof(p.Value) == "Vector3" then
+				table.insert(points, arr(p.Value))
+			end
+		end
+		return points
+	end
 	function N.saveLayout(name)
 		name = safeName(name)
 		local root = N.root()
@@ -32843,7 +33028,8 @@ do
 		if not house then
 			return false, "That house has not loaded yet: walk onto the plot and wait a moment"
 		end
-		local data = { version = 1, source = plot.Name, saved = os.time(), floors = {}, walls = {}, paths = {}, objects = {}, cost = 0, skipped = 0, roofs = 0 }
+		local data = { version = 2, source = plot.Name, saved = os.time(), floors = {}, walls = {}, paths = {}, objects = {}, roofList = {}, paint = { floors = {}, walls = {}, paths = {}, roofs = {} }, cost = 0, skipped = 0, roofs = 0 }
+		local painted = 0
 		local floor = house:FindFirstChild("Floor")
 		for _, model in ipairs(floor and floor:GetChildren() or {}) do
 			local pd = model:FindFirstChild("PointData")
@@ -32857,6 +33043,11 @@ do
 				end
 				if #points >= 3 then
 					table.insert(data.floors, points)
+					local cg = appearance(model)
+					if cg then
+						data.paint.floors[tostring(#data.floors)] = cg
+						painted += 1
+					end
 					if #data.floors == 1 then
 						-- check the "points are in plot space" reading against the floor model's own position
 						local sum = Vector3.zero
@@ -32883,7 +33074,10 @@ do
 			if not cf then
 				return
 			end
-			local entry = { name = object.Name, cf = { ground:ToObjectSpace(cf):GetComponents() }, on = on, link = link, price = item and tonumber(item.Price) or 0 }
+			local entry = { name = object.Name, cf = { ground:ToObjectSpace(cf):GetComponents() }, on = on, link = link, price = item and tonumber(item.Price) or 0, cg = appearance(object) }
+			if entry.cg then
+				painted += 1
+			end
 			table.insert(data.objects, entry)
 			data.cost += entry.price
 			local index = #data.objects
@@ -32899,6 +33093,11 @@ do
 				local down = Vector3.new(0, WALL_HALF, 0)
 				table.insert(data.walls, { arr(ground:PointToObjectSpace(a - down)), arr(ground:PointToObjectSpace(b - down)) })
 				local index = #data.walls
+				local cg = appearance(wall)
+				if cg then
+					data.paint.walls[tostring(index)] = cg
+					painted += 1
+				end
 				local holder = wall:FindFirstChild("ItemHolder")
 				for _, child in ipairs(holder and holder:GetChildren() or {}) do
 					addObject(child, "wall", index)
@@ -32910,6 +33109,11 @@ do
 			local a, b = poleOf(path, "FPole"), poleOf(path, "BPole")
 			if a and b then
 				table.insert(data.paths, { arr(ground:PointToObjectSpace(a)), arr(ground:PointToObjectSpace(b)) })
+				local cg = appearance(path)
+				if cg then
+					data.paint.paths[tostring(#data.paths)] = cg
+					painted += 1
+				end
 			end
 		end
 		for _, folderName in ipairs({ "Objects", "Counters" }) do
@@ -32919,7 +33123,28 @@ do
 			end
 		end
 		local roof = house:FindFirstChild("Roof")
-		data.roofs = roof and #roof:GetChildren() or 0
+		for _, model in ipairs(roof and roof:GetChildren() or {}) do
+			local points = pointsOf(model)
+			local item = itemData(model)
+			if #points >= 3 and not (item and (item.BSPrice or item.ECPrice)) then
+				local props = {}
+				local pd = model:FindFirstChild("PropertyData")
+				for _, v in ipairs(pd and pd:GetChildren() or {}) do
+					if type(v.Value) == "number" then
+						props[v.Name] = v.Value
+					end
+				end
+				table.insert(data.roofList, { type = model.Name, points = points, props = props })
+				local cg = appearance(model)
+				if cg then
+					data.paint.roofs[tostring(#data.roofList)] = cg
+					painted += 1
+				end
+			elseif #points >= 3 then
+				data.skipped += 1
+			end
+		end
+		data.roofs = #data.roofList
 		if #data.floors + #data.walls + #data.objects == 0 then
 			return false, "Nothing to copy found on " .. plot.Name .. " (walk closer so the house loads)"
 		end
@@ -32939,8 +33164,11 @@ do
 				writefile(N.Build.index, HttpService:JSONEncode(N.Build.names))
 			end)
 		end
-		log("BUILD saved", name, "from", plot.Name, "floors", #data.floors, "walls", #data.walls, "paths", #data.paths, "objects", #data.objects, "cost", data.cost, "skipped", data.skipped, "roofs", data.roofs)
-		return true, string.format("Saved '%s': %d floors, %d walls, %d paths, %d items ($%s for items, walls and floors extra). %d Blockbux items left out, roofs (%d) are not copied yet.", name, #data.floors, #data.walls, #data.paths, #data.objects, formatNumber(data.cost), data.skipped, data.roofs)
+		log("BUILD saved", name, "from", plot.Name, "floors", #data.floors, "walls", #data.walls, "paths", #data.paths, "roofs", data.roofs, "objects", #data.objects, "painted", painted, "cost", data.cost, "skipped", data.skipped)
+		if data.roofList[1] then
+			log("BUILD roof sample", data.roofList[1].type, "points", #data.roofList[1].points, "first", brief(vec(data.roofList[1].points[1])), "props", brief(data.roofList[1].props))
+		end
+		return true, string.format("Saved '%s': %d floors, %d walls, %d paths, %d roofs, %d items, %d painted ($%s for items, the rest extra). %d Blockbux items left out.", name, #data.floors, #data.walls, #data.paths, data.roofs, #data.objects, painted, formatNumber(data.cost), data.skipped)
 	end
 	local function loadLayout(name)
 		local ok, data = pcall(function()
@@ -32957,7 +33185,7 @@ do
 		if not data then
 			return "No layout picked"
 		end
-		InfoCache[name] = string.format("%s: %d floors, %d walls, %d paths, %d items, items $%s (from %s)", name, #(data.floors or {}), #(data.walls or {}), #(data.paths or {}), #(data.objects or {}), formatNumber(data.cost or 0), tostring(data.source))
+		InfoCache[name] = string.format("%s: %d floors, %d walls, %d paths, %d roofs, %d items, items $%s (from %s)", name, #(data.floors or {}), #(data.walls or {}), #(data.paths or {}), #(data.roofList or {}), #(data.objects or {}), formatNumber(data.cost or 0), tostring(data.source))
 		return InfoCache[name]
 	end
 	function N.layoutInfoReset(name)
@@ -33062,7 +33290,13 @@ do
 		task.wait(1)
 		local house = plot:FindFirstChild("House")
 		local done, failed, logged = 0, 0, 0
-		local total = (if parts.shell then #(data.floors or {}) + #(data.walls or {}) + #(data.paths or {}) else 0) + (if parts.items then #(data.objects or {}) else 0)
+		local paint = data.paint or {}
+		local roofs = data.roofList or {}
+		local total = (if parts.shell then #(data.floors or {}) + #(data.walls or {}) + #(data.paths or {}) else 0) + (if parts.roofs then #roofs else 0) + (if parts.items then #(data.objects or {}) else 0)
+		local painted, paintFailed, paintLogged = 0, 0, 0
+		local useMaterials = isolated(function()
+			return N.jobHandler().Shared.ColorService.UseMaterials
+		end)
 		local function place(packet, what)
 			if N.Build.stop or not alive() then
 				return false
@@ -33081,21 +33315,116 @@ do
 			task.wait(placeDelay())
 			return ok and result
 		end
+		-- the folder's children before a place, to find the new model after it
+		local function snapshot(folderName)
+			local seen = {}
+			local h = plot:FindFirstChild("House")
+			local folder = h and h:FindFirstChild(folderName)
+			for _, c in ipairs(folder and folder:GetChildren() or {}) do
+				seen[c] = true
+			end
+			return seen
+		end
+		local function newChild(folderName, seen)
+			local found
+			waitFor(function()
+				local h = plot:FindFirstChild("House")
+				local folder = h and h:FindFirstChild(folderName)
+				for _, c in ipairs(folder and folder:GetChildren() or {}) do
+					if not seen[c] and c.Name ~= "Poles" then
+						found = c
+						return true
+					end
+				end
+				return false
+			end, 3)
+			return found
+		end
+		-- paints a new thing like the copied one: only groups that differ, never under the money reserve
+		local function paintIt(target, cg, isWall)
+			if not (parts.paint and target and type(cg) == "table") then
+				return
+			end
+			local current = appearance(target) or {}
+			local jobs = {}
+			if isWall then
+				-- wall sides: group 1 = R side, group 2 = L side (BuildUI getWallPaintGroup)
+				for side, g in pairs({ R = 1, L = 2 }) do
+					local want, have = cg[g], current[g]
+					if type(want) == "table" and (want[1] ~= 0 or want[2] ~= 0) and not (have and have[1] == want[1] and have[2] == want[2]) then
+						table.insert(jobs, { Data = { want }, Side = side })
+					end
+				end
+			else
+				local differs = false
+				for i = 1, 4 do
+					local want, have = cg[i], current[i]
+					if type(want) == "table" and (want[1] ~= 0 or want[2] ~= 0) and not (have and have[1] == want[1] and have[2] == want[2]) then
+						differs = true
+					end
+				end
+				if differs then
+					table.insert(jobs, { Data = cg })
+				end
+			end
+			for _, job in ipairs(jobs) do
+				if N.Build.stop or N.money() < N.reserve() + 40 then
+					return
+				end
+				local ok, result = N.buildInvoke({ Type = "ColorObject", Object = target, Data = job.Data, Side = job.Side, UseMaterials = useMaterials })
+				if ok and tonumber(result) and tonumber(result) > 0 then
+					painted += 1
+				else
+					paintFailed += 1
+				end
+				if paintLogged < 6 then
+					paintLogged += 1
+					log("BUILD paint", brief(target), job.Side or "", brief(job.Data), "->", tostring(ok), brief(result))
+				end
+				task.wait(placeDelay())
+			end
+		end
 		if parts.shell then
-			for _, points in ipairs(data.floors or {}) do
+			for i, points in ipairs(data.floors or {}) do
 				local world = {}
 				for _, p in ipairs(points) do
 					table.insert(world, ground:PointToWorldSpace(Vector3.new(p[1], 0, p[3])) + Vector3.new(0, 0.05 + p[2], 0))
 				end
-				place({ Type = "PlaceFloor", Points = world }, "floor")
+				local seen = snapshot("Floor")
+				if place({ Type = "PlaceFloor", Points = world }, "floor") and paint.floors and paint.floors[tostring(i)] then
+					paintIt(newChild("Floor", seen), paint.floors[tostring(i)])
+				end
 			end
-			for _, w in ipairs(data.walls or {}) do
-				place({ Type = "PlaceWall", From = ground:PointToWorldSpace(vec(w[1])), To = ground:PointToWorldSpace(vec(w[2])) }, "wall")
+			for i, w in ipairs(data.walls or {}) do
+				local seen = snapshot("Walls")
+				if place({ Type = "PlaceWall", From = ground:PointToWorldSpace(vec(w[1])), To = ground:PointToWorldSpace(vec(w[2])) }, "wall") and paint.walls and paint.walls[tostring(i)] then
+					paintIt(newChild("Walls", seen), paint.walls[tostring(i)], true)
+				end
 			end
-			for _, p in ipairs(data.paths or {}) do
-				place({ Type = "PlacePath", From = ground:PointToWorldSpace(vec(p[1])), To = ground:PointToWorldSpace(vec(p[2])) }, "path")
+			for i, p in ipairs(data.paths or {}) do
+				local seen = snapshot("Paths")
+				if place({ Type = "PlacePath", From = ground:PointToWorldSpace(vec(p[1])), To = ground:PointToWorldSpace(vec(p[2])) }, "path") and paint.paths and paint.paths[tostring(i)] then
+					paintIt(newChild("Paths", seen), paint.paths[tostring(i)])
+				end
 			end
 			task.wait(1)
+		end
+		if parts.roofs then
+			-- after the walls: a roof sits on them (points carry the wall height + 0.1)
+			for i, r in ipairs(roofs) do
+				local world = {}
+				for _, p in ipairs(r.points or {}) do
+					table.insert(world, ground:PointToWorldSpace(Vector3.new(p[1], 0, p[3])) + Vector3.new(0, p[2], 0))
+				end
+				local roofSettings = { Type = r.type }
+				for k, v in pairs(r.props or {}) do
+					roofSettings[k] = v
+				end
+				local seen = snapshot("Roof")
+				if #world >= 3 and place({ Type = "PlaceRoof", Points = world, Settings = roofSettings }, "roof " .. tostring(r.type)) and paint.roofs and paint.roofs[tostring(i)] then
+					paintIt(newChild("Roof", seen), paint.roofs[tostring(i)])
+				end
+			end
 		end
 		if parts.items then
 			house = plot:FindFirstChild("House")
@@ -33106,8 +33435,8 @@ do
 						break
 					end
 					if entry.on == pass then
-						if (entry.price or 0) > 0 and N.money() < entry.price then
-							N.Build.status = string.format("Out of money at %d / %d (next item %s costs $%s)", done, total, entry.name, formatNumber(entry.price))
+						if (entry.price or 0) > 0 and N.money() < entry.price + N.reserve() then
+							N.Build.status = string.format("Out of money at %d / %d (next item %s costs $%s, reserve $%s)", done, total, entry.name, formatNumber(entry.price), formatNumber(N.reserve()))
 							N.Build.stop = true
 							break
 						end
@@ -33123,7 +33452,14 @@ do
 								target = objectNear(house, parent.name, (ground * CFrame.new(table.unpack(parent.cf))).Position)
 							end
 						end
-						place({ Type = "PlaceObject", Name = entry.name, Pos = cf.Position, Rot = rotOf(cf), TargetModel = target }, entry.name .. " on " .. tostring(target))
+						if place({ Type = "PlaceObject", Name = entry.name, Pos = cf.Position, Rot = rotOf(cf), TargetModel = target }, entry.name .. " on " .. tostring(target)) and entry.cg then
+							local placed
+							waitFor(function()
+								placed = objectNear(plot:FindFirstChild("House"), entry.name, cf.Position)
+								return placed ~= nil
+							end, 2)
+							paintIt(placed, entry.cg)
+						end
 					end
 				end
 				task.wait(0.5)
@@ -33134,13 +33470,13 @@ do
 		local stopped = N.Build.stop
 		N.Build.stop = false
 		if not string.find(N.Build.status, "Out of money", 1, true) then
-			N.Build.status = string.format("%s %s: %d placed, %d failed%s", if stopped then "Stopped" else "Finished", name, done, failed, if data.roofs and data.roofs > 0 then ". Add the roof yourself (" .. data.roofs .. ")" else "")
+			N.Build.status = string.format("%s %s: %d placed, %d failed, %d painted%s", if stopped then "Stopped" else "Finished", name, done, failed, painted, if (data.version or 1) < 2 and (data.roofs or 0) > 0 then ". Saved before roofs were copied: save it again for the roof" else "")
 		end
-		log("BUILD done", name, "placed", done, "failed", failed, "stopped", tostring(stopped))
+		log("BUILD done", name, "placed", done, "failed", failed, "painted", painted, "paint failed", paintFailed, "stopped", tostring(stopped))
 		notify("Corvus", N.Build.status, 6)
 	end
 
-	-- Auto Needs (Auto Farm Everything only): buys ONE item for a missing need and places it on YOUR plot with the
+	-- Auto Needs: buys ONE item for a missing need and places it on YOUR plot with the
 	-- normal build packets (EnterBuild, PlaceObject {Name, Pos, Rot, TargetModel}, ExitBuild), paid with your money.
 	-- Spot: a free floor point near you or near your furniture (5+ studs from every object, 2.5+ from walls, same
 	-- floor height); the server checks each spot like a manual place, a refused spot just moves on (max 10 tries).
@@ -34849,7 +35185,7 @@ do
 	end
 end
 
--- Job names in the Jobs dropdown -> the game's job keys. Best Pay (auto) is decided in p05_jobs6_plan.lua.
+-- Job names in the Jobs dropdown -> the game's job keys. The Best Pay toggle is decided in p05_jobs6_plan.lua.
 N.JobKeys = {
 	Hairdresser = "StylezHairdresser",
 	Janitor = "SchoolJanitor",
@@ -35140,7 +35476,7 @@ do
 		end
 	end
 end
--- Best Pay (auto) on the profit engine v2 (CLAUDE.md.txt 8.00): time is the currency, so every job is a value per
+-- Best Pay (toggle) on the profit engine v2 (CLAUDE.md.txt 8.00): time is the currency, so every job is a value per
 -- hour over the rest of a 24 h horizon, with its uncertainty, and the hub explores a job only while the expected gain
 -- of knowing it beats the money lost measuring it.
 --   E(job) = measured $/h + (job level rewards + pay growth from level ups reached within the horizon) / horizon
@@ -36161,6 +36497,10 @@ do
 	local TARGET = 95
 	local HORIZON_H = 2
 	local MAX_RESTORE = 25 * 60
+	-- trips run while Auto Needs, Auto Work or Daily Objectives is on, or for the manual "Restore needs now"
+	local function keep()
+		return alive() and (on("AutoNeeds") or on("AutoJob") or on("Objectives") or Q.manual == true)
+	end
 	local Keys = {
 		Energy = { "I_Sleep" },
 		Hygiene = { "I_Use", "I_UseShower", "I_UseBathtub" },
@@ -36245,7 +36585,8 @@ do
 		for _, name in ipairs(Q.names) do
 			local v = values[name]
 			local last = Q.samples[name]
-			if v and last and not Q.active and not attached and now - last.at >= 10 and now - last.at <= 40 then
+			-- a mood stuck at 0 cannot fall: those samples pulled the measured decay down to 0.01 (telemetry 2026-10-05)
+			if v and last and v > 0.5 and last.v > 0.5 and not Q.active and not attached and now - last.at >= 10 and now - last.at <= 40 then
 				local perMin = (last.v - v) / (now - last.at) * 60
 				if perMin >= 0 and perMin < 5 then
 					local d = Q.decay[name] or { v = perMin, n = 0 }
@@ -36446,11 +36787,11 @@ do
 		BuyCache[need] = pick or false
 		return pick or { name = BuyList[need][1][1], price = BuyList[need][1][2], guess = true }
 	end
-	-- Buying a missing bed, fridge, shower or TV needs the Buy missing furniture switch: returns ok and the blocker in words.
+	-- Buying a missing bed, fridge, shower or TV is part of Auto Needs (and the manual restore), above the money reserve.
 	local function buyOk(need)
 		local choice = buyChoice(need)
-		if not on("NeedsBuy") then
-			return false, choice, "turn on Buy missing furniture to buy " .. choice.name .. " $" .. choice.price .. ", or place " .. NeedThing[need] .. " yourself"
+		if not (on("AutoNeeds") or Q.manual) then
+			return false, choice, "turn on Auto Needs to buy " .. choice.name .. " $" .. choice.price .. ", or place " .. NeedThing[need] .. " yourself"
 		end
 		local reserve = (N.reserve and N.reserve()) or 0
 		if N.money() < choice.price + reserve then
@@ -36751,16 +37092,23 @@ do
 
 	-- Quick meal choice: the game's own list (QuickFoods not hidden/locked), the cheapest you can cook, never portion
 	-- trays (they must be placed on a counter first); the daily objective's quick food first when it is still open.
-	local function quickFood()
-		local jh = N.jobHandler()
-		local wantId = 0
+	-- the daily objective's quick food (server IntValue ObjectivesShared.DailyQuickFoodID, 0 = none today)
+	function N.dailyFoodId()
+		local id = 0
 		pcall(function()
 			local modules = ReplicatedStorage:FindFirstChild("Modules")
 			modules = modules and modules:FindFirstChild("ObjectivesShared")
 			local v = modules and modules:FindFirstChild("DailyQuickFoodID")
-			wantId = v and tonumber(v.Value) or 0
+			id = v and tonumber(v.Value) or 0
 		end)
-		local pick = isolated(function()
+		return id
+	end
+	-- returns food {name, price, id}, list size, and whether it is the daily objective's meal
+	local function quickFood()
+		local jh = N.jobHandler()
+		local wantId = N.dailyFoodId()
+		local pick, count = nil, 0
+		isolated(function()
 			local list = {}
 			for _, item in pairs(jh.Items.QuickFoods) do
 				local okHidden, hidden = pcall(item.IsHidden, item, LocalPlayer)
@@ -36775,14 +37123,16 @@ do
 				end
 				return a.price < b.price
 			end)
+			count = #list
 			for _, f in ipairs(list) do
 				if wantId > 0 and f.id == wantId and Q.objQuickFoodOpen then
-					return f, #list
+					pick = f
+					return
 				end
 			end
-			return list[1], #list
+			pick = list[1]
 		end)
-		return pick
+		return pick, count, pick ~= nil and wantId > 0 and pick.id == wantId
 	end
 
 	-- One need at one object. Returns ok. Sleep/shower/TV: interact, wait until the value reaches the target (or
@@ -36822,15 +37172,21 @@ do
 		end
 		local started = os.clock()
 		if need == "Hunger" then
-			local food, count = quickFood()
+			local food, count, daily = quickFood()
+			if Q.objMeal and not daily then
+				log("OBJ meal", "the daily quick meal (id " .. tostring(N.dailyFoodId()) .. ") is not on your fridge list, skipped for today")
+				Q.objMealSkip = N.dailyFoodId()
+				N.detach()
+				return false
+			end
 			if not food then
 				log("NEEDS no quick food", "list", tostring(count))
 				N.detach()
 				return false
 			end
 			local price = food.price
-			if N.money() < price then
-				log("NEEDS cannot afford", food.name, "$" .. price)
+			if not N.spendOk(price) then
+				log("NEEDS cannot afford", food.name, "$" .. price, "money", N.money(), "reserve", N.reserve())
 				N.detach()
 				return false
 			end
@@ -36848,9 +37204,17 @@ do
 				local v = N.moods()
 				return v ~= nil and v[need] > before + 0.5
 			end, 10)
-			if not rising then
+			if not rising and not (Q.objMeal and before >= 90) then
 				log("NEEDS unsupported", object.name, need, "did not rise in 10 s after eating", food.name)
 				return false, "unsupported"
+			end
+			if daily then
+				log("OBJ meal", "ate the daily quick meal", food.name)
+				Q.objMealDone = os.clock()
+				task.delay(3, N.objectivesLog, "meal")
+				if Q.objMeal then
+					return true
+				end
 			end
 			waitFor(function()
 				local v = N.moods()
@@ -36878,7 +37242,7 @@ do
 			end
 			log("NEEDS using", object.name, need, "button", tostring(title), "rising from", math.floor(before) .. "%")
 			local lastLog = os.clock()
-			while alive() and on("AutoJob") do
+			while keep() do
 				values = N.moods()
 				local v = values and values[need] or 100
 				if v >= TARGET then
@@ -36950,6 +37314,17 @@ do
 		if maxWork > 0 and Q.workSeconds >= maxWork and on("AutoNeeds") then
 			return "break"
 		end
+		-- Daily Objectives: the quick meal task (task 3 "Take a quick meal of X from a fridge"), once, on your fridge
+		local foodId = N.dailyFoodId()
+		local third = string.lower(tostring(Q.objTexts and Q.objTexts[3] or ""))
+		if on("Objectives") and Q.objQuickFoodOpen and foodId > 0 and string.find(third, "quick meal", 1, true) and Q.objMealSkip ~= foodId and now - (Q.objMealAt or -1e9) > 900 then
+			local have = plotHas()
+			if Q.have and have.Hunger and N.spendOk(20) then
+				Q.objMealAt = now
+				log("OBJ meal", "task 3 open (" .. third .. "): going home to eat it")
+				return "objective meal"
+			end
+		end
 		if not on("AutoNeeds") then
 			Q.text = nil
 			return nil
@@ -36978,8 +37353,8 @@ do
 			if back and now - back < 900 then
 				return string.format("3 restores failed, retry in %dm", math.ceil((900 - (now - back)) / 60))
 			end
-			if name == "Hunger" and not (N.spendOk and N.spendOk()) then
-				return "quick meals cost money: turn on Buy quick meals"
+			if name == "Hunger" and not N.spendOk() then
+				return "money $" .. N.money() .. " is at the reserve $" .. N.reserve() .. ", no meal"
 			end
 			if haveKnown and not have[name] then
 				local failAt = Q.missingAt[name]
@@ -37063,6 +37438,9 @@ do
 			reason = string.format("efficiency %.2f < %.2f '%s'", if effZero then 0 else eff, effFloor, effWhy)
 		elseif gain > cost then
 			reason = string.format("profit: loss $%d/%dh > cost $%d", math.floor(gain), HORIZON_H, math.floor(cost))
+		elseif job == "" and not on("AutoJob") then
+			-- Auto Needs on its own: no shift to lose, so any mood under the refill point is restored
+			reason = string.format("idle: %s %d%%", lowest, lowestV)
 		end
 		if reason and now - Q.tripAt < 300 and not floorHit and not (effHit and effNeeds) then
 			log("NEEDS plan", "trip held back, last trip under 5 min ago:", reason)
@@ -37091,9 +37469,10 @@ do
 		local descriptions = isolated(function()
 			return jh.Shared.ObjectivesShared:GetDailyDescriptions()
 		end)
-		local parts, done = {}, 0
+		local parts, done, texts = {}, 0, {}
 		for i, s in ipairs(state.States) do
 			local text = type(descriptions) == "table" and tostring(descriptions[i] or "?") or "?"
+			texts[i] = text
 			if type(s) == "table" and s.Completed then
 				done += 1
 			end
@@ -37101,7 +37480,11 @@ do
 		end
 		local third = state.States[3]
 		Q.objQuickFoodOpen = type(third) == "table" and not third.Completed
+		Q.objTexts = texts
 		local streak = tonumber(state.Streak) or 0
+		if N.objectivesUpdate then
+			N.objectivesUpdate(state.States, texts, streak, done)
+		end
 		log("OBJ", why, string.format("done=%d/%d streak=%d reward=$%d", done, #state.States, streak, math.clamp(streak, 0, 4) * 750 + 5000), table.concat(parts, " | "))
 	end
 
@@ -37122,7 +37505,7 @@ do
 			Q.breaks += 1
 			log("BREAK start", "after", math.floor(Q.workSeconds / 60), "min of work, break", math.floor(breakSeconds / 60), "min")
 		end
-		setStatus("Needs: leaving the job (" .. tostring(reason) .. ")")
+		setStatus(if N.currentJob() ~= "" then "Needs: leaving the job (" .. tostring(reason) .. ")" else "Needs: going home (" .. tostring(reason) .. ")")
 		-- the efficiency reason is only readable while still clocked in
 		local effWhy = N.effReason(select(2, N.efficiency()))
 		N.taxiRelease()
@@ -37150,16 +37533,21 @@ do
 			values = values or {}
 			local order, firstBy = needOrder(effWhy, moodName)
 			log("NEEDS order", table.concat(order, ">"), "| reason '" .. tostring(effWhy) .. "' mood '" .. tostring(moodName) .. "'", if firstBy then "-> " .. firstBy .. " first" else "")
-			local limit = if isBreak then 90 else REFILL
+			local limit = if isBreak or reason == "manual" then 90 else REFILL
+			-- the daily objective meal: only the fridge, also when Hunger is full
+			Q.objMeal = reason == "objective meal"
+			if Q.objMeal then
+				order, limit = { "Hunger" }, 101
+			end
 			for _, need in ipairs(order) do
 				local v = values[need]
-				if not alive() or not on("AutoJob") then
+				if not keep() then
 					break
 				end
-				if v and v < limit and os.clock() - (Q.backoff[need] or -1e9) > 900 and (need ~= "Hunger" or (N.spendOk and N.spendOk())) then
+				if v and v < limit and os.clock() - (Q.backoff[need] or -1e9) > 900 and (need ~= "Hunger" or N.spendOk()) then
 					local object = bestObject(objects, need)
 					if not object and os.clock() - (Q.missingAt[need] or -1e9) > 900 then
-						-- nothing on the plot: Buy missing furniture buys and places the cheapest one, else name the blocker
+						-- nothing on the plot: Auto Needs buys and places the cheapest one (above the reserve), else name the blocker
 						local ok, choice, why = buyOk(need)
 						if ok then
 							log("NEEDS buy", choice.name, "$" .. choice.price, "for", need, "at", math.floor(v) .. "%", "money", N.money())
@@ -37190,7 +37578,7 @@ do
 						for _, o in ipairs(candidates(objects, need)) do
 							local why
 							ok, why = restoreNeed(need, o, deadline)
-							if ok or not alive() or not on("AutoJob") or os.clock() > deadline then
+							if ok or not keep() or os.clock() > deadline then
 								break
 							end
 							if why == "unsupported" or why == "walk" then
@@ -37202,6 +37590,8 @@ do
 						end
 						if ok then
 							Q.fails[need] = 0
+						elseif Q.objMeal then
+							log("OBJ meal", "not eaten, next try in 15 min")
 						else
 							Q.fails[need] = (Q.fails[need] or 0) + 1
 							if Q.fails[need] >= 3 then
@@ -37222,7 +37612,7 @@ do
 				if bed and v and v.Energy and v.Energy < 100 and os.clock() < deadline - 60 then
 					restoreNeed("Energy", bed, deadline)
 				end
-				while alive() and on("AutoJob") and os.clock() < deadline do
+				while keep() and os.clock() < deadline do
 					setStatus(string.format("Break: %s left", N.longTime(deadline - os.clock())))
 					task.wait(2)
 				end
@@ -37238,9 +37628,11 @@ do
 		Q.trips += 1
 		Q.tripAt = os.clock()
 		Q.active = false
+		Q.objMeal = false
+		Q.manual = false
 		local eff = N.efficiency()
-		log("NEEDS done", "eff=" .. tostring(eff), N.moodText(), "took", math.floor(os.clock() - started), "s", "money", N.money())
-		setStatus("Needs done, back to work")
+		log("NEEDS done", reason, "eff=" .. tostring(eff), N.moodText(), "took", math.floor(os.clock() - started), "s", "money", N.money())
+		setStatus(if on("AutoJob") then "Needs done, back to work" else "Needs done")
 	end
 	-- the need that reaches the safety floor first: name, minutes (Hunger only when meals may be bought)
 	function N.needsEta()
@@ -37268,6 +37660,135 @@ do
 		end
 		local maxWork = optionNumber("WorkSessionMax", 210) * 60
 		return string.format("%s\nPlan: %s\nWork session %s of %s, trips %d, breaks %d", line, Q.text ~= "" and Q.text or "-", N.longTime(Q.workSeconds), N.longTime(maxWork), Q.trips, Q.breaks)
+	end
+end
+-- Daily Objectives (ObjectivesShared, dump 288809): 3 tasks a day, reward 5000 + 750 * min(streak, 4) paid by the
+-- server once all 3 are done (no claim packet). Task 1 is always a job task (ObjectivesData.Pools[1][i].SubTaskID,
+-- JobTaskEnum names below, dump 289108-289151), task 2 is a vendor purchase / emote / donation (not automated: no
+-- verified packet, donating needs the owner), task 3 is often "Take a quick meal of X from a fridge"
+-- (ObjectivesShared.DailyQuickFoodID, done in p05_needs as the "objective meal" trip). Profit: the reward needs all 3,
+-- so task 1 is worked only once task 2 is done (a detour without task 2 pays nothing); the detour is capped at 30 min.
+-- The state is read every 2 min while the toggle is on (GetPlayerObjectiveDailyState).
+N.Obj = { states = nil, texts = {}, streak = 0, done = 0, at = -1e9, startedAt = nil, gaveUp = {}, sub = nil }
+do
+	local O = N.Obj
+	-- JobTaskEnum name -> job in the Jobs dropdown (only jobs Corvus farms; Line Cook beta does Grill and Chop)
+	local SubJobs = {
+		LumberMill_CutTree = "Woodcutter (beta)",
+		BensIcecream_IceCreamServe = "Ice Cream",
+		Stylez_GiveHairCut = "Hairdresser",
+		BloxBurger_GrillBurger = "BloxBurgers Line Cook (beta)",
+		BloxBurger_ChoppedGreens = "BloxBurgers Line Cook (beta)",
+		Supermarket_ServeCustomer = "Supermarket Cashier",
+		SuperMarket_Restock = "Stocker",
+		PizzaPlanet_BakePizza = "Pizza Baker",
+		PizzaPlanet_DeliverPizza = "Pizza Delivery",
+		SchoolJanitor_CleanTrash = "Janitor",
+		Fisher_CatchFish = "Fisherman (beta)",
+		CaveMiner_MineBlock = "Miner",
+		MikesMechanic_ServeCustomer = "Mechanic",
+		HighSchoolTeacher_Discipline = "Teacher",
+		HighSchoolTeacher_HallPass = "Teacher",
+		HighSchoolTeacher_Lecture = "Teacher",
+	}
+	local MAX_DETOUR = 30 * 60
+	-- name of today's job sub task, read from the game's own tables
+	local function subTask()
+		local found
+		isolated(function()
+			local folder = ReplicatedStorage:FindFirstChild("Modules")
+			local objShared = folder and folder:FindFirstChild("ObjectivesShared")
+			local dataScript = objShared and objShared:FindFirstChild("ObjectivesData")
+			local data = dataScript and require(dataScript)
+			local jh = N.jobHandler()
+			local index = jh.Shared.ObjectivesShared.DailyObjectiveIndexes[1]
+			local entry = data.Pools[1][index]
+			for name, value in pairs(data.JobTaskEnum) do
+				if value == entry.SubTaskID then
+					found = name
+				end
+			end
+		end)
+		return found
+	end
+	local function completed(i)
+		local s = O.states and O.states[i]
+		return type(s) == "table" and s.Completed == true
+	end
+	function N.objectivesUpdate(states, texts, streak, done)
+		local wasDone = completed(1)
+		O.states, O.texts, O.streak, O.done, O.at = states, texts, streak, done, os.clock()
+		if completed(1) then
+			if O.startedAt and not wasDone then
+				log("OBJ job task done", tostring(O.sub), "after", math.floor(os.clock() - O.startedAt), "s")
+			end
+			O.startedAt = nil
+			table.clear(O.gaveUp)
+		end
+		O.sub = subTask()
+	end
+	function N.objectivesReward()
+		return math.clamp(O.streak or 0, 0, 4) * 750 + 5000
+	end
+	-- the job Auto Work should do now for task 1, or nil
+	function N.objectiveJob()
+		if not on("Objectives") or type(O.states) ~= "table" or completed(1) then
+			return nil
+		end
+		if not completed(2) then
+			return nil
+		end
+		local job = O.sub and SubJobs[O.sub]
+		if not job then
+			if O.loggedSub ~= O.sub then
+				O.loggedSub = O.sub
+				log("OBJ job task not farmed", tostring(O.sub), "| do it yourself:", tostring(O.texts[1]))
+			end
+			return nil
+		end
+		if O.gaveUp[O.sub] then
+			return nil
+		end
+		if not O.startedAt then
+			O.startedAt = os.clock()
+			log("OBJ job task", O.sub, "-> working", job, "until it is done (reward $" .. N.objectivesReward() .. ")")
+		end
+		if os.clock() - O.startedAt > MAX_DETOUR then
+			O.gaveUp[O.sub] = true
+			O.startedAt = nil
+			log("OBJ job task gave up", O.sub, "after 30 min on", job)
+			return nil
+		end
+		return job
+	end
+	-- Up next / Jobs tab text
+	function N.objectiveText(short)
+		if type(O.states) ~= "table" then
+			return if on("Objectives") then "Daily objectives: reading..." else nil
+		end
+		local lines = {}
+		local head = string.format("Daily reward $%s: %d/%d done", formatNumber(N.objectivesReward()), O.done or 0, #O.states)
+		if short then
+			if (O.done or 0) >= #O.states then
+				return head .. ", paid"
+			end
+			if not completed(2) then
+				return head .. ". Task 2 is yours: " .. tostring(O.texts[2] or "?")
+			end
+			local job = O.sub and SubJobs[O.sub]
+			if not completed(1) and job then
+				return head .. ". Working " .. job .. " for task 1"
+			end
+			return head
+		end
+		table.insert(lines, head)
+		for i = 1, #O.states do
+			table.insert(lines, string.format("%s %d. %s", if completed(i) then "\u{2713}" else "\u{2022}", i, tostring(O.texts[i] or "?")))
+		end
+		if not completed(2) then
+			table.insert(lines, '<font transparency="0.35">Task 2 is done by you (Corvus does task 1 once task 2 is done, and the quick meal)</font>')
+		end
+		return table.concat(lines, "\n")
 	end
 end
 local Window, Tabs, Labels
@@ -37313,53 +37834,60 @@ do
 			})
 		end)
 	end
-	Tabs.Main = N.addTab("Main", "house", "Quick start, Auto Work, what is next and session stats")
-	Tabs.Jobs = N.addTab("Jobs", "briefcase", "Job farms: pick a job, speed and see the pay")
+	-- 8.01 order: Main > game tabs (Jobs, Build) > Stats > Webhook > Misc > Settings
+	Tabs.Main = N.addTab("Main", "house", "Quick start, status and what comes next")
+	Tabs.Jobs = N.addTab("Jobs", "briefcase", "Job farm, Best Pay, Auto Needs and daily objectives")
 	Tabs.Build = N.addTab("Build", "hammer", "Copy a plot's house onto your own plot")
+	Tabs.Stats = N.addTab("Stats", "chart-column", "Money, work, pay per job and performance")
+	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts")
 	if Window.AddMiscTab then
 		pcall(function()
-			Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
+			Tabs.Misc = Window:AddMiscTab({ Description = "AFK, auto execute and connection", RejoinScript = LoaderScript })
 		end)
 	end
 	Labels = {}
-	do
-	local QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "sparkles")
-	-- Every automation is its own toggle now (Auto Work, Auto Needs, Buy quick meals). No master switch.
-	function N.excluded()
-		return false
-	end
 	function N.reserve()
 		return optionNumber("MoneyReserve", 0)
 	end
-	-- spending on food: only with Buy quick meals, never under the money reserve
+	-- Spending (quick meals, missing furniture, paint) is part of Auto Needs / Daily Objectives / the manual restore,
+	-- never under the money reserve.
 	local ReserveLogAt = -1e9
-	function N.spendOk()
-		if not on("NeedsFood") then
+	function N.spendOk(price)
+		if not (on("AutoNeeds") or on("Objectives") or (N.Needs and N.Needs.manual)) then
 			return false
 		end
 		local reserve = N.reserve()
-		if reserve > 0 and N.money() < reserve + 15 then
+		if N.money() < reserve + (price or 15) then
 			if os.clock() - ReserveLogAt > 60 then
 				ReserveLogAt = os.clock()
-				log("RESERVE", "no meal, money " .. N.money() .. " < reserve " .. reserve)
+				log("RESERVE", "no purchase, money " .. N.money() .. " < reserve " .. reserve .. " + " .. tostring(price or 15))
 			end
 			return false
 		end
 		return true
 	end
-	QuickBox:AddSlider("MoneyReserve", {
-		Text = "Money reserve",
-		Default = 0,
-		Min = 0,
-		Max = 50000,
-		Rounding = 0,
-		Prefix = "$",
-		Tooltip = "Buy quick meals never spends while your money is at or under this. 0 = no reserve",
-	})
-	QuickBox:AddLabel({
-		Text = '<font transparency="0.35">Every automation is its own switch. Work is in Auto Work, needs and meals in Auto Needs.</font>',
-		DoesWrap = true,
-	})
+
+	-- Quick Start: mirrors of the real switches in the Jobs tab (same state both ways), Stop Everything, Reset.
+	local QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "sparkles")
+	N.Mirrors = {}
+	local function mirror(key, target, text, tooltip)
+		N.Mirrors[key] = target
+		QuickBox:AddToggle(key, {
+			Text = text,
+			Default = false,
+			Tooltip = tooltip,
+			Callback = function(value)
+				local t = Toggles[target]
+				if t and t.Value ~= value then
+					t:SetValue(value)
+				end
+			end,
+		})
+	end
+	mirror("QS_AutoJob", "AutoJob", "Auto Work", "Goes to work and does the job picked in the Jobs tab")
+	mirror("QS_BestPay", "BestPay", "Best Pay", "Switches to the job that pays you the most over the next 24 h (measured, not guessed)")
+	mirror("QS_AutoNeeds", "AutoNeeds", "Auto Needs", "Sleeps, eats, showers and watches TV at home so low moods never cut your pay. Buys quick meals and missing furniture")
+	mirror("QS_Objectives", "Objectives", "Daily Objectives", "Does the daily job task and the daily quick meal for the $5,000+ daily reward")
 	QuickBox:AddButton({
 		Text = "Stop Everything",
 		Func = function()
@@ -37373,13 +37901,23 @@ do
 			Library:AskResetHubOptions(Library.ShareIgnore)
 		end,
 	})
-end
-	local JobBox = Tabs.Main:AddLeftGroupbox("Auto Work", "briefcase")
+	local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+	Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+	Labels.Job = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+	StatusBox:AddDivider()
+	Labels.Next = StatusBox:AddLabel({ Text = "Up next: switch something on in Quick Start", DoesWrap = true })
+
+	local JobBox = Tabs.Jobs:AddLeftGroupbox("Job Farm", "briefcase")
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Best Pay (auto)", "Hairdresser", "BloxBurgers Cashier", "BloxBurgers Line Cook (beta)", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Fisherman (beta)", "Woodcutter (beta)", "Taxi (beta)" },
+		Values = { "Hairdresser", "BloxBurgers Cashier", "BloxBurgers Line Cook (beta)", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Fisherman (beta)", "Woodcutter (beta)", "Taxi (beta)" },
 		Default = "Hairdresser",
-		Tooltip = "Best Pay (auto) measures each job's real pay and level rewards, and keeps working the one worth the most over the next 24 h",
+		Tooltip = "The job Auto Work does. With Best Pay on, Corvus picks the job itself",
+	})
+	JobBox:AddToggle("BestPay", {
+		Text = "Best Pay",
+		Default = false,
+		Tooltip = "Measures every job's real pay and level rewards and switches to the one worth the most over the next 24 h. Off = always the job above",
 	})
 	JobBox:AddDropdown("JobSpeed", {
 		Text = "Speed",
@@ -37390,7 +37928,7 @@ end
 	JobBox:AddToggle("AutoJob", {
 		Text = "Auto Work",
 		Default = false,
-		Tooltip = "Works the job above all day. Pick Best Pay (auto) to let Corvus switch to the job that pays most",
+		Tooltip = "Works the job above (or the Best Pay job) all day",
 	})
 	JobBox:AddButton({
 		Text = "End Shift",
@@ -37398,51 +37936,47 @@ end
 			task.spawn(N.endShift)
 		end,
 	})
-	local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
-	Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
-	Labels.Job = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-	StatusBox:AddDivider()
-	Labels.Next = StatusBox:AddLabel({ Text = "Up next: switch on Auto Work", DoesWrap = true })
-	StatusBox:AddButton({
-		Text = "Stop Everything",
-		Func = function()
-			N.stopAll()
-		end,
+	local ObjBox = Tabs.Jobs:AddLeftGroupbox("Daily Objectives", "target")
+	ObjBox:AddToggle("Objectives", {
+		Text = "Daily Objectives",
+		Default = false,
+		Tooltip = "Reward $5,000 + $750 per streak day (up to $8,000) when all 3 daily tasks are done. Corvus works the task's job (with Auto Work) and eats the daily quick meal. Tasks like donating or emotes are yours",
 	})
-	local PayBox = Tabs.Jobs:AddRightGroupbox("Pay Per Job", "coins")
-	Labels.Pay = PayBox:AddLabel({ Text = "-", DoesWrap = true })
-	local NeedsBox = Tabs.Jobs:AddLeftGroupbox("Auto Needs", "heart-pulse")
+	Labels.Obj = ObjBox:AddLabel({ Text = "-", DoesWrap = true })
+
+	local NeedsBox = Tabs.Jobs:AddRightGroupbox("Auto Needs", "heart-pulse")
 	NeedsBox:AddToggle("AutoNeeds", {
 		Text = "Auto Needs",
 		Default = false,
-		Tooltip = "Keeps Energy, Hunger, Hygiene and Fun up with your own bed, fridge, shower and TV. Low moods lower the shift efficiency (your pay) and at 0% you cannot work. Goes home only when the lost pay would cost more than the trip, or when a floor below is hit",
+		Tooltip = "Works with or without Auto Work. Keeps Energy, Hunger, Hygiene and Fun up with your own bed, fridge (quick meals), shower and TV, and buys the cheapest missing one. Low moods lower your pay and at 0% you cannot work",
 	})
-	NeedsBox:AddToggle("NeedsFood", {
-		Text = "Buy quick meals",
-		Default = false,
-		Tooltip = "Lets Auto Needs pay for a quick meal at the fridge to restore Hunger (a few dollars each time). Off = Hunger is never restored by buying food",
-	})
-	NeedsBox:AddToggle("NeedsBuy", {
-		Text = "Buy missing furniture",
-		Default = false,
-		Tooltip = "When your plot lacks a bed, fridge, shower or TV, buys the cheapest one and places it on your plot (once per need, never under the money reserve)",
+	NeedsBox:AddSlider("MoneyReserve", {
+		Text = "Money reserve",
+		Default = 0,
+		Min = 0,
+		Max = 50000,
+		Rounding = 0,
+		Prefix = "$",
+		Tooltip = "Auto Needs never buys meals or furniture while your money is at or under this. 0 = no reserve",
 	})
 	NeedsBox:AddLabel({
-		Text = '<font transparency="0.35">Needs a bed, a fridge, a shower and a TV on your plot (cheapest: Standard Single Bed $200, Icebox Fridge $500, Hygienic Shower $340, NYX VintageView TV $400). Quick meals cost their price.</font>',
+		Text = '<font transparency="0.35">Missing furniture is bought once: Standard Single Bed $200, Icebox Fridge $500, Hygienic Shower $340, Old Television $220. A quick meal costs a few dollars.</font>',
 		DoesWrap = true,
 	})
 	NeedsBox:AddSlider("NeedFloor", { Text = "Never below", Default = 25, Min = 5, Max = 60, Rounding = 0, Suffix = "%", Tooltip = "Safety floor: a mood at or under this starts a trip home right away" })
 	NeedsBox:AddSlider("EffFloor", { Text = "Restore before efficiency", Default = 70, Min = 30, Max = 95, Rounding = 0, Suffix = "%", Tooltip = "Safety floor: shift efficiency under this (with a mood under 60%) starts a trip home" })
-	NeedsBox:AddSlider("WorkSessionMax", { Text = "Work session max", Default = 210, Min = 0, Max = 600, Rounding = 0, Suffix = " min", Tooltip = "After this much work the hub takes a break at home (needs and daily objectives). 0 = no breaks" })
+	NeedsBox:AddSlider("WorkSessionMax", { Text = "Work session max", Default = 210, Min = 0, Max = 600, Rounding = 0, Suffix = " min", Tooltip = "After this much work Auto Needs takes a break at home. 0 = no breaks" })
 	NeedsBox:AddSlider("BreakMinutes", { Text = "Break", Default = 20, Min = 5, Max = 60, Rounding = 0, Suffix = " min" })
 	NeedsBox:AddButton({
 		Text = "Restore needs now",
 		Func = function()
-			if not on("AutoJob") then
-				notify("Corvus", "Turn Auto Work on first, the trip runs inside it", 4)
+			if N.Needs.active then
+				notify("Corvus", "Already restoring needs", 3)
 				return
 			end
+			N.Needs.manual = true
 			N.Needs.forced = true
+			log("NEEDS manual", "Restore needs now pressed")
 			notify("Corvus", "Going home to restore every need", 4)
 		end,
 	})
@@ -37450,7 +37984,7 @@ end
 
 	local CopyBox = Tabs.Build:AddLeftGroupbox("Copy a Plot", "copy")
 	CopyBox:AddLabel({
-		Text = '<font transparency="0.35">Stand on any plot (yours or another player\'s), name the layout and save it. Then go to your own plot and build it there with your own money. Blockbux items are never bought. Roofs and paint are not copied yet.</font>',
+		Text = '<font transparency="0.35">Stand on any plot (yours or another player\'s), name the layout and save it. Then go to your own plot and build it there with your own money: floors, walls, paths, roofs, furniture and paint. Blockbux items are never bought.</font>',
 		DoesWrap = true,
 	})
 	CopyBox:AddInput("LayoutName", {
@@ -37481,7 +38015,9 @@ end
 		AllowNull = true,
 	})
 	BuildBox:AddToggle("BuildShell", { Text = "Floors, walls and paths", Default = true })
+	BuildBox:AddToggle("BuildRoofs", { Text = "Roofs", Default = true })
 	BuildBox:AddToggle("BuildItems", { Text = "Furniture and items", Default = true })
+	BuildBox:AddToggle("BuildPaint", { Text = "Paint and materials", Default = true, Tooltip = "Colors and materials like the copied plot ($5 a color, $10 a custom color, $20 a material)" })
 	BuildBox:AddButton({
 		Text = "Build it on my plot",
 		Func = function()
@@ -37494,7 +38030,7 @@ end
 				notify("Corvus", "Pick a saved layout first", 4)
 				return
 			end
-			task.spawn(N.runManual, N.buildLayout, name, { shell = on("BuildShell"), items = on("BuildItems") })
+			task.spawn(N.runManual, N.buildLayout, name, { shell = on("BuildShell"), roofs = on("BuildRoofs"), items = on("BuildItems"), paint = on("BuildPaint") })
 		end,
 	})
 	BuildBox:AddButton({
@@ -37504,6 +38040,18 @@ end
 		end,
 	})
 	Labels.Build = BuildBox:AddLabel({ Text = "-", DoesWrap = true })
+	-- the real switches keep their Quick Start mirrors in step
+	for key, target in pairs(N.Mirrors) do
+		local t = Toggles[target]
+		if t then
+			t:OnChanged(function(value)
+				local m = Toggles[key]
+				if m and m.Value ~= value then
+					m:SetValue(value)
+				end
+			end)
+		end
+	end
 end
 N.StatRows = {}
 do
@@ -37525,15 +38073,17 @@ do
 			end,
 		}
 	end
-	local MoneyBox = Tabs.Main:AddLeftGroupbox("Money", "coins")
+	local MoneyBox = Tabs.Stats:AddLeftGroupbox("Money", "coins")
 	N.StatRows.Money = statRow(MoneyBox, "wallet", "Money", 28)
 	N.StatRows.Earned = statRow(MoneyBox, "trending-up", "Earned this session", 22)
 	N.StatRows.Rate = statRow(MoneyBox, "activity", "Per hour", 22, "FontColor")
 	N.StatRows.Time = statRow(MoneyBox, "clock", "Session", 22, "FontColor")
-	local WorkBox = Tabs.Main:AddRightGroupbox("Work", "briefcase")
+	local WorkBox = Tabs.Stats:AddRightGroupbox("Work", "briefcase")
 	N.StatRows.Done = statRow(WorkBox, "check", "Customers done", 28)
 	N.StatRows.Correct = statRow(WorkBox, "badge-check", "Correct / wrong", 22)
 	N.StatRows.Shifts = statRow(WorkBox, "briefcase", "Shifts started", 22)
+	local PayBox = Tabs.Stats:AddRightGroupbox("Pay Per Job", "coins")
+	Labels.Pay = PayBox:AddLabel({ Text = "-", DoesWrap = true })
 	-- Numbers come from N.InfoText (built in the info thread), this only copies them.
 	function N.drawStats()
 		local S = N.InfoText.stats or {}
@@ -37568,8 +38118,9 @@ do
 	end
 	function Debug.running()
 		local running = {}
-		for name, toggle in pairs(Toggles) do
-			if type(toggle) == "table" and toggle.Value == true and string.sub(name, 1, 4) == "Auto" then
+		for _, name in ipairs(N.AllAutoToggles or {}) do
+			local toggle = Toggles[name]
+			if type(toggle) == "table" and toggle.Value == true then
 				table.insert(running, name)
 			end
 		end
@@ -37624,9 +38175,9 @@ Library.OnUserToggle = function(name, value)
 end
 N.AllAutoToggles = {
 	"AutoJob",
+	"BestPay",
 	"AutoNeeds",
-	"NeedsFood",
-	"NeedsBuy",
+	"Objectives",
 }
 do
 	function N.manualRunning()
@@ -37651,6 +38202,11 @@ do
 				toggle:SetValue(false)
 			end
 		end
+		-- also a running Copy a Plot build and a manual "Restore needs now"
+		N.Build.stop = true
+		N.Needs.forced = nil
+		N.Needs.manual = false
+		log("STOP", "Stop Everything: toggles off, build stop, manual restore cancelled")
 		notify("Corvus", "Everything is off", 3)
 	end
 end
@@ -37858,13 +38414,12 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		end)
 	end
 	pcall(function()
-		local holder = Tabs.Misc or Tabs.Jobs
-		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
+		local PerfBox = Tabs.Stats:AddLeftGroupbox("Performance", "gauge")
 		Labels.Perf = PerfBox:AddLabel({ Text = "Measuring...", DoesWrap = true })
 	end)
-	if Tabs.Misc then
+	if Tabs.Webhook then
 		pcall(function()
-			local HookBox = Tabs.Misc:AddLeftGroupbox("Discord Webhook", "webhook")
+			local HookBox = Tabs.Webhook:AddLeftGroupbox("Discord Webhook", "webhook")
 				HookBox:AddToggle("WebhookOn", {
 					Text = "Post to Discord",
 					Default = false,
@@ -37965,6 +38520,8 @@ do
 		pcall(function()
 			toggleCommand("work", { "job", "farm" }, { "AutoJob" }, "Auto Work")
 			toggleCommand("needs", {}, { "AutoNeeds" }, "Auto Needs")
+			toggleCommand("bestpay", { "best" }, { "BestPay" }, "Best Pay")
+			toggleCommand("objectives", { "daily" }, { "Objectives" }, "Daily Objectives")
 			Library:AddCommand({
 				Name = "stop",
 				Aliases = { "alloff" },
@@ -38017,7 +38574,9 @@ do
 		pcall(function()
 			Library:SetQuickBar({
 				{ Toggle = "AutoJob", Icon = "briefcase", Label = "Work" },
+				{ Toggle = "BestPay", Icon = "coins", Label = "Best Pay" },
 				{ Toggle = "AutoNeeds", Icon = "heart-pulse", Label = "Needs" },
+				{ Toggle = "Objectives", Icon = "target", Label = "Daily" },
 			})
 		end)
 	end
@@ -38052,14 +38611,16 @@ do
 					Required = true,
 					Default = {},
 					Choices = {
-						{ Id = "work", Title = "Auto Work", Description = "Goes to work and does the job you pick in Auto Work (Best Pay picks the best paying one)", Icon = "briefcase", Color = "#fab428" },
-						{ Id = "needs", Title = "Auto Needs", Description = "Keeps Energy, Hunger, Hygiene and Fun up, takes breaks and does daily objectives", Icon = "heart-pulse", Color = "#60d696" },
+						{ Id = "work", Title = "Auto Work", Description = "Goes to work and does the job picked in the Jobs tab", Icon = "briefcase", Color = "#fab428" },
+						{ Id = "best", Title = "Best Pay", Description = "Switches to the job that pays you the most", Icon = "coins", Color = "#f0b90b" },
+						{ Id = "needs", Title = "Auto Needs", Description = "Keeps Energy, Hunger, Hygiene and Fun up at home, buys meals and missing furniture", Icon = "heart-pulse", Color = "#60d696" },
+						{ Id = "daily", Title = "Daily Objectives", Description = "Does the daily job task and quick meal for the daily reward", Icon = "target", Color = "#6a9bff" },
 					},
 				},
 			},
 			Finish = function(values)
 				local chosen = type(values.tasks) == "table" and values.tasks or {}
-				local groups = { work = { "AutoJob" }, needs = { "AutoNeeds" } }
+				local groups = { work = { "AutoJob" }, best = { "BestPay" }, needs = { "AutoNeeds" }, daily = { "Objectives" } }
 				for id, names in pairs(groups) do
 					setToggles(names, { if chosen[id] then "on" else "off" })
 				end
@@ -38097,6 +38658,9 @@ else
 		SaveManager:BuildConfigSection(Tabs.Settings)
 		ThemeManager:ApplyToTab(Tabs.Settings)
 		SaveManager:LoadAutoloadConfig()
+		if Library.OnAutoload then
+			pcall(Library.OnAutoload)
+		end
 	end)
 end
 if Window.AddInfoTab then
@@ -38208,7 +38772,23 @@ do
 		logProblem("The game's JobHandler was not found, job farms cannot start")
 	end
 	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep, ["Pizza Delivery"] = N.deliveryStep, Miner = N.minerStep, ["BloxBurgers Cashier"] = N.bbCashierStep, ["BloxBurgers Line Cook (beta)"] = N.cookStep, Teacher = N.teacherStep, ["Taxi (beta)"] = N.taxiStep, ["Fisherman (beta)"] = N.fishStep, ["Woodcutter (beta)"] = N.woodStep }
-	local wasWorking, lastPick = false, nil
+	local wasWorking, lastPick, lastWhy = false, nil, nil
+	-- which job Auto Work does: the open daily objective job task first, then Best Pay, then the dropdown
+	function N.workPick()
+		local objective = N.objectiveJob()
+		if objective then
+			-- Best Pay must not count the detour as its own pick failing to start
+			if N.Plan and not N.Plan.started then
+				N.Plan.pickAt = os.clock()
+			end
+			return objective, "objective"
+		end
+		local pick = optionText("JobPick", "Hairdresser")
+		if on("BestPay") or pick == "Best Pay (auto)" then
+			return N.bestJobPick(), "best pay"
+		end
+		return pick, "job pick"
+	end
 	local function leaveJob()
 		N.taxiRelease()
 		N.bbLeave()
@@ -38226,18 +38806,29 @@ do
 			task.wait(0.5)
 			return
 		end
-		if on("AutoJob") then
-			wasWorking = true
-			-- needs and breaks come first: the trip leaves the job, the next pass clocks in again
+		local working = on("AutoJob")
+		if not working and wasWorking then
+			-- Auto Work was turned off: clock out so nothing keeps running
+			wasWorking = false
+			log("WORK stop", "Auto Work is off, clocking out of", tostring(N.currentJob()))
+			leaveJob()
+		end
+		-- needs, breaks and the daily meal come first, with or without Auto Work: the trip leaves the job, the next
+		-- pass clocks in again
+		if N.Needs.forced or on("AutoNeeds") or on("Objectives") then
 			local due = if N.Needs.forced then "manual" else N.needsDue()
 			if due then
 				N.Needs.forced = nil
 				N.needsRun(due)
 				return
 			end
-			local pick = optionText("JobPick", "Hairdresser")
-			if pick == "Best Pay (auto)" then
-				pick = N.bestJobPick()
+		end
+		if working then
+			wasWorking = true
+			local pick, why = N.workPick()
+			if why ~= lastWhy then
+				log("WORK pick", tostring(pick), "by", tostring(why))
+				lastWhy = why
 			end
 			if lastPick and pick ~= lastPick then
 				-- switching jobs: leave the old one cleanly (taxi controls, till)
@@ -38253,24 +38844,21 @@ do
 			task.wait(0.05)
 			return
 		end
-		if wasWorking then
-			-- Auto Work was turned off: clock out so nothing keeps running
-			wasWorking = false
-			log("WORK stop", "Auto Work is off, clocking out of", tostring(N.currentJob()))
-			leaveJob()
-		end
-		setStatus("Idle")
+		setStatus(if on("AutoNeeds") then "Auto Needs: moods are fine, waiting" else "Idle")
 		task.wait(0.5)
 	end)
 	-- Every change of the main toggles is logged with the others' state, so a silent stop has a visible reason.
 	task.spawn(function()
-		local names = { "AutoJob", "AutoNeeds", "NeedsFood" }
+		local names = { "AutoJob", "BestPay", "AutoNeeds", "Objectives" }
 		local last = {}
 		while alive() do
 			for _, name in ipairs(names) do
 				local v = on(name)
 				if last[name] ~= nil and last[name] ~= v then
-					log("TOGGLE", name, tostring(v), "| work=" .. tostring(on("AutoJob")), "needs=" .. tostring(on("AutoNeeds")), "job=" .. tostring(N.currentJob()), "status=" .. tostring(Status))
+					log("TOGGLE", name, tostring(v), "| work=" .. tostring(on("AutoJob")), "best=" .. tostring(on("BestPay")), "needs=" .. tostring(on("AutoNeeds")), "daily=" .. tostring(on("Objectives")), "job=" .. tostring(N.currentJob()), "status=" .. tostring(Status))
+					if name == "Objectives" and v then
+						task.spawn(N.objectivesLog, "toggle")
+					end
 				end
 				last[name] = v
 			end
@@ -38315,19 +38903,22 @@ do
 						log("EFF", N.currentJob(), "efficiency", eff, "reason", tostring(tip), "'" .. why .. "'", if needsRelated then "(needs)" else "", "level", N.Levels[N.currentJob()], "shift pay", N.shiftEarnings())
 					end
 				end
-				if working then
+				if working and on("BestPay") then
 					N.planTick()
 				end
 				-- moods every 10 s: decay and efficiency model samples, the MOOD log line every 60 s (only with Auto Needs)
 				if on("AutoNeeds") and os.clock() - (N.Needs.sampleAt or -1e9) >= 10 then
 					N.Needs.sampleAt = os.clock()
 					N.moodTick((N.efficiency()))
-					if os.clock() - N.Needs.objAt >= 3600 then
-						N.Needs.objAt = os.clock()
-						task.spawn(N.objectivesLog, "hourly")
-					end
 				end
-				N.InfoText.needs = if on("AutoNeeds") then N.needsStatus() else "Auto Needs is off"
+				-- daily objectives state: every 2 min with Daily Objectives on, hourly in the log with Auto Needs
+				local objEvery = if on("Objectives") then 120 elseif on("AutoNeeds") then 3600 else nil
+				if objEvery and os.clock() - N.Needs.objAt >= objEvery then
+					N.Needs.objAt = os.clock()
+					task.spawn(N.objectivesLog, if on("Objectives") then "check" else "hourly")
+				end
+				N.InfoText.obj = if on("Objectives") then N.objectiveText(false) or "-" else "Daily Objectives is off"
+				N.InfoText.needs = if on("AutoNeeds") or N.Needs.active then N.needsStatus() else "Auto Needs is off"
 				N.InfoText.pay = N.payText()
 				-- the first pass runs inside task.spawn before N.upNextText below is defined (ERROR info: attempt to call a nil value)
 				N.InfoText.next = if N.upNextText then N.upNextText() else N.InfoText.next
@@ -38355,39 +38946,48 @@ do
 	function N.upNextText()
 		local Q = N.Needs
 		local lines = {}
-		local working = on("AutoJob")
-		if not working then
-			return "Switch on Auto Work and the plan for the next hours shows up here"
+		local working, needs, daily = on("AutoJob"), on("AutoNeeds"), on("Objectives")
+		if not (working or needs or daily or Q.active) then
+			return "Switch on Auto Work, Auto Needs or Daily Objectives in Quick Start"
 		end
 		if Q.active then
-			table.insert(lines, if Q.reason == "break" then "Now: break at home" else "Now: restoring needs at home")
+			table.insert(lines, if Q.reason == "break" then "Now: break at home" elseif Q.reason == "objective meal" then "Now: eating the daily quick meal" else "Now: restoring needs at home")
 		end
 		-- a mood that cannot be restored is named first, with what blocks it ("Need a bed: buying ...")
-		if on("AutoNeeds") and Q.blocker and Q.blocker ~= "" then
+		if needs and Q.blocker and Q.blocker ~= "" then
 			table.insert(lines, Q.blocker)
 		end
-		local pick = optionText("JobPick", "Hairdresser")
-		if pick == "Best Pay (auto)" then
-			local P = N.Plan
-			if P.lastPick and P.pickRate and P.pickRate > 0 then
-				table.insert(lines, string.format("Work %s (best pay $%s/h)", P.lastPick, formatNumber(math.floor(P.pickRate))))
+		if working then
+			local objective = N.objectiveJob()
+			if objective then
+				table.insert(lines, "Work " .. objective .. " for the daily objective")
+			elseif on("BestPay") then
+				local P = N.Plan
+				if P.lastPick and P.pickRate and P.pickRate > 0 then
+					table.insert(lines, string.format("Work %s (best pay $%s/h)", P.lastPick, formatNumber(math.floor(P.pickRate))))
+				else
+					table.insert(lines, "Work: measuring which job pays best")
+				end
 			else
-				table.insert(lines, "Work: measuring which job pays best")
+				table.insert(lines, "Work " .. optionText("JobPick", "Hairdresser"))
 			end
-		else
-			table.insert(lines, "Work " .. pick)
 		end
-		if on("AutoNeeds") and not Q.active then
+		if daily then
+			local text = N.objectiveText(true)
+			if text then
+				table.insert(lines, text)
+			end
+		end
+		if needs and not Q.active then
 			local name, minutes = N.needsEta()
 			if name then
 				table.insert(lines, if minutes <= 1 then NeedVerb[name] .. " now" else string.format("%s in ~%s", NeedVerb[name], N.longTime(minutes * 60)))
 			end
 			local maxWork = optionNumber("WorkSessionMax", 210) * 60
-			if maxWork > 0 then
-				table.insert(lines, string.format("Break at %s of work (in %s)", N.longTime(maxWork), N.longTime(maxWork - Q.workSeconds)))
+			if working and maxWork > 0 then
+				table.insert(lines, string.format("Break at %s of work (in %s)", N.longTime(maxWork), N.longTime(math.max(maxWork - Q.workSeconds, 0))))
 			end
 		end
-
 		while #lines > 5 do
 			table.remove(lines)
 		end
@@ -38416,24 +39016,27 @@ do
 					Labels.Status:SetText(Status)
 					Labels.Job:SetText(N.InfoText.jobText or "-")
 					Labels.Next:SetText(N.InfoText.next or "-")
-					N.drawStats()
 				end)
 			end
 			if shown(Tabs.Jobs) then
 				group(function()
-					Labels.Pay:SetText(N.InfoText.pay or "-")
 					Labels.Needs:SetText(N.InfoText.needs or "-")
+					Labels.Obj:SetText(N.InfoText.obj or "-")
+				end)
+			end
+			if shown(Tabs.Stats) then
+				group(function()
+					N.drawStats()
+					Labels.Pay:SetText(N.InfoText.pay or "-")
+					if Labels.Perf then
+						Labels.Perf:SetText(Debug.perfText())
+					end
 				end)
 			end
 			if Labels.Build and shown(Tabs.Build) then
 				group(function()
 					local pick = optionText("LayoutPick", "")
 					Labels.Build:SetText(N.Build.status .. (if pick ~= "" and not N.Build.running then "\n" .. N.layoutInfo(pick) else ""))
-				end)
-			end
-			if Labels.Perf and shown(Tabs.Misc) then
-				group(function()
-					Labels.Perf:SetText(Debug.perfText())
 				end)
 			end
 			Perf.work.ui = (Perf.work.ui or 0) + (os.clock() - started)
@@ -38465,7 +39068,7 @@ do
 					table.clear(Perf.work)
 					flushLog(false)
 				end
-				if Log.statusAt and os.clock() - Log.statusAt > 600 and Log.stuckAt ~= Log.statusAt and on("AutoJob") then
+				if Log.statusAt and os.clock() - Log.statusAt > 600 and Log.stuckAt ~= Log.statusAt and on("AutoJob") and not N.Needs.active then
 					Log.stuckAt = Log.statusAt
 					logProblem("Stuck for 10 minutes on: " .. tostring(Status))
 				end
