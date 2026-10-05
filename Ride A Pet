@@ -28005,7 +28005,7 @@ seconds += math.floor(math.max(0, d - (tonumber(bonus.From) or math.huge)) / mat
 end
 end
 -- the game's real timers seen on pickups (never more than +30 s)
-return seconds + math.clamp(N.BreakLearn[rarity] or 0, 0, 30)
+return math.max(seconds + math.clamp(N.BreakLearn[rarity] or 0, -15, 30), 5)
 end
 function N.luckUpgrades()
 return math.floor(tonumber(N.savedValue("HatchUpgrades")) or 0)
@@ -29060,7 +29060,7 @@ return cycle <= claimed
 end
 local list = N.playerAttr("CollectedEggs")
 if type(list) == "string" and list ~= "" and name then
-return string.find(list, name .. ",", 1, true) ~= nil
+return string.find("," .. list, "," .. name .. ",", 1, true) ~= nil
 end
 return false
 end
@@ -29382,12 +29382,18 @@ end
 Carry.items[child] = { info = info, addedAt = os.clock() }
 local actual = (tonumber(child:GetAttribute("BreakAt")) or 0) - serverNow()
 if actual > 0 and actual < 600 then
-local predicted = N.breakSeconds(name) - (N.BreakLearn[info.rarity] or 0)
+-- predict with the egg's position too (the distance bonus), otherwise far eggs teach near eggs a bonus they do not get
+if typeof(info.pos) == "Vector3" then
+local predicted = N.breakSeconds(name, info.pos) - (N.BreakLearn[info.rarity] or 0)
 local extra = actual - predicted
 -- learn slowly and on the safe side: the smallest extra the game has given for this rarity
-if extra > 0 then
+-- (the reading comes a moment after the pickup, so a small shortfall is only latency)
 local old = N.BreakLearn[info.rarity]
+if extra > 0 then
 N.BreakLearn[info.rarity] = if old then math.min(old, extra) * 0.7 + extra * 0.3 else extra * 0.8
+elseif extra < -1.5 then
+N.BreakLearn[info.rarity] = math.max((old or 0) + extra, -15)
+end
 end
 end
 log(
@@ -30282,7 +30288,7 @@ local ok = waitFor(function()
 return info.item.Parent == nil or #N.plotPets() > before
 end, 3)
 if ok then
-table.insert(taken, spot)
+table.insert(taken, drop)
 Session.placedPets += 1
 log("PETS placed", N.petTitle(info), "$" .. formatNumber(info.income) .. "/s")
 else
