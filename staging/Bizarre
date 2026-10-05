@@ -5608,11 +5608,12 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         if Library.ConfirmPrompt and Library.ConfirmPrompt.Parent then
             return
         end
+        local Extra = if Opts.Warning then 64 else 0
         local Root = New("Frame", {
             AnchorPoint = Vector2.new(1, 1),
             BackgroundTransparency = 1,
             Position = UDim2.new(1, 340, 1, -12),
-            Size = UDim2.fromOffset(320, 232),
+            Size = UDim2.fromOffset(320, 232 + Extra),
             ZIndex = 60,
             Parent = Library.ScreenGui,
         })
@@ -5678,13 +5679,29 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             ZIndex = 63,
             Parent = Content,
         })
+        if Opts.Warning then
+        	New("TextLabel", {
+        		BackgroundTransparency = 1,
+        		FontFace = GetBoldFont,
+        		Position = UDim2.fromOffset(14, 166),
+        		Size = UDim2.new(1, -28, 0, 60),
+        		Text = tostring(Opts.Warning),
+        		TextColor3 = Color3.fromRGB(255, 140, 60),
+        		TextSize = 12,
+        		TextWrapped = true,
+        		TextXAlignment = Enum.TextXAlignment.Left,
+        		TextYAlignment = Enum.TextYAlignment.Top,
+        		ZIndex = 63,
+        		Parent = Content,
+        	})
+        end
         local Confirm = New("TextButton", {
             AutoButtonColor = false,
             BackgroundColor3 = "AccentColor",
             FontFace = GetBoldFont,
-            Position = UDim2.fromOffset(12, 182),
+            Position = UDim2.fromOffset(12, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
-            Text = tostring(Opts.ConfirmText or "Confirm"),
+            Text = tostring(Opts.ConfirmText or "Confirm"), TextWrapped = true,
             TextColor3 = "BackgroundColor",
             TextSize = 14,
             ZIndex = 63,
@@ -5695,7 +5712,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             AutoButtonColor = false,
             BackgroundColor3 = "BackgroundColor",
             FontFace = GetBoldFont,
-            Position = UDim2.new(0.5, 4, 0, 182),
+            Position = UDim2.new(0.5, 4, 0, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
             Text = tostring(Opts.CancelText or "Cancel"),
             TextColor3 = "FontColor",
@@ -31337,6 +31354,8 @@ do
 		["BizarreRemotes/GymRemote"] = true,
 		["BizarreRemotes/BankRemote"] = true,
 		["Shared/Remotes/MenuRemote"] = true,
+		["Remotes/TutorialRemote"] = true,
+		["Remotes/BizarreGuiJoinSpawn"] = true,
 	}
 	local AllowedInvoke = {
 		["Remotes/InventoryRequest"] = true,
@@ -31600,6 +31619,16 @@ do
 	function N.farmActive()
 		return on("AutoFarmBest") or on("AutoFarmOP")
 	end
+	-- Safe Mode (default on): everything mirrors the game's own client: Walk movement, the real prompt hold times
+	-- and input delays, only remotes the client itself fires. The server code is not in the dump, so position and
+	-- timing checks are unknown: Tween, Teleport and Blatant are opt-in with Safe Mode off.
+	function N.safe()
+		local t = Toggles.SafeMode
+		return t == nil or t.Value == true
+	end
+	function N.blatant()
+		return on("Blatant") and not N.safe()
+	end
 	-- Player state lives in attributes on the Player (Money, BankMoney, ExperienceLevel, boosts, protection timers).
 	function N.attr(name, default)
 		local ok, value = pcall(LocalPlayer.GetAttribute, LocalPlayer, name)
@@ -31753,6 +31782,13 @@ local Session = {
 	codes = 0,
 	deaths = 0,
 	items = 0,
+	crates = 0,
+	stored = 0,
+	blood = 0,
+	-- Cash and seconds per activity (Mission, Job, Meteor, Errand, Loot), item drops per rarity.
+	sourceCash = {},
+	sourceTime = {},
+	drops = {},
 	recent = {},
 }
 N.Events = {}
@@ -31862,7 +31898,10 @@ do
 	-- The server can pull a character back (snapback): two in one trip switch to Walk for 10 minutes.
 	N.Move = { walkUntil = 0, snapbacks = 0, trips = 0, noclipParts = {} }
 	function N.moveMode()
-		local mode = optionText("MoveMode", "Tween")
+		if N.safe() then
+			return "Walk"
+		end
+		local mode = optionText("MoveMode", "Walk")
 		if mode ~= "Walk" and os.clock() < N.Move.walkUntil then
 			return "Walk"
 		end
@@ -31994,7 +32033,7 @@ do
 			return false
 		end
 		local hold = tonumber(prompt.HoldDuration) or 0
-		if on("Blatant") and type(fireproximityprompt) == "function" then
+		if N.blatant() and type(fireproximityprompt) == "function" then
 			local ok = pcall(fireproximityprompt, prompt)
 			if ok then
 				return true
@@ -32082,6 +32121,9 @@ do
 			for _, item in ipairs(type(data.Items) == "table" and data.Items or {}) do
 				if type(item) == "table" then
 					table.insert(items, tostring(item.Item or item.Name or "?") .. " [" .. tostring(item.Rarity or "?") .. "]")
+					local def = N.G.Items.Items and N.G.Items.Items[tostring(item.Item or item.Name)]
+					local rarity = tostring(item.Rarity or (def and def.Rarity) or "Common")
+					Session.drops[rarity] = (Session.drops[rarity] or 0) + (tonumber(item.Count) or 1)
 				end
 			end
 			Session.items += #items
@@ -32105,6 +32147,7 @@ do
 	N.onRemote("Remotes/DialogueOpen", function(data)
 		N.Dialog.data = N.tableOr(data)
 		N.Dialog.at = os.clock()
+		N.Dialog.answered = false
 		local options = {}
 		for _, option in ipairs(type(data) == "table" and type(data.Options) == "table" and data.Options or {}) do
 			if type(option) == "table" then
@@ -32136,7 +32179,7 @@ do
 		return "SendOut"
 	end
 	local function jobDelay(legit)
-		return if on("Blatant") then 0.05 else legit
+		return if N.blatant() then 0.05 else legit
 	end
 	N.onRemote("Remotes/JobUI", function(kind, data)
 		data = N.tableOr(data)
@@ -32228,7 +32271,7 @@ do
 			E.offerAt = os.clock()
 			log("ERRAND offer", tostring(data.Speaker), tostring(data.Text))
 			if on("AutoErrands") and not N.blocked("Errand") then
-				task.wait(if on("Blatant") then 0.1 else 0.8)
+				task.wait(if N.blatant() then 0.1 else 0.8)
 				fire("Remotes/CityPhoneQuestRemote", "Accept")
 			end
 		elseif kind == "Accepted" then
@@ -32283,7 +32326,7 @@ do
 			end
 			N.Gym.token = data.Token
 			N.Gym.at = os.clock()
-			task.wait(if on("Blatant") then 0.1 else (if kind == "YogaQuiz" then 4 else 1.3))
+			task.wait(if N.blatant() then 0.1 else (if kind == "YogaQuiz" then 4 else 1.3))
 			fire("BizarreRemotes/GymRemote", if kind == "YogaQuiz" then "CompleteYoga" else "CompletePushups", { Token = data.Token })
 		elseif kind == "TrainingComplete" then
 			N.Gym.done = os.clock()
@@ -32309,6 +32352,20 @@ do
 		end
 	end
 	N.onRemote("AdminRemotes/GlobalAnnouncement", announce("admin"))
+	-- Item reveals (crates, pawn, rewards) and inventory changes: the snapshot is read again on the next chore.
+	N.onRemote("Remotes/RewardPopup", function(data)
+		if type(data) == "table" then
+			log("REWARD", tostring(data.Banner or ""), tostring(data.ItemName or data.Text or ""), tostring(data.Rarity or ""), tostring(data.Count or ""))
+			if data.ItemName and data.Rarity then
+				Session.drops[tostring(data.Rarity)] = (Session.drops[tostring(data.Rarity)] or 0) + (tonumber(data.Count) or 1)
+			end
+		end
+	end)
+	N.onRemote("Remotes/InventoryChanged", function()
+		if N.Inv then
+			N.Inv.at = math.min(N.Inv.at, os.clock() - 50)
+		end
+	end)
 	N.onRemote("Remotes/InventoryNotify", function(data)
 		local text = tostring(if type(data) == "table" then (data.Text or data.Message) else data)
 		if string.find(string.lower(text), "full", 1, true) then
@@ -32424,6 +32481,8 @@ do
 		local seconds = math.max(os.clock() - P.startedAt, 5)
 		local gained = math.max(N.wealth() - P.startWealth, 0)
 		local sample = gained / seconds
+		Session.sourceCash[name] = (Session.sourceCash[name] or 0) + gained
+		Session.sourceTime[name] = (Session.sourceTime[name] or 0) + seconds
 		local old = P.rate[name]
 		P.rate[name] = if old then old * 0.7 + sample * 0.3 else sample
 		P.samples[name] = (P.samples[name] or 0) + 1
@@ -32543,6 +32602,525 @@ do
 		return table.concat(lines, "\n")
 	end
 end
+-- Inventory (Remotes/InventoryRequest "Snapshot", Remotes/InventoryAction Use/Equip/Store), crates, storage,
+-- cores, vampire hunger, the getting started reward and codes (Remotes/CodeRequest "Redeem").
+do
+	N.RarityRank = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6 }
+	N.RarityList = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic" }
+	function N.itemDef(name)
+		local items = N.G.Items.Items
+		return if type(items) == "table" then items[name] else nil
+	end
+	-- Snapshot items: InstanceId, ItemName/Name, DisplayName, Rarity, ItemType, Protected (stored), Count.
+	N.Inv = { list = {}, at = -1e9, ok = false }
+	function N.inventory(force)
+		local I = N.Inv
+		if force or os.clock() - I.at > 60 then
+			I.at = os.clock()
+			local ok, snap = invoke("Remotes/InventoryRequest", 6, "Snapshot")
+			if ok and type(snap) == "table" then
+				local raw = snap.Inventory or snap.Items or snap.OwnedItems or (type(snap.Data) == "table" and (snap.Data.Inventory or snap.Data.Items)) or {}
+				local list = {}
+				for _, item in pairs(raw) do
+					if type(item) == "table" then
+						local name = tostring(item.ItemName or item.Name or item.Item or "?")
+						local def = N.itemDef(name) or {}
+						table.insert(list, {
+							name = name,
+							id = item.InstanceId or item.Id,
+							display = tostring(item.DisplayName or def.DisplayName or name),
+							count = tonumber(item.Count or item.Quantity or item.Amount or item.Stack) or 1,
+							rarity = tostring(item.Rarity or def.Rarity or "Common"),
+							kind = tostring(item.ItemType or def.ItemType or "Item"),
+							protected = item.Protected == true or def.Protected == true or item.SoulLocked == true,
+						})
+					end
+				end
+				I.list = list
+				I.ok = true
+			end
+		end
+		return I.list
+	end
+	function N.countOf(name)
+		local n = 0
+		for _, item in ipairs(N.Inv.list) do
+			if item.name == name then
+				n += item.count
+			end
+		end
+		return n
+	end
+	-- Valuables for "Exclude from OP": everything Corvus can use up or equip, plus the rare progression items.
+	function N.valuableList()
+		local list, seen = {}, {}
+		local function add(name)
+			if name and not seen[name] then
+				seen[name] = true
+				table.insert(list, name)
+			end
+		end
+		local items = N.G.Items.Items
+		if type(items) == "table" then
+			for id, def in pairs(items) do
+				if type(def) == "table" and not def.AdminOnly and not def.AdminHidden and not string.find(tostring(id), "Test", 1, true) then
+					local kind = tostring(def.ItemType or "")
+					local rank = N.RarityRank[tostring(def.Rarity)] or 1
+					if kind == "Boost" or kind == "Crate" or id == "Blood Pack" or (kind == "Core" and rank >= 4) or ((kind == "Consumable" or kind == "Item" or kind == "Material") and rank >= 5) then
+						add(tostring(def.DisplayName or id))
+					end
+				end
+			end
+		end
+		if #list == 0 then
+			for _, name in ipairs({ "Rare Money Boost", "Epic Money Boost", "Legendary Money Boost", "Rare XP Boost", "Epic XP Boost", "Legendary XP Boost", "Common Crate", "Rare Crate", "Epic Crate", "Legendary Crate", "Mythic Crate", "Blood Pack", "Treasure Core", "Stand Arrow", "Arrow Shard" }) do
+				add(name)
+			end
+		end
+		table.sort(list)
+		return list
+	end
+	-- The player's "Exclude from OP" list: Corvus never uses, opens or equips these, in any mode.
+	function N.excluded(item)
+		local v = Options.OPExclude and Options.OPExclude.Value
+		if type(v) ~= "table" or type(item) ~= "table" then
+			return false
+		end
+		return v[item.display] == true or v[item.name] == true
+	end
+	local function useItem(item, action)
+		return fire("Remotes/InventoryAction", action, { InstanceId = item.id, ItemName = item.name, DisplayName = item.display })
+	end
+
+	-- Crates (Common..Mythic Crate, Pawn lootboxes): one reward each from the game's loot tables (CrateDefinitions).
+	function N.crateStep()
+		if not on("AutoCrates") or N.blocked("Crate") then
+			return false
+		end
+		for _, item in ipairs(N.inventory(false)) do
+			if item.kind == "Crate" and item.id and item.count > 0 and not N.excluded(item) and (N.isOP() or allows(Options.CrateRarities, item.rarity)) then
+				local before = N.countOf(item.name)
+				setStatus("Opening " .. item.display)
+				useItem(item, "Use")
+				task.wait(if N.blatant() then 0.4 else 1.2)
+				N.inventory(true)
+				if N.countOf(item.name) < before then
+					Session.crates += 1
+					N.ok("Crate")
+					log("CRATE opened", item.display)
+					N.note("Opened " .. item.display)
+				else
+					N.fail("Crate", "count did not drop for " .. item.display)
+				end
+				return true
+			end
+		end
+		return false
+	end
+
+	-- Store (Protected): stored items cannot be taken from you while you are downed (KnockedInteract LootDowned).
+	function N.storeStep()
+		if not on("AutoStore") or N.blocked("Store") then
+			return false
+		end
+		local from = N.RarityRank[optionText("StoreFrom", "Legendary")] or 5
+		for _, item in ipairs(N.inventory(false)) do
+			local rank = N.RarityRank[item.rarity] or 1
+			local usedLater = (item.kind == "Boost" and on("AutoBoosts")) or (item.kind == "Crate" and on("AutoCrates")) or (item.name == "Blood Pack" and on("AutoBlood")) or item.kind == "Core"
+			if item.id and not item.protected and rank >= from and not usedLater and item.kind ~= "MissionItem" and item.kind ~= "QuestItem" then
+				useItem(item, "Store")
+				task.wait(0.8)
+				N.inventory(true)
+				local stored = false
+				for _, again in ipairs(N.Inv.list) do
+					if again.id == item.id and again.protected then
+						stored = true
+					end
+				end
+				if stored then
+					Session.stored += 1
+					N.ok("Store")
+					log("STORE", item.display, item.rarity)
+				else
+					N.fail("Store", "not stored: " .. item.display)
+				end
+				return true
+			end
+		end
+		return false
+	end
+
+	-- Cores (EquippedCore attribute): Treasure Core = +20% mission money (the only income core), Phoenix and Death
+	-- Core get you up from knocked (carried cash and items are lootable), Runner Core = faster sprint for Walk.
+	N.CoreFarm = { "Treasure Core", "Phoenix Core", "Death Core", "Runner Core" }
+	function N.coreStep()
+		if not on("AutoCore") or N.blocked("Core") then
+			return false
+		end
+		local pick = if N.isOP() then "Best for farming" else optionText("CorePick", "Best for farming")
+		local order = if pick == "Best for farming" then N.CoreFarm else { pick }
+		local owned = {}
+		for _, item in ipairs(N.inventory(false)) do
+			if item.kind == "Core" and item.id and not N.excluded(item) then
+				owned[item.name] = owned[item.name] or item
+			end
+		end
+		for _, name in ipairs(order) do
+			local item = owned[name]
+			if item then
+				if tostring(N.attr("EquippedCore", "")) == name then
+					return false
+				end
+				useItem(item, "Equip")
+				if waitFor(function()
+					return tostring(N.attr("EquippedCore", "")) == name
+				end, 3) then
+					N.ok("Core")
+					log("CORE equipped", name)
+					N.note("Equipped " .. name)
+				else
+					N.fail("Core", "EquippedCore did not change to " .. name)
+				end
+				return true
+			end
+		end
+		return false
+	end
+
+	-- Vampires lose hunger over time; a Blood Pack restores 20 (ItemDefinitions UseAction BloodPack).
+	function N.isVampire()
+		return N.attr("Race", "") == "Vampire" or N.attr("HasVampire", false) == true or N.attr("VampireUnlocked", false) == true
+	end
+	function N.bloodStep()
+		if not on("AutoBlood") or not N.isVampire() or N.blocked("Blood") then
+			return false
+		end
+		local hunger = tonumber(N.attr("VampireHunger", 100)) or 100
+		local maxHunger = math.max(tonumber(N.attr("VampireMaxHunger", 100)) or 100, 1)
+		if hunger / maxHunger * 100 >= optionNumber("BloodAt", 35) then
+			return false
+		end
+		for _, item in ipairs(N.inventory(false)) do
+			if item.name == "Blood Pack" and item.id and not N.excluded(item) then
+				useItem(item, "Use")
+				if waitFor(function()
+					return (tonumber(N.attr("VampireHunger", 0)) or 0) > hunger
+				end, 3) then
+					Session.blood += 1
+					N.ok("Blood")
+					log("BLOOD pack used, hunger", hunger, "->", tostring(N.attr("VampireHunger", "?")))
+				else
+					N.fail("Blood", "hunger did not go up")
+				end
+				N.inventory(true)
+				return true
+			end
+		end
+		return false
+	end
+
+	-- Inventory overview for the Items tab: counts per rarity and how many item kinds of the game you own.
+	function N.inventoryText()
+		local list = N.Inv.list
+		if not N.Inv.ok then
+			return '<font transparency="0.4">Not read yet (turn on an item option or wait a minute)</font>'
+		end
+		local per, kinds, stored, total = {}, {}, 0, 0
+		for _, item in ipairs(list) do
+			per[item.rarity] = (per[item.rarity] or 0) + item.count
+			kinds[item.name] = true
+			total += item.count
+			if item.protected then
+				stored += 1
+			end
+		end
+		local parts = {}
+		for _, rarity in ipairs(N.RarityList) do
+			if per[rarity] then
+				table.insert(parts, rarity .. " " .. per[rarity])
+			end
+		end
+		local owned, all = 0, 0
+		for id, def in pairs(N.tableOr(N.G.Items.Items)) do
+			if type(def) == "table" and not def.AdminOnly and not def.AdminHidden and not def.PurchaseOnly then
+				all += 1
+				if kinds[id] then
+					owned += 1
+				end
+			end
+		end
+		return string.format("<b>%d</b> items  \u{00B7}  %d stored\n%s\nCollection: <b>%d</b> of %d item kinds", total, stored, if #parts > 0 then table.concat(parts, ", ") else "empty", owned, all)
+	end
+
+	-- Codes. The list comes from HubRepo .. "Codes" ({ "Bizarre": [codes] }), each code is tried once per account
+	-- and remembered (redeemed / invalid) in Corvus/BIZ_codes_<UserId>.json. Codes need the game's group
+	-- (CodePanel: GroupService:PromptJoinAsync(16856818)).
+	N.CodeGroup = 16856818
+	N.Codes = { state = { redeemed = {}, invalid = {} }, known = {}, fetchedAt = -1e9, tryAt = {}, log = {}, group = nil, groupAt = -1e9, status = "Off", claimAt = -1e9 }
+	local CodeFile = "Corvus/BIZ_codes_" .. tostring(LocalPlayer.UserId) .. ".json"
+	function N.httpGet(url)
+		return game:HttpGet(url)
+	end
+	pcall(function()
+		local data = HttpService:JSONDecode(readfile(CodeFile))
+		if type(data) == "table" then
+			N.Codes.state.redeemed = N.tableOr(data.redeemed)
+			N.Codes.state.invalid = N.tableOr(data.invalid)
+		end
+	end)
+	local function saveCodes()
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Corvus") then
+				makefolder("Corvus")
+			end
+			writefile(CodeFile, HttpService:JSONEncode(N.Codes.state))
+		end)
+	end
+	function N.inCodeGroup()
+		local C = N.Codes
+		if os.clock() - C.groupAt > 300 then
+			C.groupAt = os.clock()
+			local ok, yes = pcall(function()
+				return LocalPlayer:IsInGroup(N.CodeGroup)
+			end)
+			C.group = if ok then yes == true else nil
+		end
+		return C.group
+	end
+	function N.fetchCodes(force)
+		local C = N.Codes
+		if not force and os.clock() - C.fetchedAt < 1800 then
+			return
+		end
+		C.fetchedAt = os.clock()
+		if type(HubRepo) ~= "string" or HubRepo == "" then
+			return
+		end
+		local ok, body = pcall(N.httpGet, HubRepo .. "Codes")
+		if not ok or type(body) ~= "string" or body == "" then
+			log("CODES list unavailable")
+			return
+		end
+		local okJson, data = pcall(function()
+			return HttpService:JSONDecode(body)
+		end)
+		local list = okJson and type(data) == "table" and (data[GameName] or data.Bizarre) or nil
+		if type(list) ~= "table" then
+			return
+		end
+		local known = {}
+		for _, code in ipairs(list) do
+			if type(code) == "string" and #code >= 2 and #code <= 40 then
+				table.insert(known, code)
+			end
+		end
+		C.known = known
+		log("CODES list", #known)
+	end
+	-- Returns "redeemed", "already", "invalid", "group" or "no answer".
+	function N.redeemCode(code)
+		local C = N.Codes
+		C.tryAt[code] = os.clock()
+		local ok, result = invoke("Remotes/CodeRequest", 8, "Redeem", { Code = code })
+		local message = if type(result) == "table" then tostring(result.Message or "") else ""
+		local low = string.lower(message)
+		local verdict
+		if ok and type(result) == "table" and result.Ok == true then
+			verdict = "redeemed"
+			C.state.redeemed[code] = true
+			Session.codes += 1
+		elseif string.find(low, "already", 1, true) or string.find(low, "claimed", 1, true) then
+			verdict = "already"
+			C.state.redeemed[code] = true
+		elseif string.find(low, "group", 1, true) then
+			verdict = "group"
+		elseif not ok or type(result) ~= "table" then
+			verdict = "no answer"
+		else
+			verdict = "invalid"
+			C.state.invalid[code] = true
+		end
+		saveCodes()
+		log("CODE", code, verdict, message)
+		table.insert(C.log, 1, code .. ": " .. (if message ~= "" then message else verdict))
+		if #C.log > 5 then
+			table.remove(C.log)
+		end
+		return verdict
+	end
+	function N.codeList()
+		local list, seen = {}, {}
+		for _, code in ipairs(N.Codes.known) do
+			if not seen[code] then
+				seen[code] = true
+				table.insert(list, code)
+			end
+		end
+		for code in string.gmatch(optionText("CodeList", ""), "[^%s,;]+") do
+			if not seen[code] then
+				seen[code] = true
+				table.insert(list, code)
+			end
+		end
+		return list
+	end
+	-- "Redeem all known": everything not redeemed yet (invalid ones only when asked).
+	function N.redeemAll(includeInvalid)
+		N.fetchCodes(true)
+		local done = 0
+		for _, code in ipairs(N.codeList()) do
+			if not N.Codes.state.redeemed[code] and (includeInvalid or not N.Codes.state.invalid[code]) then
+				N.redeemCode(code)
+				done += 1
+				task.wait(1)
+			end
+		end
+		notify("Codes", if done > 0 then "Tried " .. done .. " code(s), see the Codes box" else "No new codes", 4)
+		return done
+	end
+	function N.rewardStep()
+		local C = N.Codes
+		if on("AutoRewards") and N.attr("FirstTutorialRewardClaimed", true) == false and N.attr("TutorialCompleted", false) == true and os.clock() - C.claimAt > 600 then
+			C.claimAt = os.clock()
+			fire("Remotes/GettingStartedEvent", "Claim")
+		end
+		if not on("AutoCodes") then
+			C.status = "Off"
+			return
+		end
+		N.fetchCodes(false)
+		for _, code in ipairs(N.codeList()) do
+			if not C.state.redeemed[code] and not C.state.invalid[code] and os.clock() - (C.tryAt[code] or -1e9) > 1800 then
+				C.status = "Redeeming " .. code
+				N.redeemCode(code)
+				return
+			end
+		end
+		if N.inCodeGroup() == false then
+			C.status = "Join the game's group to redeem codes"
+		else
+			C.status = if #N.codeList() == 0 then "Waiting for codes" else "All codes tried"
+		end
+	end
+end
+-- Tutorial (TutorialClient + TutorialLessons): the server sends "Objective" {Binding} for each practice lesson
+-- (Sprint, Dash, M1, Heavy, Block, Slide, Pose, Phone, Inventory), the client reports Remotes/TutorialRemote
+-- ("Action", <Binding>). Guide pages arrive as a Teacher Dwibby dialogue ("GOT IT - NEXT" = TutorialNextPage),
+-- "Complete" ends it and the client sends "EnterCity". Corvus does the same so farming can start.
+do
+	N.Tutorial = { objective = nil, objectiveAt = -1e9, reportedAt = {}, complete = false, lastAct = -1e9, blindIndex = 0, steps = 0, menuSince = nil, joinAt = -1e9, done = false }
+	N.TutorialPractice = { "Sprint", "Dash", "M1", "Heavy", "Block", "Slide", "Pose", "Phone", "Inventory" }
+	N.onRemote("Remotes/TutorialRemote", function(kind, data)
+		data = N.tableOr(data)
+		local T_ = N.Tutorial
+		if kind == "Objective" then
+			T_.objective = data.Binding
+			T_.objectiveAt = os.clock()
+			log("TUTORIAL objective", tostring(data.Binding), tostring(data.Index or "?") .. "/" .. tostring(data.Total or "?"))
+		elseif kind == "ObjectiveComplete" then
+			log("TUTORIAL step=" .. tostring(T_.objective) .. " ok=true")
+			T_.objective = nil
+		elseif kind == "Complete" then
+			T_.complete = true
+			log("TUTORIAL complete", if data.Rewarded or data.RewardPending then "reward: Epic Chest + starting cash" else "")
+		elseif kind == "EnterCity" then
+			T_.complete = false
+			T_.done = true
+			log("TUTORIAL entered the city")
+		end
+	end)
+	-- "GOT IT - NEXT" (TutorialNextPage) and the adventure choice; never "BACK TO PRACTICE" (TutorialReplayMovement).
+	function N.tutorialNext(option)
+		local text = string.lower(tostring(option.Text or "") .. " " .. tostring(option.Action or ""))
+		if string.find(text, "back to practice", 1, true) or string.find(text, "replay", 1, true) then
+			return false
+		end
+		for _, word in ipairs({ "nextpage", "next", "got it", "mission", "continue", "finish", "done" }) do
+			if string.find(text, word, 1, true) then
+				return true
+			end
+		end
+		return false
+	end
+	local function walkABit()
+		local root, hum = N.root(), N.hum()
+		if root and hum then
+			pcall(hum.MoveTo, hum, root.Position + root.CFrame.LookVector * 12)
+		end
+	end
+	function N.inTutorial()
+		return N.attr("TutorialMode", false) == true
+	end
+	-- One tutorial step. Returns a status text.
+	function N.tutorialStep()
+		local T_ = N.Tutorial
+		-- 1. A guide page is open: press NEXT.
+		local dialog = N.Dialog.data
+		if dialog and os.clock() - N.Dialog.at < 20 and not N.Dialog.answered then
+			for _, option in ipairs(N.tableOr(dialog.Options)) do
+				if type(option) == "table" and N.tutorialNext(option) then
+					N.Dialog.answered = true
+					fire("Remotes/DialogueChoice", tostring(option.Action))
+					T_.steps += 1
+					log("TUTORIAL step=" .. tostring(option.Action) .. " ok=true", tostring(option.Text))
+					task.wait(0.6)
+					return "Tutorial: next page"
+				end
+			end
+		end
+		-- 2. Finished: enter the city like the ENTER THE CITY button.
+		if T_.complete then
+			T_.complete = false
+			fire("Remotes/TutorialRemote", "EnterCity")
+			log("TUTORIAL step=EnterCity ok=" .. tostring(waitFor(function()
+				return not N.inTutorial()
+			end, 5)))
+			return "Tutorial: entering the city"
+		end
+		-- 3. A practice lesson: do it (a few steps for movement) and report it like the game's client does.
+		local binding = T_.objective
+		if binding and os.clock() - (T_.reportedAt[binding] or -1e9) > 3 then
+			T_.reportedAt[binding] = os.clock()
+			if binding == "Sprint" or binding == "Dash" or binding == "Slide" then
+				walkABit()
+			end
+			fire("Remotes/TutorialRemote", "Action", tostring(binding))
+			T_.steps += 1
+			local done = waitFor(function()
+				return T_.objective ~= binding
+			end, 3)
+			log("TUTORIAL step=" .. tostring(binding) .. " ok=" .. tostring(done))
+			return "Tutorial: " .. tostring(binding)
+		end
+		-- 4. Started mid-tutorial (no objective seen): report every lesson in turn, then a NEXT page;
+		-- the server ignores the ones that are not current.
+		if not binding and os.clock() - T_.objectiveAt > 8 and os.clock() - T_.lastAct > 1.5 then
+			T_.lastAct = os.clock()
+			T_.blindIndex = T_.blindIndex % (#N.TutorialPractice + 1) + 1
+			local action = N.TutorialPractice[T_.blindIndex]
+			if action then
+				fire("Remotes/TutorialRemote", "Action", action)
+				log("TUTORIAL step=" .. action .. " ok=? (no objective seen yet)")
+			else
+				fire("Remotes/DialogueChoice", "TutorialNextPage")
+				log("TUTORIAL step=TutorialNextPage ok=? (no page seen yet)")
+			end
+			return "Tutorial: catching up"
+		end
+		task.wait(0.3)
+		return "Tutorial: waiting for the next lesson"
+	end
+	-- Main menu: the game's own fallback for Play is Remotes/BizarreGuiJoinSpawn (TutorialClient "EnterCity").
+	function N.menuStep()
+		local T_ = N.Tutorial
+		T_.menuSince = T_.menuSince or os.clock()
+		if os.clock() - T_.menuSince > 20 and os.clock() - T_.joinAt > 30 then
+			T_.joinAt = os.clock()
+			fire("Remotes/BizarreGuiJoinSpawn")
+			log("MENU join requested")
+		end
+	end
+end
 -- The work itself: missions, job shifts, meteor, errands, world loot, gym, stat points, boosts, bank and rewards.
 do
 	local MissionWords = { "open", "secure", "recover", "intercept", "clean", "pick up", "pickup", "catch", "grab", "deliver", "drop", "plant", "steal", "search", "collect", "take", "cache", "trash", "dog", "package", "evidence", "schematic", "document" }
@@ -32654,7 +33232,9 @@ do
 	local MissionAsk = { "mission", "job", "task", "work", "quest", "help", "yes", "sure", "ok", "accept", "give" }
 	local function startMission()
 		N.planStart("Mission")
-		if not N.blocked("MissionStartRequest") then
+		-- The game's own client never fires MissionStartRequest (missions come from the quest giver dialogue),
+		-- so the direct request is only tried with Safe Mode off.
+		if not N.safe() and not N.blocked("MissionStartRequest") then
 			setStatus("Asking for a mission")
 			fire("Remotes/MissionStartRequest")
 			if waitFor(function()
@@ -33029,30 +33609,6 @@ do
 	end
 
 	-- Boosts: Money and XP boost items are free income while farming. One runs at a time per kind, strongest first.
-	N.Inv = { list = {}, at = -1e9 }
-	function N.inventory(force)
-		local I = N.Inv
-		if force or os.clock() - I.at > 60 then
-			I.at = os.clock()
-			local ok, snap = invoke("Remotes/InventoryRequest", 6, "Snapshot")
-			if ok and type(snap) == "table" then
-				local raw = snap.Inventory or snap.Items or snap.OwnedItems or (type(snap.Data) == "table" and (snap.Data.Inventory or snap.Data.Items)) or {}
-				local list = {}
-				for _, item in pairs(raw) do
-					if type(item) == "table" then
-						table.insert(list, {
-							name = tostring(item.ItemName or item.Name or item.Item or "?"),
-							id = item.InstanceId or item.Id,
-							display = item.DisplayName,
-							count = tonumber(item.Count or item.Quantity or item.Amount or item.Stack) or 1,
-						})
-					end
-				end
-				I.list = list
-			end
-		end
-		return I.list
-	end
 	function N.boostValue(name)
 		local def = N.G.Items.Items and N.G.Items.Items[name]
 		local mult = tonumber(def and def.Multiplier) or 1.25
@@ -33069,7 +33625,7 @@ do
 			if wanted and not running and not N.blocked("Boost" .. kind) then
 				local best, bestScore
 				for _, item in ipairs(N.inventory(false)) do
-					if item.id and item.count > 0 and string.sub(item.name, -#(kind .. " Boost")) == kind .. " Boost" then
+					if item.id and item.count > 0 and string.sub(item.name, -#(kind .. " Boost")) == kind .. " Boost" and not N.excluded(item) then
 						local mult, duration = N.boostValue(item.name)
 						local score = (mult - 1) * duration
 						if not bestScore or score > bestScore then
@@ -33147,42 +33703,6 @@ do
 		end
 		return true
 	end
-
-	-- Rewards: the getting-started reward and codes (the game has no code list in the client: the player adds them).
-	N.Reward = { claimAt = -1e9, codesTried = {}, log = {} }
-	N.KnownCodes = {}
-	function N.codeList()
-		local list = table.clone(N.KnownCodes)
-		local text = optionText("CodeList", "")
-		for code in string.gmatch(text, "[^%s,;]+") do
-			table.insert(list, code)
-		end
-		return list
-	end
-	function N.rewardStep()
-		local R = N.Reward
-		if on("AutoRewards") and N.attr("FirstTutorialRewardClaimed", true) == false and N.attr("TutorialCompleted", false) == true and os.clock() - R.claimAt > 600 then
-			R.claimAt = os.clock()
-			fire("Remotes/GettingStartedEvent", "Claim")
-		end
-		if on("AutoCodes") then
-			for _, code in ipairs(N.codeList()) do
-				if not R.codesTried[code] then
-					R.codesTried[code] = true
-					local ok, result = invoke("Remotes/CodeRequest", 8, "Redeem", { Code = code })
-					local fine = ok and type(result) == "table" and result.Ok == true
-					if fine then
-						Session.codes += 1
-					end
-					table.insert(R.log, 1, code .. ": " .. tostring(type(result) == "table" and result.Message or (if fine then "ok" else "no answer")))
-					if #R.log > 5 then
-						table.remove(R.log)
-					end
-					return
-				end
-			end
-		end
-	end
 end
 local Window, Tabs, Labels
 do
@@ -33228,14 +33748,15 @@ do
 		end)
 	end
 	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+	Tabs.AutoOP = N.addTab("Auto OP", "zap", "Full automatic planner and what it may never touch")
 	Tabs.Missions = N.addTab("Missions", "scroll-text", "Missions, meteors, errands and world loot")
 	Tabs.Jobs = N.addTab("Jobs", "briefcase", "Job shifts on the game clock")
 	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Stat points and gym training")
-	Tabs.Rewards = N.addTab("Rewards", "gift", "Getting started reward, codes and friends")
-	Tabs.Items = N.addTab("Items", "backpack", "Boosts and the bank")
-	Tabs.Player = N.addTab("Player", "user", "Movement and Blatant")
-	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and rates")
-	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts")
+	Tabs.Rewards = N.addTab("Rewards", "gift", "Tutorial, getting started reward, codes and friends")
+	Tabs.Items = N.addTab("Items", "backpack", "Inventory, crates, storage, cores, boosts and the bank")
+	Tabs.Player = N.addTab("Player", "user", "Safe Mode, movement, travel and Blatant")
+	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress, cash per activity and drops")
+	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts and a live profile card")
 	if Window.AddMiscTab then
 		pcall(function()
 			Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
@@ -33245,7 +33766,7 @@ do
 	do
 		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
 		-- OP = the planner does everything (also uses up boost items). Normal = exactly the toggles ticked in FarmSet.
-		N.FarmBestOn = { "AutoMissions", "AutoJob", "AutoMeteor", "AutoErrands", "AutoLoot", "AutoStats", "AutoGym", "AutoBank", "AutoRewards", "AutoCodes", "AutoBoosts", "Blatant" }
+		N.FarmBestOn = { "AutoMissions", "AutoJob", "AutoMeteor", "AutoErrands", "AutoLoot", "AutoStats", "AutoGym", "AutoBank", "AutoRewards", "AutoCodes", "AutoBoosts", "AutoCrates", "AutoStore", "AutoCore", "AutoBlood" }
 		-- Every main farm toggle: key, visible name, safe (nothing is sold, consumed, converted or spent).
 		N.FarmSetList = {
 			{ "AutoMissions", "Auto Missions", true },
@@ -33258,8 +33779,12 @@ do
 			{ "AutoBank", "Auto Bank Cash", true },
 			{ "AutoRewards", "Claim Rewards", true },
 			{ "AutoCodes", "Redeem Codes", true },
-			{ "Blatant", "Blatant", true },
+			{ "AutoStore", "Store Valuables", true },
+			{ "AutoCore", "Equip Farm Core", true },
 			{ "AutoBoosts", "Auto Use Boosts", false },
+			{ "AutoCrates", "Open Crates", false },
+			{ "AutoBlood", "Vampire Blood Packs", false },
+			{ "Blatant", "Blatant (Safe Mode off)", false },
 			{ "AutoFriend", "Auto Friend", false },
 		}
 		local farmNames, farmDefault = {}, {}
@@ -33322,7 +33847,7 @@ do
 				local card = Instance.new("Frame")
 				card.AnchorPoint = Vector2.new(0.5, 0.5)
 				card.Position = UDim2.fromScale(0.5, 0.5)
-				card.Size = UDim2.fromOffset(330, 196)
+				card.Size = UDim2.fromOffset(340, 268)
 				card.BackgroundColor3 = main
 				card.ZIndex = 200
 				card.Parent = gui
@@ -33334,13 +33859,13 @@ do
 				stroke.Thickness = 1.5
 				stroke.Parent = card
 				N.OPCard = card
-				local function label(text, y, h, size, bold, alpha)
+				local function label(text, y, h, size, bold, alpha, color)
 					local l = Instance.new("TextLabel")
 					l.BackgroundTransparency = 1
 					l.Position = UDim2.fromOffset(14, y)
 					l.Size = UDim2.new(1, -28, 0, h)
 					l.Text = text
-					l.TextColor3 = font
+					l.TextColor3 = color or font
 					l.TextTransparency = alpha or 0
 					l.TextSize = size
 					l.Font = if bold then Enum.Font.GothamBold else Enum.Font.Gotham
@@ -33351,7 +33876,8 @@ do
 					l.Parent = card
 				end
 				label("Enable Auto Farm Everything OP?", 12, 22, 16, true)
-				label("Full automatic: the planner picks every activity and uses up your Money and XP boost items for max profit. For a safe version use Auto Farm Everything and pick what it includes.", 40, 96, 13, false, 0.15)
+				label("Full automatic: the planner picks every activity and uses up boosts, crates and Blood Packs for max profit. Items in Exclude from OP are never touched. For a safe version use Auto Farm Everything on Main.", 40, 80, 13, false, 0.15)
+				label(N.OPWarning or "", 126, 84, 13, true, 0, Color3.fromRGB(255, 138, 92))
 				local function button(text, x, color, fn)
 					local b = Instance.new("TextButton")
 					b.Position = UDim2.new(0, x, 1, -46)
@@ -33361,6 +33887,7 @@ do
 					b.TextColor3 = font
 					b.TextSize = 14
 					b.Font = Enum.Font.GothamBold
+					b.TextWrapped = true
 					b.AutoButtonColor = true
 					b.ZIndex = 202
 					b.Parent = card
@@ -33376,7 +33903,7 @@ do
 					end)
 				end
 				button("Cancel", 14, Color3.fromRGB(70, 70, 78), nil)
-				button("Enable OP", 14 + 148 + 6, accent, onYes)
+				button("I understand, enable OP", 14 + 153 + 6, accent, onYes)
 			end)
 			if not ok then
 				notify("Auto Farm Everything OP", "Could not open the confirmation, nothing was changed", 4)
@@ -33411,7 +33938,7 @@ do
 			Multi = true,
 			AllowNull = true,
 			Searchable = true,
-			Tooltip = "The toggles Auto Farm Everything switches on. Safe ones are ticked. Add Auto Use Boosts yourself if you want boost items used",
+			Tooltip = "The toggles Auto Farm Everything switches on. Safe ones are ticked (nothing is used up). Add boosts, crates or Blood Packs yourself if you want them used",
 			Callback = function()
 				if on("AutoFarmBest") and not N.FarmBusy then
 					local old, keep = N.FarmApplied.Normal or {}, {}
@@ -33428,10 +33955,41 @@ do
 				end
 			end,
 		})
-		QuickBox:AddToggle("AutoFarmOP", {
+		QuickBox:AddToggle("AutoMissions", {
+			Text = "Auto Missions",
+			Default = false,
+			Tooltip = "Takes a mission from the quest giver, goes to the objective and finishes it, over and over. Fight missions (sparring) are skipped",
+		})
+		QuickBox:AddButton({
+			Text = "Recommended Settings",
+			Tooltip = "Safe Mode on (walks, real hold times), bank above $3000 keeping $500, Speed first, pushups, coffee shop job, store Legendary+ items, farming core, then Auto Farm Everything",
+			Func = function()
+				N.recommended()
+			end,
+		})
+		QuickBox:AddLabel({
+			Text = '<font transparency="0.35">Corvus picks the best cash per second between missions, your job shift, meteors, errands and loot. The full automatic planner is in the Auto OP tab.</font>',
+			DoesWrap = true,
+		})
+		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		Labels.Next = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		Labels.Recent = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		StatusBox:AddButton({
+			Text = "Stop Everything",
+			Func = function()
+				N.stopAll()
+			end,
+		})
+		-- Auto OP tab: the OP toggle, Remember Auto OP and the items OP may never touch.
+		N.OPWarning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
+		local OPBox = Tabs.AutoOP:AddLeftGroupbox("Auto Farm Everything OP", "zap")
+		N.BootAt = os.clock()
+		OPBox:AddToggle("AutoFarmOP", {
 			Text = "Auto Farm Everything OP",
 			Default = false,
-			Tooltip = "Full automatic: the planner picks every activity (mission, job, meteor, errand, loot) by cash per second and uses up your boost items. Asks to confirm",
+			Tooltip = N.OPWarning .. " The planner picks every activity by cash per second and uses up boosts, crates and Blood Packs. Asks to confirm",
 			Callback = function(value)
 				if N.FarmBusy then
 					return
@@ -33440,6 +33998,11 @@ do
 					N.FarmBusy = true
 					Toggles.AutoFarmOP:SetValue(false)
 					N.FarmBusy = false
+					-- A config load never turns OP on: only Remember Auto OP restores it (p10).
+					if os.clock() - (N.BootAt or 0) < 8 then
+						log("OP not restored from a config")
+						return
+					end
 					N.askOP(function()
 						log("OP confirmed")
 						N.OPConfirmed = true
@@ -33454,6 +34017,9 @@ do
 					N.FarmBusy = false
 					N.farmApply("Normal", false)
 				end
+				if N.saveOPState then
+					N.saveOPState()
+				end
 				task.defer(function()
 					if value then
 						log("MODE", "OP")
@@ -33462,24 +34028,34 @@ do
 				end)
 			end,
 		})
-		QuickBox:AddToggle("AutoMissions", {
-			Text = "Auto Missions",
+		OPBox:AddToggle("RememberOP", {
+			Text = "Remember Auto OP",
 			Default = false,
-			Tooltip = "Takes a mission, walks or glides to the objective and finishes it, over and over. Fight missions (sparring) are skipped",
+			Tooltip = "Starts Auto Farm Everything OP again by itself after a rejoin or teleport, without asking. " .. N.OPWarning,
+			Callback = function()
+				if N.saveOPState then
+					N.saveOPState()
+				end
+			end,
 		})
-		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">Corvus picks the best cash per second between missions, your job shift, meteors, errands and loot.</font>',
+		OPBox:AddLabel({
+			Text = '<font color="#ff8a5c">' .. N.OPWarning .. ' OP may also use up important items (boosts, crates, Blood Packs): add everything you want to keep below.</font>',
 			DoesWrap = true,
 		})
-		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
-		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
-		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		Labels.Recent = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		StatusBox:AddButton({
-			Text = "Stop Everything",
-			Func = function()
-				N.stopAll()
-			end,
+		OPBox:AddDropdown("OPExclude", {
+			Text = "Exclude from OP",
+			Values = N.valuableList(),
+			Default = {},
+			Multi = true,
+			AllowNull = true,
+			Searchable = true,
+			Tooltip = "Corvus never uses, opens or equips these, in OP and in every other mode",
+		})
+		local OPPlanBox = Tabs.AutoOP:AddRightGroupbox("What OP Does", "calculator")
+		Labels.OPPlan = OPPlanBox:AddLabel({ Text = "-", DoesWrap = true })
+		OPPlanBox:AddLabel({
+			Text = '<font transparency="0.4">OP runs every activity by measured cash per second over the next 24 h, drops everything for a meteor, opens crates and keeps the strongest Money boost running. It keeps your Safe Mode and Blatant choice and never takes fights.</font>',
+			DoesWrap = true,
 		})
 	end
 	do
@@ -33521,7 +34097,13 @@ do
 			Default = "Coffee Shop Worker",
 			Tooltip = "Only used when you have no job yet. Quitting a job has a 10 hour rehire cooldown, so Corvus never quits",
 		})
-		Labels.Job = JobBox:AddLabel({ Text = "-", DoesWrap = true })
+		JobBox:AddLabel({
+			Text = '<font transparency="0.4">Shifts follow the game clock (one game day = 8 minutes). A full shift pays more (ending early pays 70%) and has a 25% item chance. Corvus never quits (10 h rehire cooldown).</font>',
+			DoesWrap = true,
+		})
+		local ShiftBox = Tabs.Jobs:AddRightGroupbox("Shift", "clock")
+		Labels.Job = ShiftBox:AddLabel({ Text = "-", DoesWrap = true })
+		Labels.JobSchedule = ShiftBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
 		local StatBox = Tabs.Upgrades:AddLeftGroupbox("Stat Points", "chevrons-up")
@@ -33533,11 +34115,40 @@ do
 		Labels.Train = GymBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
-		local RewardBox = Tabs.Rewards:AddLeftGroupbox("Rewards", "gift")
-		RewardBox:AddToggle("AutoRewards", { Text = "Claim Rewards", Default = false, Tooltip = "Claims the getting started reward" })
-		RewardBox:AddToggle("AutoCodes", { Text = "Redeem Codes", Default = false, Tooltip = "Tries every code from the box below once" })
-		RewardBox:AddInput("CodeList", { Text = "Codes", Placeholder = "CODE1, CODE2", Finished = true, Default = "" })
+		local RewardBox = Tabs.Rewards:AddLeftGroupbox("Getting Started", "gift")
+		RewardBox:AddToggle("AutoTutorial", {
+			Text = "Finish Tutorial",
+			Default = true,
+			Tooltip = "Does the tutorial lessons, presses NEXT on the guide pages and enters the city, so farming can start. The first completion gives an Epic Chest and starting cash",
+		})
+		RewardBox:AddToggle("AutoRewards", { Text = "Claim Getting Started Reward", Default = false, Tooltip = "Claims the getting started reward once the tutorial is done" })
 		Labels.Rewards = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
+		local CodeBox = Tabs.Rewards:AddRightGroupbox("Codes", "ticket")
+		CodeBox:AddToggle("AutoCodes", {
+			Text = "Auto Redeem Codes",
+			Default = false,
+			Tooltip = "Gets the code list from Corvus and redeems each new code once on this account. Redeemed and invalid codes are remembered. Codes need the game's Roblox group",
+		})
+		CodeBox:AddInput("CodeList", { Text = "Code", Placeholder = "Type a code (or CODE1, CODE2)", Finished = true, Default = "" })
+		CodeBox:AddButton({
+			Text = "Redeem",
+			Func = function()
+				task.spawn(function()
+					local done = 0
+					for code in string.gmatch(optionText("CodeList", ""), "[^%s,;]+") do
+						N.redeemCode(code)
+						done += 1
+					end
+					notify("Codes", if done > 0 then "Tried " .. done .. " code(s)" else "Type a code first", 4)
+				end)
+			end,
+		}):AddButton({
+			Text = "Redeem all known",
+			Func = function()
+				task.spawn(N.redeemAll, false)
+			end,
+		})
+		Labels.Codes = CodeBox:AddLabel({ Text = "-", DoesWrap = true })
 		do
 			local FPlayers = game:GetService("Players")
 			local FTeleport = game:GetService("TeleportService")
@@ -33627,10 +34238,36 @@ do
 		end
 	end
 	do
+		local InvBox = Tabs.Items:AddLeftGroupbox("Inventory", "package")
+		Labels.Inventory = InvBox:AddLabel({ Text = "-", DoesWrap = true })
+		InvBox:AddToggle("AutoStore", {
+			Text = "Store Valuables",
+			Default = false,
+			Tooltip = "Stores (protects) items from the rarity below up. Stored items cannot be looted from you while you are knocked. Items Corvus uses up itself stay unstored",
+		})
+		InvBox:AddDropdown("StoreFrom", { Text = "Store From", Values = N.RarityList, Default = "Legendary" })
+		local CrateBox = Tabs.Items:AddRightGroupbox("Crates", "package-open")
+		CrateBox:AddToggle("AutoCrates", {
+			Text = "Open Crates",
+			Default = false,
+			Tooltip = "Opens crates and Pawn lootboxes between jobs. Each gives one random item from the game's own loot table (boosts, ores, cores, rare items). Uses up the crate",
+		})
+		CrateBox:AddDropdown("CrateRarities", { Text = "Crate Rarities (none = all)", Values = N.RarityList, Default = {}, Multi = true, AllowNull = true })
+		Labels.Crates = CrateBox:AddLabel({ Text = "-", DoesWrap = true })
 		local BoostBox = Tabs.Items:AddLeftGroupbox("Boosts", "zap")
 		BoostBox:AddToggle("AutoBoosts", { Text = "Auto Use Boosts", Default = false, Tooltip = "Uses up Money and XP boost items: keeps one running per kind, strongest first, only while farming" })
 		BoostBox:AddDropdown("BoostKinds", { Text = "Boost Kinds", Values = { "Money", "XP" }, Default = { "Money", "XP" }, Multi = true, AllowNull = true })
 		Labels.Boost = BoostBox:AddLabel({ Text = "-", DoesWrap = true })
+		local CoreBox = Tabs.Items:AddRightGroupbox("Core and Upkeep", "heart-pulse")
+		CoreBox:AddToggle("AutoCore", {
+			Text = "Equip Farm Core",
+			Default = false,
+			Tooltip = "Treasure Core gives +20% mission money. Without it: Phoenix or Death Core (get up from knocked), then Runner Core (faster sprint)",
+		})
+		CoreBox:AddDropdown("CorePick", { Text = "Core", Values = { "Best for farming", "Treasure Core", "Phoenix Core", "Death Core", "Runner Core" }, Default = "Best for farming" })
+		CoreBox:AddToggle("AutoBlood", { Text = "Vampire Blood Packs", Default = false, Tooltip = "Vampires only: uses a Blood Pack (+20 hunger) when hunger falls below the slider" })
+		CoreBox:AddSlider("BloodAt", { Text = "Feed Below", Default = 35, Min = 10, Max = 90, Rounding = 0, Suffix = "%" })
+		Labels.Core = CoreBox:AddLabel({ Text = "-", DoesWrap = true })
 		local BankBox = Tabs.Items:AddRightGroupbox("Bank", "landmark")
 		BankBox:AddToggle("AutoBank", { Text = "Auto Bank Cash", Default = false, Tooltip = "After the new-life loss protection ends, cash you carry can be lost. Puts it in the bank when the trip is worth it" })
 		BankBox:AddSlider("KeepCash", { Text = "Keep In Pocket", Default = 500, Min = 0, Max = 20000, Rounding = 0, Prefix = "$" })
@@ -33638,20 +34275,44 @@ do
 		Labels.Bank = BankBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
+		local SafeBox = Tabs.Player:AddLeftGroupbox("Safe Mode", "shield-check")
+		SafeBox:AddToggle("SafeMode", {
+			Text = "Safe Mode",
+			Default = true,
+			Tooltip = "Plays like the game's own client: walks, holds every prompt for its real time, keeps normal input delays and only fires remotes the game's client fires itself",
+		})
+		SafeBox:AddLabel({
+			Text = '<font transparency="0.35">The game\'s server checks are not visible to Corvus. With Safe Mode off you can use Tween, Teleport and Blatant, which are faster but can be detected.</font>',
+			DoesWrap = true,
+		})
 		local MoveBox = Tabs.Player:AddLeftGroupbox("Movement", "footprints")
 		MoveBox:AddDropdown("MoveMode", {
-			Text = "Movement",
-			Values = { "Tween", "Walk", "Teleport" },
-			Default = "Tween",
-			Tooltip = "Tween glides at the speed below with noclip. If the server pulls you back twice Corvus walks for 10 minutes. Teleport is the riskiest",
+			Text = "Movement (Safe Mode off)",
+			Values = { "Walk", "Tween", "Teleport" },
+			Default = "Walk",
+			Tooltip = "Walk uses your character like a player. Tween glides at the speed below with noclip, Teleport jumps: both are faster than any player and riskier. If the server pulls you back twice Corvus walks for 10 minutes",
 		})
-		MoveBox:AddSlider("TweenSpeed", { Text = "Tween Speed", Default = 60, Min = 20, Max = 150, Rounding = 0, Suffix = " studs/s" })
-		MoveBox:AddToggle("Noclip", { Text = "Noclip While Moving", Default = true })
+		MoveBox:AddSlider("TweenSpeed", { Text = "Tween Speed", Default = 40, Min = 20, Max = 150, Rounding = 0, Suffix = " studs/s", Tooltip = "Normal running is about 29 studs/s" })
+		MoveBox:AddToggle("Noclip", { Text = "Noclip While Tweening", Default = true })
+		local TravelBox = Tabs.Player:AddRightGroupbox("Travel", "map")
+		-- The phone map's points (PhoneController navigation list).
+		N.TravelPoints = { { "Coffee Store", "CoffeeStorePoint" }, { "Gym", "GymPoint" }, { "Quest Giver", "QuestPoint" }, { "Dwiz Corp", "DwizCorpPoint" }, { "Apartment", "ApartmentPoint" }, { "Donut Store", "DonutStorePoint" }, { "Hospital", "HospitalPoint" }, { "Pawnshop", "PawnShopPoint" } }
+		local travelNames = {}
+		for _, entry in ipairs(N.TravelPoints) do
+			table.insert(travelNames, entry[1])
+		end
+		TravelBox:AddDropdown("TravelTo", { Text = "Place", Values = travelNames, Default = "Quest Giver" })
+		TravelBox:AddButton({
+			Text = "Go there",
+			Func = function()
+				task.spawn(N.travelToPoint, optionText("TravelTo", "Quest Giver"))
+			end,
+		})
 		local BlatantBox = Tabs.Player:AddRightGroupbox("Blatant", "flame")
 		BlatantBox:AddToggle("Blatant", {
-			Text = "Blatant",
+			Text = "Blatant (Safe Mode off)",
 			Default = false,
-			Tooltip = "Skips waits the client times itself: prompt hold times, coffee order clicks, triage and gym minigame delays. The server still checks every result",
+			Tooltip = "Skips waits the client times itself: prompt hold times, coffee order clicks, triage and gym minigame delays. Faster than a player: the anticheat may notice. Only works with Safe Mode off",
 		})
 		Labels.Move = BlatantBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
@@ -33688,9 +34349,27 @@ do
 	N.StatRows.Events = statRow(WorkBox, "zap", "Meteors / errands / loot", 22)
 	N.StatRows.Other = statRow(WorkBox, "gift", "Boosts / deposits / trainings", 22)
 	N.StatRows.Lost = statRow(WorkBox, "skull", "Cash lost / deaths", 22)
-	local AnalyticsBox = Tabs.Stats:AddLeftGroupbox("Analytics", "calculator")
+	local AnalyticsBox = Tabs.Stats:AddLeftGroupbox("Cash per Activity", "calculator")
 	N.StatRows.Plan = statRow(AnalyticsBox, "calculator", "Best now", 22, "FontColor")
 	N.StatRows.Horizon = statRow(AnalyticsBox, "clock", "Next 24 h at that rate", 22, "FontColor")
+	N.SourceNames = { "Mission", "Job", "Meteor", "Errand", "Loot" }
+	for _, name in ipairs(N.SourceNames) do
+		N.StatRows["Src" .. name] = statRow(AnalyticsBox, "coins", name .. " (earned, per active hour)", 20, "FontColor")
+	end
+	local ItemsBox = Tabs.Stats:AddRightGroupbox("Items", "backpack")
+	N.StatRows.Crates = statRow(ItemsBox, "package-open", "Crates opened / items stored", 22)
+	N.StatRows.Drops = statRow(ItemsBox, "sparkles", "Drops by rarity", 20, "FontColor")
+	N.StatRows.Codes = statRow(ItemsBox, "ticket", "Codes redeemed", 22)
+	N.StatRows.Tutorial = statRow(ItemsBox, "graduation-cap", "Tutorial steps", 22)
+	function N.dropsText()
+		local parts = {}
+		for _, rarity in ipairs(N.RarityList) do
+			if Session.drops[rarity] then
+				table.insert(parts, string.sub(rarity, 1, 1) .. " " .. Session.drops[rarity])
+			end
+		end
+		return if #parts > 0 then table.concat(parts, "  ") else "-"
+	end
 	function N.drawStats()
 		local elapsed = math.max(os.clock() - Session.started, 1)
 		local hours = elapsed / 3600
@@ -33707,6 +34386,14 @@ do
 		local best = N.Plan.best
 		N.StatRows.Plan.set(if best then string.format("%s $%.2f/s", best.name, best.rate) else "-")
 		N.StatRows.Horizon.set("$" .. formatNumber(N.horizonCash()))
+		for _, name in ipairs(N.SourceNames) do
+			local cash, seconds = Session.sourceCash[name] or 0, Session.sourceTime[name] or 0
+			N.StatRows["Src" .. name].set(if seconds > 0 then string.format("$%s  \u{00B7}  $%s/h", formatNumber(cash), formatNumber(math.floor(cash / seconds * 3600))) else "-")
+		end
+		N.StatRows.Crates.set(string.format("%d / %d", Session.crates, Session.stored))
+		N.StatRows.Drops.set(N.dropsText())
+		N.StatRows.Codes.set(tostring(Session.codes))
+		N.StatRows.Tutorial.set(if N.inTutorial() then tostring(N.Tutorial.steps) .. " (in progress)" else "done")
 	end
 end
 local Debug = {}
@@ -33732,7 +34419,7 @@ do
 	function Debug.running()
 		local running = {}
 		for name, toggle in pairs(Toggles) do
-			if type(toggle) == "table" and toggle.Value == true and (string.sub(name, 1, 4) == "Auto" or name == "Blatant") then
+			if type(toggle) == "table" and toggle.Value == true and (string.sub(name, 1, 4) == "Auto" or name == "Blatant" or name == "SafeMode") then
 				table.insert(running, name)
 			end
 		end
@@ -33754,7 +34441,7 @@ do
 			"Corvus debug log  |  " .. GameName,
 			string.format("Player %s (@%s)  |  executor %s  |  place %s  |  %s", LocalPlayer.DisplayName, LocalPlayer.Name, executor, tostring(game.PlaceId), os.date("%Y-%m-%d %H:%M:%S")),
 			string.format(
-				"Session %dh %02dm  |  earned $%s lost $%s  |  missions %d/%d fail/%d skip  |  shifts %d tasks %d wrong %d  |  meteors %d errands %d loot %d",
+				"Session %dh %02dm  |  earned $%s lost $%s  |  missions %d/%d fail/%d skip  |  shifts %d tasks %d wrong %d  |  meteors %d errands %d loot %d  |  crates %d stored %d codes %d",
 				elapsed // 3600,
 				(elapsed % 3600) // 60,
 				formatNumber(Session.earned),
@@ -33767,16 +34454,21 @@ do
 				Session.tasksWrong,
 				Session.meteors,
 				Session.errands,
-				Session.loot
+				Session.loot,
+				Session.crates,
+				Session.stored,
+				Session.codes
 			),
 			"Status: " .. tostring(Status),
-			"Running: " .. table.concat(Debug.running(), ", ") .. "  |  mode " .. (if N.isOP() then "OP" elseif on("AutoFarmBest") then "Normal" else "manual"),
+			"Running: " .. table.concat(Debug.running(), ", ") .. "  |  mode " .. (if N.isOP() then "OP" elseif on("AutoFarmBest") then "Normal" else "manual") .. "  |  " .. (if N.safe() then "Safe Mode" else "Safe Mode OFF"),
 			string.format(
-				"Game: cash %s bank %s, level %s, faction %s, move %s, snapbacks %d, rates %s",
+				"Game: cash %s bank %s, level %s, faction %s, tutorial %s, core %s, move %s, snapbacks %d, rates %s",
 				formatNumber(N.money()),
 				formatNumber(N.bank()),
 				tostring(N.level()),
 				tostring(N.attr("Faction", "?")),
+				if N.inTutorial() then "IN PROGRESS" else "done",
+				tostring(N.attr("EquippedCore", "")),
 				N.moveMode(),
 				N.Move.snapbacks,
 				if #rates > 0 then table.concat(rates, ", ") else "none measured"
@@ -33803,6 +34495,10 @@ N.AllAutoToggles = {
 	"AutoRewards",
 	"AutoCodes",
 	"AutoBoosts",
+	"AutoCrates",
+	"AutoStore",
+	"AutoCore",
+	"AutoBlood",
 }
 do
 	function N.stopAll()
@@ -33919,6 +34615,136 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 	end
 	local function hookOn()
 		return Toggles.WebhookOn and Toggles.WebhookOn.Value
+	end
+	-- Live profile card: one Discord message that is posted once and then edited (PATCH /messages/<id>).
+	local Card = { saved = {}, nextAt = 0, status = "Off", updatedAt = nil, force = false, forceNew = false }
+	N.Card = Card
+	local CardFile = "Corvus/BIZ_card.json"
+	pcall(function()
+		local data = HttpService:JSONDecode(readfile(CardFile))
+		if type(data) == "table" then
+			Card.saved = data
+		end
+	end)
+	local function saveCard()
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Corvus") then
+				makefolder("Corvus")
+			end
+			writefile(CardFile, HttpService:JSONEncode(Card.saved))
+		end)
+	end
+	local function hookParts(url)
+		if not validWebhook(url) then
+			return nil
+		end
+		local base = string.match(url, "^([^?]+)")
+		local id = string.match(base or "", "/webhooks/(%d+)/")
+		local thread = string.match(url, "thread_id=(%d+)")
+		return base, id, thread
+	end
+	N.CardEvery = { ["1 minute"] = 60, ["5 minutes"] = 300, ["10 minutes"] = 600, ["30 minutes"] = 1800 }
+	local function cardEmbed()
+		local elapsed = math.max(os.clock() - Session.started, 60)
+		local hidden = Toggles.WebhookHideName and Toggles.WebhookHideName.Value
+		local best = N.Plan.best
+		return {
+			title = if hidden then "Corvus player" else LocalPlayer.DisplayName .. "  (@" .. LocalPlayer.Name .. ")",
+			description = "\u{25CF}  " .. tostring(Status):sub(1, 150) .. "\nSession " .. string.format("%dh %02dm", elapsed // 3600, (elapsed % 3600) // 60),
+			color = 13158620,
+			author = { name = GameName .. "  \u{00B7}  live profile" },
+			fields = {
+				{ name = "Cash", value = "$" .. formatNumber(N.money()), inline = true },
+				{ name = "Bank", value = "$" .. formatNumber(N.bank()), inline = true },
+				{ name = "Level", value = tostring(N.level()), inline = true },
+				{ name = "Earned", value = "$" .. formatNumber(Session.earned), inline = true },
+				{ name = "Per hour", value = "$" .. formatNumber(math.floor(Session.earned / elapsed * 3600)), inline = true },
+				{ name = "Best now", value = if best then string.format("%s $%.2f/s", best.name, best.rate) else "-", inline = true },
+				{ name = "Missions", value = tostring(Session.missions), inline = true },
+				{ name = "Shifts", value = tostring(Session.shifts), inline = true },
+				{ name = "Meteors / errands", value = Session.meteors .. " / " .. Session.errands, inline = true },
+				{ name = "Crates / stored", value = Session.crates .. " / " .. Session.stored, inline = true },
+				{ name = "Drops", value = N.dropsText(), inline = true },
+				{ name = "Mode", value = (if N.isOP() then "OP" elseif on("AutoFarmBest") then "Farm Everything" else "manual") .. (if N.safe() then ", Safe" else ""), inline = true },
+			},
+			footer = { text = "Corvus  \u{00B7}  updates every " .. optionText("WebhookCardEvery", "5 minutes") },
+			timestamp = DateTime.now():ToIsoDate(),
+		}
+	end
+	local function cardRequest(method, url, payload)
+		local response = httpRequest({ Url = url, Method = method, Headers = { ["Content-Type"] = "application/json" }, Body = HttpService:JSONEncode(payload) })
+		return response and tonumber(response.StatusCode) or 0, response and response.Body or nil
+	end
+	function N.sendCard(forceNew)
+		local base, hookId, thread = hookParts(Options.WebhookUrl and Options.WebhookUrl.Value)
+		if not base then
+			Card.status = "Bad webhook URL"
+			return
+		end
+		local payload = { username = "Corvus", embeds = { cardEmbed() }, allowed_mentions = { parse = {} } }
+		local function query(wait)
+			local parts = {}
+			if wait then
+				table.insert(parts, "wait=true")
+			end
+			if thread then
+				table.insert(parts, "thread_id=" .. thread)
+			end
+			return if #parts > 0 then "?" .. table.concat(parts, "&") else ""
+		end
+		local messageId = if forceNew then nil else Card.saved[hookId]
+		if messageId then
+			local code = cardRequest("PATCH", base .. "/messages/" .. tostring(messageId) .. query(false), { embeds = payload.embeds, allowed_mentions = payload.allowed_mentions })
+			if code >= 200 and code < 300 then
+				Card.status = "Live"
+				Card.updatedAt = os.clock()
+				return
+			end
+			if code ~= 404 then
+				Card.status = "Discord refused it (" .. tostring(code) .. ")"
+				return
+			end
+			Card.saved[hookId] = nil
+		end
+		local code, body = cardRequest("POST", base .. query(true), payload)
+		if code >= 200 and code < 300 then
+			local ok, data = pcall(function()
+				return HttpService:JSONDecode(body)
+			end)
+			if ok and type(data) == "table" and data.id then
+				Card.saved[hookId] = tostring(data.id)
+				saveCard()
+			end
+			Card.status = "Live"
+			Card.updatedAt = os.clock()
+		else
+			Card.status = "Discord refused it (" .. tostring(code) .. ")"
+		end
+	end
+	task.spawn(function()
+		while alive() do
+			task.wait(2)
+			pcall(function()
+				local wanted = on("WebhookCard") and hookOn() and validWebhook(Options.WebhookUrl and Options.WebhookUrl.Value)
+				if not wanted then
+					Card.status = if on("WebhookCard") then "Turn on Post to Discord and add a URL" else "Off"
+					return
+				end
+				if Card.force or os.clock() >= Card.nextAt then
+					local forceNew = Card.forceNew
+					Card.force, Card.forceNew = false, false
+					Card.nextAt = os.clock() + (N.CardEvery[optionText("WebhookCardEvery", "5 minutes")] or 300)
+					N.sendCard(forceNew)
+				end
+			end)
+		end
+	end)
+	function N.cardText()
+		local text = "Card: <b>" .. tostring(Card.status) .. "</b>"
+		if Card.updatedAt then
+			text ..= "\nUpdated " .. N.longTime(os.clock() - Card.updatedAt) .. " ago"
+		end
+		return text
 	end
 	local function reportEmbed(title)
 		local elapsed = math.max(os.clock() - Session.started, 60)
@@ -34080,6 +34906,31 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 					end)
 				end,
 			})
+			local CardBox = Tabs.Webhook:AddRightGroupbox("Profile Card", "id-card")
+			CardBox:AddToggle("WebhookCard", {
+				Text = "Live profile card",
+				Default = false,
+				Tooltip = "Posts your profile once and then edits that same Discord message: cash, bank, level, earnings, best activity, missions, shifts, crates and drops",
+				Callback = function(v)
+					if v and N.Card then
+						N.Card.nextAt = 0
+					end
+				end,
+			})
+			CardBox:AddDropdown("WebhookCardEvery", { Text = "Update every", Values = { "1 minute", "5 minutes", "10 minutes", "30 minutes" }, Default = "5 minutes" })
+			CardBox:AddButton({
+				Text = "Refresh now",
+				Func = function()
+					N.Card.force = true
+				end,
+			}):AddButton({
+				Text = "New card",
+				Tooltip = "Posts a fresh card and stops editing the old one",
+				Func = function()
+					N.Card.force, N.Card.forceNew = true, true
+				end,
+			})
+			Labels.Card = CardBox:AddLabel({ Text = "-", DoesWrap = true })
 		end)
 	end
 	if Tabs.Info then
@@ -34148,7 +34999,11 @@ do
 			toggleCommand("job", { "jobs", "shift" }, { "AutoJob" }, "Auto Job Shifts")
 			toggleCommand("meteor", {}, { "AutoMeteor" }, "Claim Meteors")
 			toggleCommand("bank", {}, { "AutoBank" }, "Auto Bank Cash")
-			toggleCommand("blatant", {}, { "Blatant" }, "Blatant")
+			toggleCommand("blatant", {}, { "Blatant" }, "Blatant (needs Safe Mode off)")
+			toggleCommand("safe", { "safemode" }, { "SafeMode" }, "Safe Mode")
+			toggleCommand("crates", { "crate" }, { "AutoCrates" }, "Open Crates")
+			toggleCommand("store", {}, { "AutoStore" }, "Store Valuables")
+			toggleCommand("tutorial", {}, { "AutoTutorial" }, "Finish Tutorial")
 			toggleCommand("farmall", { "farmbest", "all", "farm" }, { "AutoFarmBest" }, "Auto Farm Everything")
 			toggleCommand("farmop", { "op" }, { "AutoFarmOP" }, "Auto Farm Everything OP (full planner, asks to confirm)")
 			Library:AddCommand({
@@ -34198,7 +35053,8 @@ do
 				{ Toggle = "AutoMissions", Icon = "scroll-text", Label = "Missions" },
 				{ Toggle = "AutoJob", Icon = "briefcase", Label = "Job" },
 				{ Toggle = "AutoMeteor", Icon = "flame", Label = "Meteor" },
-				{ Toggle = "Blatant", Icon = "zap", Label = "Blatant" },
+				{ Toggle = "AutoCrates", Icon = "package-open", Label = "Crates" },
+				{ Toggle = "SafeMode", Icon = "shield-check", Label = "Safe" },
 			})
 		end)
 	end
@@ -34233,12 +35089,13 @@ do
 					Required = true,
 					Default = { "farm" },
 					Choices = {
-						{ Id = "farm", Title = "Auto Farm Everything", Description = "One switch: missions, job shifts, meteors, errands, loot, stats, gym, bank and rewards. Never uses up items", Icon = "sparkles", Color = "#60d696" },
-						{ Id = "op", Title = "Auto Farm Everything OP", Description = "The planner picks everything for max cash per second and uses up your boost items", Icon = "zap", Color = "#ff5d5d" },
+						{ Id = "farm", Title = "Auto Farm Everything", Description = "One switch: tutorial, missions, job shifts, meteors, errands, loot, stats, gym, bank, storing valuables and rewards. Never uses up items, Safe Mode stays on", Icon = "sparkles", Color = "#60d696" },
+						{ Id = "op", Title = "Auto Farm Everything OP", Description = "Full automatic, uses boosts and crates. Uses the game's remotes faster than a normal player: the anticheat MAY BAN this account. Use at your own risk, preferably on an alt", Icon = "zap", Color = "#ff5d5d" },
 						{ Id = "missions", Title = "Missions", Description = "Takes and finishes missions over and over", Icon = "scroll-text", Color = "#fab428" },
 						{ Id = "job", Title = "Job shifts", Description = "Works your job every shift: coffee orders and patients solved exactly", Icon = "briefcase", Color = "#3ccf91" },
 						{ Id = "events", Title = "City events", Description = "Meteors, errands and world loot", Icon = "flame", Color = "#c77dff" },
 						{ Id = "rewards", Title = "Claim rewards", Description = "Getting started reward and codes", Icon = "gift", Color = "#ff5d8f" },
+							{ Id = "items", Title = "Items", Description = "Store Legendary+ items and wear the farming core", Icon = "backpack", Color = "#5da9ff" },
 					},
 				},
 			},
@@ -34249,6 +35106,7 @@ do
 					job = { "AutoJob" },
 					events = { "AutoMeteor", "AutoErrands", "AutoLoot" },
 					rewards = { "AutoRewards", "AutoCodes" },
+					items = { "AutoStore", "AutoCore" },
 				}
 				for id, names in pairs(groups) do
 					setToggles(names, { if chosen[id] and not chosen.farm and not chosen.op then "on" else "off" })
@@ -34265,6 +35123,14 @@ do
 		})
 	end
 end
+pcall(function()
+	-- Auto Farm Everything OP and Remember Auto OP are never saved in a config (see Remember Auto OP below).
+	if type(SaveManager) == "table" then
+		SaveManager.Ignore = SaveManager.Ignore or {}
+		SaveManager.Ignore.AutoFarmOP = true
+		SaveManager.Ignore.RememberOP = true
+	end
+end)
 if Window.AddSettingsTab then
 	local ok, tab = pcall(Window.AddSettingsTab, Window, {
 		ThemeManager = ThemeManager,
@@ -34291,6 +35157,14 @@ else
 		SaveManager:LoadAutoloadConfig()
 	end)
 end
+pcall(function()
+	-- Auto Farm Everything OP and Remember Auto OP are never saved in a config (see Remember Auto OP below).
+	if type(SaveManager) == "table" then
+		SaveManager.Ignore = SaveManager.Ignore or {}
+		SaveManager.Ignore.AutoFarmOP = true
+		SaveManager.Ignore.RememberOP = true
+	end
+end)
 if Window.AddInfoTab then
 	local DonateMethods = {
 		{
@@ -34372,6 +35246,84 @@ pcall(function()
 		return string.format("$%s  \u{00B7}  bank $%s", formatNumber(N.money()), formatNumber(N.bank()))
 	end
 end)
+-- Remember Auto OP: OP and Remember Auto OP are never part of a saved config (SaveManager.Ignore), only of
+-- Corvus/BIZ_auto_op.json, and OP is restored only when Remember Auto OP is on.
+do
+	local OPFile = "Corvus/BIZ_auto_op.json"
+	function N.saveOPState()
+		if N.OPRestoring or os.clock() - (N.BootAt or 0) < 6 then
+			return
+		end
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Corvus") then
+				makefolder("Corvus")
+			end
+			writefile(OPFile, HttpService:JSONEncode({ remember = on("RememberOP"), op = on("RememberOP") and on("AutoFarmOP") }))
+		end)
+	end
+	function N.restoreOP()
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(readfile(OPFile))
+		end)
+		if not ok or type(data) ~= "table" or data.remember ~= true or not alive() then
+			return
+		end
+		N.OPRestoring = true
+		pcall(function()
+			Toggles.RememberOP:SetValue(true)
+			if data.op == true and not on("AutoFarmOP") then
+				N.OPConfirmed = true
+				Toggles.AutoFarmOP:SetValue(true)
+				N.OPConfirmed = false
+				log("OP restored (Remember Auto OP)")
+			end
+		end)
+		N.OPRestoring = false
+	end
+	task.delay(6.5, N.restoreOP)
+	-- Recommended Settings: the safe, profitable setup, then Auto Farm Everything.
+	function N.recommended()
+		local function set(kind, name, value)
+			local holder = if kind == "t" then Toggles[name] else Options[name]
+			if holder then
+				pcall(holder.SetValue, holder, value)
+			end
+		end
+		set("t", "SafeMode", true)
+		set("t", "Blatant", false)
+		set("o", "MoveMode", "Walk")
+		set("t", "AutoTutorial", true)
+		set("o", "KeepCash", 500)
+		set("o", "DepositAt", 3000)
+		set("o", "StatPick", "Speed")
+		set("o", "GymTrain", "Pushups")
+		set("o", "JobPick", "Coffee Shop Worker")
+		set("o", "StoreFrom", "Legendary")
+		set("o", "CorePick", "Best for farming")
+		set("o", "LootRadius", 300)
+		if not on("AutoFarmBest") and not on("AutoFarmOP") then
+			set("t", "AutoFarmBest", true)
+		end
+		log("RECOMMENDED settings applied")
+		notify("Corvus", "Recommended settings on: Safe Mode, banking, Speed first, coffee shop, storing Legendary+ items, Auto Farm Everything", 6)
+	end
+	-- Travel tab: walk (or tween with Safe Mode off) to a phone map point.
+	function N.travelToPoint(name)
+		for _, entry in ipairs(N.TravelPoints or {}) do
+			if entry[1] == name then
+				local point = N.mapPoint(entry[2])
+				if not point then
+					notify("Travel", name .. " is not loaded yet, move closer to it", 4)
+					return
+				end
+				setStatus("Travelling to " .. name)
+				log("TRAVEL", name)
+				N.travelTo(point, 8)
+				return
+			end
+		end
+	end
+end
 do
 	local ErrorLogAt = {}
 	local function reportError(where, err)
@@ -34455,10 +35407,19 @@ do
 		N.Body.dead = false
 		local inCity, why = N.inCity()
 		if not inCity then
+			-- The tutorial blocks everything else: Corvus finishes it itself (Finish Tutorial, on by default).
+			if N.inTutorial() and on("AutoTutorial") then
+				setStatus(N.tutorialStep())
+				return
+			end
+			if not N.inTutorial() and on("AutoTutorial") then
+				N.menuStep()
+			end
 			setStatus("Waiting: " .. tostring(why))
 			task.wait(3)
 			return
 		end
+		N.Tutorial.menuSince = nil
 		if choreDue("stats", 10) then
 			N.statStep()
 		end
@@ -34468,7 +35429,21 @@ do
 		if choreDue("rewards", 30) then
 			N.rewardStep()
 		end
-		local busy = N.Mission.active or N.Job.onShift
+		if choreDue("blood", 10) then
+			N.bloodStep()
+		end
+		-- A mission or shift only blocks the chores while Corvus is the one doing it.
+		local busy = (N.Mission.active and (N.isOP() or on("AutoMissions"))) or (N.Job.onShift and (N.isOP() or on("AutoJob")))
+		-- Inventory chores between jobs: open crates, store valuables, wear the farming core.
+		if not busy and choreDue("crates", 8) and N.crateStep() then
+			return
+		end
+		if not busy and choreDue("store", 20) and N.storeStep() then
+			return
+		end
+		if not busy and choreDue("core", 30) and N.coreStep() then
+			return
+		end
 		if not busy and choreDue("gym", 20) and N.gymStep() then
 			return
 		end
@@ -34505,15 +35480,61 @@ do
 				local I = N.InfoText
 				local elapsed = math.max(os.clock() - Session.started, 1)
 				I.info = string.format(
-					"<b>$%s</b> cash  \u{00B7}  <b>$%s</b> bank\nEarned <b>$%s</b> (%s/h)  \u{00B7}  level <b>%s</b>\nMode: <b>%s</b>%s",
+					"<b>$%s</b> cash  \u{00B7}  <b>$%s</b> bank\nEarned <b>$%s</b> (%s/h)  \u{00B7}  level <b>%s</b>\nMode: <b>%s</b>%s%s",
 					formatNumber(N.money()),
 					formatNumber(N.bank()),
 					formatNumber(Session.earned),
 					formatNumber(math.floor(Session.earned / elapsed * 3600)),
 					tostring(N.level()),
 					if N.isOP() then "OP" elseif on("AutoFarmBest") then "Farm Everything" else "manual",
-					if on("Blatant") then "  \u{00B7}  Blatant" else ""
+					if N.safe() then "  \u{00B7}  Safe Mode" else "  \u{00B7}  <font color=\"#ff8a5c\">Safe Mode off</font>",
+					if N.blatant() then "  \u{00B7}  Blatant" else ""
 				)
+				local best = N.Plan.best
+				I.next = if N.inTutorial() then "Next: finish the tutorial (" .. tostring(N.Tutorial.steps) .. " steps done)"
+					elseif best then string.format("Next: <b>%s</b> at $%.2f/s%s", best.name, best.rate, if N.Plan.rate[best.name] then "" else " (est.)")
+					else '<font transparency="0.4">Next: waiting for an activity</font>'
+				local excluded = #picked(Options.OPExclude)
+				I.opplan = string.format(
+					"OP is <b>%s</b>%s\n%s\nBoosts, crates, Blood Packs: <b>%s</b>  \u{00B7}  excluded items: <b>%d</b>\n%s",
+					if N.isOP() then "ON" else "off",
+					if on("RememberOP") then "  \u{00B7}  remembered" else "",
+					if best then string.format("Planner pick: %s at $%.2f/s", best.name, best.rate) else "Planner pick: -",
+					if N.isOP() then "used" else "not used",
+					excluded,
+					if N.safe() then "Safe Mode on: walks and real timings" else '<font color="#ff8a5c">Safe Mode off: faster, detectable</font>'
+				)
+				I.codes = string.format(
+					"%s\nGroup: %s  \u{00B7}  known %d  \u{00B7}  redeemed %d\n%s",
+					tostring(N.Codes.status),
+					if N.Codes.group == true then "joined" elseif N.Codes.group == false then '<font color="#ff8a5c">not joined (codes need it)</font>' else "?",
+					#N.codeList(),
+					Session.codes,
+					if #N.Codes.log > 0 then table.concat(N.Codes.log, "\n") else ""
+				)
+				I.inventory = N.inventoryText()
+				I.crates = string.format("Opened <b>%d</b> this session\nDrops: %s", Session.crates, N.dropsText())
+				I.core = string.format(
+					"Core: <b>%s</b>%s",
+					if tostring(N.attr("EquippedCore", "")) ~= "" then tostring(N.attr("EquippedCore", "")) else "none",
+					if N.isVampire() then string.format("\nHunger %s / %s  \u{00B7}  packs used %d", tostring(N.attr("VampireHunger", "?")), tostring(N.attr("VampireMaxHunger", "?")), Session.blood) else "\nNot a vampire: Blood Packs are not needed"
+				)
+				do
+					local minute, day = N.gameClock()
+					local days = N.tableOr(N.G.Jobs.DayNames)
+					local lines = { string.format("Game clock: <b>%s %02d:%02d</b>", tostring(days[day] or day), minute // 60, minute % 60) }
+					for _, name in ipairs(N.JobList) do
+						local def = N.G.Jobs.Jobs and N.G.Jobs.Jobs[N.JobNames[name]]
+						if type(def) == "table" then
+							local dayNames = {}
+							for _, d in ipairs(N.tableOr(def.Days)) do
+								table.insert(dayNames, tostring(days[d] or d))
+							end
+							table.insert(lines, string.format("%s: %02d:00-%02d:00 %s", name, (tonumber(def.StartMinute) or 0) // 60, (tonumber(def.EndMinute) or 0) // 60, table.concat(dayNames, " ")))
+						end
+					end
+					I.schedule = table.concat(lines, "\n")
+				end
 				I.recent = if #Session.recent > 0 then table.concat(Session.recent, "\n") else '<font transparency="0.4">Nothing done yet</font>'
 				local M = N.Mission
 				I.mission = if M.active
@@ -34535,7 +35556,7 @@ do
 				end
 				I.plan = N.planText()
 				I.train = string.format("Training points <b>%s</b>  \u{00B7}  unspent stat points <b>%s</b>\nTrainings %d  \u{00B7}  stats %d", tostring(N.attr("TrainingPoints", 0)), tostring(N.attr("UnspentPoints", 0)), Session.trains, Session.stats)
-				I.rewards = string.format("Codes redeemed <b>%d</b>%s", Session.codes, if #N.Reward.log > 0 then "\n" .. table.concat(N.Reward.log, "\n") else "")
+				I.rewards = string.format("Tutorial: <b>%s</b>\nGetting started reward: <b>%s</b>", if N.inTutorial() then "in progress (" .. N.Tutorial.steps .. " steps)" else "done", if N.attr("FirstTutorialRewardClaimed", false) == true then "claimed" else "not claimed")
 				local now = N.serverNow()
 				local moneyLeft = (tonumber(N.attr("MoneyBoostUntil", 0)) or 0) - now
 				local xpLeft = (tonumber(N.attr("XPBoostUntil", 0)) or 0) - now
@@ -34551,7 +35572,7 @@ do
 					Session.deposits,
 					if N.attr("NewLifeLossProtected", false) == true then "Loss protection is on, cash is safe for now" else "No loss protection: carried cash can be lost"
 				)
-				I.move = string.format("Moving: <b>%s</b>  \u{00B7}  trips %d  \u{00B7}  snapbacks %d", N.moveMode(), N.Move.trips, N.Move.snapbacks)
+				I.move = string.format("Moving: <b>%s</b>  \u{00B7}  trips %d  \u{00B7}  snapbacks %d\nBlatant: <b>%s</b>", N.moveMode(), N.Move.trips, N.Move.snapbacks, if N.blatant() then "on" elseif on("Blatant") then "waiting for Safe Mode off" else "off")
 			end)
 			if not ok then
 				reportError("info", err)
@@ -34586,7 +35607,13 @@ do
 					group(function()
 						Labels.Status:SetText(Status)
 						Labels.Info:SetText(I.info or "-")
+						Labels.Next:SetText(I.next or "-")
 						Labels.Recent:SetText(I.recent or "-")
+					end)
+				end
+				if shown(Tabs.AutoOP) then
+					group(function()
+						Labels.OPPlan:SetText(I.opplan or "-")
 					end)
 				end
 				if shown(Tabs.Missions) then
@@ -34598,6 +35625,7 @@ do
 				if shown(Tabs.Jobs) then
 					group(function()
 						Labels.Job:SetText(I.job or "-")
+						Labels.JobSchedule:SetText(I.schedule or "-")
 					end)
 				end
 				if shown(Tabs.Upgrades) then
@@ -34608,12 +35636,16 @@ do
 				if shown(Tabs.Rewards) then
 					group(function()
 						Labels.Rewards:SetText(I.rewards or "-")
+						Labels.Codes:SetText(I.codes or "-")
 					end)
 				end
 				if shown(Tabs.Items) then
 					group(function()
 						Labels.Boost:SetText(I.boost or "-")
 						Labels.Bank:SetText(I.bank or "-")
+						Labels.Inventory:SetText(I.inventory or "-")
+						Labels.Crates:SetText(I.crates or "-")
+						Labels.Core:SetText(I.core or "-")
 					end)
 				end
 				if shown(Tabs.Player) then
@@ -34623,6 +35655,11 @@ do
 				end
 				if shown(Tabs.Stats) then
 					group(N.drawStats)
+				end
+				if Labels.Card and shown(Tabs.Webhook) then
+					group(function()
+						Labels.Card:SetText(N.cardText())
+					end)
 				end
 				if Labels.Perf and shown(Tabs.Misc) then
 					group(function()
