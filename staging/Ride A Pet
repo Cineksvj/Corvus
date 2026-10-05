@@ -33751,28 +33751,19 @@ end
 Farm.skip[id] = nil
 return false
 end
--- No master switch. The Smart Planner toggle lets the planner pick eggs by weather and buy by payback.
-function N.farmOP()
+-- Smart Planner: one toggle on Main with its own loop (see "Smart Planner loop"); buys luck, nests, rebirth and shop by payback.
+function N.plannerOn()
 return on("AutoSmartPlan")
 end
-function N.farmAny()
-return false
-end
--- No exclude list any more: every sell, feed and spend is its own switch with its own filters.
-function N.opExcluded()
-return false
-end
-function N.opEggProtected()
-return false
+-- a spend switch runs when its own toggle or the Smart Planner is on (Auto Sell and Auto Feed never follow the planner)
+function N.planOn(name)
+return on(name) or on("AutoSmartPlan")
 end
 function N.nothingPicked(option)
 local v = option and option.Value
 return type(v) ~= "table" or next(v) == nil
 end
 function N.eggWanted(info)
-if N.farmOP() and N.weatherEggMult and N.weatherEggMult(info) and not (on("SkipMazeEggs") and info.maze) then
-return true
-end
 if not allows(Options.FarmRarities, info.rarity) then
 return false
 end
@@ -33814,7 +33805,7 @@ return sum
 end
 function N.eggScore(info, from)
 local weatherScore = N.weatherEggScore and N.weatherEggScore(info)
-if weatherScore and not N.farmOP() and not (N.nothingPicked(Options.TargetPets) and optionText("FarmPriority", "Best Value") == "Best Value") then
+if weatherScore and not on("StormEggsFirst") then
 weatherScore = nil
 end
 if
@@ -34443,9 +34434,6 @@ end
 do
 local PlotState = { hatchAt = {}, seenPets = {}, hatchFiredAt = -1e9, lanternUntil = 0, placeFails = {}, favAt = {} }
 local function reserveCash()
-if N.farmOP() and not N.opExcluded("Money reserve") then
-return 0
-end
 local option = Options.KeepCash
 return parseAmount(option and option.Value) or 0
 end
@@ -35033,9 +35021,6 @@ return done
 end
 function N.foodTools()
 local list = {}
-if N.opExcluded("Food items") then
-return list
-end
 for _, tool in ipairs(N.toolsWithTag("Food")) do
 local cfg = N.FoodData[tool.Name]
 if type(cfg) == "table" and allows(Options.FeedFoods, tool.Name) then
@@ -35066,7 +35051,7 @@ function N.feedTargets()
 local maxAge = tonumber(N.PetAging.MaxAge) or 100
 local list = {}
 for _, pet in ipairs(N.plotPets()) do
-if pet.age < maxAge and allows(Options.FeedRarities, pet.rarity) and not N.opExcluded(tostring(pet.rarity) .. " pets and eggs") then
+if pet.age < maxAge and allows(Options.FeedRarities, pet.rarity) then
 table.insert(list, pet)
 end
 end
@@ -35219,7 +35204,7 @@ end)
 return list
 end
 function N.lanternDue()
-if os.clock() < PlotState.lanternUntil or #N.lanternTools() == 0 or N.opExcluded("Lanterns") then
+if os.clock() < PlotState.lanternUntil or #N.lanternTools() == 0 then
 return false
 end
 for _, model in ipairs(N.plotEggModels()) do
@@ -35295,7 +35280,7 @@ end, 2)
 return N.luckUpgrades() - before
 end
 local bought = 0
-while alive() and bought < 25 and on("AutoLuck") do
+while alive() and bought < 25 and N.planOn("AutoLuck") do
 local price = N.luckPrice(N.paidLuckUpgrades())
 if not N.Plan.approve("luck", price) then
 break
@@ -35520,7 +35505,7 @@ return list
 end
 for _, item in ipairs(N.ShopItems) do
 local modeled = shopKind(item) ~= "shop"
-if selected(Options.ShopItems, item.name) or (not manual and modeled and (N.farmOP())) then
+if selected(Options.ShopItems, item.name) or (not manual and modeled and N.plannerOn()) then
 local amount = N.stockOf(item.category, item.name)
 if amount > 0 and shopOk(item, manual) then
 table.insert(list, item)
@@ -35765,7 +35750,7 @@ return o
 end
 -- Rebirth: income x(n+2)/(n+1), +1 pet slot; costs its price plus re-buying the luck it resets
 local rebirthAt = H
-if on("AutoRebirth") then
+if N.planOn("AutoRebirth") then
 local n = N.rebirths()
 local need = N.rebirthNeed(n)
 if n < N.rebirthCap() and (not need or N.ownsPet(need)) then
@@ -35789,7 +35774,7 @@ rebirthAt = math.min(H, o.eta)
 end
 end
 -- Luck: up to the next 5-step bonus; the better drops only count until the next rebirth resets the luck
-if on("AutoLuck") and N.luckEnabled() and r > 0 and #P.mix > 0 then
+if N.planOn("AutoLuck") and N.luckEnabled() and r > 0 and #P.mix > 0 then
 local n, paid = N.luckUpgrades(), N.paidLuckUpgrades()
 local k = 5 - n % 5
 local C = 0
@@ -35805,7 +35790,7 @@ o.dI = math.max(accrue(r * g1, gap1, T) - accrue(r * g0, gap0, T), 0) * m / H
 o.ratio = if C > 0 then o.dI / C else math.huge
 end
 -- Nest: one more egg hatching every growth time (only when eggs wait for a nest)
-if on("AutoBuyNests") and not noNest then
+if N.planOn("AutoBuyNests") and not noNest then
 for _, e in ipairs(N.nestList()) do
 if not e.unlocked then
 local price = N.nestPrice(e.index)
@@ -35824,7 +35809,7 @@ end
 end
 end
 -- Shop: food = pet age (income x(1 + 0.01 per age), XP per age from PetAging), lanterns = bigger hatches
-if on("AutoShop") and N.Shop.stock then
+if N.planOn("AutoShop") and N.Shop.stock then
 local target
 if on("AutoFeed") then
 local A = N.PetAging
@@ -35833,7 +35818,7 @@ local per = tonumber(A.GrowthPerAge) or 0.01
 local std = tonumber(A.WeightStandardKG) or 10
 local mults = N.tableOr(N.GeneralData.RarityLevelRequirementMultiplier)
 for _, pet in ipairs(placed) do
-if pet.age < maxAge and allows(Options.FeedRarities, pet.rarity) and not N.opExcluded(tostring(pet.rarity) .. " pets and eggs") then
+if pet.age < maxAge and allows(Options.FeedRarities, pet.rarity) then
 local scale = 1 + per * (pet.age - 1)
 local bw = math.max(pet.weight / scale / std, 0.01)
 local rm = tonumber(mults[pet.rarity]) or tonumber(mults.Common) or 10
@@ -35849,7 +35834,7 @@ local queued = #N.lanternTools()
 for _, it in ipairs(N.ShopItems) do
 local lantern = N.LanternData[it.name]
 local food = it.category == "Food" and N.FoodData[it.name]
-if (selected(Options.ShopItems, it.name) or N.farmOP()) and N.stockOf(it.category, it.name) > 0 then
+if (selected(Options.ShopItems, it.name) or N.plannerOn()) and N.stockOf(it.category, it.name) > 0 then
 if type(food) == "table" and target and allows(Options.FeedFoods, it.name) then
 -- walk the XP through the age levels (PetAging.RequirementFor grows with age)
 local xp, age = tonumber(food.XP) or 0, target.age
@@ -35965,11 +35950,7 @@ log("PLAN error", tostring(err))
 P.at = os.clock()
 end
 end
-local opKeys = { food = "Food items", lantern = "Lanterns", shop = "Shop items", rebirth = "Rebirth", luck = "Luck upgrades" }
-if opKeys[kind] and N.opExcluded(opKeys[kind]) then
-return false
-end
-local have = if kind == "rebirth" and not (N.farmOP() and N.opExcluded("Money reserve")) then N.cash() else N.spendable()
+local have = if kind == "rebirth" then N.cash() else N.spendable()
 if have < cost then
 return false
 end
@@ -35991,7 +35972,7 @@ local function radarActive()
 return #N.radarTargets() > 0
 end
 function N.radarDue()
-return #N.radarTools() > 0 and not radarActive() and os.clock() - N.Radar.at > 10 and not N.opExcluded("Radars")
+return #N.radarTools() > 0 and not radarActive() and os.clock() - N.Radar.at > 10
 end
 function N.useRadar()
 local tools = N.radarTools()
@@ -36123,7 +36104,6 @@ if
 selected(Options.SellRarities, info.rarity)
 and not (on("SellKeepMutated") and (info.mutation or info.spawnMutation))
 and info.kg < N.optionAmount("SellBelowKG", math.huge)
-and not N.opEggProtected(info)
 then
 table.insert(list, info)
 end
@@ -36341,13 +36321,9 @@ N.EverythingBox = OPBox
 OPBox:AddToggle("AutoSmartPlan", {
 Text = "Smart Planner (best value)",
 Default = false,
-Tooltip = "Lets the planner pick eggs by weather bonus and buy shop items and upgrades by profit payback, with real game odds. It never sells or feeds on its own: Auto Sell and Auto Feed stay on their own switches.",
+Tooltip = "Runs its own loop: buys luck, nests, rebirth and shop items by profit payback with the real game odds, without turning other switches on. Keeps your Keep Cash. It never sells or feeds: Auto Sell and Auto Feed stay on their own switches.",
 })
-OPBox:AddLabel({
-Text = '<font transparency="0.4">Every automation is its own switch in the tabs. Nothing turns on by itself.</font>',
-DoesWrap = true,
-})
-OPBox:AddButton({
+N.QuickStartStop = {
 Text = "Stop Everything",
 Tooltip = "Turns every automatic switch off",
 Func = function()
@@ -36360,15 +36336,8 @@ end
 log("STOP everything")
 notify("Corvus", "Everything stopped", 3)
 end,
-})
-OPBox:AddButton({
-Text = "Reset Hub Options",
-Tooltip = "Puts every control back to its default after a confirmation. Saved configs are not deleted.",
-Func = function()
-Library:AskResetHubOptions({ MenuKeybind = true })
-end,
-})
-local FarmBox = Tabs.Main:AddLeftGroupbox("Egg Farm", "rocket")
+}
+local FarmBox = Tabs.Eggs:AddRightGroupbox("Egg Farm", "rocket")
 FarmBox:AddToggle("AutoFarm", {
 Text = "Auto Farm Eggs",
 Default = false,
@@ -36419,15 +36388,15 @@ Suffix = " studs",
 HideMax = true,
 Tooltip = "0 means any distance",
 })
-FarmBox:AddToggle("TeleportIfFar", {
-Text = "Teleport Home If Too Far",
-Default = false,
-Tooltip = "Turned off by the game's new delivery check: carried eggs now always travel at your pet's speed",
-})
 FarmBox:AddToggle(
 "AdminFirst",
 { Text = "Event Eggs First", Default = true, Tooltip = "Admin spawned and spotlight eggs are grabbed before anything else" }
 )
+FarmBox:AddToggle("StormEggsFirst", {
+Text = "Storm Eggs First",
+Default = true,
+Tooltip = "During a weather with a mutation, eggs with the storm mutation (x2 to x12.5 income) are grabbed first. Your egg filters still apply.",
+})
 FarmBox:AddToggle("WaitOnPlot", { Text = "Wait On Plot Between Spawns", Default = true })
 FarmBox:AddToggle("PauseEggTimer", {
 Text = "Pause Egg Timer",
@@ -37804,6 +37773,25 @@ return text .. (if setToggles(names, args) then " on" else " off")
 end,
 })
 end
+do
+-- Main Quick Start: the core loop switches, two-way bound to their own tabs
+local QS = N.EverythingBox
+for _, name in ipairs({ "AutoFarm", "AutoPlaceEggs", "AutoHatch", "AutoPlacePets", "AutoCollect" }) do
+Library:MirrorToggle(name, QS)
+end
+QS:AddLabel({
+Text = '<font transparency="0.4">Each switch is the same one as in its tab. Nothing turns on by itself.</font>',
+DoesWrap = true,
+})
+QS:AddButton(N.QuickStartStop)
+QS:AddButton({
+Text = "Reset Hub Options",
+Tooltip = "Puts every control back to its default after a confirmation. Saved configs are not deleted.",
+Func = function()
+Library:AskResetHubOptions({ MenuKeybind = true })
+end,
+})
+end
 local PlotToggles = { "AutoBuyNests", "AutoPlaceEggs", "AutoHatch" }
 N.AllAutoToggles = {
 "AutoSmartPlan",
@@ -38077,6 +38065,13 @@ Required = true,
 Default = {},
 Choices = {
 {
+Id = "planner",
+Title = "Smart Planner",
+Description = "Buys luck, nests, rebirth and shop items by profit payback",
+Icon = "rocket",
+Color = "#ff5d8f",
+},
+{
 Id = "farm",
 Title = "Farm eggs",
 Description = "Rides out to the best eggs and brings them home before they break",
@@ -38130,7 +38125,7 @@ Color = "#ff78c8",
 {
 Id = "move",
 Title = "How should Corvus travel?",
-Description = "You can change this later in the Main tab.",
+Description = "You can change this later in the Player tab.",
 Default = "Blatant",
 SingleColumn = true,
 ChoiceHeight = 54,
@@ -38193,7 +38188,7 @@ Color = "#ffaa00",
 {
 Id = "keep",
 Title = "Keep my filters",
-Description = "Uses the Egg Filters in the Main tab",
+Description = "Uses the Egg Filters in the Eggs tab",
 Icon = "funnel",
 Color = "#9085e9",
 },
@@ -38206,6 +38201,7 @@ end,
 Finish = function(values)
 local picked = type(values.tasks) == "table" and values.tasks or {}
 local groups = {
+planner = { "AutoSmartPlan" },
 farm = { "AutoFarm" },
 plot = { "AutoBuyNests", "AutoPlaceEggs", "AutoHatch" },
 pets = { "AutoPlacePets" },
@@ -38365,9 +38361,7 @@ Session.fed
 .. " ("
 .. optionValueText("RidePet")
 .. "), riding "
-.. tostring(N.isRiding())
-.. ", teleport if far "
-.. tostring(on("TeleportIfFar")),
+.. tostring(N.isRiding()),
 "Farm: first "
 .. optionValueText("FarmPriority")
 .. ", per trip "
@@ -39017,7 +39011,7 @@ if on("AutoRadar") and choreDue("radar", 15) and N.radarDue() then
 N.useRadar()
 return true
 end
-if on("AutoShop") and choreDue("shop", 20) and N.shopDue() then
+if N.planOn("AutoShop") and choreDue("shop", 20) and N.shopDue() then
 N.shopTick(false)
 return true
 end
@@ -39274,9 +39268,9 @@ end
 local Jobs = {
 { "AutoHatch", "hatch", 3, N.hatchEggs },
 { "AutoFusionCollect", "fusion", 5, N.fusionTick },
-{ "AutoBuyNests", "nests", 8, N.buyNests, true },
-{ "AutoLuck", "luck", 5, N.upgradeLuck, true },
-{ "AutoRebirth", "rebirth", 5, N.rebirthTick },
+{ "AutoBuyNests", "nests", 8, N.buyNests, true, true },
+{ "AutoLuck", "luck", 5, N.upgradeLuck, true, true },
+{ "AutoRebirth", "rebirth", 5, N.rebirthTick, false, true },
 { "AutoIndex", "index", 20, N.indexTick },
 { "AutoOffline", "offline", 10, N.offlineTick },
 { "AutoEventBoost", "event", 30, N.eventTick },
@@ -39287,12 +39281,30 @@ if N.myPlot() and not N.tutorialActive() then
 local root = rootPart()
 local home = root ~= nil and N.onPlot(root.Position, 6)
 for _, job in ipairs(Jobs) do
-if on(job[1]) and (home or not job[5]) and every(job[2], job[3]) then
+if (on(job[1]) or (job[6] and N.plannerOn())) and (home or not job[5]) and every(job[2], job[3]) then
 runJob(job[2], job[4])
 end
 end
 end
 task.wait(0.5)
+end
+end)
+-- Smart Planner loop: recomputes the plan every 5 s only while the toggle is on (PLAN lines only then); the buys it approves run in the job loop above.
+task.spawn(function()
+local was = false
+while alive() do
+local now = N.plannerOn()
+if now ~= was then
+was = now
+log(if now then "PLAN on (luck, nests, rebirth, shop by payback)" else "PLAN off")
+end
+if now and N.myPlot() and not N.tutorialActive() then
+local ok, err = pcall(N.Plan.compute)
+if not ok then
+log("PLAN error", tostring(err))
+end
+end
+task.wait(5)
 end
 end)
 N.Weather = { list = {}, at = -1e9, seen = {} }
@@ -39353,7 +39365,7 @@ active[w.name] = true
 if not W.seen[w.name] then
 W.seen[w.name] = true
 if N.anyAuto() then log("WEATHER", w.name, string.format("mult=%.4g until=%ds", w.mult, math.floor(w.left))) end
-if w.mutation and (on("AutoFarm") or N.farmAny()) then
+if w.mutation and on("AutoFarm") and on("StormEggsFirst") then
 log("WEATHER prioritise eggs")
 end
 end
@@ -39409,7 +39421,7 @@ return false
 end
 function N.pauseTick()
 local P = N.Pause
-local active = not P.dead and on("PauseEggTimer") and (on("AutoFarm") or N.farmAny())
+local active = not P.dead and on("PauseEggTimer") and on("AutoFarm")
 local root = rootPart()
 local home = root ~= nil and N.onPlot(root.Position, 4)
 local want = active and #N.basketItems() > 0 and not home
