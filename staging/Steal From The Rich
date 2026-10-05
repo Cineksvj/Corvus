@@ -4725,6 +4725,7 @@ end
 				Close(false, "outside")
 			end)
 		end
+		local ModalOpenedAt = os.clock()
 		pcall(function()
 			KeyConnection = UserInputService.InputBegan:Connect(function(Input, Processed)
 				if Input.UserInputType ~= Enum.UserInputType.Keyboard then
@@ -4732,7 +4733,7 @@ end
 				end
 				if Input.KeyCode == Enum.KeyCode.Escape then
 					Close(false, "close")
-				elseif not Processed and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
+				elseif not Processed and not Opts.Warning and os.clock() - ModalOpenedAt > 0.8 and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
 					Close(true, "key")
 				end
 			end)
@@ -9289,6 +9290,9 @@ if Toggle.Disabled then
 return
 end
 Toggle:SetValue(not Toggle.Value)
+if typeof(Idx) == "string" and Library.OnUserToggle then
+	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+end
 end)
 )
 if typeof(Toggle.Tooltip) == "string" or typeof(Toggle.DisabledTooltip) == "string" then
@@ -9543,6 +9547,9 @@ if Toggle.Disabled then
 return
 end
 Toggle:SetValue(not Toggle.Value)
+if typeof(Idx) == "string" and Library.OnUserToggle then
+	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+end
 end)
 )
 table.insert(
@@ -15524,6 +15531,28 @@ return Value, Value ~= Default
 end
 return nil, false
 end
+function Library:ResetHubOptions(Ignore: any): (boolean, any)
+	local Ok, Json = pcall(HttpService.JSONEncode, HttpService, { v = 1, g = game.GameId, d = {} })
+	if not Ok then
+		return false, "Could not reset"
+	end
+	return Library:ImportShareCode("CORVUS-" .. Library.Base64Encode(Json), Ignore)
+end
+
+function Library:AskResetHubOptions(Ignore: any)
+	return Library:ShowModal({
+		Icon = "rotate-ccw",
+		Title = "Reset all options to defaults?",
+		Text = "Every toggle, dropdown, slider and input of this hub goes back to its default value. Saved configs are not deleted.",
+		ConfirmText = "Reset",
+		CancelText = "Cancel",
+		OnConfirm = function()
+			local Ok, Result = Library:ResetHubOptions(Ignore)
+			Library:Notify({ Title = "Reset Hub Options", Description = if Ok then string.format("%d options reset", Result) else tostring(Result), Time = 4 })
+		end,
+	})
+end
+
 function Library:ExportShareCode(Ignore: any): (string?, any)
 local Changed = {}
 local Count = 0
@@ -24792,6 +24821,7 @@ end,
 if Info.AutoLoad ~= false then
 task.defer(function()
 pcall(SaveManager.LoadAutoloadConfig, SaveManager)
+if Library.OnAutoload then pcall(Library.OnAutoload) end
 end)
 end
 end
@@ -26953,6 +26983,9 @@ Button.MouseButton1Click:Connect(function()
 local Toggle = Library.Toggles[Item.Toggle]
 if Toggle and not Toggle.Disabled then
 Toggle:SetValue(not Toggle.Value)
+if typeof(Item.Toggle) == "string" and Library.OnUserToggle then
+	pcall(Library.OnUserToggle, Item.Toggle, Toggle.Value)
+end
 end
 end)
 table.insert(DockButtons, Entry)
@@ -28622,30 +28655,6 @@ return true
 end
 logEvery("opx:reserve", 300, "OP exclude", "money reserve", "(holding back $" .. formatNumber(cost) .. ")")
 return false
-end
-function Plan.opExcludeLabels()
-local labels, defaults = {}, {}
-local function add(label, default)
-table.insert(labels, label)
-if default then
-table.insert(defaults, label)
-end
-end
-for _, name in ipairs({ "Cosmic", "Secret", "Eternal", "Divine" }) do
-if RarityRank[name] then
-add("Item: " .. name, true)
-end
-end
-local from = CrateRarities.rank["Godly"] or 6
-for index, name in ipairs(CrateRarities.list) do
-if index >= from then
-add("Crate: " .. name, name == "Secret" or name == "Divine" or name == "Cosmic")
-end
-end
-add("Thunder points", true)
-add("Blessing points", true)
-add("Money reserve (keep 25%)", false)
-return labels, defaults
 end
 local function wantsProtect(tool)
 local tier = tierOf(tool)
@@ -31654,10 +31663,11 @@ return Plan.on("SmartSpend")
 end
 Plan.touched, Plan.setting = {}, 0
 function Plan.myFilters()
-return Options.FarmMode ~= nil and Options.FarmMode.Value == "My filters"
+return false
 end
+-- No master switch: the planner never overrides what the player touched, and no exclude list is enforced.
 function Plan.op()
-return Toggles.AutoFarmOP ~= nil and Toggles.AutoFarmOP.Value == true and not Plan.myFilters()
+return false
 end
 function Plan.touch(name)
 if Plan.setting == 0 then
@@ -32585,7 +32595,7 @@ return false
 end
 return Plan.allow("slot", price)
 end
-Plan.farmNames = {
+Plan.plannerNames = {
 "AutoSteal",
 "AutoSell",
 "AutoPlace",
@@ -32601,123 +32611,19 @@ Plan.farmNames = {
 "AutoThunder",
 "AutoBlessing",
 "AutoFuse",
-"SmartZones",
-"SmartSpend",
-"SmartSchedule",
+"EventHop",
 "AutoEventGame",
 "AutoAdminPhrases",
 "AutoFriend",
 }
-Plan.farmSet = {}
-Plan.farmMode = nil
-local function farmTurnOff()
-for name in pairs(Plan.farmSet) do
-local toggle = Toggles[name]
-if toggle and toggle.Value then
-toggle:SetValue(false)
+-- The planner (compute, PLAN and ZONES log lines) only runs while one of these action toggles is on.
+function Plan.anyOn()
+for _, name in ipairs(Plan.plannerNames) do
+if Plan.on(name) then
+return true
 end
 end
-Plan.farmSet = {}
-end
-Plan.runMap = {
-{ "Auto Steal", "AutoSteal" },
-{ "Auto Place", "AutoPlace" },
-{ "Auto Open", "AutoOpen" },
-{ "Auto Equip Best", "AutoEquipBest" },
-{ "Auto Train (Treadmill)", "AutoTreadmill" },
-{ "Collect Storm Orbs", "AutoOrbs" },
-{ "Thunder (charge crates)", "AutoThunder" },
-{ "Blessing (bless crates)", "AutoBlessing" },
-{ "Event Minigame", "AutoEventGame" },
-{ "Event Hop", "EventHop" },
-{ "Admin Phrases", "AutoAdminPhrases" },
-{ "Auto Friend", "AutoFriend" },
-{ "Free Gift", "AutoFreeGift" },
-{ "Offline Cash", "AutoOffline" },
-{ "Claim Index", "AutoIndex" },
-}
-Plan.runDefault = { "Auto Steal", "Auto Place", "Auto Open", "Event Minigame", "Free Gift", "Offline Cash" }
-function Plan.applyRun()
-local picked = if Options.FarmRun and type(Options.FarmRun.Value) == "table" then Options.FarmRun.Value else {}
-for _, entry in ipairs(Plan.runMap) do
-local toggle = Toggles[entry[2]]
-if toggle then
-if picked[entry[1]] then
-if not toggle.Value then
-Plan.farmSet[entry[2]] = true
-toggle:SetValue(true)
-end
-elseif Plan.farmSet[entry[2]] then
-Plan.farmSet[entry[2]] = nil
-if toggle.Value then
-toggle:SetValue(false)
-end
-end
-end
-end
-end
-function Plan.farmStop()
-if Plan.farmMode == nil then
-return
-end
-local mode = Plan.farmMode
-Plan.farmMode = nil
-farmTurnOff()
-log("FARM ALL off", mode)
-end
-function Plan.farmOP(value)
-if not value then
-if Plan.farmMode == "op" or Plan.farmMode == "my" then
-Plan.farmStop()
-end
-return
-end
-if Plan.farmMode ~= nil then
-Plan.farmStop()
-end
-if Plan.myFilters() then
-Plan.farmMode = "my"
-log("MODE", "My filters", "(no planner, no selling, no fusing, no spending)")
-Plan.applyRun()
-local turned = {}
-for name in pairs(Plan.farmSet) do
-table.insert(turned, name)
-end
-table.sort(turned)
-log("FARM MY FILTERS on, switched on:", if #turned > 0 then table.concat(turned, ",") else "nothing new, all were on already")
-return
-end
-Plan.farmMode = "op"
-log("MODE", "OP", "(farm all start)")
-for _, name in ipairs(Plan.farmNames) do
-local toggle = Toggles[name]
-if toggle and not toggle.Value then
-Plan.farmSet[name] = true
-toggle:SetValue(true)
-end
-end
-pcall(function()
-local zones, rarities = {}, {}
-for _, label in ipairs(ZoneLabels) do
-zones[label] = true
-end
-for _, name in ipairs(CrateRarities.list) do
-rarities[name] = true
-end
-Plan.setting += 1
-Options.StealZones:SetValue(zones)
-Options.StealCrateRarities:SetValue(rarities)
-Options.StealPriority:SetValue("Best Value")
-Options.SellMode:SetValue("All")
-Plan.setting -= 1
-end)
-Plan.setting = 0
-local turned = {}
-for name in pairs(Plan.farmSet) do
-table.insert(turned, name)
-end
-table.sort(turned)
-log("FARM ALL on, switched on:", if #turned > 0 then table.concat(turned, ",") else "nothing new, all were on already")
+return false
 end
 function Sched.sample(moneyGain, speedGain, step)
 if step <= 0 or step > 5 then
@@ -32740,6 +32646,10 @@ if now - Sched.updatedAt < 5 then
 return
 end
 Sched.updatedAt = now
+if not Plan.anyOn() then
+Plan.ready = false
+return
+end
 Plan.refresh()
 logEvery("sched", 120, "SCHED", Sched.info)
 end
@@ -32956,7 +32866,7 @@ end,
 })
 end)
 end
-Tabs.Main = addTab("Main", "house", "Auto Farm Everything, what Corvus does now and what comes next")
+Tabs.Main = addTab("Main", "house", "Quick start, what Corvus does now and what comes next")
 Tabs.Storm = addTab("Storm", "cloud-lightning", "Storm orbs, Thunder Machine and Archangel Blessing")
 Tabs.Upgrades = addTab("Upgrades", "trending-up", "Smart Spending, trails and the treadmill")
 Tabs.Rewards = addTab("Rewards", "gift", "Index, offline cash, admin events, friends and the Free Gift")
@@ -32969,137 +32879,10 @@ Tabs.Misc = Window:AddMiscTab({ Description = "Movement, performance, AFK and co
 end)
 end
 local StatusBox, StatusLabel, UpNextLabel, StormLabel, BlessLabel
-local AutoDisclaimer = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
 do
-local FarmBox = Tabs.Main:AddLeftGroupbox("Auto Farm Everything", "rocket")
-FarmBox:AddToggle("AutoFarmOP", {
-Text = "Auto Farm Everything",
-Default = false,
-Tooltip = "Full automatic: the planner steals, places, opens, sells, fuses, trains and spends points and money for the most profit in 24 hours. " .. AutoDisclaimer,
-Callback = function(value)
-if value and not Plan.opApproved then
-Plan.opSilent = true
-Toggles.AutoFarmOP:SetValue(false)
-Plan.opSilent = false
-if os.clock() - Plan.bootAt < 10 then
-log("OP not restored", "(the master toggle is never loaded from a config)")
-return
-end
-if Plan.myFilters() then
-Plan.opApproved = true
-Toggles.AutoFarmOP:SetValue(true)
-return
-end
-if Plan.uiReady and Library.ShowConfirmPrompt then
-Library:ShowConfirmPrompt({
-Title = "Enable Auto Farm Everything?",
-Text = "Full automatic: the planner steals, places, opens, sells, fuses and spends for the most profit. It can sell or fuse your crates unless you list them under Exclude.",
-ConfirmText = "I understand, enable it",
-Warning = AutoDisclaimer,
-CancelText = "Cancel",
-OnConfirm = function()
-log("OP confirmed")
-Plan.opApproved = true
-Toggles.AutoFarmOP:SetValue(true)
-end,
-OnCancel = function()
-log("OP cancelled")
-end,
-})
-end
-return
-end
-Plan.opApproved = false
-task.spawn(Plan.farmOP, value)
-end,
-})
-FarmBox:AddDropdown("FarmMode", {
-Text = "Mode",
-Values = { "Best value", "My filters" },
-Default = "Best value",
-Multi = false,
-Tooltip = "Best value: the planner decides everything for the most profit. My filters: no planner, no selling, no fusing, no spending, it only runs the loops you pick under Run, with your own Steal filters.",
-Callback = function()
-if Toggles.AutoFarmOP and Toggles.AutoFarmOP.Value then
-Plan.opSilent = true
-Toggles.AutoFarmOP:SetValue(false)
-Plan.opSilent = false
-end
-if Options.FarmRun then
-Options.FarmRun:SetVisible(Plan.myFilters())
-end
-end,
-})
-FarmBox:AddDropdown("FarmRun", {
-Text = "Run",
-Values = (function()
-local labels = {}
-for _, entry in ipairs(Plan.runMap) do
-table.insert(labels, entry[1])
-end
-return labels
-end)(),
-Default = Plan.runDefault,
-Multi = true,
-AllowNull = true,
-Searchable = true,
-Visible = false,
-Tooltip = "Loops that run in My filters mode. Auto Steal uses your own zone, rarity and priority filters from the Steal box. Nothing is sold, fused or bought.",
-Callback = function()
-if Plan.farmMode == "my" then
-Plan.applyRun()
-end
-end,
-})
-Options.FarmRun:SetVisible(Plan.myFilters())
-local exLabels, exDefaults = Plan.opExcludeLabels()
-FarmBox:AddDropdown("OPExclude", {
-Text = "Exclude",
-Values = exLabels,
-Default = exDefaults,
-Multi = true,
-AllowNull = true,
-Searchable = true,
-Tooltip = "Auto Farm Everything never sells or fuses these items and crates, never spends Thunder or Blessing points when listed, and keeps a money reserve when listed. Event crates are the Cosmic ones.",
-})
-FarmBox:AddButton({
-Text = "Recommended Settings",
-Tooltip = "All zones and rarities, Best Value priority, Only Zones I Can Escape, Smart Spending and Balance on, protection on, free rewards on, default Exclude list",
-Func = function()
-Plan.setting += 1
-pcall(function()
-local zones, rarities = {}, {}
-for _, label in ipairs(ZoneLabels) do
-zones[label] = true
-end
-for _, name in ipairs(CrateRarities.list) do
-rarities[name] = true
-end
-Options.StealZones:SetValue(zones)
-Options.StealCrateRarities:SetValue(rarities)
-Options.StealPriority:SetValue("Best Value")
-Options.SellMode:SetValue("All")
-Options.OrbPriority:SetValue("Orbs first")
-local keep = {}
-for _, label in ipairs(exDefaults) do
-keep[label] = true
-end
-Options.OPExclude:SetValue(keep)
-end)
-Plan.setting -= 1
-Plan.setting = 0
-for _, name in ipairs({ "SmartZones", "SmartSpend", "SmartSchedule", "ProtectItems", "PlaceBestBeforeSell", "SellTeleport", "SellReturn", "NoSlowMode", "UseAdminTreadmill", "AutoEquipTrail", "AutoEquipBat", "AutoOffline", "AutoFreeGift", "AutoFriend", "AutoEventGame" }) do
-local toggle = Toggles[name]
-if toggle and not toggle.Value then
-toggle:SetValue(true)
-end
-end
-log("RECOMMENDED settings applied")
-notify("Recommended Settings", "Applied. Turn on Auto Farm Everything when you are ready.", 5)
-end,
-})
+local FarmBox = Tabs.Main:AddLeftGroupbox("Quick Start", "rocket")
 FarmBox:AddLabel({
-Text = '<font transparency="0.35">One switch, full automatic. It sells, fuses and spends by profit math. ' .. AutoDisclaimer .. ' Anything under Exclude is never touched.</font>',
+Text = '<font transparency="0.35">Nothing starts on its own. Every automation is its own switch in the tabs, and Corvus only plans while one of them is on.</font>',
 DoesWrap = true,
 })
 local StealBox = Tabs.Main:AddLeftGroupbox("Steal", "hand")
@@ -33156,6 +32939,27 @@ Func = function()
 Plan.stopAll()
 end,
 })
+StatusBox:AddButton({
+Text = "Reset Hub Options",
+Tooltip = "Puts every toggle, dropdown, slider and input back to its default value. Saved configs are not deleted.",
+Func = function()
+Library:AskResetHubOptions(Library.ShareIgnore)
+end,
+})
+-- what changed a toggle is always in the log: the saved config at start (AUTOLOAD) or the player (CLICK)
+Library.OnAutoload = function()
+local names = {}
+for name, toggle in pairs(Toggles) do
+if toggle.Value == true then
+table.insert(names, name)
+end
+end
+table.sort(names)
+log("AUTOLOAD", "toggles=" .. (if #names > 0 then table.concat(names, ",") else "-"))
+end
+Library.OnUserToggle = function(name, value)
+log("CLICK", name .. "=" .. tostring(value))
+end
 local MoveBox = (Tabs.Misc or Tabs.Main):AddLeftGroupbox("Movement", "footprints")
 MoveBox:AddLabel({
 Text = '<font transparency="0.35">Corvus maps the whole level once and runs the shortest free way around houses and walls at your own speed. The server undoes teleports, so walking is what keeps every steal.</font>',
@@ -33260,10 +33064,10 @@ TrailBox:AddToggle(
 "AutoTrails",
 { Text = "Auto Buy Trails", Default = false, Tooltip = "Buys the next trail as soon as you can afford it" }
 )
-TrailBox:AddToggle("AutoEquipTrail", { Text = "Auto Equip Best Trail", Default = true })
+TrailBox:AddToggle("AutoEquipTrail", { Text = "Auto Equip Best Trail", Default = false })
 TrailBox:AddToggle(
 "AutoEquipBat",
-{ Text = "Auto Equip Best Bat", Default = true, Tooltip = "Equips the strongest bat your index unlocked" }
+{ Text = "Auto Equip Best Bat", Default = false, Tooltip = "Equips the strongest bat your index unlocked" }
 )
 local TreadBox = Tabs.Upgrades:AddRightGroupbox("Treadmill", "gauge")
 TreadBox:AddToggle("AutoTreadmill", {
@@ -33287,7 +33091,7 @@ IndexBox:AddToggle("AutoIndex", { Text = "Auto Claim Index", Default = false, To
 local AdminBox = Tabs.Rewards:AddLeftGroupbox("Admin Events", "crown")
 AdminBox:AddToggle("AutoEventGame", {
 Text = "Auto Event Minigame",
-Default = true,
+Default = false,
 Tooltip = "When an admin runs the MisterTrippleT minigame: hits him with the bat, carries his Secret Crate (Admin Throne, billions per second) to the safe zone, then picks up the admin crates and brings them to your plot.",
 })
 AdminBox:AddToggle("EventHop", {
@@ -33305,11 +33109,11 @@ Admin.label = AdminBox:AddLabel({ Text = "Admin boosts: none", DoesWrap = true }
 local RewardBox = Tabs.Rewards:AddRightGroupbox("Free Rewards", "gift")
 RewardBox:AddToggle(
 "AutoOffline",
-{ Text = "Auto Claim Offline Cash", Default = true, Tooltip = "Claims the offline earnings popup as soon as it shows" }
+{ Text = "Auto Claim Offline Cash", Default = false, Tooltip = "Claims the offline earnings popup as soon as it shows" }
 )
 RewardBox:AddToggle("AutoFreeGift", {
 Text = "Auto Claim Free Gift",
-Default = true,
+Default = false,
 Tooltip = "The 10,000 speed chest at spawn. Needs you in the game's group; the button below asks you to join.",
 })
 RewardBox:AddButton({
@@ -33334,7 +33138,7 @@ end,
 do
 local FPlayers = game:GetService("Players")
 local FTeleport = game:GetService("TeleportService")
-local F = { on = true, asked = {}, friend = {}, sent = 0, lastSend = -1e9, lastLog = "", lastLogAt = -1e9 }
+local F = { on = false, asked = {}, friend = {}, sent = 0, lastSend = -1e9, lastLog = "", lastLogAt = -1e9 }
 local function friendBoost()
 local v = LocalPlayer:GetAttribute("FriendBoostPct")
 if type(v) == "number" then return "+" .. math.floor(v) .. "%" end
@@ -33412,7 +33216,7 @@ FriendBox:AddToggle("AutoFriend", {
 Text = "Auto Friend",
 Description = "Sends friend requests to everyone in the server, once each",
 Tooltip = "Every friend in the server gives a boost. Sends one request per 10 s (and accepts requests sent to you).",
-Default = true,
+Default = false,
 Callback = function(v)
 F.on = v == true
 end,
@@ -34050,7 +33854,6 @@ end,
 })
 end
 local AllAutoToggles = {
-"AutoFarmOP",
 "AutoSteal",
 "AutoSell",
 "AutoPlace",
@@ -34084,7 +33887,6 @@ toggleCommand("trails", { "autotrails" }, { "AutoTrails" }, "Auto Buy Trails")
 toggleCommand("orbs", { "storm" }, { "AutoOrbs" }, "Auto Collect Storm Orbs")
 toggleCommand("thunder", { "charge" }, { "AutoThunder" }, "Auto Charge Crates")
 toggleCommand("fuse", { "autofuse" }, { "AutoFuse" }, "Auto Fuse")
-toggleCommand("farmall", { "farm", "autofarm", "everything", "afk" }, { "AutoFarmOP" }, "Auto Farm Everything")
 toggleCommand("bless", { "blessing", "archangel" }, { "AutoBlessing" }, "Auto Bless Crates")
 toggleCommand("eventgame", { "minigame", "event" }, { "AutoEventGame" }, "Auto Event Minigame")
 toggleCommand("hop", { "eventhop", "serverhop" }, { "EventHop" }, "Event Hop")
@@ -34238,7 +34040,7 @@ end
 if Library.SetQuickBar then
 pcall(function()
 Library:SetQuickBar({
-{ Toggle = "AutoFarmOP", Icon = "rocket", Label = "Farm All", Default = false },
+{ Toggle = "SmartSpend", Icon = "rocket", Label = "Smart Spend", Default = false },
 { Toggle = "AutoSteal", Icon = "hand", Label = "Steal" },
 { Toggle = "AutoSell", Icon = "banknote", Label = "Sell" },
 { Toggle = "AutoPlace", Icon = "house", Label = "Place" },
@@ -34255,176 +34057,7 @@ Library:SetQuickBar({
 })
 end)
 end
-local SetupFlag = "Corvus/SFTR_setup_done.txt"
-local function markSetupDone()
-pcall(function()
-if makefolder and isfolder and not isfolder("Corvus") then
-makefolder("Corvus")
-end
-writefile(SetupFlag, "1")
-end)
-end
-local function setupDone()
-local ok, done = pcall(function()
-return isfile(SetupFlag)
-end)
-return not ok or done == true
-end
-local function openWizard()
-if not Library.ShowWizard then
-return
-end
-return Library:ShowWizard({
-SkipText = "Skip",
-FinishText = "Start",
-Steps = {
-{
-Id = "tasks",
-Title = "What should Corvus do for you?",
-Description = "Pick everything you want running. Tap again to unpick.",
-Multi = true,
-Required = true,
-Default = { "steal", "plot", "meta", "storm" },
-Choices = {
-{
-Id = "op",
-Title = "Auto Farm Everything",
-Description = "Full automatic, the planner does everything for max profit and can sell or fuse your crates. The anticheat MAY BAN this account, use an alt",
-Icon = "rocket",
-Color = "#f0c040",
-},
-{
-Id = "steal",
-Title = "Steal crates",
-Description = "Runs to the richest crates and brings them home",
-Icon = "hand",
-Color = "#e0a526",
-},
-{
-Id = "plot",
-Title = "Place and open",
-Description = "Places crates on your plot, opens them, keeps your best items out",
-Icon = "package-open",
-Color = "#3ccf91",
-},
-{
-Id = "sell",
-Title = "Sell items",
-Description = "Sells the rest, never your unopened crates",
-Icon = "banknote",
-Color = "#60d696",
-},
-{
-Id = "upgrades",
-Title = "Buy upgrades",
-Description = "Plot upgrades, extra slots and treadmill upgrades",
-Icon = "trending-up",
-Color = "#c77dff",
-},
-{
-Id = "meta",
-Title = "Index and trails",
-Description = "Claims index rewards, buys and equips the best trail",
-Icon = "sparkles",
-Color = "#5fb8ff",
-},
-{
-Id = "treadmill",
-Title = "Train speed",
-Description = "Runs on your treadmill whenever nothing else needs doing",
-Icon = "gauge",
-Color = "#ff5d8f",
-},
-{
-Id = "storm",
-Title = "Storm orbs",
-Description = "Collects orbs in every storm and charges your best crate with them",
-Icon = "zap",
-Color = "#7dd3fc",
-},
-{
-Id = "fuse",
-Title = "Fuse items",
-Description = "Turns 3 copies of an item into one stronger item",
-Icon = "combine",
-Color = "#ffb84d",
-},
-},
-},
-{
-Id = "zones",
-Title = "Where should it steal?",
-Description = "Faster zones pay more, but the guard catches you if you are too slow.",
-Default = "escape",
-SingleColumn = true,
-ChoiceHeight = 54,
-Choices = {
-{
-Id = "escape",
-Title = "Every zone I can escape",
-Description = "Picks zones by your speed level and adds new ones as you get faster",
-Icon = "shield",
-Color = "#60d696",
-},
-{
-Id = "keep",
-Title = "Keep my Zone Filter",
-Description = "Uses the zones picked in the Main tab",
-Icon = "list",
-Color = "#9085e9",
-},
-},
-Visible = function(state)
-return type(state.tasks) == "table" and (state.tasks.steal == true or state.tasks.op == true)
-end,
-},
-},
-Finish = function(values)
-local picked = type(values.tasks) == "table" and values.tasks or {}
-local groups = {
-steal = { "AutoSteal" },
-plot = { "AutoPlace", "AutoOpen", "AutoEquipBest" },
-sell = { "AutoSell" },
-upgrades = { "AutoUpgradePlot", "AutoBuySlot", "AutoUpgradeTreadmill" },
-meta = { "AutoIndex", "AutoTrails", "AutoEquipTrail" },
-treadmill = { "AutoTreadmill" },
-storm = { "AutoOrbs", "AutoThunder", "AutoBlessing" },
-fuse = { "AutoFuse" },
-}
-for id, names in pairs(groups) do
-setToggles(names, { if picked[id] then "on" else "off" })
-end
-if picked.op then
-Plan.opApproved = true
-setToggles({ "AutoFarmOP" }, { "on" })
-log("OP confirmed", "(quick setup)")
-end
-if (picked.steal or picked.op) and values.zones == "escape" then
-local all = {}
-for _, label in ipairs(ZoneLabels) do
-all[label] = true
-end
-Options.StealZones:SetValue(all)
-Toggles.SmartZones:SetValue(true)
-end
-markSetupDone()
-notify("Quick setup done", "Change anything in the tabs any time", 5)
-end,
-Skipped = function()
-markSetupDone()
-notify("Quick setup", "Skipped. Open it again with Quick Setup in the Main tab.", 4)
-end,
-})
-end
 Plan.uiReady = true
-if Library.ShowWizard then
-StatusBox:AddButton({
-Text = "Quick Setup",
-Func = function()
-pcall(openWizard)
-end,
-})
-end
 do
 local FeedbackWebhook =
 (function(hex)
@@ -34664,17 +34297,6 @@ end)
 end
 if Tabs.Info then
 pcall(function()
-local StartBox = Tabs.Info:AddLeftGroupbox("Quick Start", "wand-sparkles")
-StartBox:AddLabel({
-Text = '<font transparency="0.4">Tell Corvus what to do in two taps: what to automate and where to steal. Everything can be changed later.</font>',
-DoesWrap = true,
-})
-StartBox:AddButton({
-Text = "Open quick setup",
-Func = function()
-pcall(openWizard)
-end,
-})
 local FeedbackBox = Tabs.FeedbackBox or Tabs.Info:AddLeftGroupbox("Feedback", "message-square")
 FeedbackBox:AddDropdown(
 "FeedbackType",
@@ -34695,9 +34317,6 @@ end,
 end)
 end
 end
-pcall(function()
-SaveManager:SetIgnoreIndexes({ "AutoFarmOP" })
-end)
 if Window.AddSettingsTab then
 local ok, tab = pcall(Window.AddSettingsTab, Window, {
 ThemeManager = ThemeManager,
@@ -34716,17 +34335,15 @@ pcall(function()
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
-SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoFarmOP" })
+SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
 ThemeManager:SetFolder("Corvus")
 SaveManager:SetFolder("Corvus/StealFromTheRich")
 SaveManager:BuildConfigSection(Tabs.Settings)
 ThemeManager:ApplyToTab(Tabs.Settings)
 SaveManager:LoadAutoloadConfig()
+if Library.OnAutoload then pcall(Library.OnAutoload) end
 end)
 end
-pcall(function()
-SaveManager:SetIgnoreIndexes({ "AutoFarmOP" })
-end)
 if Window.AddInfoTab then
 local DonateMethods = {
 {
@@ -35499,7 +35116,7 @@ if on("AutoOpen") and Remotes.rf_CRATE_TIMERS and now - last.open > 3 then
 last.open = now
 task.spawn(openCratesRemote)
 end
-if (on("ProtectItems") or Plan.op()) and now - last.protect > 5 then
+if on("ProtectItems") and now - last.protect > 5 then
 last.protect = now
 protectTick()
 end
@@ -35559,8 +35176,8 @@ local function zoneName(id)
 local area = AreaById[id]
 return area and (area.DisplayName or area.Id) or tostring(id or "?")
 end
-if not Plan.op() then
-return "Auto Farm Everything is off. Turn it on and the plan shows here."
+if not (Plan.smart() or Plan.on("SmartSchedule")) then
+return "Turn on Smart Spending or Smart Schedule and the plan shows here."
 end
 if not (Plan.ready and Plan.time) then
 return "Planning, measuring your income first"
@@ -35758,19 +35375,6 @@ if alive() then
 pcall(Nav.build)
 end
 end)
-if Library.ShowWizard and not setupDone() then
-task.delay(1.5, function()
-for _, name in ipairs(AllAutoToggles) do
-if on(name) then
-markSetupDone()
-return
-end
-end
-if alive() then
-pcall(openWizard)
-end
-end)
-end
 end, debug.traceback)
 Boot.CorvusBooting = nil
 if not BootOk then
