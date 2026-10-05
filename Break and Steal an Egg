@@ -30933,6 +30933,16 @@ function N.bestZone()
 		end
 		return N.ZoneCache.best
 	end
+	local best = N.topZone()
+	-- The planner's zone (highest value per second of farming, 8.00) when it is open and not above the top one.
+	local planned = N.Plan and N.Plan.farmZone
+	if planned and planned < best and not N.zonePenalized(planned) and N.power() >= N.Cat.zones[planned].power then
+		return planned
+	end
+	return best
+end
+-- Highest zone the current speed opens (no planner), used for the zone unlock events.
+function N.topZone()
 	local power = N.power()
 	local best = 1
 	for index, zone in ipairs(N.Cat.zones) do
@@ -31768,14 +31778,18 @@ do
 	N.onRemote("AnimalBankedRemote", function(...)
 		log("BANKED event", ...)
 	end)
-	function N.hitPace()
+	function N.hitRange()
 		local base = N.swingGap()
 		local range = ({
 			Slow = { base + 0.15, base + 0.3 },
 			Fast = { 0.36, 0.4 },
 			["Blatant (HIGH RISK OF BAN)"] = { 0.1, 0.14 },
 		})[optionText("HitSpeed", "Normal")] or { base, base + 0.06 }
-		return range[1] + math.random() * (range[2] - range[1])
+		return range[1], range[2]
+	end
+	function N.hitPace()
+		local lo, hi = N.hitRange()
+		return lo + math.random() * (hi - lo)
 	end
 	local function equipPickaxe()
 		local char = character()
@@ -31826,9 +31840,11 @@ do
 		return false
 	end
 	function N.eggScore(info, origin)
-		local priority = optionText("EggPriority", "Fewest hits")
+		local priority = optionText("EggPriority", "Best value per second")
 		local distance = if origin then (info.position - origin).Magnitude else 0
-		if priority == "Heaviest" then
+		if priority == "Best value per second" then
+			return N.Plan.eggRate(info, distance)
+		elseif priority == "Heaviest" then
 			return info.kg * 1000 - distance
 		elseif priority == "Luckiest" then
 			return info.luck * 100000 - distance
@@ -31840,7 +31856,8 @@ do
 	function N.chooseEgg()
 		local root = rootPart()
 		local origin = root and root.Position
-		local maxHits = math.max(optionNumber("MaxHits", 80), 1)
+		-- "Best value per second" already prices the hits, so the hit limit only applies to the other priorities.
+		local maxHits = if optionText("EggPriority", "Best value per second") == "Best value per second" then math.huge else math.max(optionNumber("MaxHits", 80), 1)
 		local titanicFirst = on("TitanicFirst")
 		local others = if on("AvoidPlayers") then otherPositions() else {}
 		local best, bestScore
@@ -32072,12 +32089,14 @@ do
 			return false
 		end
 		local carried = math.max(N.carryCount(), 1)
+		local tripZone, tripStart = F.carryZone, os.clock()
 		for _ = 1, 2 do
 			N.goHome(string.format("Bringing %d animal%s home", carried, if carried == 1 then "" else "s"))
 			if waitFor(function()
 				return not N.carrying()
 			end, 3) then
 				Session.banked += carried
+				N.Plan.observeTrip(tripZone, os.clock() - tripStart)
 				F.placeWanted = true
 				F.carryZone = nil
 				log("BANKED", carried)
@@ -32182,6 +32201,7 @@ do
 		-- An egg that vanished without a single hit of ours was broken by another player: not ours, no hatch to wait for.
 		if egg:GetAttribute("Broken") or egg:GetAttribute("Hatching") or (egg.Parent == nil and hits > 0) then
 			Session.eggs += 1
+			N.Plan.observeEgg(info.zone, info.max)
 			table.insert(F.hatches, { position = info.position, at = os.clock(), zone = info.zone, before = before, kind = info.kind })
 			while #F.hatches > 8 do
 				table.remove(F.hatches, 1)
@@ -32418,6 +32438,651 @@ do
 		return false
 	end
 end
+-- Profit engine v2 (CLAUDE.md.txt 8.00). One planner ranks every way to spend cash and time on one scale.
+-- Value of a state = extra cash the egg farm adds by the end of the 24 h horizon, from the best schedule
+-- "train to power X (or not), then farm the best zone" (V). An option's gain = (V after - V now) / T in $/s,
+-- compared by gain per dollar. Game numbers come from the configs (ZoneAnimalsConfig pool, EggConfig,
+-- PickaxeConfig, SpeedConfig, TrailsConfig, TreadmillUpgradeConfig, PlotUpgradeConfig, SatchelConfig);
+-- egg HP, luck, animal size, trip length, training speed and the farm's real pace are measured live.
+-- The math and the assumptions are written down in Games/BreakAndStealAnEgg/notes.md.
+N.Plan = {
+	at = -1e9,
+	logAt = -1e9,
+	hp = {},
+	hpBroken = {},
+	luck = {},
+	size = {},
+	seen = {},
+	trip = {},
+	wsRatio = 1,
+	calib = 1,
+	farmTime = 0,
+	bankedAt = 0,
+	activity = "farm",
+	valid = {},
+	summary = "",
+	HatchDelay = 12,
+	EggGap = 1.5,
+	BankOverhead = 2,
+	Horizon = 86400,
+}
+do
+	local P = N.Plan
+	local function ema(old, new, weight)
+		if old == nil then
+			return new
+		end
+		return old + (new - old) * weight
+	end
+	P.ema = ema
+	-- Rolling horizon: always the next 24 h from now (the hub farms forever, nothing counts down).
+	function P.horizon()
+		return P.Horizon
+	end
+	local function speedConst(key, default)
+		return tonumber(N.G.Speed[key]) or default
+	end
+	-- SpeedConfig.SpeedPowerToProgression / SpeedPowerToWalkSpeed / AwardInterval, same math as the game.
+	function P.progression(power)
+		local base = speedConst("DefaultSpeedPower", 10)
+		local top = speedConst("MaxSpeedPower", 1e9)
+		local p = math.max(power or base, base)
+		return math.clamp(math.log10(p / base) / math.log10(top / base), 0, 1) * 290 + 10
+	end
+	function P.walkSpeedFor(power)
+		local base = speedConst("DefaultSpeedPower", 10)
+		local top = speedConst("MaxSpeedPower", 1e9)
+		local over = speedConst("OverdriveMaxSpeedPower", 1e12)
+		local soft = speedConst("SoftCapWalkSpeed", 100)
+		local cap = speedConst("MaxWalkSpeed", 120)
+		local p = math.max(power or base, base)
+		if p > top then
+			return soft + math.clamp(math.log10(p / top) / math.log10(over / top), 0, 1) * (cap - soft)
+		end
+		local walk0 = speedConst("BaseWalkSpeed", 18)
+		local curve = speedConst("WalkSpeedCurveExponent", 1.59)
+		return walk0 + math.clamp((P.progression(p) - 10) / 290, 0, 1) ^ curve * (soft - walk0)
+	end
+	function P.awardInterval(power)
+		return 0.25 - math.clamp((P.progression(power) - 10) / 90, 0, 1) * 0.15
+	end
+	-- Treadmill gain per step = trail Multiplier x machine SpeedMultiplier (game docs in the dump).
+	function P.machineMult()
+		local model = N.treadmill()
+		local value = model and tonumber(model:GetAttribute("SpeedMultiplier"))
+		if value then
+			return value
+		end
+		local levels = N.G.Treadmill.Levels
+		local level = tonumber(N.plotAttr("TreadmillLevel", 1)) or 1
+		local data = type(levels) == "table" and levels[level]
+		return (data and tonumber(data.Multiplier)) or 1
+	end
+	function P.trainMult()
+		return N.trailMultiplier(tonumber(LocalPlayer:GetAttribute("EquippedTrail")) or 0) * P.machineMult()
+	end
+	-- SpeedPower per second on the treadmill. Measured per multiplier when the hub has trained, the game formula otherwise.
+	function P.trainRate(power, mult)
+		if mult <= 0 then
+			return 0
+		end
+		if P.trainUnit then
+			return P.trainUnit * mult * P.awardInterval(P.trainUnitPower or power) / P.awardInterval(power)
+		end
+		return mult * speedConst("SpeedPowerPerStep", 1) / P.awardInterval(power)
+	end
+	P.pools = {}
+	P.poolCash = {}
+	-- ZoneAnimalsConfig through EggRewards.Pool: species, Chance, Cash and rank inside the zone.
+	function P.pool(zone)
+		local cached = P.pools[zone]
+		if cached then
+			return cached
+		end
+		local list = {}
+		local pool = N.G.Rewards.Pool
+		if type(pool) == "table" then
+			for _, entry in ipairs(pool) do
+				if type(entry) == "table" then
+					local cash, chance = tonumber(entry.Cash), tonumber(entry.Chance)
+					if type(entry.Name) == "string" and cash then
+						P.poolCash[entry.Name] = cash
+					end
+					if entry.Zone == zone and cash and chance and chance > 0 then
+						table.insert(list, { cash = cash, chance = chance, rank = tonumber(entry.ZoneRank) or 1, count = tonumber(entry.ZoneCount) or 1 })
+					end
+				end
+			end
+		end
+		P.pools[zone] = list
+		return list
+	end
+	-- Hatch distribution of a zone: value (pool Cash x measured size/weight/variant ratio) and probability.
+	-- Luck tilts the odds toward the rarer ranks (assumption, the server roll is not in the dump).
+	P.distCache = {}
+	function P.dist(zone, luck)
+		local L = math.max(tonumber(luck) or P.luck[zone] or 1, 1)
+		local key = zone .. ":" .. math.floor(L * 20)
+		local cached = P.distCache[key]
+		if cached then
+			return cached
+		end
+		local out, total = {}, 0
+		local list = P.pool(zone)
+		local ratio = P.size[zone] or 1
+		for _, entry in ipairs(list) do
+			local weight = entry.chance * L ^ ((entry.rank - 1) / math.max(entry.count - 1, 1))
+			total += weight
+			table.insert(out, { v = entry.cash * ratio, p = weight })
+		end
+		if total > 0 then
+			for _, row in ipairs(out) do
+				row.p /= total
+			end
+		elseif P.seen[zone] then
+			out = { { v = P.seen[zone], p = 1 } }
+		end
+		table.sort(out, function(a, b)
+			return a.v > b.v
+		end)
+		P.distCache[key] = out
+		return out
+	end
+	-- Expected income added by one animal when the weakest placed one earns `worst` (0 while the plot has room).
+	function P.gain(dist, worst)
+		local g = 0
+		for _, row in ipairs(dist) do
+			g += row.p * math.max(row.v - worst, 0)
+		end
+		return g
+	end
+	function P.mean(dist)
+		local g = 0
+		for _, row in ipairs(dist) do
+			g += row.p * row.v
+		end
+		return g
+	end
+	-- Expected income of the best `slots` animals among the placed ones and n new draws (fractional counts).
+	function P.topIncome(dist, n, placed, slots)
+		local items = {}
+		for _, value in ipairs(placed) do
+			table.insert(items, { v = value, c = 1 })
+		end
+		for _, row in ipairs(dist) do
+			if n * row.p > 0 then
+				table.insert(items, { v = row.v, c = n * row.p })
+			end
+		end
+		table.sort(items, function(a, b)
+			return a.v > b.v
+		end)
+		local left, sum = slots, 0
+		for _, item in ipairs(items) do
+			if left <= 0 then
+				break
+			end
+			local take = math.min(left, item.c)
+			sum += take * item.v
+			left -= take
+		end
+		return sum
+	end
+	-- Cash gained by the horizon end from income growing at F $/s per second for t seconds, up to `cap` $/s more.
+	function P.farmValue(F, cap, t)
+		if F <= 0 or t <= 0 or cap <= 0 then
+			return 0
+		end
+		if F * t <= cap then
+			return F * t * t / 2
+		end
+		local reach = cap / F
+		return cap * (t - reach / 2)
+	end
+	-- Egg HP: the eggs the hub really broke, else the ones seen (the hub picks the easier ones), else EggConfig.
+	function P.eggHp(zone)
+		if P.hpBroken[zone] then
+			return P.hpBroken[zone]
+		end
+		if P.hp[zone] then
+			return P.hp[zone] * 0.75
+		end
+		local mults = N.G.Egg.ZoneHealthMult
+		local base = tonumber(N.G.Egg.MaxHealth) or 5
+		local mult = type(mults) == "table" and tonumber(mults[zone]) or nil
+		return base * (mult or 20 ^ (zone - 1)) * 2
+	end
+	-- One-way walk from the zone to the plot in studs: measured bank trips, else map distance, else a guess.
+	function P.distance(zone)
+		if P.trip[zone] then
+			return P.trip[zone]
+		end
+		local hitbox = N.plotHitbox()
+		local model = N.zoneModel(zone)
+		if hitbox and model then
+			local ok, pivot = pcall(model.GetPivot, model)
+			if ok and pivot then
+				return flat(pivot.Position, hitbox.Position)
+			end
+		end
+		return 150 * zone
+	end
+	function P.pace()
+		local lo, hi = N.hitRange()
+		return (lo + hi) / 2
+	end
+	-- Animals banked per second in a zone: hits on the egg, a short hop between eggs, the walk home shared by the
+	-- animals one trip carries (eggs broken while the first one hatches), times the measured calibration.
+	function P.animalRate(zone, state, walk)
+		local hits = math.ceil(P.eggHp(zone) / math.max(state.damage, 1))
+		local hitTime = hits * state.pace + P.EggGap
+		local perTrip = math.min(state.capacity, 1 + P.HatchDelay / hitTime)
+		local walkTime = 2 * P.distance(zone) / math.max(walk, 1)
+		return P.calib / (hitTime + (walkTime + P.BankOverhead) / perTrip), hits
+	end
+	function P.zoneNeed(zone)
+		local margin = math.clamp(optionNumber("EscapeMargin", 100), 50, 300) / 100
+		local data = N.Cat.zones[zone]
+		return if data then data.power * margin else math.huge
+	end
+	function P.copy(state, changes)
+		local out = table.clone(state)
+		for k, v in pairs(changes) do
+			out[k] = v
+		end
+		return out
+	end
+	function P.state()
+		local placed = {}
+		local income = 0
+		for _, info in ipairs(N.placedAnimals()) do
+			local value = N.cashValue(info)
+			if value <= 0 then
+				value = info.cash
+			end
+			table.insert(placed, value)
+			income += value
+		end
+		table.sort(placed, function(a, b)
+			return a > b
+		end)
+		local spare = 0
+		for _, entry in ipairs(N.animalTools()) do
+			if not entry.held then
+				spare = math.max(spare, N.cashValue(entry))
+			end
+		end
+		local slots = tonumber(N.plotAttr("MaxAnimals", 0)) or 0
+		if slots <= 0 then
+			slots = math.max(#placed, 8)
+		end
+		return {
+			damage = N.damage(),
+			capacity = N.capacity(),
+			power = N.power(),
+			pace = P.pace(),
+			slots = slots,
+			placed = placed,
+			income = income,
+			spare = spare,
+			trainMult = P.trainMult(),
+			unlocked = N.treadmillUnlocked(),
+			canTrain = on("AutoTrain"),
+			canFarm = on("AutoFarm"),
+			walkBoost = P.wsRatio,
+			teleport = N.moveMode() == "Teleport",
+		}
+	end
+	-- Best schedule over t seconds: for every target power (now, each locked zone, one decade more for walk speed)
+	-- train first, then farm the zone with the highest value.
+	function P.evaluate(state, horizon)
+		local best = { value = 0, zone = nil, target = state.power, train = 0, F = 0, rate = 0 }
+		if not state.canFarm then
+			return best
+		end
+		local targets = { state.power }
+		if state.canTrain and state.unlocked and state.trainMult > 0 then
+			for zone in ipairs(N.Cat.zones) do
+				local need = P.zoneNeed(zone)
+				if need > state.power then
+					table.insert(targets, need)
+				end
+			end
+			if P.walkSpeedFor(state.power * 10) > P.walkSpeedFor(state.power) + 0.5 then
+				table.insert(targets, state.power * 10)
+			end
+		end
+		local placedSum = 0
+		for _, value in ipairs(state.placed) do
+			placedSum += value
+		end
+		local worst = if #state.placed < state.slots then 0 else (state.placed[#state.placed] or 0)
+		for _, target in ipairs(targets) do
+			local trainTime = 0
+			if target > state.power then
+				local rate = P.trainRate(math.sqrt(state.power * target), state.trainMult)
+				trainTime = if rate > 0 then (target - state.power) / rate else math.huge
+			end
+			local left = horizon - trainTime
+			if left > 0 then
+				local walk = if state.teleport then 1e6 else P.walkSpeedFor(target) * state.walkBoost * 0.97
+				for zone in ipairs(N.Cat.zones) do
+					if P.zoneNeed(zone) <= target and not N.zonePenalized(zone) then
+						local rate = P.animalRate(zone, state, walk)
+						local dist = P.dist(zone)
+						local F = rate * P.gain(dist, worst)
+						local cap = P.topIncome(dist, rate * left, state.placed, state.slots) - placedSum
+						local value = P.farmValue(F, cap, left)
+						if value > best.value then
+							best = { value = value, zone = zone, target = target, train = trainTime, F = F, rate = rate }
+						end
+					end
+				end
+			end
+		end
+		return best
+	end
+	-- Every cash option the enabled toggles allow: key, label, cost, the state after buying and the buy action.
+	function P.options(state, horizon, base)
+		local list = {}
+		local function add(key, label, cost, after, extra, act)
+			if not cost or cost <= 0 or (N.Shop.lastAt[key] or 0) > os.clock() then
+				return
+			end
+			local value = P.evaluate(after, horizon).value - base.value + (extra or 0)
+			local gain = value / horizon
+			table.insert(list, { key = key, label = label, cost = cost, gain = gain, ratio = gain / cost, act = act })
+		end
+		local tiers = N.G.Pickaxe.Tiers
+		if on("AutoPickaxe") and type(tiers) == "table" then
+			local current = N.pickaxeTier()
+			local owned = N.ownedList("OwnedPickaxes")
+			local top = if N.Shop.stepByStep then math.min(current + 1, #tiers) else #tiers
+			for tier = current + 1, top do
+				local data = tiers[tier]
+				if data and not owned[tier] then
+					add("pickaxe", tostring(data.Name), tonumber(data.Price), P.copy(state, { damage = math.max(tonumber(data.Damage) or 1, 1) }), 0, function()
+						return N.buyPickaxe(tier)
+					end)
+				end
+			end
+		end
+		local trails = N.G.Trails.Trails
+		if on("AutoTrail") and type(trails) == "table" then
+			local owned = N.ownedList("OwnedTrails")
+			local currentMult = N.trailMultiplier(tonumber(LocalPlayer:GetAttribute("EquippedTrail")) or 0)
+			local nextMult = math.huge
+			for _, trail in ipairs(trails) do
+				local mult = tonumber(trail.Multiplier) or 0
+				if mult > currentMult and not owned[trail.Id] and (not N.Shop.trailStepByStep or mult <= nextMult) then
+					if N.Shop.trailStepByStep then
+						nextMult = mult
+					end
+					add("trail", tostring(trail.Name), tonumber(trail.Price), P.copy(state, { trainMult = state.trainMult / currentMult * mult }), 0, function()
+						return N.buyTrail(trail)
+					end)
+				end
+			end
+		end
+		if on("AutoTreadmill") then
+			if not state.unlocked then
+				local levels = N.G.Treadmill.Levels
+				local first = type(levels) == "table" and levels[1]
+				add("treadmill", "Treadmill unlock", tonumber(N.G.TreadmillUnlock.Cost) or 100, P.copy(state, {
+					unlocked = true,
+					trainMult = N.trailMultiplier(tonumber(LocalPlayer:GetAttribute("EquippedTrail")) or 0) * ((first and tonumber(first.Multiplier)) or 1),
+				}), 0, N.unlockTreadmill)
+			else
+				local level = tonumber(N.plotAttr("TreadmillLevel", 1)) or 1
+				local levels = N.G.Treadmill.Levels
+				local now = type(levels) == "table" and levels[level]
+				local after = type(levels) == "table" and levels[level + 1]
+				if now and after and tonumber(now.UpgradeCost) then
+					local ratio = (tonumber(after.Multiplier) or 1) / math.max(tonumber(now.Multiplier) or 1, 1e-9)
+					add("treadmill", "Treadmill level " .. (level + 1), tonumber(now.UpgradeCost), P.copy(state, { trainMult = state.trainMult * ratio }), 0, N.upgradeTreadmill)
+				end
+			end
+		end
+		if on("AutoPlotUpgrade") then
+			local level = tonumber(N.plotAttr("PlotLevel", 1)) or 1
+			local costs = N.G.Plot.Costs
+			if level < (tonumber(N.G.Plot.MaxLevel) or 9) and type(costs) == "table" and tonumber(costs[level]) then
+				-- The new slot takes the best spare backpack animal at once (its income for the whole horizon), and the
+				-- farm gets one more slot to fill.
+				local placed = table.clone(state.placed)
+				local extra = 0
+				if state.spare > 0 and #placed >= state.slots then
+					table.insert(placed, state.spare)
+					table.sort(placed, function(a, b)
+						return a > b
+					end)
+					extra = state.spare * horizon
+				end
+				add("plot", "Plot level " .. (level + 1), tonumber(costs[level]), P.copy(state, { slots = state.slots + 1, placed = placed }), extra, N.buyPlot)
+			end
+		end
+		if on("AutoSatchel") then
+			local tier = tonumber(LocalPlayer:GetAttribute("SatchelTier")) or 1
+			local price = N.satchelPrice(tier)
+			if price and N.satchelStation() then
+				add("satchel", "Satchel tier " .. (tier + 1), price, P.copy(state, { capacity = state.capacity + 1 }), 0, N.buySatchel)
+			end
+		end
+		return list
+	end
+	-- Ranking (8.00 points 4 and 5): highest gain per dollar first; an option must be affordable and paid back inside
+	-- the horizon. While saving for the best one, a cheaper affordable option is bought on the way when it pays back
+	-- before the best one could be bought.
+	function P.choose(list, cash, income, horizon)
+		local valid = {}
+		for _, option in ipairs(list) do
+			if option.gain > 0 then
+				option.payback = option.cost / option.gain
+				option.eta = if option.cost <= cash then 0 elseif income > 0 then (option.cost - cash) / income else math.huge
+				if option.eta + option.payback <= horizon then
+					table.insert(valid, option)
+				end
+			end
+		end
+		table.sort(valid, function(a, b)
+			return a.ratio > b.ratio
+		end)
+		local best = valid[1]
+		if not best then
+			return nil, valid
+		end
+		if best.cost <= cash then
+			return best, valid
+		end
+		for _, option in ipairs(valid) do
+			if option.cost <= cash and option.payback <= best.eta then
+				return option, valid
+			end
+		end
+		return nil, valid
+	end
+	function P.observeTrip(zone, seconds)
+		if zone and seconds > 1 and seconds < 300 then
+			P.trip[zone] = ema(P.trip[zone], seconds * N.modeSpeed(), 0.3)
+		end
+	end
+	function P.observeEgg(zone, maxHp)
+		if zone and maxHp and maxHp > 0 then
+			P.hpBroken[zone] = ema(P.hpBroken[zone], maxHp, 0.2)
+		end
+	end
+	-- Live measurements: egg HP and luck per zone, animal value vs pool Cash, training speed, WalkSpeed boosts and the
+	-- real banking pace (calibration of the model).
+	function P.observe()
+		local now = os.clock()
+		for _, info in ipairs(N.eggs()) do
+			if not info.titanic then
+				P.hp[info.zone] = ema(P.hp[info.zone], info.max, 0.05)
+				P.luck[info.zone] = ema(P.luck[info.zone], math.max(info.luck, 1), 0.05)
+			end
+		end
+		if next(P.poolCash) == nil then
+			for zone in ipairs(N.Cat.zones) do
+				P.pool(zone)
+			end
+		end
+		for _, info in ipairs(N.pickups()) do
+			local value = N.cashValue(info)
+			if value > 0 then
+				local cash = P.poolCash[info.name]
+				if cash and cash > 0 then
+					P.size[info.zone] = ema(P.size[info.zone], math.clamp(value / cash, 0.05, 50), 0.05)
+				end
+				P.seen[info.zone] = ema(P.seen[info.zone], value, 0.05)
+			end
+		end
+		local power = N.power()
+		if P.lastTraining and N.Train.startedAt and P.lastPower and P.lastAt then
+			local dt, dp = now - P.lastAt, power - P.lastPower
+			local mult = P.trainMult()
+			if dt > 0.5 and dp > 0 and mult > 0 then
+				P.trainUnit = ema(P.trainUnit, dp / dt / mult, 0.3)
+				P.trainUnitPower = power
+			end
+		end
+		P.lastTraining = N.Train.startedAt ~= nil
+		P.lastPower, P.lastAt = power, now
+		local hum = humanoid()
+		if hum and not N.inHell() then
+			local formula = P.walkSpeedFor(power)
+			if formula > 0 and hum.WalkSpeed > 0 then
+				P.wsRatio = ema(P.wsRatio, math.clamp(hum.WalkSpeed / formula, 0.3, 3), 0.2)
+			end
+		end
+		-- Calibration: banked animals per farming second vs the model's rate, over 5 minute windows.
+		local farming = on("AutoFarm") and not N.Train.startedAt
+		if farming and P.farmCheck then
+			P.farmTime += now - P.farmCheck
+		end
+		P.farmCheck = now
+		if P.farmTime >= 300 then
+			local measured = (Session.banked - P.bankedAt) / P.farmTime
+			local model = P.modelRate
+			if model and model > 0 and measured > 0 then
+				P.calib = math.clamp(ema(P.calib, P.calib * measured / model, 0.5), 0.2, 5)
+			end
+			P.measuredRate = measured
+			P.farmTime = 0
+			P.bankedAt = Session.banked
+		end
+	end
+	-- Demon potions (15 min) by the value they add, in $ (divided by the token price in N.demonStep).
+	function P.potionValue(id)
+		local state = P.lastState
+		local base = P.base
+		if not (state and base) then
+			return if id == "Cash" then 1 else 0
+		end
+		local horizon = P.horizon()
+		local span = math.min(900, horizon)
+		if id == "Cash" then
+			return state.income * span
+		elseif id == "Swing" or id == "WalkSpeed" then
+			local changes = if id == "Swing" then { pace = state.pace / 1.25 } else { walkBoost = state.walkBoost * 1.25 }
+			local after = P.evaluate(P.copy(state, changes), span)
+			local now = P.evaluate(state, span)
+			-- Income won during the potion keeps paying until the horizon end.
+			return math.max(after.value - now.value, 0) / span * (horizon - span / 2)
+		elseif id == "Treadmill" then
+			if P.activity ~= "train" or base.train <= 0 then
+				return 0
+			end
+			local saved = math.min(span, base.train) / 2
+			return base.F * saved * (horizon - base.train)
+		end
+		return 1
+	end
+	-- Value per second of breaking one egg: expected gain of its animal over the time it takes (egg choice by zone and luck).
+	function P.eggRate(info, distance)
+		local state = P.lastState
+		if not state then
+			return -info.hits
+		end
+		local worst = if #state.placed < state.slots then 0 else (state.placed[#state.placed] or 0)
+		local dist = P.dist(info.zone, info.luck)
+		local g = P.gain(dist, worst) + P.mean(dist) * 1e-6
+		local walk = if state.teleport then 1e6 else math.max(N.modeSpeed(), 1)
+		local seconds = info.hits * state.pace + P.EggGap + (distance or 0) / walk
+		return math.min(g / math.max(seconds, 0.1), 1e14)
+	end
+	function P.formatSeconds(seconds)
+		seconds = math.max(math.floor(seconds), 0)
+		if seconds >= 3600 then
+			return string.format("%dh %02dm", seconds // 3600, (seconds % 3600) // 60)
+		elseif seconds >= 60 then
+			return string.format("%dm %02ds", seconds // 60, seconds % 60)
+		end
+		return seconds .. "s"
+	end
+	local function short(option)
+		return if option then string.format("%s %.3g", option.label, option.ratio) else "-"
+	end
+	function P.update(force)
+		if not force and os.clock() - P.at < 4 then
+			return
+		end
+		P.at = os.clock()
+		P.distCache = {}
+		P.observe()
+		local horizon = P.horizon()
+		local state = P.state()
+		P.lastState = state
+		local base = P.evaluate(state, horizon)
+		P.base = base
+		P.modelRate = base.rate
+		-- Time: train when the best schedule starts on the treadmill. A started training run keeps going to its target
+		-- (re-checked every 60 s), so the hub does not walk back and forth every few seconds.
+		local committed = P.activity == "train" and P.trainTarget and state.power < P.trainTarget and os.clock() < (P.commitUntil or 0)
+		if not committed then
+			if base.train > 0 and state.canTrain then
+				if P.activity ~= "train" then
+					log(string.format("PLAN train to %s speed (%ds) then zone %s", formatNumber(base.target), math.floor(base.train), tostring(base.zone)))
+				end
+				P.activity = "train"
+				P.trainTarget = base.target
+				P.commitUntil = os.clock() + 60
+			else
+				P.activity = "farm"
+				P.trainTarget = nil
+			end
+		end
+		P.farmZone = if base.train <= 0 then base.zone else nil
+		local list = P.options(state, horizon, base)
+		local cash = N.cash()
+		local income = math.max(N.cashPerSecond(), state.income)
+		local pick, valid = P.choose(list, cash, income, horizon)
+		P.pick, P.valid = pick, valid
+		local best = valid[1]
+		P.summary = if best
+			then string.format("Plan: %s $%s%s", best.label, formatNumber(best.cost), if best.eta > 0 then string.format(" in %s", P.formatSeconds(math.min(best.eta, 1e7))) else " now")
+			else "Plan: nothing pays back in 24 h, saving"
+		local doing = if P.activity == "train" then string.format("train->%s", formatNumber(P.trainTarget or 0)) else "farm z" .. tostring(base.zone or "-")
+		local key = tostring(best and best.label) .. "|" .. doing
+		if key ~= P.logKey or os.clock() - P.logAt > 60 or force then
+			P.logKey = key
+			P.logAt = os.clock()
+			log(string.format(
+				"PLAN best=%s gain/$=%.3g eta=%ds alt=%s, %s buy=%s do=%s F=%.3g/s2 rate=%.3g/s calib=%.2f T=%.1fh",
+				if best then best.label else "save",
+				if best then best.ratio else 0,
+				if best then math.floor(math.min(best.eta, 1e9)) else 0,
+				short(valid[2]),
+				short(valid[3]),
+				if pick then pick.label else "-",
+				doing,
+				base.F or 0,
+				base.rate or 0,
+				P.calib,
+				horizon / 3600
+			))
+		end
+	end
+end
 N.Train = { session = false, startedAt = nil, phase = "farm", phaseSince = os.clock(), unlockAskedAt = -1e9 }
 N.Shop = { lastAt = {}, boothNeeded = {}, log = {} }
 do
@@ -32469,33 +33134,27 @@ do
 		if not T.startedAt then
 			T.startedAt = os.clock()
 		end
-		setStatus(string.format("Training on the treadmill  \u{00B7}  %s speed", formatNumber(N.power())))
+		local plan = N.Plan
+		local goal = if plan and plan.activity == "train" and plan.trainTarget then "  \u{00B7}  goal " .. formatNumber(plan.trainTarget) else ""
+		setStatus(string.format("Training on the treadmill  \u{00B7}  %s speed%s", formatNumber(N.power()), goal))
 		task.wait(1)
 		return true
 	end
-	-- True while more speed still helps: a zone is still locked, or WalkSpeed is below the game's cap.
-	function N.trainUseful()
-		if N.nextZone() then
-			return true
-		end
-		local cap = tonumber(N.G.Speed.MaxWalkSpeed) or 120
-		return N.walkSpeed() < cap - 1
-	end
-	-- Decides farm vs train when both are on.
+	-- Decides farm vs train when both are on. "Profit plan" asks the planner (time is a currency, CLAUDE.md.txt 8.00):
+	-- train only while the best 24 h schedule starts with training. The other two modes are the player's own schedule.
 	function N.wantTrain(farmHadWork)
 		local farmOn = on("AutoFarm") or on("StealPickups")
 		if not on("AutoTrain") then
 			return false
 		end
-		-- Speed only buys new zones and a faster WalkSpeed (capped). With both done, time on the treadmill earns nothing
-		-- while the farm is running, so the farm gets all of it.
-		if farmOn and not N.trainUseful() then
-			return false
-		end
 		if not farmOn or farmHadWork == false then
 			return true
 		end
-		local mode = optionText("TrainMode", "Alternate")
+		local mode = optionText("TrainMode", "Profit plan")
+		if mode == "Profit plan" then
+			N.Plan.update(false)
+			return N.Plan.activity == "train"
+		end
 		if mode == "When nothing to farm" then
 			return false
 		end
@@ -32534,120 +33193,100 @@ do
 		end
 		return false
 	end
-	function N.pickaxeStep()
-		local tiers = N.G.Pickaxe.Tiers
-		if type(tiers) ~= "table" then
-			return false
+	local function boughtEvent(name, price)
+		Session.bought += 1
+		if N.Events.bought then
+			pcall(N.Events.bought, name, price)
 		end
-		local current = N.pickaxeTier()
-		local owned = N.ownedList("OwnedPickaxes")
-		owned[current] = true
-		local bestOwned = current
-		for tier in pairs(owned) do
-			if tier > bestOwned and tiers[tier] then
-				bestOwned = tier
+	end
+	function N.trailMultiplier(id)
+		for _, trail in ipairs(type(N.G.Trails.Trails) == "table" and N.G.Trails.Trails or {}) do
+			if trail.Id == id then
+				return tonumber(trail.Multiplier) or 1
 			end
 		end
-		if bestOwned > current then
-			fire("PickaxeShopRequest", "Equip", bestOwned)
-			task.wait(0.5)
-			return true
-		end
-		local cash = N.cash()
-		local top = if N.Shop.stepByStep then math.min(current + 1, #tiers) else #tiers
-		for tier = top, current + 1, -1 do
-			local data = tiers[tier]
-			if data and not owned[tier] and (tonumber(data.Price) or math.huge) <= cash then
-				local ok = buyThenCheck("pickaxe", "PickaxeShopRequest", { "Buy", tier }, function()
-					return N.ownedList("OwnedPickaxes")[tier] == true or N.pickaxeTier() >= tier
-				end, "Pickaxe Shop")
-				if ok then
-					Session.bought += 1
-					shopNote("Bought " .. tostring(data.Name))
-					fire("PickaxeShopRequest", "Equip", tier)
-					if N.Events.bought then
-						pcall(N.Events.bought, tostring(data.Name), tonumber(data.Price) or 0)
-					end
-				elseif tier > current + 1 and not N.Shop.stepByStep then
-					N.Shop.stepByStep = true
-					log("SHOP pickaxe skip refused, buying tier by tier")
-				else
-					N.Shop.lastAt.pickaxe = os.clock() + 60
+		return 1
+	end
+	-- Equipping an owned better pickaxe or trail is free, so it never waits for the planner.
+	function N.equipOwnedStep()
+		local tiers = N.G.Pickaxe.Tiers
+		if on("AutoPickaxe") and type(tiers) == "table" then
+			local current = N.pickaxeTier()
+			local bestOwned = current
+			for tier in pairs(N.ownedList("OwnedPickaxes")) do
+				if tier > bestOwned and tiers[tier] then
+					bestOwned = tier
 				end
+			end
+			if bestOwned > current then
+				fire("PickaxeShopRequest", "Equip", bestOwned)
+				task.wait(0.5)
+				return true
+			end
+		end
+		local trails = N.G.Trails.Trails
+		if on("AutoTrail") and type(trails) == "table" then
+			local owned = N.ownedList("OwnedTrails")
+			local equippedMult = N.trailMultiplier(tonumber(LocalPlayer:GetAttribute("EquippedTrail")) or 0)
+			local bestId, bestMult = nil, equippedMult
+			for _, trail in ipairs(trails) do
+				if owned[trail.Id] and (tonumber(trail.Multiplier) or 0) > bestMult then
+					bestId, bestMult = trail.Id, tonumber(trail.Multiplier) or 0
+				end
+			end
+			if bestId then
+				fire("TrailShopRequest", "Equip", bestId)
+				task.wait(0.5)
 				return true
 			end
 		end
 		return false
 	end
-	function N.trailStep()
-		local trails = N.G.Trails.Trails
-		if type(trails) ~= "table" then
+	function N.buyPickaxe(tier)
+		local data = N.pickaxeData(tier)
+		if not data or N.cash() < (tonumber(data.Price) or math.huge) then
 			return false
 		end
-		local owned = N.ownedList("OwnedTrails")
-		local equipped =tonumber(LocalPlayer:GetAttribute("EquippedTrail")) or 0
-		local bestId, bestMult = nil, 0
-		local equippedMult = 0
-		for _, trail in ipairs(trails) do
-			if owned[trail.Id] and (tonumber(trail.Multiplier) or 0) > bestMult then
-				bestId, bestMult = trail.Id, tonumber(trail.Multiplier) or 0
-			end
-			if trail.Id == equipped then
-				equippedMult = tonumber(trail.Multiplier) or 0
-			end
+		local current = N.pickaxeTier()
+		local ok = buyThenCheck("pickaxe", "PickaxeShopRequest", { "Buy", tier }, function()
+			return N.ownedList("OwnedPickaxes")[tier] == true or N.pickaxeTier() >= tier
+		end, "Pickaxe Shop")
+		if ok then
+			shopNote("Bought " .. tostring(data.Name))
+			fire("PickaxeShopRequest", "Equip", tier)
+			boughtEvent(tostring(data.Name), tonumber(data.Price) or 0)
+		elseif tier > current + 1 and not N.Shop.stepByStep then
+			N.Shop.stepByStep = true
+			log("SHOP pickaxe skip refused, buying tier by tier")
+		else
+			N.Shop.lastAt.pickaxe = os.clock() + 60
 		end
-		if bestId and bestMult > equippedMult then
-			fire("TrailShopRequest", "Equip", bestId)
-			task.wait(0.5)
-			return true
-		end
-		-- Trails only multiply training speed: no buying unless the hub trains and speed still helps.
-		if not (on("AutoTrain") and N.trainUseful()) then
-			return false
-		end
-		local cash = N.cash()
-		local pick
-		for _, trail in ipairs(trails) do
-			local mult = tonumber(trail.Multiplier) or 0
-			if not owned[trail.Id] and mult > bestMult and (tonumber(trail.Price) or math.huge) <= cash then
-				local better = if N.Shop.trailStepByStep then mult < (tonumber(pick and pick.Multiplier) or math.huge) else mult > (tonumber(pick and pick.Multiplier) or 0)
-				if not pick or better then
-					pick = trail
-				end
-			end
-		end
-		if pick then
-			local ok = buyThenCheck("trail", "TrailShopRequest", { "Buy", pick.Id }, function()
-				return N.ownedList("OwnedTrails")[pick.Id] == true
-			end, "Trails Shop")
-			if ok then
-				Session.bought += 1
-				shopNote("Bought " .. tostring(pick.Name))
-				fire("TrailShopRequest", "Equip", pick.Id)
-				if N.Events.bought then
-					pcall(N.Events.bought, tostring(pick.Name), tonumber(pick.Price) or 0)
-				end
-			elseif not N.Shop.trailStepByStep then
-				N.Shop.trailStepByStep = true
-				log("SHOP trail skip refused, buying one by one")
-			else
-				N.Shop.lastAt.trail = os.clock() + 60
-			end
-			return true
-		end
-		return false
+		return true
 	end
-	function N.plotStep()
+	function N.buyTrail(trail)
+		if N.cash() < (tonumber(trail.Price) or math.huge) then
+			return false
+		end
+		local ok = buyThenCheck("trail", "TrailShopRequest", { "Buy", trail.Id }, function()
+			return N.ownedList("OwnedTrails")[trail.Id] == true
+		end, "Trails Shop")
+		if ok then
+			shopNote("Bought " .. tostring(trail.Name))
+			fire("TrailShopRequest", "Equip", trail.Id)
+			boughtEvent(tostring(trail.Name), tonumber(trail.Price) or 0)
+		elseif not N.Shop.trailStepByStep then
+			N.Shop.trailStepByStep = true
+			log("SHOP trail skip refused, buying one by one")
+		else
+			N.Shop.lastAt.trail = os.clock() + 60
+		end
+		return true
+	end
+	function N.buyPlot()
 		local level = tonumber(N.plotAttr("PlotLevel", 1)) or 1
 		local costs = N.G.Plot.Costs
 		local cost = type(costs) == "table" and tonumber(costs[level]) or nil
-		if not cost or level >= (tonumber(N.G.Plot.MaxLevel) or 9) or N.cash() < cost then
-			return false
-		end
-		-- A new level only adds one slot. While slots stand empty and no animal waits in the backpack, it earns nothing,
-		-- so the cash goes to the pickaxe or stays for later.
-		local maxAnimals = tonumber(N.plotAttr("MaxAnimals", 0)) or 0
-		if maxAnimals > 0 and #N.placedAnimals() + N.backpackCount() < maxAnimals then
+		if not cost or N.cash() < cost then
 			return false
 		end
 		fire("UpgradePlotRequest")
@@ -32661,22 +33300,20 @@ do
 		end
 		return true
 	end
-	function N.treadmillStep()
-		if not N.treadmillUnlocked() then
-			local cost = tonumber(N.G.TreadmillUnlock.Cost) or 100
-			if N.cash() >= cost then
-				fire("UnlockTreadmillRequest")
-				if waitFor(N.treadmillUnlocked, 2.5) then
-					shopNote("Treadmill unlocked")
-				end
-				return true
-			end
+	function N.unlockTreadmill()
+		local cost = tonumber(N.G.TreadmillUnlock.Cost) or 100
+		if N.treadmillUnlocked() or N.cash() < cost then
 			return false
 		end
-		-- Treadmill levels only multiply training, so they are bought only while the hub trains and speed still helps.
-		if not (on("AutoTrain") and N.trainUseful()) then
-			return false
+		fire("UnlockTreadmillRequest")
+		if waitFor(N.treadmillUnlocked, 2.5) then
+			shopNote("Treadmill unlocked")
+		else
+			N.Shop.lastAt.treadmill = os.clock() + 60
 		end
+		return true
+	end
+	function N.upgradeTreadmill()
 		local level = tonumber(N.plotAttr("TreadmillLevel", 1)) or 1
 		local levels = N.G.Treadmill.Levels
 		local data = type(levels) == "table" and levels[level]
@@ -32695,20 +33332,18 @@ do
 		end
 		return true
 	end
-	-- Satchel: every tier carries one more animal per trip. Prices from SatchelConfig (tier 2..6). The station is a
-	-- tagged part with a prompt, found at runtime. Bought only when the price is at most half of the cash, so the
-	-- pickaxe and plot upgrades are never starved by it.
+	-- Satchel: every tier carries one more animal per trip. Prices from SatchelConfig. The station is a tagged part
+	-- with a prompt, found at runtime (it was not in the 2026-10-04 dump).
 	N.SatchelPrices = { 60000, 10000000, 2000000000, 400000000000, 12000000000000 }
-	function N.satchelStep()
-		local tier = tonumber(LocalPlayer:GetAttribute("SatchelTier")) or 1
-		local price = N.SatchelPrices[tier]
-		if not price or N.cash() < price * 2 then
-			return false
-		end
+	function N.satchelPrice(tier)
+		local tiers = N.G.Satchel.Tiers
+		local data = type(tiers) == "table" and tiers[tier + 1]
+		return (data and tonumber(data.Price)) or N.SatchelPrices[tier]
+	end
+	function N.satchelStation()
 		local station = N.tagged("SatchelUpgrade")[1]
 		if not station then
-			N.Shop.lastAt.satchel = os.clock() + 120
-			return false
+			return nil, nil
 		end
 		local prompt
 		if station:IsA("ProximityPrompt") then
@@ -32732,6 +33367,18 @@ do
 			position = if ok then pivot else nil
 		end
 		if not (prompt and position) then
+			return nil, nil
+		end
+		return prompt, position
+	end
+	function N.buySatchel()
+		local tier = tonumber(LocalPlayer:GetAttribute("SatchelTier")) or 1
+		local price = N.satchelPrice(tier)
+		if not price or N.cash() < price then
+			return false
+		end
+		local prompt, position = N.satchelStation()
+		if not prompt then
 			N.Shop.lastAt.satchel = os.clock() + 120
 			return false
 		end
@@ -32750,14 +33397,12 @@ do
 		return true
 	end
 	-- Fallen Tokens (Hell boss reward) buy 15 minute potions in the demon furnace shop (prices from DemonEventConfig).
-	-- Order by value: x2 cash for every placed animal first, then swing speed, walk speed, treadmill gain, egg growth.
+	-- Order: the planner's value per token (N.Plan.potionValue), see p06 planner below.
 	N.DemonPotions = {
 		{ id = "Cash", price = 275 },
 		{ id = "Swing", price = 400 },
 		{ id = "WalkSpeed", price = 150 },
-		{ id = "Treadmill", price = 250, need = function()
-			return on("AutoTrain") and N.trainUseful()
-		end },
+		{ id = "Treadmill", price = 250 },
 		{ id = "EggGrowth", price = 325, need = function()
 			return #N.tagged("MergeEggPlaced") > 0
 		end },
@@ -32769,39 +33414,51 @@ do
 			return false
 		end
 		local now = N.serverNow()
+		local best, bestScore
 		for _, potion in ipairs(N.DemonPotions) do
 			if tokens >= potion.price and (not potion.need or potion.need()) then
 				local ends = tonumber(LocalPlayer:GetAttribute("PotionEndsAt_" .. potion.id)) or 0
 				if ends <= now + 20 and os.clock() - (N.Demon.at[potion.id] or -1e9) > 30 then
-					N.Demon.at[potion.id] = os.clock()
-					fire("DemonEventRequest", "BuyPotion", potion.id)
-					N.Demon.bought += 1
-					shopNote("Fallen Tokens: " .. potion.id .. " potion")
-					task.wait(0.5)
-					return true
+					local ok, value = pcall(N.Plan.potionValue, potion.id)
+					local score = (if ok and type(value) == "number" then value else 0) / potion.price
+					if score > 0 and (not bestScore or score > bestScore) then
+						best, bestScore = potion, score
+					end
 				end
 			end
 		end
-		return false
+		if not best then
+			return false
+		end
+		N.Demon.at[best.id] = os.clock()
+		fire("DemonEventRequest", "BuyPotion", best.id)
+		N.Demon.bought += 1
+		shopNote(string.format("Fallen Tokens: %s potion (worth $%s per token)", best.id, formatNumber(math.floor(bestScore))))
+		task.wait(0.5)
+		return true
 	end
 	function N.shopStep()
+		pcall(N.Plan.update, false)
 		if N.tutorial() or N.carrying() then
 			return false
 		end
-		local steps = {
-			{ "AutoPickaxe", "pickaxe", N.pickaxeStep },
-			{ "AutoPlotUpgrade", "plot", N.plotStep },
-			{ "AutoTreadmill", "treadmill", N.treadmillStep },
-			{ "AutoTrail", "trail", N.trailStep },
-			{ "AutoSatchel", "satchel", N.satchelStep },
-			{ "AutoDemonShop", "demon", N.demonStep },
-		}
-		for _, step in ipairs(steps) do
-			if on(step[1]) and (N.Shop.lastAt[step[2]] or 0) < os.clock() then
-				local ok, did = pcall(step[3])
-				if ok and did then
-					return true
-				end
+		if N.equipOwnedStep() then
+			return true
+		end
+		local pick = N.Plan.pick
+		if pick and (N.Shop.lastAt[pick.key] or 0) < os.clock() then
+			N.Plan.pick = nil
+			local ok, did = pcall(pick.act)
+			if ok and did then
+				log(string.format("PLAN bought %s for $%s (gain/$ %.3g, pays back in %ds)", pick.label, formatNumber(pick.cost), pick.ratio, math.floor(pick.payback or 0)))
+				N.Plan.at = -1e9
+				return true
+			end
+		end
+		if on("AutoDemonShop") and (N.Shop.lastAt.demon or 0) < os.clock() then
+			local ok, did = pcall(N.demonStep)
+			if ok and did then
+				return true
 			end
 		end
 		return false
@@ -33159,6 +33816,13 @@ do
 						if Options.ZoneMode then
 							Options.ZoneMode:SetValue("Best zone")
 						end
+						-- The counting mode (8.00): the planner picks the egg, the zone and farm vs train.
+						if Options.EggPriority then
+							Options.EggPriority:SetValue("Best value per second")
+						end
+						if Options.TrainMode then
+							Options.TrainMode:SetValue("Profit plan")
+						end
 						if Options.MoveMode and N.moveMode() ~= "Walk" then
 							Options.MoveMode:SetValue("Walk")
 						end
@@ -33214,9 +33878,9 @@ do
 		})
 		EggBox:AddDropdown("EggPriority", {
 			Text = "Egg Priority",
-			Values = { "Fewest hits", "Heaviest", "Luckiest", "Nearest" },
-			Default = "Fewest hits",
-			Tooltip = "Heaviest eggs hatch bigger animals, luckiest ones roll rarer animals",
+			Values = { "Best value per second", "Fewest hits", "Heaviest", "Luckiest", "Nearest" },
+			Default = "Best value per second",
+			Tooltip = "Best value per second weighs the expected animal (zone odds, egg luck, your weakest pet) against the hits and the walk. Heaviest eggs hatch bigger animals, luckiest ones roll rarer animals",
 		})
 		EggBox:AddDropdown("EggPick", {
 			Text = "Egg Types (none = all)",
@@ -33326,8 +33990,9 @@ do
 		})
 		TrainBox:AddDropdown("TrainMode", {
 			Text = "With Egg Farm On",
-			Values = { "Alternate", "When nothing to farm" },
-			Default = "Alternate",
+			Values = { "Profit plan", "Alternate", "When nothing to farm" },
+			Default = "Profit plan",
+			Tooltip = "Profit plan trains only when more speed (a new zone or faster walking) earns more in 24 h than farming now. Alternate follows the minutes below",
 		})
 		TrainBox:AddSlider("FarmMinutes", { Text = "Farm For", Default = 10, Min = 1, Max = 120, Rounding = 0, Suffix = " min" })
 		TrainBox:AddSlider("TrainMinutes", { Text = "Then Train For", Default = 5, Min = 1, Max = 120, Rounding = 0, Suffix = " min" })
@@ -33349,13 +34014,13 @@ do
 	do
 		local BuyBox = Tabs.Upgrades:AddLeftGroupbox("Auto Buy", "shopping-cart")
 		BuyBox:AddToggle("AutoPickaxe", { Text = "Best Pickaxe", Default = false, Tooltip = "Buys and equips the best pickaxe you can afford" })
-		BuyBox:AddToggle("AutoTrail", { Text = "Best Trail", Default = false, Tooltip = "Trails multiply the speed you get on the treadmill. Bought only while Auto Train is on and speed still helps" })
-		BuyBox:AddToggle("AutoPlotUpgrade", { Text = "Plot Upgrades", Default = false, Tooltip = "Every plot level holds one more animal. Bought when your plot and backpack have no free slot left" })
+		BuyBox:AddToggle("AutoTrail", { Text = "Best Trail", Default = false, Tooltip = "Trails multiply the speed you get on the treadmill. Bought when the profit plan says the faster training pays back" })
+		BuyBox:AddToggle("AutoPlotUpgrade", { Text = "Plot Upgrades", Default = false, Tooltip = "Every plot level holds one more animal. Bought when the profit plan ranks it best per dollar" })
 		BuyBox:AddToggle("AutoTreadmill", { Text = "Treadmill Unlock And Upgrades", Default = false })
 		BuyBox:AddToggle("AutoSatchel", {
 			Text = "Satchel Upgrades",
 			Default = false,
-			Tooltip = "Every satchel tier carries one more animal per trip. Walks to the satchel station when the price is at most half of your cash",
+			Tooltip = "Every satchel tier carries one more animal per trip. Walks to the satchel station when the profit plan ranks it best per dollar",
 		})
 		BuyBox:AddToggle("ShopTravel", {
 			Text = "Walk To Shop If Needed",
@@ -33367,7 +34032,7 @@ do
 		TokenBox:AddToggle("AutoDemonShop", {
 			Text = "Buy Potions With Fallen Tokens",
 			Default = false,
-			Tooltip = "Spends the Fallen Tokens you own in the demon shop on 15 minute potions: x2 cash first, then swing, walk speed, treadmill and egg growth. Buys again when a potion ends",
+			Tooltip = "Spends the Fallen Tokens you own in the demon shop on 15 minute potions, the one worth the most cash per token first. Buys again when a potion ends",
 		})
 		TokenBox:AddLabel({
 			Text = '<font transparency="0.35">Tokens drop from the Hell boss. Needs the demon furnace unlocked in the game.</font>',
@@ -34579,13 +35244,13 @@ do
 	-- Builds every label text here, the draw thread below only copies strings.
 	N.InfoText = {}
 	task.spawn(function()
-		local lastBest = N.bestZone()
+		local lastBest = N.topZone()
 		while alive() do
 			local started = os.clock()
 			pcall(function()
 				local I = N.InfoText
 				local power = N.power()
-				local best = N.bestZone()
+				local best = N.topZone()
 				if best > lastBest then
 					for index = lastBest + 1, best do
 						local zone = N.Cat.zones[index]
@@ -34600,6 +35265,7 @@ do
 					return
 				end
 				local nextZone = N.nextZone()
+				best = N.bestZone()
 				local zone = N.Cat.zones[best]
 				I.info = string.format(
 					"<b>$%s</b>  \u{00B7}  $%s/s  \u{00B7}  speed <b>%s</b>\nPickaxe <b>%s</b> (%s dmg)  \u{00B7}  carrying <b>%d/%d</b>\nBest zone <b>%d %s</b>%s",
@@ -34613,7 +35279,7 @@ do
 					best,
 					if zone then zone.rarity else "?",
 					if nextZone then string.format("\nNext: zone %d at <b>%s</b> speed", nextZone.index, formatNumber(nextZone.power)) else "\nEvery zone is open"
-				) .. (if N.tutorial() then '\n<font color="#fab428">Finish the game tutorial first, it blocks every purchase</font>' else "")
+				) .. "\n" .. tostring(N.Plan.summary or "") .. (if N.tutorial() then '\n<font color="#fab428">Finish the game tutorial first, it blocks every purchase</font>' else "")
 				local guards = {}
 				for _, info in ipairs(N.guards()) do
 					if info.state ~= "Roaming" and info.state ~= "Idle" then
@@ -34687,7 +35353,7 @@ do
 						tostring(N.plotAttr("TreadmillLevel", "?")),
 						tostring(mult),
 						formatNumber(trailMult),
-						if N.Train.startedAt then '<font color="#60d696">Training now</font>' else "Phase: " .. N.Train.phase
+						if N.Train.startedAt then '<font color="#60d696">Training now</font>' elseif optionText("TrainMode", "Profit plan") == "Profit plan" then "Plan: " .. N.Plan.activity else "Phase: " .. N.Train.phase
 					)
 					else '<font color="#fab428">Treadmill is locked</font>, turn on the treadmill upgrade in Upgrades or buy it at your plot'
 				local shopLines = {}
