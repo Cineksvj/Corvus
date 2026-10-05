@@ -30637,6 +30637,7 @@ do
 	N.G.Daily = N.tableOr(safeRequire("Framework.Features.Rewards.DailyRewardConfig"))
 	N.G.Group = N.tableOr(safeRequire("Framework.Features.Rewards.GroupRewardConfig"))
 	N.G.Mutations = N.tableOr(safeRequire("Framework.Features.Inventory.Kinds.Unit.Mutations"))
+	N.G.Monetization = N.tableOr(safeRequire("Framework.Features.Monetization.MonetizationConfig"))
 end
 local formatNumber, allows, selected, on, optionNumber, optionText, Status, setStatus, picked
 do
@@ -31346,7 +31347,7 @@ do
 	-- With high luck the game stops rolling plain low units but still rolls their Silver/Gold versions, so nearly
 	-- every roll is "mutated". Only the mutations picked in Keep Mutations are protected, the rest is judged by value.
 	N.MutationNames = { "Silver", "Gold", "Emerald", "Diamond", "Ruby", "Rainbow" }
-	-- relax 1 (storage full and nothing to sell for a while): the extra best units are not kept any more.
+	-- relax 1 (storage full, rolling blocked): the extra best units are not kept any more.
 	-- relax 2: mutations picked in Keep Mutations may go too. Plot, team, locked and rare units are never sold.
 	function N.sellPlan(relax)
 		relax = relax or 0
@@ -31387,7 +31388,9 @@ do
 		local relax = 0
 		if N.Roll.fullSince then
 			local stuck = os.clock() - N.Roll.fullSince
-			relax = if stuck > 120 then 2 elseif stuck > 45 then 1 else 0
+			-- Extra copies earn nothing while rolling is blocked (new drops refill any slot a rebirth opens), so they go
+			-- at once. Kept mutations are the player's own protection and only go after 2 minutes.
+			relax = if stuck > 120 then 2 else 1
 		end
 		local plan = N.sellPlan(relax)
 		if relax > 0 and #plan > 0 then
@@ -31756,7 +31759,12 @@ do
 				end
 			end
 		end
-		if on("AutoTicketPasses") and due("passes", 15) then
+		if on("SmartSpend") then
+			-- Profit engine: passes and spins ranked by income gained per ticket (p05_spend).
+			if (on("AutoTicketPasses") or on("AutoTicketSpins")) and due("ticketPlan", 15) then
+				N.ticketStep()
+			end
+		elseif on("AutoTicketPasses") and due("passes", 15) then
 			local tickets = N.amount("Tickets")
 			local order = { optionText("TicketPassFirst", "Roll Speed") }
 			for _, name in ipairs(N.TicketPasses) do
@@ -31774,7 +31782,7 @@ do
 				end
 			end
 		end
-		if on("AutoTicketSpins") and due("ticketSpins", 10) then
+		if not on("SmartSpend") and on("AutoTicketSpins") and due("ticketSpins", 10) then
 			local allPasses = true
 			for _, name in ipairs(N.TicketPasses) do
 				if not N.ownsPass(name) then
@@ -31954,24 +31962,55 @@ do
 	end
 end
 do
-	-- Smart Spending: every way to spend cash goes on one scale, payback time = price / extra $ per second.
-	--   Slot level: +25% of the unit's level-1 income (exact, N.levelGain).
-	--   Money upgrade: plot income * amount / current money percent (the percent bucket is additive).
-	--   Dice, Luck/Fortune upgrades, Roll Speed: the server rolls with weights 1/(chance/luck) over every unit
-	--     and mutation whose chance/luck >= 1 (RollUtil.RollUnit). The hub rebuilds that exact distribution,
-	--     takes K = rolls in the planning horizon and computes how much plot income those rolls are expected to
-	--     add (expected best of K against the weakest plot unit, capped by the slots). The difference between
-	--     the new and the current luck/speed is the gain.
-	--   Sell upgrades: the cash per second the hub really got from selling so far * amount / sell percent.
-	--   Upgrade tree: an upgrade can only be bought after its parent, so a cheap upgrade that opens a great one
-	--     (Luck III -> Roll Speed I, Luck VI -> Fortune I) is rated by the best payback of the path up to 3 steps deep.
-	--   Rebirth: costs all your cash, multiplies luck and money and opens plot slots (filled with spare units).
-	-- The best payback is bought when affordable. Otherwise the hub saves for it, unless another option pays
-	-- back within 3x and saving would take longer than that option's own payback. A purchase that did not go
-	-- through is verified and that option is skipped for 30 s (no remote spam).
-	N.Spend = { at = -1e9, nextAt = 0, collectAt = -1e9, last = "", plan = {}, cache = {}, cacheCount = 0, failed = {}, top = nil }
+	-- Profit engine v2 (CLAUDE.md.txt 8.00). Every way to spend cash or tickets is an option with a cost C and an
+	-- expected extra plot income dI ($/s). Options are bought in falling dI/C order (the exchange argument).
+	--   Rolls: the server rolls with weights luck/chance over every unit and mutation with chance/luck >= 1
+	--     (RollUtil.RollUnit). The hub rebuilds that distribution and computes the expected plot income after K more
+	--     drops exactly: top-S sum = integral over v of E[min(S, plot units >= v + Poisson(K * P(drop >= v)))].
+	--     For small K that is drops/s * E[max(0, drop - weakest slot)], the value of the next rolls that beat the
+	--     worst slot; for large K it saturates at the best units the luck can give.
+	--   Luck, dice, roll speed, storage, money and rebirth all change (luck, drops/s, money multiplier, slots), so
+	--     they are all valued by the same function: the plot income they lead to over time minus the plot income
+	--     without them.
+	--   Time: dI is averaged over the rolling 24 h horizon, weighted by e^(-rho t), where rho is the
+	--     measured return of the cash the hub reinvested (gain/$ of recent purchases). A constant gain keeps its
+	--     value, a gain that only arrives later (luck) is worth less when money compounds fast.
+	--   Slot levels stay on the unit, so a level is only worth the time its unit is expected to stay on the plot
+	--     (Poisson odds that enough better drops arrive to push it out).
+	--   Rebirth wipes all cash: the excess above its cost is spent first, and it is only done when its gain per $
+	--     destroyed beats what that cash would buy.
+	--   Saving: when the best option is too expensive, a cheaper one is bought on the way only when it shortens the
+	--     wait for the best one: (price - cash + C) / (income + dI) < (price - cash) / income.
+	--   Horizon: rolling 24 h from now. Options that cannot pay back within it are skipped (rebirth is progress and stays).
+	-- All rates (drops/s, cash/s, sold $/s, storage blocked time, tickets/s) are measured live.
+	N.Spend = {
+		at = -1e9,
+		nextAt = 0,
+		collectAt = -1e9,
+		last = "",
+		plan = {},
+		cache = {},
+		cacheCount = 0,
+		failed = {},
+		top = nil,
+		spent = 0,
+		ticketsSpent = 0,
+		luckCache = {},
+		luckCount = 0,
+		retGain = 0,
+		retPrice = 0,
+		retAt = 0,
+		planAt = -1e9,
+		planBest = "",
+		ticketAt = -1e9,
+		ticketBest = "",
+		ticketLast = "",
+		rates = { at = nil, mark = nil, blocked = 0, episodes = 0, lastFull = nil },
+	}
 	local Sp = N.Spend
-	-- Every unit/mutation outcome with its weight and level-1 income (before money buffs).
+	N.DayLength = 86400
+	local Samples = 8
+	-- Every unit/mutation outcome with its chance and level-1 income (before money buffs), sorted by income.
 	function N.rollOutcomes()
 		if Sp.outcomes then
 			return Sp.outcomes
@@ -32004,60 +32043,176 @@ do
 		Sp.outcomes = list
 		return list
 	end
-	-- Expected plot income (level-1 units, before money buffs) added by K rolls at luck L.
-	function N.rollValue(luck, rolls)
+	-- Drop distribution at a luck: incomes from high to low with q = P(drop income >= that income).
+	local function luckTable(luck)
 		luck = math.max(luck, 1)
-		local key = string.format("%.4g|%.4g", luck, rolls)
-		local cached = Sp.cache[key]
-		if cached and os.clock() - cached.at < 5 then
-			return cached.value
+		local key = string.format("%.6g", luck)
+		local cached = Sp.luckCache[key]
+		if cached then
+			return cached
 		end
 		local outcomes = N.rollOutcomes()
 		local total = 0
 		for _, o in ipairs(outcomes) do
-			local c = o.chance / luck
-			if c >= 1 then
-				total += 1 / c
+			if o.chance / luck >= 1 then
+				total += luck / o.chance
 			end
 		end
-		local value = 0
+		local levels = {}
 		if total > 0 then
-			local plotted, slots, weakest = 0, #N.unlockedSlots(), math.huge
-			for _, info in ipairs(N.units()) do
-				if info.slot then
-					plotted += 1
-					weakest = math.min(weakest, info.income)
-				end
-			end
-			if plotted < slots or weakest == math.huge then
-				weakest = 0
-			end
-			local mult = math.max(N.buff("Money Multiplier", 1) or 1, 1e-9)
-			weakest /= mult
-			-- Per roll: expected improvement over the weakest plot unit. Over K rolls: expected best roll.
-			local perRoll, cdf, prevPow, best = 0, 0, 0, 0
-			for _, o in ipairs(outcomes) do
-				local c = o.chance / luck
-				if c >= 1 then
-					local p = (1 / c) / total
-					if o.income > weakest then
-						perRoll += p * (o.income - weakest)
+			local tail = 0
+			for i = #outcomes, 1, -1 do
+				local o = outcomes[i]
+				if o.chance / luck >= 1 then
+					tail += (luck / o.chance) / total
+					local last = levels[#levels]
+					if last and last.income == o.income then
+						last.q = math.min(tail, 1)
+					else
+						table.insert(levels, { income = o.income, q = math.min(tail, 1) })
 					end
-					cdf += p
-					local pow = math.min(cdf, 1) ^ rolls
-					best += o.income * (pow - prevPow)
-					prevPow = pow
 				end
 			end
-			value = math.min(perRoll * rolls, math.max(best - weakest, 0) * math.max(slots, 1))
 		end
-		if Sp.cacheCount > 400 then
-			table.clear(Sp.cache)
-			Sp.cacheCount = 0
+		if Sp.luckCount > 200 then
+			table.clear(Sp.luckCache)
+			Sp.luckCount = 0
 		end
-		Sp.cacheCount += 1
-		Sp.cache[key] = { at = os.clock(), value = value }
-		return value
+		Sp.luckCount += 1
+		Sp.luckCache[key] = levels
+		return levels
+	end
+	N.luckTable = luckTable
+	-- P(drop income > v)
+	local function qAbove(levels, v)
+		local q = 0
+		for _, level in ipairs(levels) do
+			if level.income > v then
+				q = level.q
+			else
+				break
+			end
+		end
+		return q
+	end
+	-- E[min(S, c + X)], X ~ Poisson(lambda): how many of the S slots hold a unit worth at least v.
+	local function expectedFilled(slots, count, lambda)
+		if count >= slots then
+			return slots
+		end
+		if lambda <= 0 then
+			return count
+		end
+		local need = slots - count
+		-- Numerical cut only: P(X < need) is below 1e-20 here.
+		if lambda - need > 10 * math.sqrt(lambda) + 10 then
+			return slots
+		end
+		local p = math.exp(-lambda)
+		local short = 0
+		for j = 0, need - 1 do
+			short += (need - j) * p
+			p = p * lambda / (j + 1)
+		end
+		return slots - short
+	end
+	-- P(X <= n), X ~ Poisson(lambda)
+	local function poissonAtMost(lambda, n)
+		if n < 0 then
+			return 0
+		end
+		if lambda <= 0 then
+			return 1
+		end
+		local p = math.exp(-lambda)
+		local sum = p
+		for j = 1, n do
+			p = p * lambda / j
+			sum += p
+		end
+		return math.min(sum, 1)
+	end
+	-- Merges the drop distribution, the plot units (high to low) and an optional one-off extra drop (spin) into
+	-- the steps of the income integral. Stops once the plot alone fills every slot.
+	local function buildProfile(levels, plot, slots, extra)
+		local v, c, q, qe = {}, {}, {}, {}
+		local li, pi, ei = 1, 1, 1
+		local count, tail, tailExtra = 0, 0, 0
+		while true do
+			local top = 0
+			if levels[li] and levels[li].income > top then
+				top = levels[li].income
+			end
+			if plot[pi] and plot[pi] > top then
+				top = plot[pi]
+			end
+			if extra and extra[ei] and extra[ei].income > top then
+				top = extra[ei].income
+			end
+			if top <= 0 then
+				break
+			end
+			while levels[li] and levels[li].income >= top do
+				tail = levels[li].q
+				li += 1
+			end
+			while plot[pi] and plot[pi] >= top do
+				count += 1
+				pi += 1
+			end
+			while extra and extra[ei] and extra[ei].income >= top do
+				tailExtra = extra[ei].q
+				ei += 1
+			end
+			table.insert(v, top)
+			table.insert(c, count)
+			table.insert(q, tail)
+			table.insert(qe, tailExtra)
+			if count >= slots then
+				break
+			end
+		end
+		return { v = v, c = c, q = q, qe = qe }
+	end
+	-- Expected plot income (level-1 incomes, before money buffs) after `drops` more drops.
+	local function plotAfter(profile, drops, slots)
+		local v, c, q, qe = profile.v, profile.c, profile.q, profile.qe
+		local total = 0
+		for k = 1, #v do
+			local width = v[k] - (v[k + 1] or 0)
+			local filled
+			if c[k] >= slots then
+				filled = slots
+			else
+				local lambda = drops * q[k]
+				filled = expectedFilled(slots, c[k], lambda)
+				if qe[k] > 0 then
+					filled = qe[k] * expectedFilled(slots, c[k] + 1, lambda) + (1 - qe[k]) * filled
+				end
+			end
+			total += width * filled
+		end
+		return total
+	end
+	-- Plot units (incomes before money buffs, high to low) and the slot count.
+	local function currentPlot()
+		local mult = math.max(N.buff("Money Multiplier", 1) or 1, 1e-9)
+		local plot = {}
+		for _, info in ipairs(N.units()) do
+			if info.slot then
+				table.insert(plot, info.income / mult)
+			end
+		end
+		table.sort(plot, function(a, b)
+			return a > b
+		end)
+		return plot, math.max(#N.unlockedSlots(), 1), mult
+	end
+	-- Expected plot income (before money buffs) that `rolls` more drops add at luck L.
+	function N.rollValue(luck, rolls)
+		local plot, slots = currentPlot()
+		local profile = buildProfile(luckTable(luck), plot, slots, nil)
+		return math.max(plotAfter(profile, rolls, slots) - plotAfter(profile, 0, slots), 0)
 	end
 	-- Sum of one buff bucket over the upgrades you own (luck base, money percent, sell percent).
 	local function bucketSum(buffName, bucket)
@@ -32071,44 +32226,152 @@ do
 		end
 		return total
 	end
-	function N.horizon()
-		return math.clamp(optionNumber("SpendHorizon", 30), 5, 720) * 60
+	-- Rolling 24 h horizon: always the next 24 hours from now (the hub farms forever, nothing counts down).
+	function N.horizonLeft()
+		return N.DayLength
 	end
 	function N.diceLuck(name)
 		local dice = N.call(N.G.Dice.Get, name)
 		return tonumber(type(dice) == "table" and dice.luck) or 1
 	end
-	-- Extra plot $/s from a change of luck and/or roll speed, averaged over the horizon (income from new rolls
-	-- grows from 0 to the full gain, so half of it on average).
-	function N.luckGain(newLuck, newDuration)
-		local H = N.horizon()
-		local rollsBuff = math.max(N.buff("Rolls", 1) or 1, 1)
-		local duration = N.rollDuration()
-		local luck = N.diceLuck(tostring(N.field("Dice", "Basic"))) * (N.buff("Luck", 1) or 1)
-		local now = N.rollValue(luck, H / duration * rollsBuff)
-		local after = N.rollValue(newLuck or luck, H / math.max(newDuration or duration, 0.2) * rollsBuff)
-		local mult = N.buff("Money Multiplier", 1) or 1
-		return math.max(after - now, 0) * mult * 0.5
+	-- Live rates, exponential moving averages over about 5 minutes (prior: the game formula).
+	function N.measureRates()
+		local R = Sp.rates
+		local now = os.clock()
+		local mark = {
+			rolls = Session.rolls,
+			cash = N.money() + N.pendingBalance() + Sp.spent,
+			sold = Session.soldCash,
+			tickets = N.amount("Tickets") + Sp.ticketsSpent,
+		}
+		if R.at and R.mark then
+			local dt = now - R.at
+			if dt < 0.5 then
+				return R
+			end
+			local a = 1 - math.exp(-dt / 300)
+			local function ema(old, value)
+				return old + a * (value - old)
+			end
+			if on("AutoRoll") and not N.manualRunning() then
+				local rollsBuff = math.max(N.buff("Rolls", 1) or 1, 1)
+				R.rolls = ema(R.rolls or rollsBuff / (N.rollDuration() + N.Roll.margin), math.max(mark.rolls - R.mark.rolls, 0) / dt)
+				local full = N.Roll.fullSince
+				R.blocked = ema(R.blocked, if full then 1 else 0)
+				R.episodes = ema(R.episodes, (if full and full ~= R.lastFull then 1 else 0) / dt)
+				R.lastFull = full
+			end
+			R.cash = ema(R.cash or N.plotIncome(), math.max(mark.cash - R.mark.cash, 0) / dt)
+			R.sold = ema(R.sold or 0, math.max(mark.sold - R.mark.sold, 0) / dt)
+			R.tickets = ema(R.tickets or 0, math.max(mark.tickets - R.mark.tickets, 0) / dt)
+		end
+		R.at, R.mark = now, mark
+		return R
+	end
+	-- Discount points: quantiles of e^(-rho t) on [0, T]. A constant gain averages to itself.
+	local function samplePoints(rho, T)
+		local list = {}
+		local mass = 1 - math.exp(-rho * T)
+		for i = 1, Samples do
+			local u = (i - 0.5) / Samples
+			table.insert(list, if mass < 1e-9 then u * T else -math.log(1 - u * mass) / rho)
+		end
+		return list
 	end
 	-- Everything the gain maths needs, read once per planning round.
 	function N.spendContext()
-		local elapsed = os.clock() - Session.started
-		local stuck = N.Roll.fullSince ~= nil and os.clock() - N.Roll.fullSince > 20
-		return {
-			income = math.max(N.plotIncome(), 1),
+		local now = os.clock()
+		local R = Sp.rates
+		local plot, slots, mult = currentPlot()
+		local duration = N.rollDuration()
+		local rollsBuff = math.max(N.buff("Rolls", 1) or 1, 1)
+		local fullRate = rollsBuff / (duration + N.Roll.margin)
+		local left = N.horizonLeft()
+		-- Return of the reinvested cash: gain/$ of recent purchases, fading over about 10 minutes.
+		local fade = math.exp(-math.max(now - Sp.retAt, 0) / 600)
+		Sp.retGain *= fade
+		Sp.retPrice *= fade
+		Sp.retAt = now
+		local rho = math.max(if Sp.retPrice > 0 then Sp.retGain / Sp.retPrice else 0, 1 / left)
+		local buffLuck = N.buff("Luck", 1) or 1
+		local diceLuck = N.diceLuck(tostring(N.field("Dice", "Basic")))
+		local ctx = {
+			income = math.max(N.plotIncome(), 1e-9),
+			cashRate = math.max(R.cash or N.plotIncome(), N.plotIncome(), 1e-9),
 			money = N.money(),
-			buffLuck = N.buff("Luck", 1) or 1,
-			diceLuck = N.diceLuck(tostring(N.field("Dice", "Basic"))),
+			mult = mult,
+			plot = plot,
+			slots = slots,
+			buffLuck = buffLuck,
+			diceLuck = diceLuck,
+			luck = diceLuck * buffLuck,
+			duration = duration,
+			rollsBuff = rollsBuff,
+			fullRate = fullRate,
+			rate = R.rolls or fullRate * (1 - R.blocked),
+			blocked = R.blocked,
+			episodes = R.episodes,
 			luckBase = 1 + bucketSum("Luck", "base"),
 			moneyPercent = 1 + bucketSum("Money Multiplier", "percentage"),
 			sellPercent = 1 + bucketSum("Sell Multiplier", "percentage"),
-			sellRate = if elapsed > 120 then Session.soldCash / elapsed else 0,
-			stuck = stuck,
-			nearFull = N.UnitCache.count >= N.storage() * 0.85,
+			sellRate = R.sold or 0,
+			left = left,
+			rho = rho,
+			samples = samplePoints(rho, left),
+			profiles = {},
+			values = {},
 		}
+		return ctx
+	end
+	-- Discounted average plot income (before money buffs) at a luck and drop rate.
+	local function valueOf(ctx, luck, rate, change)
+		local plot = change and change.plot or ctx.plot
+		local slots = change and change.slots or ctx.slots
+		local extraLuck = change and change.extraLuck
+		local tag = (change and change.tag or "") .. "|" .. (if extraLuck then string.format("%.6g", extraLuck) else "")
+		local key = string.format("%.6g|%.6g|", luck, rate) .. tag
+		local hit = ctx.values[key]
+		if hit then
+			return hit
+		end
+		local profileKey = string.format("%.6g|", luck) .. tag
+		local profile = ctx.profiles[profileKey]
+		if not profile then
+			profile = buildProfile(luckTable(luck), plot, slots, if extraLuck then luckTable(extraLuck) else nil)
+			ctx.profiles[profileKey] = profile
+		end
+		local sum = 0
+		for _, t in ipairs(ctx.samples) do
+			sum += plotAfter(profile, rate * t, slots)
+		end
+		local value = sum / #ctx.samples
+		ctx.values[key] = value
+		return value
+	end
+	-- Extra $/s of a change: { luck, rate, moneyRatio, plot, slots, extraLuck, tag }.
+	function N.changeGain(ctx, change)
+		local after = valueOf(ctx, change.luck or ctx.luck, change.rate or ctx.rate, change)
+		local before = valueOf(ctx, ctx.luck, ctx.rate, nil)
+		return ((change.moneyRatio or 1) * after - before) * ctx.mult
+	end
+	-- Share of the horizon a plot unit is expected to stay on the plot (better drops push it out).
+	local function survival(ctx, info)
+		local v = info.income / ctx.mult
+		local rank = 1
+		for _, other in ipairs(ctx.plot) do
+			if other > v then
+				rank += 1
+			end
+		end
+		local q = qAbove(luckTable(ctx.luck), v)
+		local sum = 0
+		for _, t in ipairs(ctx.samples) do
+			sum += poissonAtMost(ctx.rate * t * q, ctx.slots - rank)
+		end
+		return sum / #ctx.samples
 	end
 	local function newDelta()
-		return { money = 0, luck = 0, duration = 0, sell = 0, storage = 0, other = 0 }
+		return { money = 0, luck = 0, duration = 0, sell = 0, storage = 0 }
 	end
 	local function addUpgrade(into, name)
 		local data = N.G.Upgrades[name]
@@ -32124,31 +32387,41 @@ do
 			elseif buffName == "Sell Multiplier" and buff.bucket == "percentage" then
 				into.sell += amount
 			elseif buffName == "Unit Storage" then
-				into.storage += 1
-			else
-				-- Damage, health, walkspeed, trait/grade luck: no direct income.
-				into.other += 1
+				into.storage += amount
 			end
+			-- Damage, health, walkspeed, trait/grade luck: no cash (towers pay boosts, gems and rerolls), worth 0 on
+			-- their own; they are bought only when they open a branch that pays (path lookahead).
 		end
 	end
-	-- Extra plot $/s from a summed change of buffs.
+	-- Extra $/s from a summed change of buffs.
 	local function deltaGain(d, ctx)
-		local gain = 0
-		if d.money ~= 0 then
-			gain += ctx.income * d.money / math.max(ctx.moneyPercent, 1)
+		local change = {}
+		if d.luck ~= 0 then
+			change.luck = ctx.luck * (ctx.luckBase + d.luck) / math.max(ctx.luckBase, 1e-9)
 		end
-		if d.luck ~= 0 or d.duration ~= 0 then
-			local newLuck = if d.luck ~= 0 then ctx.diceLuck * ctx.buffLuck * (ctx.luckBase + d.luck) / math.max(ctx.luckBase, 1) else nil
-			gain += N.luckGain(newLuck, if d.duration ~= 0 then N.rollDuration() + d.duration else nil)
+		local rate = ctx.rate
+		if d.duration ~= 0 then
+			rate = rate * ctx.duration / math.max(ctx.duration + d.duration, 0.2)
+		end
+		if d.storage ~= 0 then
+			-- Each time the storage fills, `storage` more drops fit before rolling stops (measured fills per second),
+			-- never more than the drops that were blocked.
+			rate += math.min(ctx.blocked * ctx.fullRate, d.storage * ctx.episodes)
+		end
+		if rate ~= ctx.rate then
+			change.rate = rate
+		end
+		if d.money ~= 0 then
+			change.moneyRatio = (ctx.moneyPercent + d.money) / math.max(ctx.moneyPercent, 1e-9)
+		end
+		local gain = 0
+		if change.luck or change.rate or change.moneyRatio then
+			gain = N.changeGain(ctx, change)
 		end
 		if d.sell ~= 0 then
-			gain += ctx.sellRate * d.sell / math.max(ctx.sellPercent, 1)
+			gain += ctx.sellRate * d.sell / math.max(ctx.sellPercent, 1e-9)
 		end
-		if d.storage > 0 then
-			-- Storage only matters when it blocks rolling.
-			gain += ctx.income * (if ctx.stuck then 0.5 elseif ctx.nearFull then 0.05 else 0.002)
-		end
-		return gain + ctx.income * 0.002 * d.other
+		return gain
 	end
 	-- Best payback of buying `head` and then walking down its children (max 3 steps): returns payback and the
 	-- upgrade that makes it worth it.
@@ -32177,50 +32450,61 @@ do
 		walk(head.name, 1, head.price, d)
 		return best, via
 	end
-	-- Plot income added by the next rebirth: the money multiplier on everything plus the spare units that fill
-	-- the slots it opens.
-	local function rebirthSlotsGain(ctx, moneyRatio)
-		local current = N.rebirth()
+	-- The next rebirth: luck and money multipliers, plus the slots it opens filled with the best spare units.
+	local function rebirthChange(ctx, nextData, current)
+		local moneyRatio = (tonumber(nextData.moneyMultiplier) or 1) / math.max(tonumber(current.moneyMultiplier) or 1, 1e-9)
+		local luckRatio = (tonumber(nextData.luckMultiplier) or 1) / math.max(tonumber(current.luckMultiplier) or 1, 1e-9)
+		local rebirth = N.rebirth()
 		local opened = 0
 		for i = 1, N.maxSlots() do
 			local ok, need = pcall(N.G.Plot.GetSlotRebirthRequirement, i)
-			if ok and type(need) == "number" and need > current and need <= current + 1 then
+			if ok and type(need) == "number" and need > rebirth and need <= rebirth + 1 then
 				opened += 1
 			end
 		end
-		local spare = 0
+		local plot = ctx.plot
 		if opened > 0 then
+			plot = table.clone(ctx.plot)
+			local left = opened
 			for _, info in ipairs(N.units()) do
-				if not info.slot and opened > 0 then
-					spare += info.income
-					opened -= 1
+				if not info.slot and left > 0 then
+					table.insert(plot, info.income / ctx.mult)
+					left -= 1
 				end
 			end
+			table.sort(plot, function(a, b)
+				return a > b
+			end)
 		end
-		local mult = N.buff("Money Multiplier", 1) or 1
-		return (ctx.income + spare * mult) * moneyRatio - ctx.income
+		return { luck = ctx.luck * luckRatio, moneyRatio = moneyRatio, plot = plot, slots = ctx.slots + opened, tag = "rebirth" }
 	end
 	function N.spendOptions()
 		local list = {}
 		local now = os.clock()
 		local ctx = N.spendContext()
+		Sp.ctx = ctx
 		local owned = N.field("Upgrades", {}) or {}
-		local function add(kind, name, price, gain, buy, done)
+		local function add(kind, name, price, gain, buy, done, progress)
 			if price and price > 0 and gain and gain > 0 and (Sp.failed[name] or 0) <= now then
-				local option = { kind = kind, name = name, price = price, gain = gain, payback = price / gain, buy = buy, done = done }
-				table.insert(list, option)
-				return option
+				local payback = price / gain
+				-- Rolling 24 h horizon: what cannot pay back within it is skipped, unless it is progress that counts on
+				-- its own (rebirth).
+				if payback <= ctx.left or progress then
+					local option = { kind = kind, name = name, price = price, gain = gain, payback = payback, ratio = gain / price, buy = buy, done = done }
+					table.insert(list, option)
+					return option
+				end
 			end
 			return nil
 		end
 		-- Always ranked by payback here, whatever the Level Strategy says (that one only drives Auto Level).
 		for i, option in ipairs(N.levelOptions("Fastest payback")) do
-			if i > 6 then
+			if i > 8 then
 				break
 			end
 			local info = option.info
 			local key, slot, before = info.key, info.slot, info.level
-			add("Level", string.format("Slot %d %s Lv %d", slot, info.name, before + 1), option.price, option.gain, function()
+			add("Level", string.format("Slot %d %s Lv %d", slot, info.name, before + 1), option.price, option.gain * survival(ctx, info), function()
 				fire(N.R.levelUp, slot)
 			end, function()
 				local item = N.inventory()[key]
@@ -32232,7 +32516,7 @@ do
 			for _, dice in ipairs(N.diceList()) do
 				if dice.price and not N.ownsDice(dice.name) and dice.luck > ctx.diceLuck then
 					local name = dice.name
-					add("Dice", name .. " Dice", dice.price, N.luckGain(dice.luck * ctx.buffLuck), function()
+					add("Dice", name .. " Dice", dice.price, N.changeGain(ctx, { luck = dice.luck * ctx.buffLuck }), function()
 						fire(N.R.buyDice, name)
 					end, function()
 						return N.ownsDice(name)
@@ -32262,49 +32546,110 @@ do
 			local nextData = N.nextRebirth()
 			local current = N.call(N.G.Rebirths.Get, N.rebirth())
 			if nextData and type(current) == "table" then
-				local moneyRatio = (tonumber(nextData.moneyMultiplier) or 1) / math.max(tonumber(current.moneyMultiplier) or 1, 1e-9)
-				local luckRatio = (tonumber(nextData.luckMultiplier) or 1) / math.max(tonumber(current.luckMultiplier) or 1, 1e-9)
-				local gain = rebirthSlotsGain(ctx, moneyRatio) + N.luckGain(ctx.diceLuck * ctx.buffLuck * luckRatio)
+				local gain = N.changeGain(ctx, rebirthChange(ctx, nextData, current))
 				local before = N.rebirth()
-				-- A rebirth takes all the cash, so its real price is everything you hold (at least its cost).
-				local option = add("Rebirth", "Rebirth " .. (before + 1), math.max(tonumber(nextData.cost) or 0, ctx.money), gain, function()
+				local cost = math.max(tonumber(nextData.cost) or 0, 1)
+				local option = add("Rebirth", "Rebirth " .. (before + 1), cost, gain, function()
 					fire(N.R.rebirth)
 				end, function()
 					return N.rebirth() > before
-				end)
+				end, true)
 				if option then
-					option.need = tonumber(nextData.cost) or 0
+					option.need = cost
 				end
 			end
 		end
 		table.sort(list, function(a, b)
-			return a.payback < b.payback
+			return a.ratio > b.ratio
 		end)
 		return list
 	end
 	local function canPay(option, money)
-		return (option.need or option.price) <= money
+		return option.price <= money
 	end
+	-- Returns the option to buy now (or nil), the option the hub is working towards and the seconds to afford it.
 	function N.spendPick()
 		local list = N.spendOptions()
 		Sp.plan = list
 		local best = list[1]
 		Sp.top = best
 		if not best then
-			return nil
+			Sp.last = "Nothing pays back within 24 hours"
+			return nil, nil, 0
 		end
 		local money = N.money()
-		if canPay(best, money) then
-			return best
+		local income = Sp.ctx.cashRate
+		if best.kind == "Rebirth" and money >= best.price then
+			-- A rebirth wipes all cash: first spend what is above its cost on anything that pays back in time.
+			for _, option in ipairs(list) do
+				if option.kind ~= "Rebirth" and option.price <= money - best.price then
+					return option, best, 0
+				end
+			end
+			-- Nothing fits: rebirth only when its gain per $ destroyed beats what that cash would buy.
+			local alt
+			for _, option in ipairs(list) do
+				if option.kind ~= "Rebirth" then
+					alt = option
+					break
+				end
+			end
+			if not alt or best.gain / money >= alt.ratio then
+				return best, best, 0
+			end
+			best = alt
+			Sp.top = alt
 		end
-		local wait = ((best.need or best.price) - money) / math.max(N.plotIncome(), 1)
+		if canPay(best, money) then
+			return best, best, 0
+		end
+		local wait = (best.price - money) / income
+		-- Saving: a cheaper option is bought on the way only when it shortens the wait for the best one.
 		for _, option in ipairs(list) do
-			if canPay(option, money) and option.payback <= best.payback * 3 and wait > option.payback then
-				return option
+			if option ~= best and canPay(option, money) then
+				local kept = if option.kind == "Rebirth" then 0 else money - option.price
+				if (best.price - kept) / (income + option.gain) < wait then
+					return option, best, wait
+				end
 			end
 		end
-		Sp.last = string.format("Saving for %s ($%s, %s)", best.label or best.name, formatNumber(best.need or best.price), N.longTime(wait))
-		return nil
+		Sp.last = string.format("Saving for %s ($%s, %s)", best.label or best.name, formatNumber(best.price), N.longTime(wait))
+		return nil, best, wait
+	end
+	local function short(x)
+		return string.format("%.3g", x)
+	end
+	-- PLAN log line: when the target changes, else once a minute.
+	function N.planLog(target, wait, pick)
+		local list = Sp.plan or {}
+		local ctx = Sp.ctx
+		local name = if target then target.label or target.name else "none"
+		local now = os.clock()
+		if not ctx or (name == Sp.planBest and now - Sp.planAt < 60) then
+			return
+		end
+		Sp.planBest, Sp.planAt = name, now
+		local alts = {}
+		for _, option in ipairs(list) do
+			if option ~= target and #alts < 2 then
+				table.insert(alts, string.format("%s %s", option.label or option.name, short(option.ratio)))
+			end
+		end
+		log(
+			string.format(
+				"PLAN best=%s gain/$=%s eta=%ds alt=%s | buy=%s drops/s=%s blocked=%d%% income=%s/s rho=%s left=%.1fh",
+				name,
+				if target then short(target.ratio) else "0",
+				math.floor(wait or 0),
+				if #alts > 0 then table.concat(alts, ", ") else "none",
+				if pick then pick.label or pick.name else "wait",
+				short(ctx.rate),
+				math.floor(ctx.blocked * 100 + 0.5),
+				formatNumber(ctx.cashRate),
+				short(ctx.rho),
+				ctx.left / 3600
+			)
+		)
 	end
 	-- Cash that is still sitting on the plot slots.
 	function N.pendingBalance()
@@ -32326,15 +32671,17 @@ do
 		if now < Sp.nextAt then
 			return false
 		end
-		-- Nothing bought: look again in a second (the plan only changes when cash or the game state does).
-		Sp.nextAt = now + 1
-		local pick = N.spendPick()
+		-- Nothing bought: plan again in 2 seconds (the plan only changes when cash or the game state does).
+		Sp.nextAt = now + 2
+		N.measureRates()
+		local pick, target, wait = N.spendPick()
+		N.planLog(target, wait, pick)
 		if not pick then
 			-- The cash for the next purchase may already be waiting on the plot.
 			local top = Sp.top
 			if top and on("AutoCollect") and now - Sp.collectAt > 1.5 then
 				local pending = N.pendingBalance()
-				if pending > 0 and (top.need or top.price) <= N.money() + pending then
+				if pending > 0 and top.price <= N.money() + pending then
 					Sp.collectAt = now
 					N.collectStep()
 					N.Data.at = -1e9
@@ -32344,6 +32691,7 @@ do
 			return false
 		end
 		Sp.at = now
+		local cashBefore = N.money()
 		pick.buy()
 		local gone = waitFor(function()
 			N.Data.at = -1e9
@@ -32360,14 +32708,18 @@ do
 			Sp.nextAt = os.clock() + 0.3
 			return true
 		end
+		local paid = if pick.kind == "Rebirth" then math.max(cashBefore, pick.price) else pick.price
+		Sp.spent += paid
+		Sp.retGain += pick.gain
+		Sp.retPrice += paid
 		if pick.kind == "Level" then
 			Session.levels += 1
 		else
 			Session.bought += 1
 		end
 		Sp.nextAt = 0
-		Sp.last = string.format("Bought %s for $%s (pays back in %s)", pick.label or pick.name, formatNumber(pick.price), N.longTime(pick.payback))
-		log("SPEND", pick.kind, pick.label or pick.name, "price", pick.price, "gain/s", pick.gain, "payback", math.floor(pick.payback))
+		Sp.last = string.format("Bought %s for $%s (pays back in %s)", pick.label or pick.name, formatNumber(paid), N.longTime(paid / pick.gain))
+		log("SPEND", pick.kind, pick.label or pick.name, "price", paid, "gain/s", pick.gain, "gain/$", short(pick.gain / paid), "payback", math.floor(paid / pick.gain))
 		table.insert(N.Shop.log, 1, pick.name)
 		while #N.Shop.log > 5 do
 			table.remove(N.Shop.log)
@@ -32382,13 +32734,85 @@ do
 		end
 		return true
 	end
+	-- Tickets (quest shop): gamepasses and Lucky Spins on the same dI per ticket scale. Tickets earn nothing
+	-- themselves, so the best dI/ticket is always bought first and saved for (Smith's rule).
+	function N.ticketOptions(ctx)
+		local list = {}
+		local passes = N.tableOr(N.G.Monetization).Gamepasses
+		if on("AutoTicketPasses") and type(passes) == "table" then
+			for _, name in ipairs(N.TicketPasses) do
+				local data = passes[name]
+				if not N.ownsPass(name) and type(data) == "table" and type(data.buffs) == "table" then
+					local change = {}
+					for buffName, buff in pairs(data.buffs) do
+						local amount = tonumber(buff.amount) or 0
+						if buffName == "Luck" and buff.bucket == "multiplier" then
+							change.luck = (change.luck or ctx.luck) * amount
+						elseif buffName == "Money Multiplier" and buff.bucket == "multiplier" then
+							change.moneyRatio = (change.moneyRatio or 1) * amount
+						elseif buffName == "Roll Duration" then
+							change.rate = (change.rate or ctx.rate) * ctx.duration / math.max(ctx.duration + amount, 0.2)
+						elseif buffName == "Rolls" then
+							change.rate = (change.rate or ctx.rate) * (ctx.rollsBuff + amount) / ctx.rollsBuff
+						end
+					end
+					local price = N.ticketPrice(name)
+					local gain = N.changeGain(ctx, change)
+					if price < math.huge and gain > 0 then
+						table.insert(list, { name = name, price = price, gain = gain, ratio = gain / price })
+					end
+				end
+			end
+		end
+		if on("AutoTicketSpins") then
+			local spin = N.entry("Lucky Spin")
+			local mult = tonumber(spin and spin.luckMultiplier)
+			local price = N.ticketPrice("Lucky Spin")
+			if mult and price < math.huge then
+				local gain = N.changeGain(ctx, { extraLuck = ctx.luck * mult, tag = "spin" })
+				if gain > 0 then
+					table.insert(list, { name = "Lucky Spin", price = price, gain = gain, ratio = gain / price })
+				end
+			end
+		end
+		table.sort(list, function(a, b)
+			return a.ratio > b.ratio
+		end)
+		return list
+	end
+	function N.ticketStep()
+		N.measureRates()
+		local ctx = N.spendContext()
+		local list = N.ticketOptions(ctx)
+		local best = list[1]
+		if not best then
+			return false
+		end
+		local tickets = N.amount("Tickets")
+		local wait = if best.price <= tickets then 0 else (best.price - tickets) / math.max(Sp.rates.tickets or 0, 1e-9)
+		local now = os.clock()
+		if best.name ~= Sp.ticketBest or now - Sp.ticketAt > 120 then
+			Sp.ticketBest, Sp.ticketAt = best.name, now
+			local alt = list[2]
+			log(string.format("PLAN tickets best=%s gain/ticket=%s eta=%s alt=%s", best.name, short(best.ratio), if wait < 1e8 then math.floor(wait) .. "s" else "never", if alt then alt.name .. " " .. short(alt.ratio) else "none"))
+		end
+		if best.price > tickets then
+			Sp.ticketLast = string.format("Saving tickets for %s (%d/%d)", best.name, tickets, best.price)
+			return false
+		end
+		fire(N.R.questBuy, best.name)
+		Sp.ticketsSpent += best.price
+		Sp.ticketLast = "Bought " .. best.name .. " with tickets"
+		log("TICKETS bought", best.name, "price", best.price, "gain/s", best.gain)
+		return true
+	end
 	function N.spendText()
 		local rows = {}
 		for i, option in ipairs(Sp.plan or {}) do
 			if i > 6 then
 				break
 			end
-			table.insert(rows, string.format("%d. %s: $%s, +$%s/s, pays back %s", i, option.label or option.name, formatNumber(option.need or option.price), formatNumber(option.gain), N.longTime(option.payback)))
+			table.insert(rows, string.format("%d. %s: $%s, +$%s/s, pays back %s", i, option.label or option.name, formatNumber(option.price), formatNumber(option.gain), N.longTime(option.payback)))
 		end
 		return (if #rows > 0 then table.concat(rows, "\n") else "Nothing to buy") .. (if Sp.last ~= "" then "\n" .. Sp.last else "")
 	end
@@ -32920,7 +33344,7 @@ do
 		SpendBox:AddToggle("SmartSpend", {
 			Text = "Smart Spending",
 			Default = false,
-			Tooltip = "Puts slot levels, dice, every upgrade and rebirths on one scale: price divided by the extra cash per second it brings (luck and roll speed from the game's exact roll odds). Buys the fastest payback first and saves for it. Replaces Auto Level, Auto Buy Dice, Auto Upgrade and Auto Rebirth while on",
+			Tooltip = "Puts slot levels, dice, every upgrade, rebirths and ticket gamepasses on one scale: extra cash per second for each $ spent, with luck and roll speed valued from the game's exact roll odds over the next 24 hours. Buys the best first and saves for it. Replaces Auto Level, Auto Buy Dice, Auto Upgrade, Auto Rebirth and the gamepass order while on",
 		})
 		SpendBox:AddDropdown("SpendOn", {
 			Text = "May Spend On",
@@ -32929,15 +33353,6 @@ do
 			Multi = true,
 			AllowNull = true,
 			Tooltip = "Slot levels are always included (pick slots in the Slots tab)",
-		})
-		SpendBox:AddSlider("SpendHorizon", {
-			Text = "Planning Horizon",
-			Default = 30,
-			Min = 5,
-			Max = 240,
-			Rounding = 0,
-			Suffix = " min",
-			Tooltip = "How far ahead luck and roll speed are valued. Longer favours luck, shorter favours instant income",
 		})
 		Labels.Spend = SpendBox:AddLabel({ Text = "-", DoesWrap = true })
 		local UpgradeBox = Tabs.Upgrades:AddLeftGroupbox("Upgrade Tree", "git-branch")
