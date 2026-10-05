@@ -5600,11 +5600,12 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         if Library.ConfirmPrompt and Library.ConfirmPrompt.Parent then
             return
         end
+        local Extra = if Opts.Warning then 64 else 0
         local Root = New("Frame", {
             AnchorPoint = Vector2.new(1, 1),
             BackgroundTransparency = 1,
             Position = UDim2.new(1, 340, 1, -12),
-            Size = UDim2.fromOffset(320, 232),
+            Size = UDim2.fromOffset(320, 232 + Extra),
             ZIndex = 60,
             Parent = Library.ScreenGui,
         })
@@ -5670,13 +5671,29 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             ZIndex = 63,
             Parent = Content,
         })
+        if Opts.Warning then
+        	New("TextLabel", {
+        		BackgroundTransparency = 1,
+        		FontFace = GetBoldFont,
+        		Position = UDim2.fromOffset(14, 166),
+        		Size = UDim2.new(1, -28, 0, 60),
+        		Text = tostring(Opts.Warning),
+        		TextColor3 = Color3.fromRGB(255, 140, 60),
+        		TextSize = 12,
+        		TextWrapped = true,
+        		TextXAlignment = Enum.TextXAlignment.Left,
+        		TextYAlignment = Enum.TextYAlignment.Top,
+        		ZIndex = 63,
+        		Parent = Content,
+        	})
+        end
         local Confirm = New("TextButton", {
             AutoButtonColor = false,
             BackgroundColor3 = "AccentColor",
             FontFace = GetBoldFont,
-            Position = UDim2.fromOffset(12, 182),
+            Position = UDim2.fromOffset(12, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
-            Text = tostring(Opts.ConfirmText or "Confirm"),
+            Text = tostring(Opts.ConfirmText or "Confirm"), TextWrapped = true,
             TextColor3 = "BackgroundColor",
             TextSize = 14,
             ZIndex = 63,
@@ -5687,7 +5704,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             AutoButtonColor = false,
             BackgroundColor3 = "BackgroundColor",
             FontFace = GetBoldFont,
-            Position = UDim2.new(0.5, 4, 0, 182),
+            Position = UDim2.new(0.5, 4, 0, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
             Text = tostring(Opts.CancelText or "Cancel"),
             TextColor3 = "FontColor",
@@ -36524,7 +36541,7 @@ do
 		QuickBox:AddToggle("AutoFarmOP", {
 			Text = "Auto Farm Everything OP",
 			Default = false,
-			Tooltip = "Full automatic: picks the best paying job, Blatant speed, builds/spends for max profit. Can spend your money.",
+			Tooltip = "Picks the best paying job, Blatant speed, builds/spends for max profit and can spend your money. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
 			Callback = function(value)
 				task.defer(function()
 					if not value then
@@ -36545,13 +36562,14 @@ do
 					local okDialog = Window.AddDialog and pcall(function()
 						Window:AddDialog("CorvusOP", {
 							Title = "Enable Auto Farm Everything OP?",
-							Description = "Full automatic: picks the best paying job, Blatant speed, builds/spends for max profit. It can spend your money (food, your saved layout) and Blatant has a high ban risk in Bloxburg.",
+							Description = "WARNING: Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.\n\nThe planner picks the best paying job, Blatant speed, builds/spends for max profit. It can spend your money (food, your saved layout).",
+							DescriptionColor = Color3.fromRGB(255, 140, 60),
 							AutoDismiss = true,
 							OutsideClickDismiss = true,
 							FooterButtons = {
 								Cancel = { Title = "Cancel", Variant = "Secondary", Order = 1 },
 								Enable = {
-									Title = "Enable OP",
+									Title = "I understand, enable OP",
 									Variant = "Primary",
 									Order = 2,
 									Callback = function()
