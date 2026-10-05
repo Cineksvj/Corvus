@@ -30120,10 +30120,12 @@ local BootOk, BootError = xpcall(function()
 			end
 			local floor = Game.plotFloor and Game.plotFloor() or 0
 			local anyIndex = false
-			local rushing = Game.event ~= nil and Game.event.rushing()
+			-- the planner (value, index, event rush, lucky blocks) works only with Auto Farm Everything; alone Blatant follows the player's filters and priority
+			local planner = on("AutoFarmAll")
+			local rushing = planner and Game.event ~= nil and Game.event.rushing()
 			local evCount = 0
 			for _, item in ipairs(list) do
-				item.gain = Game.itemGain and Game.itemGain(item.info, floor) or 0
+				item.gain = planner and Game.itemGain and Game.itemGain(item.info, floor) or 0
 				item.idx = 0
 				-- Event Rush: missing event index animals and event eggs go before everything else
 				item.ev = rushing and Game.event.wanted(item.info) == true
@@ -30131,7 +30133,7 @@ local BootOk, BootError = xpcall(function()
 					evCount += 1
 					anyIndex = true
 				end
-				if item.info.kind ~= "Egg" and not item.info.special and Game.indexGain then
+				if planner and item.info.kind ~= "Egg" and not item.info.special and Game.indexGain then
 					item.idx = Game.indexGain(item.info.type, item.info.mutation)
 					if item.idx > 0 then
 						anyIndex = true
@@ -30191,7 +30193,7 @@ local BootOk, BootError = xpcall(function()
 			end
 			local ids, infos = {}, {}
 			-- while rushing the event items keep their slots: lucky blocks only get what is left
-			for _, id in ipairs(Game.lucky.take(blocks, capacity - math.min(evCount, capacity))) do
+			for _, id in ipairs(Game.lucky.take(blocks, if planner then capacity - math.min(evCount, capacity) else 0)) do
 				table.insert(ids, id)
 			end
 			local blockCount = #ids
