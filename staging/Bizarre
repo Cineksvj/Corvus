@@ -31611,13 +31611,13 @@ do
 	Log.context = function()
 		return Status
 	end
-	-- OP (Auto Farm Everything OP, confirmed on a card) = the planner overrides the player's own picks.
-	-- Auto Farm Everything (Normal) only switches the toggles ticked in "Farm Everything includes".
-	function N.isOP()
-		return on("AutoFarmOP")
+	-- Auto Farm Everything (confirmed on a card) = full automatic: the planner overrides the player's own picks
+	-- and uses boosts, crates and Blood Packs (except the Exclude list).
+	function N.farming()
+		return on("AutoFarmBest")
 	end
 	function N.farmActive()
-		return on("AutoFarmBest") or on("AutoFarmOP")
+		return on("AutoFarmBest")
 	end
 	-- Safe Mode (default on): everything mirrors the game's own client: Walk movement, the real prompt hold times
 	-- and input delays, only remotes the client itself fires. The server code is not in the dump, so position and
@@ -32433,7 +32433,7 @@ do
 		if kind == "Sparring" or kind == "SyndicateKillCivilians" then
 			return false
 		end
-		if not N.isOP() and Options.MissionTypes then
+		if not N.farming() and Options.MissionTypes then
 			return allows(Options.MissionTypes, tostring(def.DisplayName or def.Id))
 		end
 		return true
@@ -32506,7 +32506,7 @@ do
 	end
 	N.travelSeconds = travelSeconds
 	local function allowed(toggle)
-		return N.isOP() or on(toggle)
+		return N.farming() or on(toggle)
 	end
 	-- Every option available right now: { name, value ($), seconds, rate ($/s) }.
 	function N.planOptions()
@@ -32651,7 +32651,7 @@ do
 		end
 		return n
 	end
-	-- Valuables for "Exclude from OP": everything Corvus can use up or equip, plus the rare progression items.
+	-- Valuables for "Exclude" (Main): everything Corvus can use up or equip, plus the rare progression items.
 	function N.valuableList()
 		local list, seen = {}, {}
 		local function add(name)
@@ -32680,9 +32680,9 @@ do
 		table.sort(list)
 		return list
 	end
-	-- The player's "Exclude from OP" list: Corvus never uses, opens or equips these, in any mode.
+	-- The player's "Exclude" (Main) list: Corvus never uses, opens or equips these, in any mode.
 	function N.excluded(item)
-		local v = Options.OPExclude and Options.OPExclude.Value
+		local v = Options.FarmExclude and Options.FarmExclude.Value
 		if type(v) ~= "table" or type(item) ~= "table" then
 			return false
 		end
@@ -32698,7 +32698,7 @@ do
 			return false
 		end
 		for _, item in ipairs(N.inventory(false)) do
-			if item.kind == "Crate" and item.id and item.count > 0 and not N.excluded(item) and (N.isOP() or allows(Options.CrateRarities, item.rarity)) then
+			if item.kind == "Crate" and item.id and item.count > 0 and not N.excluded(item) and (N.farming() or allows(Options.CrateRarities, item.rarity)) then
 				local before = N.countOf(item.name)
 				setStatus("Opening " .. item.display)
 				useItem(item, "Use")
@@ -32757,7 +32757,7 @@ do
 		if not on("AutoCore") or N.blocked("Core") then
 			return false
 		end
-		local pick = if N.isOP() then "Best for farming" else optionText("CorePick", "Best for farming")
+		local pick = if N.farming() then "Best for farming" else optionText("CorePick", "Best for farming")
 		local order = if pick == "Best for farming" then N.CoreFarm else { pick }
 		local owned = {}
 		for _, item in ipairs(N.inventory(false)) do
@@ -33311,8 +33311,8 @@ do
 		return J.info
 	end
 	function N.jobWanted()
-		-- OP: the coffee shop, its orders are solved exactly and it runs 5 days a week.
-		local pick = if N.isOP() then "Coffee Shop Worker" else optionText("JobPick", "Coffee Shop Worker")
+		-- Auto Farm Everything: the coffee shop, its orders are solved exactly and it runs 5 days a week.
+		local pick = if N.farming() then "Coffee Shop Worker" else optionText("JobPick", "Coffee Shop Worker")
 		return N.JobNames[pick]
 	end
 	function N.jobReady()
@@ -33586,7 +33586,7 @@ do
 		end
 		local cap = tonumber(N.G.Progression.StatCap) or 10
 		local order = table.clone(N.StatOrder)
-		if not N.isOP() then
+		if not N.farming() then
 			local first = optionText("StatPick", "Speed")
 			table.remove(order, table.find(order, first) or 1)
 			table.insert(order, 1, first)
@@ -33620,7 +33620,7 @@ do
 			return
 		end
 		for _, kind in ipairs({ "Money", "XP" }) do
-			local wanted = if N.isOP() then (kind == "Money" or N.level() < 10) else allows(Options.BoostKinds, kind)
+			local wanted = if N.farming() then (kind == "Money" or N.level() < 10) else allows(Options.BoostKinds, kind)
 			local running = (tonumber(N.attr(kind .. "BoostUntil", 0)) or 0) > N.serverNow() + 1
 			if wanted and not running and not N.blocked("Boost" .. kind) then
 				local best, bestScore
@@ -33748,15 +33748,16 @@ do
 		end)
 	end
 	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
-	Tabs.AutoOP = N.addTab("Auto OP", "zap", "Full automatic planner and what it may never touch")
-	Tabs.Missions = N.addTab("Missions", "scroll-text", "Missions, meteors, errands and world loot")
-	Tabs.Jobs = N.addTab("Jobs", "briefcase", "Job shifts on the game clock")
-	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Stat points and gym training")
-	Tabs.Rewards = N.addTab("Rewards", "gift", "Tutorial, getting started reward, codes and friends")
+	-- Packed tabs: Jobs live in Missions, Upgrades and Rewards in Progress, Webhook in Stats.
+	Tabs.Missions = N.addTab("Missions", "scroll-text", "Missions, job shifts, meteors, errands and world loot")
+	Tabs.Jobs = Tabs.Missions
+	Tabs.Progress = N.addTab("Progress", "trending-up", "Stat points, gym, tutorial, rewards, codes and friends")
+	Tabs.Upgrades = Tabs.Progress
+	Tabs.Rewards = Tabs.Progress
 	Tabs.Items = N.addTab("Items", "backpack", "Inventory, crates, storage, cores, boosts and the bank")
 	Tabs.Player = N.addTab("Player", "user", "Safe Mode, movement, travel and Blatant")
-	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress, cash per activity and drops")
-	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts and a live profile card")
+	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress, cash per activity, drops, Discord webhook and live profile card")
+	Tabs.Webhook = Tabs.Stats
 	if Window.AddMiscTab then
 		pcall(function()
 			Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
@@ -33764,79 +33765,40 @@ do
 	end
 	Labels = {}
 	do
-		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
-		-- OP = the planner does everything (also uses up boost items). Normal = exactly the toggles ticked in FarmSet.
+		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm Everything", "sparkles")
+		-- Auto Farm Everything = full automatic: the planner does everything, also uses up boost items (except Exclude).
 		N.FarmBestOn = { "AutoMissions", "AutoJob", "AutoMeteor", "AutoErrands", "AutoLoot", "AutoStats", "AutoGym", "AutoBank", "AutoRewards", "AutoCodes", "AutoBoosts", "AutoCrates", "AutoStore", "AutoCore", "AutoBlood" }
-		-- Every main farm toggle: key, visible name, safe (nothing is sold, consumed, converted or spent).
-		N.FarmSetList = {
-			{ "AutoMissions", "Auto Missions", true },
-			{ "AutoJob", "Auto Job Shifts", true },
-			{ "AutoMeteor", "Claim Meteors", true },
-			{ "AutoErrands", "City Errands", true },
-			{ "AutoLoot", "Pick Up World Loot", true },
-			{ "AutoStats", "Auto Stat Points", true },
-			{ "AutoGym", "Auto Gym Training", true },
-			{ "AutoBank", "Auto Bank Cash", true },
-			{ "AutoRewards", "Claim Rewards", true },
-			{ "AutoCodes", "Redeem Codes", true },
-			{ "AutoStore", "Store Valuables", true },
-			{ "AutoCore", "Equip Farm Core", true },
-			{ "AutoBoosts", "Auto Use Boosts", false },
-			{ "AutoCrates", "Open Crates", false },
-			{ "AutoBlood", "Vampire Blood Packs", false },
-			{ "Blatant", "Blatant (Safe Mode off)", false },
-			{ "AutoFriend", "Auto Friend", false },
-		}
-		local farmNames, farmDefault = {}, {}
-		for _, entry in ipairs(N.FarmSetList) do
-			table.insert(farmNames, entry[2])
-			if entry[3] then
-				table.insert(farmDefault, entry[2])
-			end
-		end
-		N.FarmApplied = {}
-		function N.farmKeys(kind)
-			if kind == "OP" then
-				return N.FarmBestOn
-			end
-			local list = {}
-			local chosen = Options.FarmSet and Options.FarmSet.Value
-			for _, entry in ipairs(N.FarmSetList) do
-				if type(chosen) == "table" and chosen[entry[2]] then
-					table.insert(list, entry[1])
-				end
-			end
-			return list
-		end
-		function N.farmApply(kind, value)
+		N.FarmApplied = nil
+		function N.farmApply(value)
 			if value then
-				local keys = N.farmKeys(kind)
-				N.FarmApplied[kind] = keys
-				for _, name in ipairs(keys) do
+				N.FarmApplied = N.FarmBestOn
+				for _, name in ipairs(N.FarmBestOn) do
 					local toggle = Toggles[name]
 					if toggle and not toggle.Value then
 						toggle:SetValue(true)
 					end
 				end
 			else
-				-- Turning a farm off turns off everything it turned on.
-				for _, name in ipairs(N.FarmApplied[kind] or N.farmKeys(kind)) do
+				-- Turning the farm off turns off everything it turned on.
+				for _, name in ipairs(N.FarmApplied or N.FarmBestOn) do
 					local toggle = Toggles[name]
 					if toggle and toggle.Value then
 						toggle:SetValue(false)
 					end
 				end
-				N.FarmApplied[kind] = nil
+				N.FarmApplied = nil
 			end
 		end
-		-- Confirmation card for Auto Farm Everything OP (the toggle stays off until the player presses Enable OP).
-		function N.askOP(onYes)
+		N.FarmWarning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
+		N.BootAt = os.clock()
+		-- Confirmation card for Auto Farm Everything (the toggle stays off until the player presses enable).
+		function N.askFarm(onYes)
 			local gui = Library.ScreenGui
 			if not gui then
 				onYes()
 				return
 			end
-			if N.OPCard and N.OPCard.Parent then
+			if N.FarmCard and N.FarmCard.Parent then
 				return
 			end
 			local ok = pcall(function()
@@ -33858,7 +33820,7 @@ do
 				stroke.Color = accent
 				stroke.Thickness = 1.5
 				stroke.Parent = card
-				N.OPCard = card
+				N.FarmCard = card
 				local function label(text, y, h, size, bold, alpha, color)
 					local l = Instance.new("TextLabel")
 					l.BackgroundTransparency = 1
@@ -33875,9 +33837,9 @@ do
 					l.ZIndex = 201
 					l.Parent = card
 				end
-				label("Enable Auto Farm Everything OP?", 12, 22, 16, true)
-				label("Full automatic: the planner picks every activity and uses up boosts, crates and Blood Packs for max profit. Items in Exclude from OP are never touched. For a safe version use Auto Farm Everything on Main.", 40, 80, 13, false, 0.15)
-				label(N.OPWarning or "", 126, 84, 13, true, 0, Color3.fromRGB(255, 138, 92))
+				label("Enable Auto Farm Everything?", 12, 22, 16, true)
+				label("Full automatic: the planner picks every activity by cash per second and uses up boosts, crates and Blood Packs for max profit. Items in Exclude on Main are never touched.", 40, 80, 13, false, 0.15)
+				label(N.FarmWarning or "", 126, 84, 13, true, 0, Color3.fromRGB(255, 138, 92))
 				local function button(text, x, color, fn)
 					local b = Instance.new("TextButton")
 					b.Position = UDim2.new(0, x, 1, -46)
@@ -33896,85 +33858,88 @@ do
 					bc.Parent = b
 					b.MouseButton1Click:Connect(function()
 						card:Destroy()
-						N.OPCard = nil
+						N.FarmCard = nil
 						if fn then
 							fn()
 						end
 					end)
 				end
 				button("Cancel", 14, Color3.fromRGB(70, 70, 78), nil)
-				button("I understand, enable OP", 14 + 153 + 6, accent, onYes)
+				button("I understand, enable", 14 + 153 + 6, accent, onYes)
 			end)
 			if not ok then
-				notify("Auto Farm Everything OP", "Could not open the confirmation, nothing was changed", 4)
+				notify("Auto Farm Everything", "Could not open the confirmation, nothing was changed", 4)
 			end
 		end
 		QuickBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "Turns on exactly the toggles ticked below, with your own picks (mission types, job, stat, boosts). Nothing is used up unless you tick it yourself",
+			Tooltip = N.FarmWarning .. " The planner picks every activity by cash per second and uses up boosts, crates and Blood Packs (not the Exclude list). Asks to confirm",
 			Callback = function(value)
 				if N.FarmBusy then
 					return
 				end
-				if value and on("AutoFarmOP") then
+				if value and not N.FarmConfirmed then
 					N.FarmBusy = true
-					Toggles.AutoFarmOP:SetValue(false)
+					Toggles.AutoFarmBest:SetValue(false)
 					N.FarmBusy = false
-					N.farmApply("OP", false)
+					-- A config load never turns the farm on: only Remember Auto Farm Everything restores it (p10).
+					if os.clock() - (N.BootAt or 0) < 8 then
+						log("Farm not restored from a config")
+						return
+					end
+					N.askFarm(function()
+						log("Farm confirmed")
+						N.FarmConfirmed = true
+						Toggles.AutoFarmBest:SetValue(true)
+						N.FarmConfirmed = false
+					end)
+					return
+				end
+				if N.saveFarmState then
+					N.saveFarmState()
 				end
 				task.defer(function()
 					if value then
-						log("MODE", "Normal", #N.farmKeys("Normal"))
+						log("MODE", "Farm Everything")
 					end
-					N.farmApply("Normal", value)
+					N.farmApply(value)
 				end)
 			end,
 		})
-		QuickBox:AddDropdown("FarmSet", {
-			Text = "Farm Everything includes",
-			Values = farmNames,
-			Default = farmDefault,
-			Multi = true,
-			AllowNull = true,
-			Searchable = true,
-			Tooltip = "The toggles Auto Farm Everything switches on. Safe ones are ticked (nothing is used up). Add boosts, crates or Blood Packs yourself if you want them used",
+		QuickBox:AddToggle("RememberFarm", {
+			Text = "Remember Auto Farm Everything",
+			Default = false,
+			Tooltip = "Starts Auto Farm Everything again by itself after a rejoin or teleport, without asking. " .. N.FarmWarning,
 			Callback = function()
-				if on("AutoFarmBest") and not N.FarmBusy then
-					local old, keep = N.FarmApplied.Normal or {}, {}
-					for _, name in ipairs(N.farmKeys("Normal")) do
-						keep[name] = true
-					end
-					for _, name in ipairs(old) do
-						local toggle = Toggles[name]
-						if not keep[name] and toggle and toggle.Value then
-							toggle:SetValue(false)
-						end
-					end
-					N.farmApply("Normal", true)
+				if N.saveFarmState then
+					N.saveFarmState()
 				end
 			end,
 		})
-		QuickBox:AddToggle("AutoMissions", {
-			Text = "Auto Missions",
-			Default = false,
-			Tooltip = "Takes a mission from the quest giver, goes to the objective and finishes it, over and over. Fight missions (sparring) are skipped",
+		QuickBox:AddDropdown("FarmExclude", {
+			Text = "Exclude",
+			Values = N.valuableList(),
+			Default = {},
+			Multi = true,
+			AllowNull = true,
+			Searchable = true,
+			Tooltip = "Corvus never uses, opens or equips these items, in Auto Farm Everything and in every other mode",
 		})
 		QuickBox:AddButton({
 			Text = "Recommended Settings",
-			Tooltip = "Safe Mode on (walks, real hold times), bank above $3000 keeping $500, Speed first, pushups, coffee shop job, store Legendary+ items, farming core, then Auto Farm Everything",
+			Tooltip = "Safe Mode on (walks, real hold times), bank above $3000 keeping $500, Speed first, pushups, coffee shop job, store Legendary+ items, farming core, then Auto Farm Everything (asks to confirm)",
 			Func = function()
 				N.recommended()
 			end,
 		})
 		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">Corvus picks the best cash per second between missions, your job shift, meteors, errands and loot. The full automatic planner is in the Auto OP tab.</font>',
+			Text = '<font color="#ff8a5c">' .. N.FarmWarning .. '</font> <font transparency="0.35">Corvus picks the best cash per second between missions, your job shift, meteors, errands and loot, and keeps the strongest Money boost running.</font>',
 			DoesWrap = true,
 		})
 		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		Labels.Next = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 		Labels.Recent = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 		StatusBox:AddButton({
 			Text = "Stop Everything",
@@ -33982,84 +33947,16 @@ do
 				N.stopAll()
 			end,
 		})
-		-- Auto OP tab: the OP toggle, Remember Auto OP and the items OP may never touch.
-		N.OPWarning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
-		local OPBox = Tabs.AutoOP:AddLeftGroupbox("Auto Farm Everything OP", "zap")
-		N.BootAt = os.clock()
-		OPBox:AddToggle("AutoFarmOP", {
-			Text = "Auto Farm Everything OP",
-			Default = false,
-			Tooltip = N.OPWarning .. " The planner picks every activity by cash per second and uses up boosts, crates and Blood Packs. Asks to confirm",
-			Callback = function(value)
-				if N.FarmBusy then
-					return
-				end
-				if value and not N.OPConfirmed then
-					N.FarmBusy = true
-					Toggles.AutoFarmOP:SetValue(false)
-					N.FarmBusy = false
-					-- A config load never turns OP on: only Remember Auto OP restores it (p10).
-					if os.clock() - (N.BootAt or 0) < 8 then
-						log("OP not restored from a config")
-						return
-					end
-					N.askOP(function()
-						log("OP confirmed")
-						N.OPConfirmed = true
-						Toggles.AutoFarmOP:SetValue(true)
-						N.OPConfirmed = false
-					end)
-					return
-				end
-				if value and on("AutoFarmBest") then
-					N.FarmBusy = true
-					Toggles.AutoFarmBest:SetValue(false)
-					N.FarmBusy = false
-					N.farmApply("Normal", false)
-				end
-				if N.saveOPState then
-					N.saveOPState()
-				end
-				task.defer(function()
-					if value then
-						log("MODE", "OP")
-					end
-					N.farmApply("OP", value)
-				end)
-			end,
-		})
-		OPBox:AddToggle("RememberOP", {
-			Text = "Remember Auto OP",
-			Default = false,
-			Tooltip = "Starts Auto Farm Everything OP again by itself after a rejoin or teleport, without asking. " .. N.OPWarning,
-			Callback = function()
-				if N.saveOPState then
-					N.saveOPState()
-				end
-			end,
-		})
-		OPBox:AddLabel({
-			Text = '<font color="#ff8a5c">' .. N.OPWarning .. ' OP may also use up important items (boosts, crates, Blood Packs): add everything you want to keep below.</font>',
-			DoesWrap = true,
-		})
-		OPBox:AddDropdown("OPExclude", {
-			Text = "Exclude from OP",
-			Values = N.valuableList(),
-			Default = {},
-			Multi = true,
-			AllowNull = true,
-			Searchable = true,
-			Tooltip = "Corvus never uses, opens or equips these, in OP and in every other mode",
-		})
-		local OPPlanBox = Tabs.AutoOP:AddRightGroupbox("What OP Does", "calculator")
-		Labels.OPPlan = OPPlanBox:AddLabel({ Text = "-", DoesWrap = true })
-		OPPlanBox:AddLabel({
-			Text = '<font transparency="0.4">OP runs every activity by measured cash per second over the next 24 h, drops everything for a meteor, opens crates and keeps the strongest Money boost running. It keeps your Safe Mode and Blatant choice and never takes fights.</font>',
-			DoesWrap = true,
-		})
+		local NextBox = Tabs.Main:AddRightGroupbox("Up Next", "list-checks")
+		Labels.Next = NextBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
 		local MissionBox = Tabs.Missions:AddLeftGroupbox("Missions", "scroll-text")
+		MissionBox:AddToggle("AutoMissions", {
+			Text = "Auto Missions",
+			Default = false,
+			Tooltip = "Takes a mission from the quest giver, goes to the objective and finishes it, over and over. Fight missions (sparring) are skipped",
+		})
 		local names = {}
 		for id, def in pairs(N.tableOr(N.G.Missions.Missions)) do
 			if type(def) == "table" and def.Type ~= "Sparring" and def.Type ~= "SyndicateKillCivilians" then
@@ -34460,7 +34357,7 @@ do
 				Session.codes
 			),
 			"Status: " .. tostring(Status),
-			"Running: " .. table.concat(Debug.running(), ", ") .. "  |  mode " .. (if N.isOP() then "OP" elseif on("AutoFarmBest") then "Normal" else "manual") .. "  |  " .. (if N.safe() then "Safe Mode" else "Safe Mode OFF"),
+			"Running: " .. table.concat(Debug.running(), ", ") .. "  |  mode " .. (if N.farming() then "Auto Farm Everything" else "manual") .. "  |  " .. (if N.safe() then "Safe Mode" else "Safe Mode OFF"),
 			string.format(
 				"Game: cash %s bank %s, level %s, faction %s, tutorial %s, core %s, move %s, snapbacks %d, rates %s",
 				formatNumber(N.money()),
@@ -34483,7 +34380,6 @@ do
 end
 N.AllAutoToggles = {
 	"AutoFarmBest",
-	"AutoFarmOP",
 	"AutoMissions",
 	"AutoJob",
 	"AutoMeteor",
@@ -34665,7 +34561,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 				{ name = "Meteors / errands", value = Session.meteors .. " / " .. Session.errands, inline = true },
 				{ name = "Crates / stored", value = Session.crates .. " / " .. Session.stored, inline = true },
 				{ name = "Drops", value = N.dropsText(), inline = true },
-				{ name = "Mode", value = (if N.isOP() then "OP" elseif on("AutoFarmBest") then "Farm Everything" else "manual") .. (if N.safe() then ", Safe" else ""), inline = true },
+				{ name = "Mode", value = (if N.farming() then "Farm Everything" else "manual") .. (if N.safe() then ", Safe" else ""), inline = true },
 			},
 			footer = { text = "Corvus  \u{00B7}  updates every " .. optionText("WebhookCardEvery", "5 minutes") },
 			timestamp = DateTime.now():ToIsoDate(),
@@ -35004,8 +34900,7 @@ do
 			toggleCommand("crates", { "crate" }, { "AutoCrates" }, "Open Crates")
 			toggleCommand("store", {}, { "AutoStore" }, "Store Valuables")
 			toggleCommand("tutorial", {}, { "AutoTutorial" }, "Finish Tutorial")
-			toggleCommand("farmall", { "farmbest", "all", "farm" }, { "AutoFarmBest" }, "Auto Farm Everything")
-			toggleCommand("farmop", { "op" }, { "AutoFarmOP" }, "Auto Farm Everything OP (full planner, asks to confirm)")
+			toggleCommand("farmall", { "farmbest", "all", "farm" }, { "AutoFarmBest" }, "Auto Farm Everything (asks to confirm)")
 			Library:AddCommand({
 				Name = "stop",
 				Aliases = { "alloff" },
@@ -35049,7 +34944,6 @@ do
 		pcall(function()
 			Library:SetQuickBar({
 				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm All" },
-				{ Toggle = "AutoFarmOP", Icon = "zap", Label = "OP" },
 				{ Toggle = "AutoMissions", Icon = "scroll-text", Label = "Missions" },
 				{ Toggle = "AutoJob", Icon = "briefcase", Label = "Job" },
 				{ Toggle = "AutoMeteor", Icon = "flame", Label = "Meteor" },
@@ -35089,8 +34983,7 @@ do
 					Required = true,
 					Default = { "farm" },
 					Choices = {
-						{ Id = "farm", Title = "Auto Farm Everything", Description = "One switch: tutorial, missions, job shifts, meteors, errands, loot, stats, gym, bank, storing valuables and rewards. Never uses up items, Safe Mode stays on", Icon = "sparkles", Color = "#60d696" },
-						{ Id = "op", Title = "Auto Farm Everything OP", Description = "Full automatic, uses boosts and crates. Uses the game's remotes faster than a normal player: the anticheat MAY BAN this account. Use at your own risk, preferably on an alt", Icon = "zap", Color = "#ff5d5d" },
+						{ Id = "farm", Title = "Auto Farm Everything", Description = "Full automatic: tutorial, missions, job shifts, meteors, errands, loot, stats, gym, bank, items and rewards, picked by cash per second. Asks to confirm. The game's anticheat MAY BAN this account, preferably use an alt", Icon = "sparkles", Color = "#60d696" },
 						{ Id = "missions", Title = "Missions", Description = "Takes and finishes missions over and over", Icon = "scroll-text", Color = "#fab428" },
 						{ Id = "job", Title = "Job shifts", Description = "Works your job every shift: coffee orders and patients solved exactly", Icon = "briefcase", Color = "#3ccf91" },
 						{ Id = "events", Title = "City events", Description = "Meteors, errands and world loot", Icon = "flame", Color = "#c77dff" },
@@ -35109,11 +35002,10 @@ do
 					items = { "AutoStore", "AutoCore" },
 				}
 				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] and not chosen.farm and not chosen.op then "on" else "off" })
+					setToggles(names, { if chosen[id] and not chosen.farm then "on" else "off" })
 				end
 				N.markSetupDone()
-				setToggles({ "AutoFarmBest" }, { if chosen.farm and not chosen.op then "on" else "off" })
-				setToggles({ "AutoFarmOP" }, { if chosen.op then "on" else "off" })
+				setToggles({ "AutoFarmBest" }, { if chosen.farm then "on" else "off" })
 				notify("Quick setup done", "Change anything in the tabs any time", 5)
 			end,
 			Skipped = function()
@@ -35124,11 +35016,11 @@ do
 	end
 end
 pcall(function()
-	-- Auto Farm Everything OP and Remember Auto OP are never saved in a config (see Remember Auto OP below).
+	-- Auto Farm Everything and Remember Auto Farm Everything are never saved in a config (see Remember below).
 	if type(SaveManager) == "table" then
 		SaveManager.Ignore = SaveManager.Ignore or {}
-		SaveManager.Ignore.AutoFarmOP = true
-		SaveManager.Ignore.RememberOP = true
+		SaveManager.Ignore.AutoFarmBest = true
+		SaveManager.Ignore.RememberFarm = true
 	end
 end)
 if Window.AddSettingsTab then
@@ -35158,11 +35050,11 @@ else
 	end)
 end
 pcall(function()
-	-- Auto Farm Everything OP and Remember Auto OP are never saved in a config (see Remember Auto OP below).
+	-- Auto Farm Everything and Remember Auto Farm Everything are never saved in a config (see Remember below).
 	if type(SaveManager) == "table" then
 		SaveManager.Ignore = SaveManager.Ignore or {}
-		SaveManager.Ignore.AutoFarmOP = true
-		SaveManager.Ignore.RememberOP = true
+		SaveManager.Ignore.AutoFarmBest = true
+		SaveManager.Ignore.RememberFarm = true
 	end
 end)
 if Window.AddInfoTab then
@@ -35246,41 +35138,41 @@ pcall(function()
 		return string.format("$%s  \u{00B7}  bank $%s", formatNumber(N.money()), formatNumber(N.bank()))
 	end
 end)
--- Remember Auto OP: OP and Remember Auto OP are never part of a saved config (SaveManager.Ignore), only of
--- Corvus/BIZ_auto_op.json, and OP is restored only when Remember Auto OP is on.
+-- Remember Auto Farm Everything: the farm toggle and the Remember toggle are never part of a saved config
+-- (SaveManager.Ignore), only of Corvus/BIZ_auto_farm.json, and the farm is restored only when Remember is on.
 do
-	local OPFile = "Corvus/BIZ_auto_op.json"
-	function N.saveOPState()
-		if N.OPRestoring or os.clock() - (N.BootAt or 0) < 6 then
+	local FarmFile = "Corvus/BIZ_auto_farm.json"
+	function N.saveFarmState()
+		if N.FarmRestoring or os.clock() - (N.BootAt or 0) < 6 then
 			return
 		end
 		pcall(function()
 			if makefolder and isfolder and not isfolder("Corvus") then
 				makefolder("Corvus")
 			end
-			writefile(OPFile, HttpService:JSONEncode({ remember = on("RememberOP"), op = on("RememberOP") and on("AutoFarmOP") }))
+			writefile(FarmFile, HttpService:JSONEncode({ remember = on("RememberFarm"), farm = on("RememberFarm") and on("AutoFarmBest") }))
 		end)
 	end
-	function N.restoreOP()
+	function N.restoreFarm()
 		local ok, data = pcall(function()
-			return HttpService:JSONDecode(readfile(OPFile))
+			return HttpService:JSONDecode(readfile(FarmFile))
 		end)
 		if not ok or type(data) ~= "table" or data.remember ~= true or not alive() then
 			return
 		end
-		N.OPRestoring = true
+		N.FarmRestoring = true
 		pcall(function()
-			Toggles.RememberOP:SetValue(true)
-			if data.op == true and not on("AutoFarmOP") then
-				N.OPConfirmed = true
-				Toggles.AutoFarmOP:SetValue(true)
-				N.OPConfirmed = false
-				log("OP restored (Remember Auto OP)")
+			Toggles.RememberFarm:SetValue(true)
+			if data.farm == true and not on("AutoFarmBest") then
+				N.FarmConfirmed = true
+				Toggles.AutoFarmBest:SetValue(true)
+				N.FarmConfirmed = false
+				log("Farm restored (Remember Auto Farm Everything)")
 			end
 		end)
-		N.OPRestoring = false
+		N.FarmRestoring = false
 	end
-	task.delay(6.5, N.restoreOP)
+	task.delay(6.5, N.restoreFarm)
 	-- Recommended Settings: the safe, profitable setup, then Auto Farm Everything.
 	function N.recommended()
 		local function set(kind, name, value)
@@ -35301,7 +35193,7 @@ do
 		set("o", "StoreFrom", "Legendary")
 		set("o", "CorePick", "Best for farming")
 		set("o", "LootRadius", 300)
-		if not on("AutoFarmBest") and not on("AutoFarmOP") then
+		if not on("AutoFarmBest") then
 			set("t", "AutoFarmBest", true)
 		end
 		log("RECOMMENDED settings applied")
@@ -35433,7 +35325,7 @@ do
 			N.bloodStep()
 		end
 		-- A mission or shift only blocks the chores while Corvus is the one doing it.
-		local busy = (N.Mission.active and (N.isOP() or on("AutoMissions"))) or (N.Job.onShift and (N.isOP() or on("AutoJob")))
+		local busy = (N.Mission.active and (N.farming() or on("AutoMissions"))) or (N.Job.onShift and (N.farming() or on("AutoJob")))
 		-- Inventory chores between jobs: open crates, store valuables, wear the farming core.
 		if not busy and choreDue("crates", 8) and N.crateStep() then
 			return
@@ -35471,6 +35363,71 @@ do
 		end
 		return Library.ActiveTab == nil or Library.ActiveTab == tab
 	end
+	-- "Up next" in plain words (3-5 lines). The planner's own PLAN line stays in the log only.
+	local JobShort = { CoffeeShopWorker = "cafe", HospitalReceptionist = "hospital", DonutDelivery = "donut shop" }
+	function N.upNextLines()
+		local lines, seen = {}, {}
+		local function add(text)
+			if #lines < 5 and not seen[text] then
+				seen[text] = true
+				table.insert(lines, text)
+			end
+		end
+		if N.inTutorial() then
+			add("Finish tutorial")
+		end
+		if not N.farming() then
+			if #lines == 0 then
+				add("Turn on Auto Farm Everything to get a plan")
+			end
+			return lines
+		end
+		local M = N.Mission
+		if M.active then
+			add("Mission: " .. tostring(M.data.Name or M.data.Id or "in progress"))
+		end
+		if N.Job.onShift then
+			add("Working your shift")
+		end
+		local hasMeteor, hasJob = false, false
+		for _, option in ipairs(N.Plan.options or {}) do
+			if option.name == "Meteor" then
+				hasMeteor = true
+				add("Meteor at the crater now (about $3,000)")
+			elseif option.name == "Errand" then
+				add("City errand ($500)")
+			elseif option.name == "Job" then
+				hasJob = true
+				add("Shift at work, ready to start")
+			elseif option.name == "Mission" then
+				add(string.format("Mission: %s (about $%s)", if M.active then "next one" else "from the quest giver", formatNumber(math.floor(N.missionValue()))))
+			elseif option.name == "Loot" then
+				add("Pick up loot nearby")
+			end
+		end
+		if not hasJob and not N.Job.onShift then
+			local jobId = N.jobWanted()
+			local def = jobId and N.G.Jobs.Jobs and N.G.Jobs.Jobs[jobId]
+			if type(def) == "table" and def.StartMinute then
+				local minute = tonumber(def.StartMinute) or 0
+				add(string.format("Shift at %s %02d:%02d", JobShort[jobId] or "work", minute // 60, minute % 60))
+			end
+		end
+		if not hasMeteor then
+			add("Meteor when announced")
+		end
+		if #lines == 0 then
+			add("Waiting for an activity")
+		end
+		return lines
+	end
+	function N.upNextText()
+		local lines = N.upNextLines()
+		for k, line in ipairs(lines) do
+			lines[k] = "\u{2022} " .. line
+		end
+		return table.concat(lines, "\n")
+	end
 	-- Builds every label text here, the draw thread below only copies strings.
 	N.InfoText = {}
 	task.spawn(function()
@@ -35480,30 +35437,17 @@ do
 				local I = N.InfoText
 				local elapsed = math.max(os.clock() - Session.started, 1)
 				I.info = string.format(
-					"<b>$%s</b> cash  \u{00B7}  <b>$%s</b> bank\nEarned <b>$%s</b> (%s/h)  \u{00B7}  level <b>%s</b>\nMode: <b>%s</b>%s%s",
+					"<b>$%s</b> cash  \u{00B7}  <b>$%s</b> bank\nEarned <b>$%s</b> (%s/h)  \u{00B7}  level <b>%s</b>\nAuto Farm Everything: <b>%s</b>%s%s",
 					formatNumber(N.money()),
 					formatNumber(N.bank()),
 					formatNumber(Session.earned),
 					formatNumber(math.floor(Session.earned / elapsed * 3600)),
 					tostring(N.level()),
-					if N.isOP() then "OP" elseif on("AutoFarmBest") then "Farm Everything" else "manual",
+					if N.farming() then "on" else "off",
 					if N.safe() then "  \u{00B7}  Safe Mode" else "  \u{00B7}  <font color=\"#ff8a5c\">Safe Mode off</font>",
 					if N.blatant() then "  \u{00B7}  Blatant" else ""
 				)
-				local best = N.Plan.best
-				I.next = if N.inTutorial() then "Next: finish the tutorial (" .. tostring(N.Tutorial.steps) .. " steps done)"
-					elseif best then string.format("Next: <b>%s</b> at $%.2f/s%s", best.name, best.rate, if N.Plan.rate[best.name] then "" else " (est.)")
-					else '<font transparency="0.4">Next: waiting for an activity</font>'
-				local excluded = #picked(Options.OPExclude)
-				I.opplan = string.format(
-					"OP is <b>%s</b>%s\n%s\nBoosts, crates, Blood Packs: <b>%s</b>  \u{00B7}  excluded items: <b>%d</b>\n%s",
-					if N.isOP() then "ON" else "off",
-					if on("RememberOP") then "  \u{00B7}  remembered" else "",
-					if best then string.format("Planner pick: %s at $%.2f/s", best.name, best.rate) else "Planner pick: -",
-					if N.isOP() then "used" else "not used",
-					excluded,
-					if N.safe() then "Safe Mode on: walks and real timings" else '<font color="#ff8a5c">Safe Mode off: faster, detectable</font>'
-				)
+				I.next = N.upNextText()
 				I.codes = string.format(
 					"%s\nGroup: %s  \u{00B7}  known %d  \u{00B7}  redeemed %d\n%s",
 					tostring(N.Codes.status),
@@ -35609,11 +35553,6 @@ do
 						Labels.Info:SetText(I.info or "-")
 						Labels.Next:SetText(I.next or "-")
 						Labels.Recent:SetText(I.recent or "-")
-					end)
-				end
-				if shown(Tabs.AutoOP) then
-					group(function()
-						Labels.OPPlan:SetText(I.opplan or "-")
 					end)
 				end
 				if shown(Tabs.Missions) then
