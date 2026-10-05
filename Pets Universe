@@ -30442,6 +30442,56 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	PartyEggModule = require(ReplicatedStorage.Modules:WaitForChild("PartyEggModule", 5))
     end)
     
+    Auto.Log = { lines = {}, start = os.clock(), dirty = false, flushedAt = 0, limit = 3000, file = "Corvus_PU_" .. tostring(LocalPlayer.Name) .. "_log.txt" }
+    function Auto.log(...)
+    	local state = Auto.Log
+    	local parts = table.pack(...)
+    	for i = 1, parts.n do
+    		local value = parts[i]
+    		if type(value) == "number" then
+    			if value ~= value then
+    				parts[i] = "nan"
+    			elseif value % 1 == 0 and math.abs(value) < 1e15 then
+    				parts[i] = string.format("%d", value)
+    			else
+    				parts[i] = string.format("%.4g", value)
+    			end
+    		else
+    			parts[i] = tostring(value)
+    		end
+    	end
+    	local line = string.format("[%8.1f] %s", os.clock() - state.start, table.concat(parts, " ", 1, parts.n))
+    	if #line > 900 then
+    		line = string.sub(line, 1, 900) .. "..."
+    	end
+    	local lines = state.lines
+    	lines[#lines + 1] = line
+    	if #lines > state.limit + 500 then
+    		table.move(lines, #lines - state.limit + 1, #lines, 1)
+    		for i = #lines, state.limit + 1, -1 do
+    			lines[i] = nil
+    		end
+    	end
+    	state.dirty = true
+    end
+    function Auto.flushLog(force)
+    	local state = Auto.Log
+    	if state.dirty and type(writefile) == "function" and (force or os.clock() - state.flushedAt >= 30) then
+    		state.dirty = false
+    		state.flushedAt = os.clock()
+    		local okExec, exec = pcall(function() return identifyexecutor() end)
+    		local head = string.format("Corvus Pets Universe log | %s | %s | %s", tostring(LocalPlayer.Name), if okExec then tostring(exec) else "?", os.date("%Y-%m-%d %H:%M:%S"))
+    		task.spawn(pcall, writefile, state.file, head .. "\n" .. table.concat(state.lines, "\n"))
+    	end
+    end
+    task.spawn(function()
+    	Auto.log("START", "Pets Universe hub, place", game.PlaceId, "server", string.sub(tostring(game.JobId), 1, 8))
+    	while alive() do
+    		task.wait(5)
+    		pcall(Auto.flushLog, false)
+    	end
+    	pcall(Auto.flushLog, true)
+    end)
     local S = {
     	autoFarm = false,
     	farmAll = false,
@@ -30491,7 +30541,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	moonPermPick = {},
     	autoMoonIncr = false,
     	moonIncrPick = {},
-    	upgradeOrder = "Cheapest first",
+    	upgradeOrder = "Best value",
     	autoFriendSend = false,
     	autoFriendAccept = false,
     	webhookOn = false,
@@ -30507,7 +30557,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	luckyBatch = "Auto",
     	autoTree = false,
     	treePick = {},
-    	treeOrder = "Cheapest first",
+    	treeOrder = "Best value",
     	autoSpecial = false,
     	specialPick = {},
     	rubyReserve = 0,
@@ -32271,6 +32321,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     local function diag(where, err)
     	if DiagShown[where] then return end
     	DiagShown[where] = true
+    	Auto.log("PROBLEM", where, tostring(err))
     	DiagText = string.format('<font color="#ff6e8a">%s:</font> %s', where, tostring(err))
     end
     
@@ -32441,7 +32492,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	"AutoLucky", "AutoEquipBest", "AutoGolden", "AutoDiamond", "AutoFish", "FishIndexHunt",
     	"FishIndexGolden", "FishTap", "AutoWorms", "AutoHooks", "AutoSellFish", "AutoMerchantBuy",
     	"AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoMoonPerm", "AutoMoonIncr",
-    	"MoonGameAuto", "AutoRebirth", "RebirthWaitPerm", "AutoServerLuck", "SkipHatchAnim", "SkipLuckyAnim",
+    	"MoonGameAuto", "AutoRebirth", "AutoServerLuck", "SkipHatchAnim", "SkipLuckyAnim",
     }
     Auto.farmSet = {}
     function Auto.farmAll(value)
@@ -32449,15 +32500,14 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	if value then
     		for _, name in ipairs(Auto.farmNames) do
     			local toggle = Toggles[name]
-    			if toggle and not toggle.Value and not (name == "AutoHatch" and S.hatchEggName == "") then
+    			if toggle and not toggle.Value then
     				Auto.farmSet[name] = true
     				pcall(function() toggle:SetValue(true) end)
     			end
     		end
-    		if S.hatchEggName == "" then
-    			notify("Auto Farm Everything", "Pick an egg in the Eggs tab and it will start opening eggs too", 6)
-    		end
+    		Auto.log("FARMALL", "on")
     	else
+    		Auto.log("FARMALL", "off")
     		for name in pairs(Auto.farmSet) do
     			local toggle = Toggles[name]
     			if toggle and toggle.Value then
@@ -32473,7 +32523,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     FarmBox:AddToggle("FarmAll", {
     	Text = "Auto Farm Everything",
     	Description = "One switch for the whole farm",
-    	Tooltip = "Turns on every automation: farm, eggs, index, fishing, rewards, upgrades, worlds, UFO and Moon. Spending is planned: it saves coins for the next world once you are halfway there, and buys the cheapest upgrade first. Turning it off only switches off what it switched on.",
+    	Tooltip = "Turns on every automation: farm, eggs, index, fishing, rewards, upgrades, worlds, UFO and Moon. Spending is planned: every egg, world, upgrade, tree node and rebirth is compared by how much income it adds per coin, ruby or gem over the next 24 hours, and the best one is bought or saved for. Turning it off only switches off what it switched on.",
     	Default = false,
     	Callback = function(v)
     		task.spawn(Auto.farmAll, v)
@@ -33830,9 +33880,9 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     UI.BudgetBox = Tabs.Upgrades:AddLeftGroupbox("Budget", "wallet")
     UI.BudgetBox:AddDropdown("UpgradeOrder", {
     	Text = "Buy order",
-    	Values = { "Cheapest first", "Top to bottom" },
-    	Default = "Cheapest first",
-    	Tooltip = "Cheapest first spreads your gems and rubies evenly. Top to bottom maxes one upgrade before the next.",
+    	Values = { "Best value", "Cheapest first", "Top to bottom" },
+    	Default = "Best value",
+    	Tooltip = "Best value buys the upgrade that adds the most income per ruby or gem over the next 24 hours. Cheapest first spreads your gems and rubies evenly. Top to bottom maxes one upgrade before the next.",
     	Callback = function(v)
     		S.upgradeOrder = tostring(v or "Cheapest first")
     	end,
@@ -34015,9 +34065,9 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     })
     UI.TreeBox:AddDropdown("TreeOrder", {
     	Text = "Order",
-    	Values = { "Cheapest first", "Tree order" },
-    	Default = "Cheapest first",
-    	Tooltip = "Cheapest first grabs the most nodes for your rubies. Tree order follows the branches as they are drawn.",
+    	Values = { "Best value", "Cheapest first", "Tree order" },
+    	Default = "Best value",
+    	Tooltip = "Best value buys the node that adds the most income per ruby over the next 24 hours, counting the branches it opens. Cheapest first grabs the most nodes for your rubies. Tree order follows the branches as they are drawn.",
     	Callback = function(v)
     		S.treeOrder = tostring(v or "Cheapest first")
     	end,
@@ -36439,6 +36489,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     			local waited = 0
     			while waited < 4 do
     				if worldUnlocked(info.next) then
+    					Auto.log("BUY", "world", info.next, "for", info.price, info.currency)
     					Saved.worldsBought += 1
     					SaveDirty = true
     					Worlds.fails = 0
@@ -36560,6 +36611,9 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     			local allMaxed, anyPicked, capped = true, false, false
     			local balance = getStat(shop.currency) or 0
     			local reserve = if shop.currency == "Rubies" then S.rubyReserve elseif shop.currency == "Gems" then S.gemReserve else 0
+    			local plan = Auto.Plan
+    			local planOn = plan ~= nil and plan.ready and (S.farmAll or S.upgradeOrder == "Best value")
+    			local bestValue = -math.huge
     			for index, name in ipairs(shop.names) do
     				local level = readLevel(shop.folder, name)
     				local maxLevel = shop.maxLevel(name)
@@ -36577,7 +36631,13 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     					end
     					if price then
     						local better
-    						if S.upgradeOrder == "Top to bottom" then
+    						if planOn then
+    							local value = plan.score("shop:" .. shop.id .. ":" .. name)
+    							better = best == nil or value > bestValue
+    							if better then
+    								bestValue = value
+    							end
+    						elseif S.upgradeOrder == "Top to bottom" then
     							better = best == nil or index < bestIndex
     						else
     							better = best == nil or price < bestPrice
@@ -36595,7 +36655,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				balance = balance,
     				reserve = reserve,
     				currency = shop.currency,
-    				affordable = best ~= nil and bestPrice ~= nil and balance - (tonumber(reserve) or 0) >= bestPrice,
+    				affordable = best ~= nil and bestPrice ~= nil and balance - (tonumber(reserve) or 0) >= bestPrice and (not planOn or plan.allows("shop:" .. shop.id .. ":" .. best, bestPrice, rows[best].level)),
     				allMaxed = anyPicked and allMaxed,
     				capped = capped,
     				anyPicked = anyPicked,
@@ -36630,6 +36690,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     					break
     				end
     				bought += 1
+    				Auto.log("BUY", shop.id, snap.best, "level", before + 1, "for", snap.bestPrice, shop.currency, "score", if Auto.Plan then Auto.Plan.score("shop:" .. shop.id .. ":" .. snap.best) else -1)
     				state.bought += 1
     				Saved.upgradesBought += 1
     				SaveDirty = true
@@ -36737,8 +36798,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				local ok, err = pcall(function()
     					local info = worldInfo()
     					S.worldSave = 0
-    					if S.farmAll and S.autoBuyWorlds and info.next and info.currency == "Coins" and info.price and Worlds.fails < 2 and (info.balance or 0) >= info.price * 0.5 then
-    						S.worldSave = info.price
+    					if S.farmAll and S.autoBuyWorlds and info.next and info.currency == "Coins" and info.price and Auto.Plan and Auto.Plan.ready then
+    						S.worldSave = Auto.Plan.keep.Coins or 0
     					end
     					if not S.autoBuyWorlds then
     						Worlds.status = ""
@@ -37264,6 +37325,9 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				info.balance = balance
     				local best, bestCost, bestIndex
     				local now = os.clock()
+    				local plan = Auto.Plan
+    				local planOn = plan ~= nil and plan.ready and (S.farmAll or S.treeOrder == "Best value")
+    				local bestValue = -math.huge
     				for index, group in ipairs(tree.Groups) do
     					if group.parent then
     						local level = levels[group.id] or 0
@@ -37282,7 +37346,13 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     								elseif (parentDone or level > 0) and node and (Tree.blocked[group.id] or 0) < now then
     									local cost = tonumber(node.cost) or 0
     									local better
-    									if S.treeOrder == "Tree order" then
+    									if planOn then
+    										local value = plan.score("tree:" .. group.id)
+    										better = best == nil or value > bestValue
+    										if better then
+    											bestValue = value
+    										end
+    									elseif S.treeOrder == "Tree order" then
     										better = best == nil or index < bestIndex
     									else
     										better = best == nil or cost < bestCost
@@ -37300,7 +37370,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     					info.cost = bestCost
     					info.title = tostring(best.node.title or best.group.title or best.node.id)
     					info.image = best.node.image or best.group.image
-    					info.affordable = spend >= bestCost
+    					info.affordable = spend >= bestCost and (not planOn or plan.allows("tree:" .. best.group.id, bestCost, best.node.id))
     				end
     				return info
     			end
@@ -37356,7 +37426,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     						info.allDone = false
     						if row.locked then
     							info.anyLocked = true
-    						elseif anchor and (Special.blocked[entry.name] or 0) < now and (info.next == nil or entry.price < info.next.price) then
+    						elseif anchor and (Special.blocked[entry.name] or 0) < now and (info.next == nil or entry.price < info.next.price) and not (Auto.Plan and Auto.Plan.on() and not Auto.Plan.allows("special:" .. entry.name, entry.price)) then
     							info.next = row
     						end
     					end
@@ -37397,6 +37467,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				if flag("SP" .. tostring(index)) then
     					Saved.specialBought += 1
     					SaveDirty = true
+    					Auto.log("BUY", "special", row.name, row.title, "for", row.price, "rubies")
     					queueToast("Special Upgrades", "Unlocked " .. row.title)
     					postEvent("Special", "Special upgrade", "**" .. row.title .. "** unlocked", 12759680)
     				else
@@ -37433,6 +37504,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				local remote = Auto.knitRemote("MoonRebirthService", "RE", "DoRebirth")
     				if not remote then return false end
     				local before = rebirthInfo().rebirths
+    				local gemsBefore = getStat("Gems")
     				if travel then
     					local ok = travelTo(moonWorld())
     					if not ok then return false end
@@ -37449,6 +37521,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     					waited += task.wait(0.2) or 0.2
     				end
     				local after = rebirthInfo().rebirths
+    				Auto.log("REBIRTH", if after > before then "done" else "failed", before, "->", after, "gems", gemsBefore, "->", getStat("Gems"), "damage level", readData("MoonUpgradesData", "Damage"))
     				if after > before then
     					Saved.rebirthsDone += 1
     					SaveDirty = true
@@ -37460,10 +37533,849 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				return false
     			end
     
+    			do
+    				-- Profit engine v2: every spend and time option on one dV/C scale (CLAUDE.md.txt 8.00, notes.md)
+    				local P = { ready = false, H = 86400, w = { Coins = 1, Rubies = 0, Gems = 0 }, byId = {}, best = {}, keep = { Coins = 0, Rubies = 0, Gems = 0 }, egg = nil, eggWhy = "", fishOff = false, act = {}, last = nil, lastLog = {}, rebirthNow = false, rebirthPath = false, moonTry = -1e9, I = { Coins = 0, Rubies = 0, Gems = 0 } }
+    				Auto.Plan = P
+    				local plMods = {}
+    				local plLog = function(...)
+    					if Auto.log then
+    						Auto.log(...)
+    					end
+    				end
+    
+    				local function plReq(key, parentName, childName)
+    					if plMods[key] then
+    						return plMods[key]
+    					end
+    					pcall(function()
+    						local parent = ReplicatedStorage:FindFirstChild(parentName)
+    						local child = parent and parent:FindFirstChild(childName)
+    						if child then
+    							local value = require(child)
+    							if type(value) == "table" then
+    								plMods[key] = value
+    							end
+    						end
+    					end)
+    					return plMods[key]
+    				end
+    
+    				local function plNum(value, default)
+    					value = tonumber(value)
+    					if value == nil or value ~= value or value == math.huge or value == -math.huge then
+    						return default
+    					end
+    					return value
+    				end
+    
+    				local function plCall(module, fname, ...)
+    					if type(module) ~= "table" or type(module[fname]) ~= "function" then
+    						return nil
+    					end
+    					local ok, result = pcall(module[fname], ...)
+    					if ok then
+    						return result
+    					end
+    					return nil
+    				end
+    
+    				local function plRate(key)
+    					local metrics = Auto.Metrics
+    					if not (metrics and metrics.current) then
+    						return 0
+    					end
+    					local ok, value = pcall(metrics.current, key)
+    					return math.max(0, plNum(if ok then value else nil, 0)) / 3600
+    				end
+    
+    				local function plPower(multi, petName)
+    					local entry = multi and multi[petName]
+    					if type(entry) ~= "table" or entry[1] then
+    						return 0
+    					end
+    					return plNum(entry[2], 0)
+    				end
+    
+    				local function plBoostAt(list, lvl, base)
+    					if lvl <= 0 or type(list) ~= "table" then
+    						return base
+    					end
+    					local entry = list[lvl]
+    					return if type(entry) == "table" then plNum(entry.Boost, base) else base
+    				end
+    
+    				-- expected team power gain per hatched egg (real egg odds with the player's luck)
+    				local function plEggGain(egg, luck, goldPct)
+    					local handler = plReq("egg", "NormalEggs", "EggHandlerModule")
+    					local multi = plReq("multi", "Pets", "Multi")
+    					local list = handler and handler[egg]
+    					if type(list) ~= "table" or not multi then
+    						return nil
+    					end
+    					local chances = nil
+    					if type(handler.GetNormalizedChances) == "function" then
+    						local ok, result = pcall(handler.GetNormalizedChances, handler, list, luck, P.secretLuck or 1, P.charmSecret or 0)
+    						if ok and type(result) == "table" then
+    							chances = result
+    						end
+    					end
+    					chances = chances or list
+    					local total = 0
+    					for _, entry in ipairs(chances) do
+    						if type(entry) == "table" then
+    							total += math.max(0, plNum(entry.Chance, 0))
+    						end
+    					end
+    					if total <= 0 then
+    						return nil
+    					end
+    					local golden = math.clamp((goldPct or 0) / 100, 0, 1)
+    					local weakest = P.team.weakest
+    					local gain = 0
+    					for _, entry in ipairs(chances) do
+    						if type(entry) == "table" and type(entry.Name) == "string" then
+    							local share = math.max(0, plNum(entry.Chance, 0)) / total
+    							local normal = math.max(0, plPower(multi, entry.Name) - weakest)
+    							local gold = math.max(0, plPower(multi, "Golden " .. entry.Name) - weakest)
+    							gain += share * ((1 - golden) * normal + golden * gold)
+    						end
+    					end
+    					return gain
+    				end
+    
+    				-- coins (and rubies) paid per point of damage in a world, from BreakablesConfig tiers
+    				local function plWorldEff(world)
+    					local cfg = plReq("brk", "Modules", "BreakablesConfig")
+    					local worlds = cfg and cfg.Worlds
+    					if type(worlds) ~= "table" or not world then
+    						return nil
+    					end
+    					local entry = worlds[world]
+    					if not entry then
+    						for key, value in pairs(worlds) do
+    							if Auto.worldKey(key) == world then
+    								entry = value
+    								break
+    							end
+    						end
+    					end
+    					local tiers = type(entry) == "table" and entry.Tiers
+    					if type(tiers) ~= "table" then
+    						return nil
+    					end
+    					local hp, pay = 0, {}
+    					for _, tier in pairs(tiers) do
+    						if type(tier) == "table" and type(tier.Currency) == "string" and tier.Group ~= "Fruits" then
+    							local weight = plNum(tier.HP, 0) * plNum(tier.SpawnChance, 0)
+    							hp += weight
+    							pay[tier.Currency] = (pay[tier.Currency] or 0) + weight * plNum(tier.Multiplier, 0)
+    						end
+    					end
+    					if hp <= 0 then
+    						return nil
+    					end
+    					for key, value in pairs(pay) do
+    						pay[key] = value / hp
+    					end
+    					return pay
+    				end
+    
+    				-- dV in coin-equivalent per second for each kind of effect
+    				local V = {}
+    				function V.dmg(rel)
+    					return P.V * rel
+    				end
+    				function V.coinAdd(delta)
+    					return P.I.Coins * delta / P.Mc
+    				end
+    				function V.rubyAdd(delta)
+    					return P.w.Rubies * P.I.Rubies * delta / P.Mr
+    				end
+    				function V.gemsMul(rel)
+    					return P.w.Gems * P.I.Gems * rel
+    				end
+    				function V.gemsAdd(delta)
+    					return P.w.Gems * P.I.Gems * delta / P.gemsAdd
+    				end
+    				function V.luck(delta)
+    					local h = P.hatch
+    					if not h or h.rate <= 0 or delta <= 0 then
+    						return 0
+    					end
+    					local after = plEggGain(h.egg, P.luck + delta, P.gold) or h.gain
+    					return h.rate * math.max(0, after - h.gain) / P.team.power * P.V
+    				end
+    				function V.golden(deltaPct)
+    					local h = P.hatch
+    					if not h or h.rate <= 0 then
+    						return 0
+    					end
+    					local after = plEggGain(h.egg, P.luck, P.gold + deltaPct) or h.gain
+    					return h.rate * math.max(0, after - h.gain) / P.team.power * P.V
+    				end
+    				function V.hatchSpeed(delta)
+    					local h = P.hatch
+    					if not h or not h.bound or h.rate <= 0 then
+    						return 0
+    					end
+    					return h.rate * delta / P.hatchSpeed * h.gain / P.team.power * P.V
+    				end
+    				function V.eggOpen()
+    					local h = P.hatch
+    					if not h or not h.bound or h.rate <= 0 then
+    						return 0
+    					end
+    					return h.rate / math.max(1, h.maxOpen) * h.gain / P.team.power * P.V
+    				end
+    				function V.equip()
+    					return P.V * P.team.weakest / P.team.power
+    				end
+    				function V.crit(delta)
+    					return P.V * delta * (P.critDmg - 1) / (1 + P.crit * (P.critDmg - 1))
+    				end
+    				function V.critDmg(rel)
+    					return P.V * P.crit * P.critDmg * rel / (1 + P.crit * (P.critDmg - 1))
+    				end
+    				function V.tap(rel)
+    					return P.V * (if S.autoTap then 0.05 else 0) * rel
+    				end
+    				function V.walk(rel)
+    					return P.V * 0.1 * rel
+    				end
+    				function V.bonus(cur, extra)
+    					if cur == "Coins" then
+    						return P.I.Coins * extra
+    					elseif cur == "Rubies" then
+    						return P.w.Rubies * P.I.Rubies * extra
+    					end
+    					return P.w.Gems * P.I.Gems * extra
+    				end
+    
+    				local plTreeValue = {
+    					CoinsMult = function(v) return V.coinAdd(v) end,
+    					WorldBoostAdd = function(v) return V.coinAdd(v) end,
+    					RubiesMult = function(v) return V.rubyAdd(v) end,
+    					GemsMult = function(v) return V.gemsAdd(v) end,
+    					LuckMult = function(v) return V.luck(v) end,
+    					HatchSpeedMult = function(v) return V.hatchSpeed(v) end,
+    					PetDamageMult = function(v) return V.dmg(v / P.treeDmg) end,
+    					AttackSpeedMult = function(v) return V.dmg(v / P.treeAtk) end,
+    					CritChanceAdd = function(v) return V.crit(v) end,
+    					CritDamageMult = function(v) return V.critDmg(v) end,
+    					CoinBonusX2Chance = function(v) return V.bonus("Coins", v) end,
+    					CoinBonusX3Chance = function(v) return V.bonus("Coins", 2 * v) end,
+    					RubyBonusX2Chance = function(v) return V.bonus("Rubies", v) end,
+    					RubyBonusX3Chance = function(v) return V.bonus("Rubies", 2 * v) end,
+    					GemBonusX2Chance = function(v) return V.bonus("Gems", v) end,
+    					GoldenPetChanceAdd = function(v) return V.golden(v) end,
+    					MaxEggOpenAdd = function() return V.eggOpen() end,
+    					MaxEquipAdd = function() return V.equip() end,
+    					TapPowerMult = function(v) return V.tap(v) end,
+    					BreakableDamageMult = function(v) return V.tap(v) end,
+    					PetSpeedMult = function(v) return V.walk(v) end,
+    				}
+    
+    				local function plSpawnBoost(track, lvl)
+    					local folder = ReplicatedStorage:FindFirstChild("UpgradesModule")
+    					if not folder then
+    						return nil
+    					end
+    					for _, child in ipairs(folder:GetChildren()) do
+    						if child.Name ~= "UpgradesModule" then
+    							local module = plReq("up:" .. child.Name, "UpgradesModule", child.Name)
+    							local list = module and module[track]
+    							if type(list) == "table" then
+    								local entry = list[lvl]
+    								return if type(entry) == "table" then plNum(entry.Boost, nil) else nil
+    							end
+    						end
+    					end
+    					return nil
+    				end
+    
+    				local function plSpawnValue(track, lvl)
+    					local now, nxt = plSpawnBoost(track, lvl), plSpawnBoost(track, lvl + 1)
+    					if not (now and nxt) then
+    						return 0
+    					end
+    					if track == "CoinsUpgrades" then
+    						return V.coinAdd(math.max(0, math.min(nxt, 3) - math.min(now, 3)))
+    					elseif track == "RubiesUpgrades" then
+    						return V.rubyAdd(math.max(0, math.min(nxt, 3) - math.min(now, 3)))
+    					elseif track == "LuckUpgrades" then
+    						return V.luck(math.max(0, math.min(nxt, 2) - math.min(now, 2)))
+    					elseif track == "HatchSpeedUpgrades" then
+    						return V.hatchSpeed(nxt - now)
+    					elseif track == "CriticalUpgrades" then
+    						return V.crit(0.01 * (nxt - now))
+    					elseif track == "PetSpeedUpgrades" then
+    						return V.walk((nxt - now) / math.max(now, 1))
+    					end
+    					return 0
+    				end
+    
+    				local plMoonKind = {
+    					Incremental = {
+    						Damage = function(b, n) return V.dmg(n / b - 1) end,
+    						PetAttackSpeed = function(b, n) return V.dmg(n / b - 1) end,
+    						MoreGems = function(b, n) return V.gemsAdd(n - b) end,
+    						TapPower = function(b, n) return V.tap(n / b - 1) end,
+    						CritDmg = function(b, n) return V.critDmg(n / b - 1) end,
+    					},
+    					Permanent = {
+    						CoinMultiplier = function(b, n) return V.coinAdd(n - b) end,
+    						RubiesMultiplier = function(b, n) return V.rubyAdd(n - b) end,
+    						GemsMultiplier = function(b, n) return V.gemsMul(n / b - 1) end,
+    						LuckMultiplier = function(b, n) return V.luck(n - b) end,
+    						HatchSpeedMultiplier = function(b, n) return V.hatchSpeed(n - b) end,
+    						CritChance = function(b, n) return V.crit(n - b) end,
+    						EggHatch = function() return V.eggOpen() end,
+    						PetEquip = function() return V.equip() end,
+    					},
+    				}
+    
+    				local function plSpecialValue(title)
+    					title = string.lower(tostring(title or ""))
+    					if string.find(title, "pet equip", 1, true) then
+    						return V.equip(), false
+    					elseif string.find(title, "egg open", 1, true) then
+    						return V.eggOpen(), false
+    					elseif string.find(title, "hatch speed", 1, true) then
+    						return V.hatchSpeed(0.1), false
+    					elseif string.find(title, "crit chance", 1, true) then
+    						return V.crit(0.001), false
+    					elseif string.find(title, "golden chance", 1, true) then
+    						return V.golden(0.2), false
+    					end
+    					return 0, true
+    				end
+    
+    				local function plAdd(list, option)
+    					if option.cost and option.cost > 0 then
+    						option.dV = math.max(0, option.dV or 0)
+    						option.ratio = option.dV / option.cost
+    						table.insert(list, option)
+    					end
+    				end
+    
+    				local function plReserve(cur)
+    					if cur == "Rubies" then
+    						return tonumber(S.rubyReserve) or 0
+    					elseif cur == "Gems" then
+    						return tonumber(S.gemReserve) or 0
+    					end
+    					return 0
+    				end
+    
+    				-- every money option of the account, one list
+    				local function plOptions()
+    					local list = {}
+    					-- eggs (coins): expected power gain per egg, minus the farm income lost while standing at the egg
+    					local pets = loadEggPets() or {}
+    					local bestEff = P.farmEff or 0
+    					for egg in pairs(pets) do
+    						local price, free = getEggPrice(egg)
+    						local event = Auto.eggEvent(egg)
+    						local world = Auto.eggWorld(egg)
+    						if price and Auto.eggCurrency(egg) == "Coins" and not (event and (event.ended or event.locked)) and worldUnlocked(world) then
+    							local gain = plEggGain(egg, P.luck, P.gold) or 0
+    							local perEgg = gain / P.team.power * P.V
+    							local eff = plWorldEff(world)
+    							local lost = if bestEff > 0 and eff and eff.Coins then math.max(0, 1 - eff.Coins / bestEff) else 0
+    							local timeCost = lost * P.V * P.eggSeconds
+    							local cost = (if free then 0 else price) + timeCost
+    							plAdd(list, { id = "egg:" .. egg, cur = "Coins", kind = "Egg", name = egg, cost = math.max(cost, 1), price = if free then 0 else price, dV = perEgg, perEgg = perEgg, gain = gain })
+    						end
+    					end
+    					-- next world (coins): pay per damage of the new world vs the best one now
+    					local info = worldInfo()
+    					if info.next and info.price and info.currency == "Coins" then
+    						local eff = plWorldEff(info.next)
+    						local rel = if eff and eff.Coins and bestEff > 0 then eff.Coins / bestEff - 1 else 0
+    						local rubyRel = if eff and eff.Rubies and (P.farmRubyEff or 0) > 0 then eff.Rubies / P.farmRubyEff - 1 else 0
+    						plAdd(list, { id = "world:" .. info.next, cur = "Coins", kind = "World", name = info.next, cost = info.price, dV = P.I.Coins * math.max(0, rel) + P.w.Rubies * P.I.Rubies * math.max(0, rubyRel) })
+    					end
+    					-- Moon world (rubies): progress, bought when affordable
+    					local cost = Auto.GameData.worldCost
+    					if cost and cost.MoonWorld and tonumber(cost.MoonRubiesCost) then
+    						local moon = Auto.worldKey(cost.MoonWorld)
+    						local needs = cost.MoonRequires and Auto.worldKey(cost.MoonRequires) or nil
+    						if not worldUnlocked(moon) and (not needs or worldUnlocked(needs)) then
+    							plAdd(list, { id = "moonworld", cur = "Rubies", kind = "World", name = moon, from = needs, cost = tonumber(cost.MoonRubiesCost), dV = 0, progress = true })
+    						end
+    					end
+    					-- spawn machine (rubies)
+    					local spawn = Auto.GameData.spawnUpgrades
+    					if spawn and S.autoSpawnUp then
+    						for _, track in ipairs(UI.SpawnUpgradeNames or {}) do
+    							if S.spawnPick[track] then
+    								local lvl = readLevel("UpgradesData", track)
+    								local maxLevel = tonumber(spawn.MaxLevels and spawn.MaxLevels[track]) or 0
+    								local entry = type(spawn[track]) == "table" and spawn[track][lvl + 1] or nil
+    								if lvl < maxLevel and type(entry) == "table" then
+    									plAdd(list, { id = "shop:spawn:" .. track, cur = "Rubies", kind = "Spawn", name = track, level = lvl, cost = plNum(entry.Price, 0), dV = plSpawnValue(track, lvl) })
+    								end
+    							end
+    						end
+    					end
+    					-- Moon shops (gems)
+    					local moonCfg = Auto.GameData.moonConfig
+    					if moonCfg then
+    						for _, shopKey in ipairs({ "Permanent", "Incremental" }) do
+    							local shop = moonCfg[shopKey]
+    							local on = if shopKey == "Permanent" then S.autoMoonPerm else S.autoMoonIncr
+    							local pick = if shopKey == "Permanent" then S.moonPermPick else S.moonIncrPick
+    							local folder = moonCfg.DataFolders and moonCfg.DataFolders[shopKey] or (if shopKey == "Permanent" then "MoonPermUpgradesData" else "MoonUpgradesData")
+    							if shop and on then
+    								for _, uname in ipairs(shop.Order or {}) do
+    									local levels = shop[uname]
+    									local lvl = readLevel(folder, uname)
+    									local cap = plNum(plCall(moonCfg, "GetLevelCap", LocalPlayer, shopKey, uname), 0)
+    									cap = math.min(cap, plNum(shop.MaxLevels and shop.MaxLevels[uname], cap))
+    									local entry = type(levels) == "table" and levels[lvl + 1] or nil
+    									if pick[uname] and lvl < cap and type(entry) == "table" then
+    										local additive = shop.AdditiveUpgrades and shop.AdditiveUpgrades[uname]
+    										local base = if additive then 0 else 1
+    										local b = plBoostAt(levels, lvl, base)
+    										local n = plNum(entry.Boost, b)
+    										local fn = plMoonKind[shopKey][uname]
+    										local dV = if fn then fn(if b > 0 or additive then b else 1, n) else 0
+    										plAdd(list, { id = "shop:" .. shopKey .. ":" .. uname, cur = "Gems", kind = "Moon " .. shopKey, name = uname, level = lvl, cost = plNum(entry.Price, 0), dV = dV, incremental = shopKey == "Incremental" })
+    									end
+    								end
+    							end
+    						end
+    					end
+    					-- Upgrade Tree (rubies), one level of lookahead through nodes that only open branches
+    					local tree = Auto.GameData.tree
+    					if tree and S.autoTree and flag(Auto.GameData.treeFlag or "SP13") then
+    						local folder = getDataFolder(Auto.GameData.treeFolder or "TreeData")
+    						local levels = {}
+    						for _, group in ipairs(tree.Groups) do
+    							local lvl = 0
+    							if not group.parent then
+    								lvl = #group.levels
+    							else
+    								for _, node in ipairs(group.levels) do
+    									if not treeOwned(folder, node.id) then break end
+    									lvl += 1
+    								end
+    							end
+    							levels[group.id] = lvl
+    						end
+    						local function nodeValue(node)
+    							local effect = node and node.effect
+    							local fn = effect and plTreeValue[effect.Type]
+    							return if fn then fn(plNum(effect.Value, 0)) else 0
+    						end
+    						for _, group in ipairs(tree.Groups) do
+    							local lvl = levels[group.id] or 0
+    							local node = group.parent and group.levels[lvl + 1]
+    							if node and S.treePick[group.id] and (group.requires == nil or flag(group.requires)) then
+    								local parent = tree.GroupById and tree.GroupById[group.parent]
+    								local parentDone = parent == nil or (levels[parent.id] or 0) >= (tonumber(group.parentLevel) or #parent.levels)
+    								if parentDone or lvl > 0 then
+    									local nodeCost = plNum(node.cost, 0)
+    									local dV = nodeValue(node)
+    									if dV <= 0 then
+    										-- value of the best branch this node opens: its gain over both prices
+    										for _, child in ipairs(tree.Groups) do
+    											if child.parent == group.id and (tonumber(child.parentLevel) or #group.levels) == lvl + 1 and child.levels[1] and S.treePick[child.id] then
+    												local childCost = plNum(child.levels[1].cost, 0)
+    												local childValue = nodeValue(child.levels[1])
+    												if nodeCost + childCost > 0 then
+    													dV = math.max(dV, childValue * nodeCost / (nodeCost + childCost))
+    												end
+    											end
+    										end
+    									end
+    									plAdd(list, { id = "tree:" .. group.id, cur = "Rubies", kind = "Tree", name = tostring(node.title or group.title or node.id), level = node.id, cost = nodeCost, dV = dV })
+    								end
+    							end
+    						end
+    					end
+    					-- Special upgrades (rubies)
+    					if S.autoSpecial then
+    						local special = specialInfo()
+    						for _, row in ipairs(special.rows) do
+    							if row.picked and not row.owned and not row.locked then
+    								local dV, progress = plSpecialValue(row.title)
+    								plAdd(list, { id = "special:" .. row.name, cur = "Rubies", kind = "Special", name = row.title, cost = row.price, dV = dV, progress = progress })
+    							end
+    						end
+    					end
+    					return list
+    				end
+    
+    				-- rebirth: x1.1 gems for good, but the Incremental shop resets
+    				local function plRebirth()
+    					local moonCfg = Auto.GameData.moonConfig
+    					local rb = rebirthInfo()
+    					if not (moonCfg and rb.available and rb.moonUnlocked and rb.nextNumber and moonCfg.Incremental) then
+    						return nil
+    					end
+    					local shop = moonCfg.Incremental
+    					local folder = moonCfg.DataFolders and moonCfg.DataFolders.Incremental or "MoonUpgradesData"
+    					local remain, rebuild, dmgB, gemsB = 0, 0, 1, 1
+    					for _, uname in ipairs(shop.Order or {}) do
+    						local levels = shop[uname]
+    						if type(levels) == "table" then
+    							local lvl = readLevel(folder, uname)
+    							local cap = plNum(plCall(moonCfg, "GetLevelCap", LocalPlayer, "Incremental", uname), lvl)
+    							for k = 1, lvl do
+    								rebuild += plNum(type(levels[k]) == "table" and levels[k].Price, 0)
+    							end
+    							for k = lvl + 1, cap do
+    								remain += plNum(type(levels[k]) == "table" and levels[k].Price, 0)
+    							end
+    							if uname == "Damage" or uname == "PetAttackSpeed" then
+    								dmgB *= math.max(1, plBoostAt(levels, lvl, 1))
+    							elseif uname == "MoreGems" then
+    								gemsB = math.max(1, plBoostAt(levels, lvl, 1))
+    							end
+    						end
+    					end
+    					local gems = P.I.Gems
+    					local after = gems * 1.1 / (dmgB * gemsB)
+    					local T = if gems > 0 then rebuild / math.max((after + gems * 1.1) / 2, 1e-9) else math.huge
+    					local drop = P.V * (1 - 1 / dmgB) + P.w.Gems * gems / dmgB * (1 - 1 / gemsB)
+    					local loss = drop * math.min(T, P.H) / 2
+    					local wRebuild = if rebuild > 0 then P.V * (1 - 1 / dmgB) * P.H / rebuild else 0
+    					local gainRate = 0.1 * gems * math.max(P.w.Gems, wRebuild)
+    					local gain = gainRate * math.max(0, P.H - T)
+    					return { ready = rb.ready, remain = remain, rebuild = rebuild, T = T, gain = gain, loss = loss, net = gain - loss, gainRate = gainRate, rebirths = rb.rebirths }
+    				end
+    
+    				local function plLabel(option)
+    					if not option then
+    						return "none"
+    					end
+    					return option.kind .. ":" .. tostring(option.name)
+    				end
+    
+    				local function plFmt(value)
+    					value = plNum(value, 0)
+    					if value == math.huge then
+    						return "inf"
+    					end
+    					return string.format("%.3g", value)
+    				end
+    
+    				-- one pass: rates, weights, options, best per currency and what may be bought
+    				function P.compute()
+    					local I = P.I
+    					I.Coins, I.Rubies, I.Gems = plRate("Coins"), plRate("Rubies"), plRate("Gems")
+    					P.eggRate = plRate("Eggs")
+    					if I.Coins <= 0 then
+    						P.ready = false
+    						return
+    					end
+    					local eff = plReq("eff", "Modules", "EffectiveBoostsModule")
+    					P.Mc = math.max(1, plNum(plCall(eff, "GetCoinsMultiplier", LocalPlayer), 1))
+    					P.Mr = math.max(1, plNum(plCall(eff, "GetRubiesMultiplier", LocalPlayer), 1))
+    					P.crit = math.clamp(plNum(plCall(eff, "GetCritChance", LocalPlayer), 0.01), 0, 1)
+    					P.critDmg = math.max(1, plNum(plCall(eff, "GetCritDamage", LocalPlayer), 4))
+    					P.hatchSpeed = math.max(0.1, plNum(plCall(eff, "GetHatchSpeed", LocalPlayer), 1))
+    					P.treeDmg = math.max(1, plNum(plCall(eff, "GetTreePetDamageMultiplier", LocalPlayer), 1))
+    					P.treeAtk = math.max(1, plNum(plCall(eff, "GetTreeAttackSpeedMultiplier", LocalPlayer), 1))
+    					local moonCfg = Auto.GameData.moonConfig
+    					local more = moonCfg and moonCfg.Incremental and moonCfg.Incremental.MoreGems
+    					P.gemsAdd = math.max(1, plBoostAt(more, readLevel("MoonUpgradesData", "MoreGems"), 1))
+    					P.luck = math.max(0.01, plNum(readData("TrustedStats", "LuckMultiplier"), 1))
+    					P.secretLuck = plNum(readData("TrustedStats", "SecretLuckMultiplier"), 1)
+    					P.charmSecret = plNum(readData("VariousBoosts", "CharmsSecretBoost"), 0)
+    					P.gold = plNum(plCall(plReq("gold", "Modules", "GoldenChanceModule"), "GetGoldenChance", "Basic", LocalPlayer), 0.1)
+    					local team = teamSnapshot()
+    					local slots = plNum(plCall(plReq("equip", "Modules", "EquippedPetsModule"), "GetMaxEquip", LocalPlayer), team.count)
+    					local weakest = math.huge
+    					for _, entry in ipairs(team.list) do
+    						weakest = math.min(weakest, entry.power / math.max(1, entry.count))
+    					end
+    					if team.count < slots or weakest == math.huge then
+    						weakest = 0
+    					end
+    					P.team = { power = math.max(1, team.power), weakest = weakest, count = team.count, slots = slots }
+    					local maxOpen = math.max(1, plNum(readData("TrustedStats", "MaxEggOpen"), 1))
+    					P.eggSeconds = if P.eggRate > 0 then 1 / P.eggRate else 0
+    					-- farm world efficiency: the best unlocked coin world
+    					local bestEff, bestRuby, moon = 0, 0, moonWorld()
+    					for _, key in ipairs(Auto.GameData.worldOrder or UI.WorldOrder or {}) do
+    						if key ~= moon and worldUnlocked(key) then
+    							local e = plWorldEff(key)
+    							if e and (e.Coins or 0) > bestEff then
+    								bestEff = e.Coins
+    								bestRuby = e.Rubies or 0
+    							end
+    						end
+    					end
+    					P.farmEff, P.farmRubyEff = bestEff, bestRuby
+    					local options
+    					for _ = 1, 3 do
+    						P.V = I.Coins + P.w.Rubies * I.Rubies + P.w.Gems * I.Gems
+    						-- the egg to hatch: best gain per coin (needed first, luck and hatch speed are valued through it)
+    						P.hatch = nil
+    						options = plOptions()
+    						local bestEgg = nil
+    						for _, option in ipairs(options) do
+    							if option.kind == "Egg" and option.gain > 0 and (not bestEgg or option.perEgg / option.cost > bestEgg.perEgg / bestEgg.cost) then
+    								bestEgg = option
+    							end
+    						end
+    						if bestEgg then
+    							local rate = if P.eggRate > 0 then P.eggRate else maxOpen
+    							P.hatch = { egg = bestEgg.name, gain = bestEgg.gain, rate = rate, maxOpen = maxOpen, bound = I.Coins > rate * bestEgg.price }
+    							options = plOptions()
+    						end
+    						-- shadow price of rubies and gems: best gain over the horizon per unit
+    						local nextW = { Coins = 1, Rubies = 0, Gems = 0 }
+    						for _, option in ipairs(options) do
+    							if option.cur ~= "Coins" and not option.progress then
+    								local income = math.max(I[option.cur], 1e-9)
+    								local balance = (getStat(option.cur) or 0) - plReserve(option.cur)
+    								local eta = math.max(0, option.cost - balance) / income
+    								nextW[option.cur] = math.max(nextW[option.cur], option.dV * math.max(0, P.H - eta) / option.cost)
+    							end
+    						end
+    						P.w = nextW
+    					end
+    					-- best per currency: largest gain over the 24 h horizon per unit, cheaper buys only when they beat the delay they cause
+    					local byId, best = {}, {}
+    					for _, option in ipairs(options) do
+    						byId[option.id] = option
+    						local income = math.max(I[option.cur], 1e-9)
+    						local balance = (getStat(option.cur) or 0) - plReserve(option.cur)
+    						option.balance = balance
+    						option.eta = math.max(0, option.cost - balance) / income
+    						option.score = option.dV * math.max(0, P.H - option.eta) / option.cost
+    						local worth = if option.cur == "Coins" then option.score > 1 else option.score > 0
+    						if worth and not option.progress then
+    							local current = best[option.cur]
+    							if not current or option.score > current.score then
+    								best[option.cur] = option
+    							end
+    						end
+    					end
+    					for _, option in ipairs(options) do
+    						local target = best[option.cur]
+    						if option.progress then
+    							option.allowed = true
+    						elseif option == target then
+    							option.allowed = true
+    						elseif target and target.eta > 0 and option.eta <= 0 and option.score > (if option.cur == "Coins" then 1 else 0) then
+    							local income = math.max(I[option.cur], 1e-9)
+    							local net = option.dV * P.H - (if option.cur == "Coins" then option.cost else 0)
+    							option.allowed = net > target.dV * option.cost / income
+    						else
+    							option.allowed = false
+    						end
+    					end
+    					-- rebirth path: finishing the Incremental shop is one option, the rebirth decides the rest
+    					local rb = plRebirth()
+    					P.rebirth = rb
+    					P.rebirthPath = false
+    					P.rebirthNow = false
+    					if rb then
+    						local pathScore = if rb.remain > 0 then rb.gainRate * math.max(0, P.H - rb.remain / math.max(I.Gems, 1e-9)) / rb.remain else math.huge
+    						local gemBest = best.Gems
+    						P.rebirthPath = rb.net > 0 and (gemBest == nil or gemBest.incremental or pathScore >= gemBest.score)
+    						if P.rebirthPath then
+    							for _, option in ipairs(options) do
+    								if option.incremental then
+    									option.allowed = true
+    								end
+    							end
+    						end
+    						if rb.ready and rb.net > 0 then
+    							local permFirst = false
+    							for _, option in ipairs(options) do
+    								if option.cur == "Gems" and not option.incremental and option.allowed and option.eta <= 0 then
+    									permFirst = true
+    								end
+    							end
+    							P.rebirthNow = not permFirst
+    							P.rebirthWhy = if permFirst then "buying Permanent first" else "net gain"
+    						else
+    							P.rebirthWhy = if rb.ready then "reset not paid back in 24 h" else "Incremental not maxed"
+    						end
+    					end
+    					P.byId, P.best, P.options = byId, best, options
+    					-- coins: egg to hatch and how much to keep for the world
+    					local coinBest = best.Coins
+    					local eggPick, world = nil, nil
+    					for _, option in ipairs(options) do
+    						if option.kind == "Egg" and option.allowed and (not eggPick or option.score > eggPick.score) then
+    							eggPick = option
+    						end
+    						if option.kind == "World" and option.cur == "Coins" then
+    							world = option
+    						end
+    					end
+    					P.egg = eggPick and eggPick.name or nil
+    					P.eggWhy = if eggPick then "" elseif coinBest and coinBest.kind == "World" then "saving for " .. prettyWorld(coinBest.name) else "no egg pays back in 24 h"
+    					P.keep.Coins = if coinBest and coinBest == world and world.eta > 0 and not eggPick then world.cost else 0
+    					P.ready = true
+    				end
+    
+    				function P.allows(id, price, stamp)
+    					if not P.ready then
+    						return true
+    					end
+    					local option = P.byId[id]
+    					if not option or not option.allowed then
+    						return false
+    					end
+    					if stamp ~= nil and option.level ~= nil and option.level ~= stamp then
+    						return false
+    					end
+    					local balance = (getStat(option.cur) or 0) - plReserve(option.cur)
+    					return balance >= (price or option.cost)
+    				end
+    
+    				function P.score(id)
+    					local option = P.byId[id]
+    					return if option then option.score else -1
+    				end
+    
+    				function P.on()
+    					return P.ready and S.farmAll
+    				end
+    
+    				-- time: value earned per second in each activity (coin-equivalent), half-life 30 min
+    				local function plActivity()
+    					if Mover.busy then
+    						return nil
+    					end
+    					local fish = Auto.Fish
+    					if fish and fish.active then
+    						return "Fish"
+    					end
+    					if Ufo.engaged then
+    						return "UFO"
+    					end
+    					if S.indexHunt and Hunter.egg then
+    						return "Index"
+    					end
+    					return "Farm"
+    				end
+    
+    				local function plTrack(now)
+    					local metrics = Auto.Metrics
+    					if not metrics then
+    						return
+    					end
+    					local cum = metrics.cum
+    					local value = cum.Coins + P.w.Rubies * cum.Rubies + P.w.Gems * cum.Gems
+    					local last = P.last
+    					local activity = plActivity()
+    					if last and last.activity then
+    						local dt = now - last.t
+    						if dt > 0 and dt < 60 then
+    							local decay = 0.5 ^ (dt / 1800)
+    							for _, a in pairs(P.act) do
+    								a.v *= decay
+    								a.t *= decay
+    							end
+    							local a = P.act[last.activity] or { v = 0, t = 0 }
+    							P.act[last.activity] = a
+    							a.v += math.max(0, value - last.value)
+    							a.t += dt
+    						end
+    					end
+    					P.last = { t = now, value = value, activity = activity }
+    					-- fishing vs farming: measure both, keep the better one (tokens from fish are not counted as money)
+    					local farm, fishAct = P.act.Farm, P.act.Fish
+    					if not (S.farmAll and S.autoFish) then
+    						P.fishOff = false
+    					elseif not fishAct or fishAct.t < 180 then
+    						P.fishOff = false
+    					elseif not farm or farm.t < 180 then
+    						P.fishOff = true
+    					else
+    						P.fishOff = farm.v / farm.t > fishAct.v / fishAct.t
+    					end
+    				end
+    
+    				local function plReport(now)
+    					local I = P.I
+    					if now - (P.lastLog.rate or -1e9) >= 60 then
+    						P.lastLog.rate = now
+    						plLog("RATE", "coins/s=" .. plFmt(I.Coins), "rubies/s=" .. plFmt(I.Rubies), "gems/s=" .. plFmt(I.Gems), "eggs/s=" .. plFmt(P.eggRate), "V=" .. plFmt(P.V), "Mc=" .. plFmt(P.Mc), "Mr=" .. plFmt(P.Mr), "luck=" .. plFmt(P.luck), "team=" .. plFmt(P.team.power), "weakest=" .. plFmt(P.team.weakest), "slots=" .. tostring(P.team.count) .. "/" .. tostring(P.team.slots), "w_r=" .. plFmt(P.w.Rubies), "w_g=" .. plFmt(P.w.Gems), "H=" .. P.H)
+    						local parts = {}
+    						for name, a in pairs(P.act) do
+    							table.insert(parts, name .. "=" .. plFmt(if a.t > 0 then a.v / a.t else 0) .. "/s(" .. math.floor(a.t) .. "s)")
+    						end
+    						table.sort(parts)
+    						plLog("TIME", table.concat(parts, " "), "fishOff=" .. tostring(P.fishOff))
+    						local rb = P.rebirth
+    						if rb then
+    							plLog("REBIRTH", "ready=" .. tostring(rb.ready), "now=" .. tostring(P.rebirthNow), "why=" .. tostring(P.rebirthWhy), "net=" .. plFmt(rb.net), "gain=" .. plFmt(rb.gain), "loss=" .. plFmt(rb.loss), "rebuildT=" .. plFmt(rb.T), "remain=" .. plFmt(rb.remain), "path=" .. tostring(P.rebirthPath))
+    						end
+    					end
+    					for _, cur in ipairs({ "Coins", "Rubies", "Gems" }) do
+    						local sorted = {}
+    						for _, option in ipairs(P.options or {}) do
+    							if option.cur == cur then
+    								table.insert(sorted, option)
+    							end
+    						end
+    						table.sort(sorted, function(a, b)
+    							return a.score > b.score
+    						end)
+    						local best = P.best[cur]
+    						local key = plLabel(best) .. "|" .. tostring(P.egg)
+    						if #sorted > 0 and (P.lastLog[cur] ~= key or now - (P.lastLog[cur .. "t"] or -1e9) >= 300) then
+    							P.lastLog[cur] = key
+    							P.lastLog[cur .. "t"] = now
+    							local alt = {}
+    							for i = 1, math.min(#sorted, 4) do
+    								local option = sorted[i]
+    								if option ~= best then
+    									table.insert(alt, plLabel(option) .. " " .. plFmt(option.ratio) .. (if option.allowed then "+" else ""))
+    								end
+    							end
+    							plLog("PLAN", "best=" .. cur .. "/" .. plLabel(best), "gain/$=" .. plFmt(best and best.ratio), "score=" .. plFmt(best and best.score), "eta=" .. plFmt(best and best.eta), "alt=" .. table.concat(alt, ", "), if cur == "Coins" then "egg=" .. tostring(P.egg) .. " keep=" .. plFmt(P.keep.Coins) .. " " .. P.eggWhy else "")
+    						end
+    					end
+    				end
+    
+    				task.spawn(function()
+    					while alive() do
+    						task.wait(5)
+    						local ok, err = pcall(function()
+    							local now = os.clock()
+    							P.compute()
+    							plTrack(now)
+    							if P.ready then
+    								plReport(now)
+    								-- Moon world: progress, bought with rubies as soon as it is affordable
+    								local moonOpt = P.byId.moonworld
+    								if S.farmAll and S.autoBuyWorlds and moonOpt and moonOpt.eta <= 0 and not Mover.busy and now - P.moonTry > 30 then
+    									P.moonTry = now
+    									plLog("BUY", "moon world for", moonOpt.cost, "rubies")
+    									buyWorld({ next = moonOpt.name, moon = true, from = moonOpt.from, price = moonOpt.cost, currency = "Rubies" }, Worlds.fails >= 2)
+    								end
+    							end
+    						end)
+    						if not ok then
+    							plLog("PROBLEM", "plan", tostring(err))
+    						end
+    					end
+    				end)
+    
+    				function Auto.effectiveEgg()
+    					if P.on() then
+    						return P.egg or ""
+    					end
+    					return S.hatchEggName
+    				end
+    			end
+
     			Extra.nextErrand = function(now)
     				if S.autoRebirth and now - Rebirth.lastTry > 12 and now >= Rebirth.blockedUntil then
     					local info = rebirthInfo()
-    					if info.available and info.ready and info.moonUnlocked and info.nextNumber and not info.stopped and not (S.rebirthWaitPerm and Auto.permMaxed and not Auto.permMaxed()) then
+    					local planWait = if Auto.Plan and Auto.Plan.on() then not Auto.Plan.rebirthNow else (S.rebirthWaitPerm and Auto.permMaxed and not Auto.permMaxed())
+    					if info.available and info.ready and info.moonUnlocked and info.nextNumber and not info.stopped and not planWait then
     						return "Moon rebirth", function()
     							local travel = Rebirth.needsTravel == true
     							if rebirthTrip(travel) then
@@ -37647,6 +38559,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     								Saved.treeBought += 1
     								SaveDirty = true
     								Tree.last = info.title
+    								Auto.log("BUY", "tree", node.id, info.title, "for", info.cost, "rubies")
     							else
     								Tree.blocked[info.next.group.id] = os.clock() + 30
     							end
@@ -37700,6 +38613,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     								Rebirth.status = "Max rebirths"
     							elseif info.stopped then
     								Rebirth.status = "Stopped at " .. tostring(S.rebirthStopAt)
+    							elseif info.ready and Auto.Plan and Auto.Plan.on() and not Auto.Plan.rebirthNow then
+    								Rebirth.status = "Plan: " .. tostring(Auto.Plan.rebirthWhy or "waiting")
     							elseif info.ready and S.rebirthWaitPerm and Auto.permMaxed and not Auto.permMaxed() then
     								local _, owned, cap = Auto.permMaxed()
     								Rebirth.status = string.format("Waiting for Permanent %d/%d", owned or 0, cap or 0)
@@ -38136,7 +39051,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     			if not (S.autoHatch and S.eggAutoTravel and EggTravel.need) then return false end
     			if S.autoFish and S.fishPriority == "Fishing first" then return false end
     			if S.indexHunt and Hunter.egg then return false end
-    			if EggTravel.need ~= S.hatchEggName then
+    			if EggTravel.need ~= (if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName) then
     				EggTravel.need = nil
     				return false
     			end
@@ -39718,14 +40633,15 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				return best
     			end
     			local function farmWorldWait(target)
-    				if S.autoFish then
+    				if S.autoFish and not (Auto.Plan and Auto.Plan.on() and Auto.Plan.fishOff) then
     					return "Fishing"
     				end
     				if S.indexHunt and Hunter.egg then
     					return "Index Hunter"
     				end
-    				if S.autoHatch and S.eggAutoTravel and S.hatchEggName ~= "" then
-    					local eggWorld = Auto.eggWorld(S.hatchEggName)
+    				local hatchEgg = if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName
+    				if S.autoHatch and S.eggAutoTravel and hatchEgg ~= "" then
+    					local eggWorld = Auto.eggWorld(hatchEgg)
     					if eggWorld ~= target then
     						return "Hatching in " .. prettyWorld(eggWorld)
     					end
@@ -40956,7 +41872,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     			end
     
     			Auto.eggsActive = function()
-    				local wants = (S.autoHatch and S.hatchEggName ~= "") or (S.indexHunt and Hunter.egg ~= nil) or S.autoInvEggs
+    				local wants = (S.autoHatch and (if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName) ~= "") or (S.indexHunt and Hunter.egg ~= nil) or S.autoInvEggs
     				if not wants then
     					return false
     				end
@@ -40966,6 +41882,9 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     			local function fishBlocked()
     				if S.fishPriority ~= "Fishing first" and Auto.eggsActive() then
     					return "Paused for eggs"
+    				end
+    				if Auto.Plan and Auto.Plan.on() and Auto.Plan.fishOff then
+    					return "Farming pays more"
     				end
     				return nil
     			end
@@ -41528,7 +42447,12 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     
     local function hatchStep()
     	local huntEgg = if S.indexHunt then Auto.Hunter.egg else nil
-    	local eggName = huntEgg or (if S.autoHatch then S.hatchEggName else nil)
+    	local eggName = huntEgg or (if S.autoHatch then (if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName) else nil)
+    	if eggName == "" and not huntEgg and S.autoHatch and Auto.Plan and Auto.Plan.on() then
+    		HatchState.status = "Plan: " .. Auto.Plan.eggWhy
+    		HatchState.waiting = false
+    		return
+    	end
     	if not (eggName and EggHatch) then
     		HatchState.status = "Off"
     		return
