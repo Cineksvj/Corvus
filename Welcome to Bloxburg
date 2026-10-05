@@ -30497,7 +30497,7 @@ do
 	end
 	-- Only the job actions a worker sends. Never purchases, trading, admin or anything for other players.
 	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true, TakeOil = true, TakeWheel = true, TakePainter = true, FixBike = true, DeliverPizza = true }
-	local AllowedJobInvoke = { CleanSchoolJanitorObject = true, TakePizzaBox = true }
+	local AllowedJobInvoke = { CleanSchoolJanitorObject = true, TakePizzaBox = true, MineBlock = true }
 	function N.jobFire(packet)
 		local jh = N.jobHandler()
 		if not (jh and AllowedJob[packet.Type]) then
@@ -31816,6 +31816,77 @@ do
 		log("DELIVERY delivered")
 	end
 end
+
+-- Cave Miner: the server sends only the exposed blocks (UpdateMineBlocks / NewMineBlock); the client keeps them as
+-- models named "x:depth:y" in a folder under JobHandler.GameFolder. Mining one is
+-- InvokeServer({Type = "MineBlock", P = Vector3.new(x, depth, y)}) with the Pickaxe, true when it broke.
+N.Miner = { skip = {}, folder = nil }
+do
+	local function blocksFolder()
+		if N.Miner.folder and N.Miner.folder.Parent then
+			return N.Miner.folder
+		end
+		local jh = N.jobHandler()
+		local root = jh and jh.GameFolder
+		for _, child in ipairs(typeof(root) == "Instance" and root:GetChildren() or {}) do
+			if child:IsA("Folder") then
+				local first = child:GetChildren()[1]
+				if first and string.match(first.Name, "^%-?%d+:%-?%d+:%-?%d+$") then
+					N.Miner.folder = child
+					return child
+				end
+			end
+		end
+		return nil
+	end
+	function N.minerStep()
+		if not N.ensureShift("CaveMiner") then
+			return
+		end
+		local folder, root = blocksFolder(), N.root()
+		if not (folder and root) then
+			setStatus("Miner: waiting for the mine")
+			task.wait(1)
+			return
+		end
+		local best, bestDist
+		local now = os.clock()
+		for _, block in ipairs(folder:GetChildren()) do
+			if (N.Miner.skip[block] or 0) <= now then
+				local part = block.PrimaryPart or block:FindFirstChildWhichIsA("BasePart")
+				if part then
+					local d = (part.Position - root.Position).Magnitude
+					if not bestDist or d < bestDist then
+						best, bestDist = block, d
+					end
+				end
+			end
+		end
+		if not best then
+			setStatus("Miner: no block to mine, waiting")
+			task.wait(1)
+			return
+		end
+		local x, depth, y = string.match(best.Name, "^(%-?%d+):(%-?%d+):(%-?%d+)$")
+		if not x then
+			N.Miner.skip[best] = now + 60
+			return
+		end
+		local part = best.PrimaryPart or best:FindFirstChildWhichIsA("BasePart")
+		if bestDist > 8 then
+			N.walkTo(part.Position, 6, 10)
+		end
+		setStatus(string.format("Miner: mining (%d blocks)", Session.done))
+		task.wait(N.actionDelay() * 0.5)
+		local ok, result = N.jobInvoke({ Type = "MineBlock", P = Vector3.new(tonumber(x), tonumber(depth), tonumber(y)) })
+		if ok and result then
+			Session.done += 1
+			Session.correct += 1
+		else
+			N.Miner.skip[best] = os.clock() + 10
+		end
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -31872,7 +31943,7 @@ do
 	})
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream", "Supermarket Cashier", "Pizza Baker", "Mechanic", "Pizza Delivery" },
+		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream", "Supermarket Cashier", "Pizza Baker", "Mechanic", "Pizza Delivery", "Miner" },
 		Default = "Hairdresser",
 		Tooltip = "The Pay box shows what every job really paid you per hour",
 	})
@@ -32577,7 +32648,7 @@ do
 	if not N.jobHandler() then
 		logProblem("The game's JobHandler was not found, job farms cannot start")
 	end
-	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep, ["Pizza Delivery"] = N.deliveryStep }
+	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep, ["Pizza Delivery"] = N.deliveryStep, Miner = N.minerStep }
 	local wasWorking = false
 	loop("main loop", function()
 		if N.manualRunning() then
