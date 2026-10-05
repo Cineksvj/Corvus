@@ -25358,10 +25358,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             })
     
             local Profile = Tab:AddLeftGroupbox("Profile", "user-round")
-            Profile:AddAvatarCard({
-                Height = Info.AvatarHeight or 196,
-                Mode = Info.AvatarMode,
-            })
+            if Info.AvatarMode ~= "off" then
+            	Profile:AddAvatarCard({ Height = Info.AvatarHeight or 96, Mode = Info.AvatarMode })
+            end
     
             local AccountAge = tonumber(LocalPlayer.AccountAge) or 0
             local Membership = "Standard"
@@ -25560,7 +25559,7 @@ end)
             end
             local Socials = Info.Socials
             if Invite or (typeof(Socials) == "table" and #Socials > 0) then
-                local Community = Tab:AddRightGroupbox("Community", "users")
+                local Community = Tab:AddLeftGroupbox("Community", "users")
                 if Invite then
                     Community:AddDiscordCard("CorvusDiscord", {
                         Title = Info.DiscordTitle or WindowInfo.Title,
@@ -25585,6 +25584,25 @@ end)
                 end
             end
     
+            local FeedbackBox
+            if typeof(Info.Feedback) == "function" then
+            	FeedbackBox = Tab:AddLeftGroupbox("Feedback", "message-square")
+            	local FeedbackOk, FeedbackError = pcall(Info.Feedback, FeedbackBox)
+            	if not FeedbackOk then
+            		warn("[Corvus] feedback form failed: " .. tostring(FeedbackError))
+            	end
+            end
+            pcall(function()
+            	if Tab.Groupboxes.Community then
+            		Tab.Groupboxes.Community.BoxHolder.LayoutOrder = -300
+            	end
+            	if FeedbackBox then
+            		FeedbackBox.BoxHolder.LayoutOrder = -200
+            	end
+            	Session.BoxHolder.LayoutOrder = -300
+            	GamesBox.BoxHolder.LayoutOrder = -200
+            	Profile.BoxHolder.LayoutOrder = 1000
+            end)
             return Tab
         end
     
@@ -30263,16 +30281,34 @@ local ThemeManager, SaveManager, Options, Toggles, Discord, GameName, LoaderScri
 local RunService, LogFile, Log, brief, log, logProblem, flushLog, Perf, fire, invoke, waitFor, isolated
 do
 	local function loadAddon(name)
-		local ok, addon = pcall(function()
-			return loadstring(game:HttpGet(AddonsUrl .. name))()
-		end)
-		if ok and type(addon) == "table" then
-			return addon
+		local lastError
+		for attempt = 1, 3 do
+			local ok, addon = pcall(function()
+				return loadstring(game:HttpGet(AddonsUrl .. name))()
+			end)
+			if ok and type(addon) == "table" then
+				return addon
+			end
+			lastError = addon
+			if attempt < 3 then
+				task.wait(1)
+			end
 		end
-		warn("[Corvus] could not load " .. name .. " (" .. tostring(addon) .. "), themes and configs are off this time")
-		return setmetatable({}, {
-			__index = function()
-				return function() end
+		warn("[Corvus] addon failed: " .. name .. " (" .. tostring(lastError) .. "), themes and configs are off this time")
+		return setmetatable({ Ignore = {} }, {
+			__index = function(_, key)
+				if key == "Folder" or key == "SubFolder" then
+					return nil
+				end
+				return function(_, ...)
+					if key == "RefreshConfigList" then
+						return {}
+					end
+					if key == "Save" or key == "Load" or key == "Delete" or key == "SaveAutoloadConfig" then
+						return false, "addons unavailable"
+					end
+					return nil
+				end
 			end,
 		})
 	end
@@ -33073,6 +33109,9 @@ do
 				DiscordBanner = "corvus-banner",
 				DiscordTitle = "Corvus",
 				DiscordDescription = "Keyless scripts, updates and support",
+				Feedback = function(Box)
+					Tabs.FeedbackBox = Box
+				end,
 			})
 		end)
 	end
@@ -33966,7 +34005,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 					pcall(N.openWizard)
 				end,
 			})
-			local FeedbackBox = Tabs.Info:AddLeftGroupbox("Feedback", "message-square")
+			local FeedbackBox = Tabs.FeedbackBox or Tabs.Info:AddLeftGroupbox("Feedback", "message-square")
 			FeedbackBox:AddDropdown("FeedbackType", { Text = "Type", Values = { "Idea", "Bug", "Question", "Other" }, Default = "Idea" })
 			FeedbackBox:AddInput("FeedbackText", { Text = "Message", Placeholder = "Tell Cinek what to add or fix...", Finished = false, Default = "" })
 			FeedbackBox:AddToggle("FeedbackAnon", { Text = "Send anonymously", Default = false })
@@ -34227,42 +34266,26 @@ if Window.AddInfoTab then
 			Note = "Only send on BNB Smart Chain (BEP20)",
 		},
 	}
-	for _, tab in ipairs({
-		Tabs.Info,
-		Tabs.Main,
-		Tabs.Roll,
-		Tabs.Towers,
-		Tabs.Plot,
-		Tabs.Upgrades,
-		Tabs.Rewards,
-		Tabs.Items,
-		Tabs.Stats,
-		Tabs.Webhook,
-		Tabs.Misc,
-		Tabs.Settings,
-	}) do
-		pcall(function()
-			local left = tab == Tabs.Info and tab.Groupboxes.Community or nil
-			if left then
-				left.BoxHolder.Parent = tab.Sides[1]
-			else
-				left = tab:AddLeftGroupbox("Community", "users")
-				left:AddCommunityStrip({ Invite = Discord, Title = "Corvus Community", Description = "Updates, support and new scripts" })
-			end
-			left:AddLabel({
+	pcall(function()
+		local info = Tabs.Info
+		if not info then
+			return
+		end
+		local community = info.Groupboxes and info.Groupboxes.Community
+		if community then
+			community:AddLabel({
 				Text = '<font color="#60d696">All Corvus scripts are keyless and free.</font> <font transparency="0.35">Want your own script for any game? We make custom paid scripts on request, open a ticket on our Discord.</font>',
 				DoesWrap = true,
 			})
-			local right = tab:AddRightGroupbox("Support Corvus", "heart")
-			right:AddDonateBoard({ Methods = DonateMethods })
-			right:AddLabel({
-				Text = '<font transparency="0.35">Donations are 100% voluntary, nothing is locked behind them. They help keep Corvus updated.</font>',
-				DoesWrap = true,
-			})
-			left.BoxHolder.LayoutOrder = -100
-			right.BoxHolder.LayoutOrder = -100
-		end)
-	end
+		end
+		local right = info:AddRightGroupbox("Support Corvus", "heart", nil, true)
+		right:AddDonateBoard({ Methods = DonateMethods })
+		right:AddLabel({
+			Text = '<font transparency="0.35">Donations are 100% voluntary, nothing is locked behind them. They help keep Corvus updated.</font>',
+			DoesWrap = true,
+		})
+		right.BoxHolder.LayoutOrder = -100
+	end)
 end
 pcall(function()
 	Library.RenderOverlayInfo = function()
