@@ -32014,17 +32014,30 @@ do
 	end
 	-- Throw Speed and Movement in two words (debug header, Main info).
 	function N.paceText()
-		return (if optionText("ThrowSpeed", "Max (Blatant)") == "Max (Blatant)" then "Max" else "Legit") .. ", " .. (if optionText("MoveMode", "Teleport (Fast)") == "Teleport (Fast)" then "Teleport" else "Walk")
+		local speed = N.throwSpeed()
+		local mode = if N.throwMode then N.throwMode() else speed
+		return (if speed == "blatant" then "Blatant" elseif speed == "fast" then "Fast" else "Legit") .. (if speed ~= "legit" then " (" .. mode .. ")" else "") .. ", " .. (if optionText("MoveMode", "Teleport (Fast)") == "Teleport (Fast)" then "Teleport" else "Walk")
+	end
+	-- Throw Speed: "blatant" = direct Throw right after ThrowFinished plus a second throw in flight when the server takes it,
+	-- "fast" = direct Throw right after ThrowFinished, "legit" = the game's button at the game's Auto Wins pace. A saved
+	-- "Max (Blatant)" from older configs counts as Blatant.
+	function N.throwSpeed()
+		local text = optionText("ThrowSpeed", "Blatant")
+		if text == "Legit (game pace)" then
+			return "legit"
+		elseif text == "Fast" then
+			return "fast"
+		end
+		return "blatant"
 	end
 	-- Smart Planner (one toggle, default off): the profit engine owns the throw/train split, the purchases and the
 	-- rebirth timing. Off = every toggle does its plain job.
 	function N.planner()
 		return on("SmartPlanner")
 	end
-	-- Max throw rate: no pause between throws beyond the game's own cooldown (the Throw button comes back after it), with
-	-- a back-off when the server refuses a throw. Default Max.
+	-- Blatant or Fast: no pause between throws beyond what the server takes, with a back-off when it refuses a throw.
 	function N.blatant()
-		return optionText("ThrowSpeed", "Max (Blatant)") == "Max (Blatant)"
+		return N.throwSpeed() ~= "legit"
 	end
 	-- Movement: Walk walks like a player; Teleport (opt-in) moves the character instantly.
 	function N.safeMove()
@@ -32448,26 +32461,57 @@ do
 end
 -- Throwing ------------------------------------------------------------------------------------------------------
 -- The throw is simulated by the server (Request "Throw" -> ThrowStarted, Bounce, ThrowFinished). The game's own client
--- cancels any throw it did not start (it compares the RequestId), so the hub presses the game's own Throw button:
--- the same path as a click, with all of the game's checks (launch zone, idle, 0.8 s cooldown).
-N.Throw = { id = nil, pressedAt = -1e9, startedAt = -1e9, finishedAt = -1e9, noStart = 0, method = nil, last = "", pending = false, rejectedAt = -1e9, pauseUntil = 0, extraGap = 0, okRun = 0 }
+-- cancels any throw it did not start (it compares the RequestId). Legit and the "button" mode press the game's own
+-- Throw button (all of the game's checks: launch zone, idle, 0.8 s cooldown); Blatant/Fast send direct throws (below).
+N.Throw = { id = nil, pressedAt = -1e9, startedAt = -1e9, finishedAt = -1e9, noStart = 0, method = nil, last = "", pending = false, rejectedAt = -1e9, pauseUntil = 0, extraGap = 0, okRun = 0, live = {}, paid = 0 }
+-- Direct throws (Throw Speed Blatant / Fast, ideas.md "Blatant discovery" A and B): the hub sends the game's own
+-- Request("Throw", RequestId) with its own RequestIds. mine[RequestId] = the hub's request (started / rejected /
+-- cancelled), byId[server throw Id] = RequestId.
+N.Direct = { seq = 100000 + math.random(0, 899) * 1000, mine = {}, byId = {}, rejectRun = 0, offUntil = 0, hook = nil, dropped = 0, logs = 0 }
+N.Parallel = { off = false, rejectRun = 0, ok = 0, logs = 0, sentAt = -1e9 }
+local function liveCount()
+	local n = 0
+	for _ in pairs(N.Throw.live) do
+		n += 1
+	end
+	return n
+end
+N.throwsInFlight = liveCount
 N.onEvent("ThrowStarted", function(data)
 	if type(data) == "table" and data.UserId == LocalPlayer.UserId then
-		N.Throw.id = data.Id
-		N.Throw.startedAt = os.clock()
-		N.Throw.pending = true
-		N.Throw.noStart = 0
-		N.Throw.secret = data.Secret == true
-		N.Throw.colossus = data.Colossus == true
+		local T = N.Throw
+		T.id = data.Id
+		T.startedAt = os.clock()
+		T.live[data.Id or "?"] = { secret = data.Secret == true, colossus = data.Colossus == true, at = os.clock() }
+		T.pending = true
+		T.noStart = 0
+		T.secret = data.Secret == true
+		T.colossus = data.Colossus == true
+		local mine = data.RequestId ~= nil and N.Direct.mine[data.RequestId]
+		if mine then
+			mine.started = true
+			mine.id = data.Id
+			N.Direct.byId[data.Id or "?"] = data.RequestId
+		end
 	end
 end)
 N.onEvent("ThrowRejected", function(data)
 	if type(data) == "table" then
+		local mine = data.RequestId ~= nil and N.Direct.mine[data.RequestId]
+		if mine then
+			mine.rejected = tostring(data.Message)
+			N.Direct.mine[data.RequestId] = nil
+			-- A refused second throw (parallel probe) is the expected answer, not a "too early": no back-off.
+			if mine.parallel then
+				return
+			end
+		end
 		Session.rejected += 1
-		N.Throw.pending = false
+		N.Throw.pending = liveCount() > 0
 		N.Throw.rejectedAt = os.clock()
-		-- Back off: the server refused a throw sent too early. Wait longer before the next one, never faster.
-		N.Throw.extraGap = math.min(1.5, N.Throw.extraGap + 0.15)
+		-- Back off: the server refused a throw sent too early. Wait longer before the next one, never faster (direct
+		-- throws step faster towards the game's 0.8 s cooldown).
+		N.Throw.extraGap = math.min(1.5, N.Throw.extraGap + (if mine then 0.25 else 0.15))
 		N.Throw.okRun = 0
 		log("THROW gap=" .. string.format("%.2f", os.clock() - N.Throw.finishedAt), "accepted=false", "backoff", string.format("%.2f", N.Throw.extraGap), tostring(data.Message))
 	end
@@ -32476,7 +32520,24 @@ local function throwEnded(kind, data)
 	if type(data) ~= "table" or data.UserId ~= LocalPlayer.UserId then
 		return
 	end
-	N.Throw.pending = false
+	local entry = N.Throw.live[data.Id or "?"]
+	N.Throw.live[data.Id or "?"] = nil
+	if entry then
+		N.Throw.secret, N.Throw.colossus = entry.secret, entry.colossus
+	end
+	local req = N.Direct.byId[data.Id or "?"]
+	if req then
+		N.Direct.byId[data.Id or "?"] = nil
+		local mine = N.Direct.mine[req]
+		N.Direct.mine[req] = nil
+		if mine and kind == "ThrowCancelled" then
+			mine.cancelled = true
+			-- The server dropped one of our throws (a second throw displaced the first, or the game's client cancelled it).
+			N.noteDirectCancel(mine)
+		end
+	end
+	N.Throw.pending = liveCount() > 0
+	local lastEnd = N.Throw.finishedAt
 	N.Throw.finishedAt = os.clock()
 	if kind == "ThrowFinished" and N.Throw.extraGap > 0 then
 		N.Throw.okRun += 1
@@ -32491,6 +32552,9 @@ local function throwEnded(kind, data)
 	end
 	local wins = tonumber(data.Wins) or 0
 	local dist = tonumber(data.Distance) or 0
+	if wins > 0 then
+		N.Throw.paid += 1
+	end
 	Session.throws += 1
 	Session.winsFromThrows += wins
 	if N.Throw.secret then
@@ -32507,7 +32571,8 @@ local function throwEnded(kind, data)
 	end
 	N.Throw.last = string.format("%s wins, %d studs%s", formatNumber(wins), math.floor(dist), if N.Throw.secret then " (secret)" else "")
 	if N.notePlanThrow then
-		N.notePlanThrow(wins, os.clock() - N.Throw.pressedAt)
+		-- Seconds per throw = time since the previous throw ended (parallel throws share the time), the first from the press.
+		N.notePlanThrow(wins, if lastEnd > N.Throw.pressedAt then os.clock() - lastEnd else os.clock() - N.Throw.pressedAt)
 	end
 	if Session.throws <= 3 or Session.throws % 25 == 0 or N.Throw.secret then
 		log("THROW", "#" .. Session.throws, "wins", brief(wins), "dist", math.floor(dist), "secret", tostring(N.Throw.secret), "colossus", tostring(N.Throw.colossus))
@@ -32706,16 +32771,301 @@ function N.pressThrow()
 	end
 	return nil
 end
+-- Direct throws ---------------------------------------------------------------------------------------------------
+-- The throw payload is one number (the client's RequestId); distance, bounces and Wins are simulated by the server.
+-- The game's own client sends CancelThrow for every ThrowStarted whose RequestId it did not make (GameplayController
+-- dump 12473-12481), so a namecall hook drops CancelThrow only for the hub's own RequestIds (nothing else is touched).
+-- Without the hook the direct modes are off and the hub uses the game's button.
+function N.directHook()
+	local D = N.Direct
+	if D.hook ~= nil then
+		return D.hook
+	end
+	D.hook = false
+	if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
+		log("THROW direct unavailable", "no namecall hook in this executor, using the game's button")
+		return false
+	end
+	local remote = N.net("Request")
+	if not remote then
+		D.hook = nil
+		return false
+	end
+	local ok, err = pcall(function()
+		local old
+		local function hook(self, ...)
+			if self == remote and D.active then
+				local action, id = ...
+				if action == "CancelThrow" and D.mine[id] and getnamecallmethod() == "FireServer" then
+					D.dropped += 1
+					return nil
+				end
+			end
+			return old(self, ...)
+		end
+		old = hookmetamethod(game, "__namecall", if type(newcclosure) == "function" then newcclosure(hook) else hook)
+	end)
+	D.hook = ok
+	D.active = ok
+	log("THROW direct hook", if ok then "on" else "failed: " .. tostring(err))
+	return ok
+end
+-- Which throw path runs now: "parallel" (two in flight), "direct", "button" (the game's button, no pause) or "legit".
+-- The pick comes from the self-measuring probe (N.ThrowProbe) among what the Throw Speed allows and what is not
+-- switched off by the server's answers.
+N.ThrowProbe = { score = {}, win = nil, cur = nil, reprobeAt = 0, say = "", logs = 0 }
+local function throwCandidates()
+	local speed = N.throwSpeed()
+	if speed == "legit" then
+		return { "legit" }
+	elseif speed == "fast" then
+		return { "direct", "button" }
+	end
+	return { "parallel", "direct", "button" }
+end
+function N.throwModeAvailable(mode)
+	if mode == "parallel" then
+		return not N.Parallel.off and N.throwModeAvailable("direct")
+	elseif mode == "direct" then
+		local D = N.Direct
+		if os.clock() < D.offUntil then
+			return false
+		end
+		return N.directHook() == true
+	end
+	return true
+end
+function N.throwMode()
+	local list = throwCandidates()
+	local TP = N.ThrowProbe
+	if TP.cur and table.find(list, TP.cur) and N.throwModeAvailable(TP.cur) then
+		return TP.cur
+	end
+	for _, mode in ipairs(list) do
+		if N.throwModeAvailable(mode) then
+			return mode
+		end
+	end
+	return list[#list]
+end
+-- Self-measuring: every 60 s of throwing time in one mode logs PROBE throw_<mode> result=<paid throws/min>; each allowed
+-- mode is measured once, then the best one stays (re-measured every hour). A mode the server turns down drops out.
+function N.throwProbeTick(mode)
+	local TP = N.ThrowProbe
+	local list = throwCandidates()
+	if #list < 2 then
+		TP.win = nil
+		return
+	end
+	local secs = Session.throwSeconds
+	local W = TP.win
+	-- A world probe trip measures the world, not the throw mode.
+	if N.ZoneProbe.world then
+		TP.win = nil
+		return
+	end
+	if not W or W.mode ~= mode then
+		TP.win = { mode = mode, secs = secs, paid = N.Throw.paid, wins = Session.winsFromThrows }
+		return
+	end
+	local span = secs - W.secs
+	if span < 60 then
+		return
+	end
+	local rate = (N.Throw.paid - W.paid) * 60 / span
+	local winsRate = (Session.winsFromThrows - W.wins) * 60 / span
+	TP.win = nil
+	if rate <= 0 then
+		-- No throw landed in the window (blocked, no launch zone): nothing measured, the mode keeps its chance.
+		log("PROBE throw_" .. mode, "result=0", "no throw landed in", string.format("%.0fs", span), "(not scored)")
+		return
+	end
+	TP.score[mode] = rate
+	log("PROBE throw_" .. mode, "result=" .. string.format("%.1f", rate) .. "/min", "wins/min", brief(winsRate), "in", string.format("%.0fs", span))
+	local now = os.clock()
+	local nextMode
+	for _, m in ipairs(list) do
+		if TP.score[m] == nil and N.throwModeAvailable(m) then
+			nextMode = m
+			break
+		end
+	end
+	if nextMode then
+		TP.cur = nextMode
+		TP.say = "measuring " .. nextMode
+		return
+	end
+	local best, bestScore = nil, -1
+	for _, m in ipairs(list) do
+		if TP.score[m] and N.throwModeAvailable(m) and TP.score[m] > bestScore then
+			best, bestScore = m, TP.score[m]
+		end
+	end
+	if best then
+		local parts = {}
+		for _, m in ipairs(list) do
+			if TP.score[m] then
+				table.insert(parts, m .. " " .. string.format("%.1f", TP.score[m]))
+			end
+		end
+		TP.say = "kept " .. best .. " (" .. table.concat(parts, ", ") .. " throws/min)"
+		if TP.cur ~= best or TP.reprobeAt <= now then
+			log("PROBE keep", best, table.concat(parts, ", "))
+		end
+		TP.cur = best
+		if TP.reprobeAt <= now then
+			TP.reprobeAt = now + 3600
+		end
+	end
+	if now >= TP.reprobeAt and TP.reprobeAt > 0 then
+		-- Hourly re-measure: forget the scores, start again from the fastest allowed mode.
+		TP.score = {}
+		TP.cur = nil
+		TP.reprobeAt = now + 3600
+	end
+end
+local function nextRequestId()
+	local D = N.Direct
+	D.seq += 1
+	return D.seq
+end
+-- A direct throw refused or dropped: 3 in a row = the game's button for 10 minutes (then direct again).
+local function directFailed(why)
+	local D = N.Direct
+	D.rejectRun += 1
+	log("THROW direct", "accepted=false", why, "run", D.rejectRun)
+	if D.rejectRun >= 3 then
+		D.rejectRun = 0
+		D.offUntil = os.clock() + 600
+		log("THROW direct fallback", "the game's button for 10 min after 3 refusals")
+	end
+end
+local function parallelFailed(why)
+	local P = N.Parallel
+	P.rejectRun += 1
+	log("THROW parallel rejected", why, "run", P.rejectRun)
+	if P.rejectRun >= 3 and not P.off then
+		P.off = true
+		log("THROW parallel off", "single direct throws for this session")
+	end
+end
+function N.noteDirectCancel(mine)
+	if mine.parallel or liveCount() > 0 then
+		parallelFailed("a throw was cancelled while two were in flight")
+	else
+		directFailed("cancelled by the server")
+	end
+end
+-- Sends one hub throw and waits up to 2 s for the server's answer. Returns "started", "rejected" or "none".
+local function sendDirect(parallel)
+	local D = N.Direct
+	local req = nextRequestId()
+	local mine = { sentAt = os.clock(), parallel = parallel }
+	D.mine[req] = mine
+	if not send("Throw", req) then
+		D.mine[req] = nil
+		return "none", mine
+	end
+	waitFor(function()
+		return mine.started or mine.rejected ~= nil or mine.cancelled
+	end, 2)
+	if mine.started and not mine.cancelled then
+		return "started", mine
+	end
+	if not mine.started then
+		-- No answer: forget it (a late ThrowStarted for it counts as a foreign throw then).
+		task.delay(10, function()
+			if D.mine[req] == mine and not mine.started then
+				D.mine[req] = nil
+			end
+		end)
+	end
+	return (if mine.rejected ~= nil or mine.cancelled then "rejected" else "none"), mine
+end
+-- Probe B: a second Throw while ours is in flight. Accepted = its own ThrowStarted and the first one not cancelled.
+local function parallelStep()
+	local T, P = N.Throw, N.Parallel
+	local now = os.clock()
+	if liveCount() ~= 1 or now - T.startedAt < 0.3 or now - P.sentAt < 0.3 then
+		return false
+	end
+	P.sentAt = now
+	local result, mine = sendDirect(true)
+	if result == "started" then
+		P.rejectRun = 0
+		P.ok += 1
+		P.logs += 1
+		if P.logs <= 5 or P.logs % 100 == 0 then
+			log("THROW parallel accepted=true", "in flight", liveCount(), "ok", P.ok)
+		end
+		return true
+	end
+	parallelFailed(if result == "rejected" then "msg=" .. tostring(mine.rejected or "cancelled") else "no ThrowStarted in 2 s")
+	return false
+end
+-- Probe A: Throw 0.15 s after ThrowFinished (Network.RequestInterval) instead of the client's 0.8 s cooldown.
+local function directStep(gap)
+	local T, D = N.Throw, N.Direct
+	T.pressedAt = os.clock()
+	local result, mine = sendDirect(false)
+	if result == "started" then
+		D.rejectRun = 0
+		D.logs += 1
+		if D.logs <= 5 or D.logs % 50 == 0 then
+			log("THROW direct gap=" .. (if gap then string.format("%.2f", gap) else "first"), "accepted=true", "dropped cancels", D.dropped)
+		end
+		return true
+	end
+	directFailed(if result == "rejected" then "msg=" .. tostring(mine.rejected or "cancelled") else "no ThrowStarted in 2 s")
+	return false
+end
+-- Pace: throws per minute and the average gap between the end of a throw and the next one (blocks included).
+local function notePace(gap, firstThrow)
+	local T = N.Throw
+	T.pace = T.pace or { at = os.clock(), n = 0, gaps = 0, blocked = 0 }
+	local pace = T.pace
+	if not firstThrow then
+		pace.n += 1
+		pace.gaps += gap
+	end
+	if os.clock() - pace.at >= 60 then
+		if pace.n > 0 then
+			log("THROW pace", pace.n, "throws in", string.format("%.0fs", os.clock() - pace.at), "avg gap", string.format("%.2fs", pace.gaps / pace.n), "blocked", string.format("%.1fs", pace.blocked), "mode", N.throwMode(), "in flight", liveCount())
+		end
+		T.pace = { at = os.clock(), n = 0, gaps = 0, blocked = 0 }
+	end
+end
 -- One throw from the launch zone. Returns true when a throw finished (or is running).
 function N.throwStep()
 	local T = N.Throw
 	local activity = N.activity()
+	local mode = N.throwMode()
+	N.throwProbeTick(mode)
+	-- A throw whose ThrowFinished never came (world change, lost packet) is forgotten after 30 s, so a ghost never
+	-- counts as "in flight".
+	for id, entry in pairs(T.live) do
+		if os.clock() - entry.at > 30 then
+			T.live[id] = nil
+		end
+	end
+	T.pending = liveCount() > 0
 	if T.pending and os.clock() - T.startedAt < 30 then
-		setStatus("Throwing" .. (if T.secret then " (secret throw)" else ""))
-		task.wait(0.2)
+		if mode == "parallel" and parallelStep() then
+			return true
+		end
+		setStatus("Throwing" .. (if T.secret then " (secret throw)" else "") .. (if liveCount() > 1 then " x" .. liveCount() else ""))
+		task.wait(if mode == "button" or mode == "legit" then 0.2 else 0.05)
 		return true
 	end
+	if T.pending then
+		table.clear(T.live)
+	end
 	T.pending = false
+	-- Direct: the server's State may still say Throw for a moment after ThrowFinished.
+	if activity == "Throw" and (mode == "direct" or mode == "parallel") and os.clock() - T.finishedAt < 2 then
+		task.wait(0.05)
+		return false
+	end
 	if activity == "Practice" then
 		setStatus("Leaving training to throw")
 		send("StopPractice", nil)
@@ -32748,8 +33098,26 @@ function N.throwStep()
 		end
 		task.wait(0.4)
 	end
-	-- Legit pace = the game's Auto Wins pass (2 s between throws plus 0.35 s settle). Blatant throws as soon as the
-	-- game allows (its own 0.8 s cooldown still applies, the server checks every throw).
+	if mode == "direct" or mode == "parallel" then
+		-- 0.15 s after ThrowFinished (the game's Network.RequestInterval) plus the back-off after a refusal.
+		local pause = 0.15 + T.extraGap - (os.clock() - T.finishedAt)
+		if pause > 0 then
+			task.wait(pause)
+		end
+		if N.hatchRevealOpen() then
+			N.hatchRevealStep(0.5)
+		end
+		setStatus("Throwing")
+		local firstThrow = T.finishedAt < -1e8
+		local gap = os.clock() - T.finishedAt
+		if directStep(if firstThrow then nil else gap) then
+			notePace(gap, firstThrow)
+			return true
+		end
+		return false
+	end
+	-- Legit pace = the game's Auto Wins pass (2 s between throws plus 0.35 s settle). Button mode presses the game's
+	-- button as soon as it comes back (its own 0.8 s cooldown applies).
 	if not N.blatant() then
 		local pause = 2.35 - (os.clock() - T.finishedAt)
 		if pause > 0 then
@@ -32839,18 +33207,7 @@ function N.throwStep()
 	if T.gapLogs <= 5 or T.gapLogs % 50 == 0 then
 		log("THROW gap=" .. (if firstThrow then "first" else string.format("%.2f", gap)), "accepted=true")
 	end
-	-- Pace: throws per minute and the average gap between the end of a throw and the next press (blocks included).
-	local pace = T.pace
-	if not firstThrow then
-		pace.n += 1
-		pace.gaps += gap
-	end
-	if os.clock() - pace.at >= 60 then
-		if pace.n > 0 then
-			log("THROW pace", pace.n, "throws in", string.format("%.0fs", os.clock() - pace.at), "avg gap", string.format("%.2fs", pace.gaps / pace.n), "blocked", string.format("%.1fs", pace.blocked))
-		end
-		T.pace = { at = os.clock(), n = 0, gaps = 0, blocked = 0 }
-	end
+	notePace(gap, firstThrow)
 	if not T.method then
 		T.method = method
 		log("THROW method", method)
@@ -32918,7 +33275,17 @@ function N.zones()
 	return list
 end
 -- Why the player cannot use a zone (nil = can use it).
+-- Zone Probe (ideas.md "Blatant discovery" C and D): the zone lock may be client-only. Once per session the hub stands
+-- on the best locked stand and measures 15 s of skill against the open zone; a zone the server trains in faster is kept
+-- for the session. keep["World/zone"] = true.
+N.ZoneProbe = { done = {}, keep = {}, base = nil, sample = nil, last = "", worldDone = {}, world = nil }
+local function zoneKey(name)
+	return tostring(N.worldId()) .. "/" .. tostring(name)
+end
 function N.zoneLock(zone)
+	if N.ZoneProbe.keep[zoneKey(zone.name)] then
+		return nil
+	end
 	if not zone.owned then
 		return "needs the training pass"
 	end
@@ -32977,6 +33344,158 @@ local function rest(zone, seconds, reason)
 	N.Train.verifyAt = nil
 	logProblem("Training did not start at " .. zone.name .. ": " .. reason)
 end
+-- Baseline: skill per second at the open zone over 15 s of Practice (same rebirths, the same stone).
+local function zoneBaseSample()
+	local Z, now = N.ZoneProbe, os.clock()
+	local S = Z.sample
+	if not S or S.zone ~= N.Train.zone or S.rebirths ~= N.rebirths() or S.stone ~= N.state().EquippedStone then
+		Z.sample = { zone = N.Train.zone, at = now, skill = N.skill(), rebirths = N.rebirths(), stone = N.state().EquippedStone }
+		return
+	end
+	if now - S.at >= 15 then
+		local rate = (N.skill() - S.skill) / (now - S.at)
+		if rate > 0 then
+			Z.base = { zone = S.zone, rate = rate, bonus = N.Train.bonus or 0, at = now, rebirths = S.rebirths, stone = S.stone }
+		end
+		Z.sample = nil
+	end
+end
+-- The best locked stand not probed yet in this world, with a bigger bonus than the zone we train in.
+function N.zoneProbeCandidate()
+	local Z = N.ZoneProbe
+	local base = Z.base
+	if not base then
+		return nil
+	end
+	for _, zone in ipairs(N.zones()) do
+		if zone.bonus > base.bonus and not Z.done[zoneKey(zone.name)] and N.zoneLock(zone) ~= nil and N.zoneStandPart(zone) then
+			return zone
+		end
+	end
+	return nil
+end
+-- Probe C: stand on the locked stand, wait 5 s for Practice, measure 15 s of skill. Keep it when the server trains
+-- faster there, else back to the open zone. Logs TRAIN zone probe + PROBE zone_<name>. Returns nil when nothing to do.
+function N.zoneProbeStep()
+	local Z = N.ZoneProbe
+	if not on("ZoneProbe") then
+		return nil
+	end
+	zoneBaseSample()
+	local base = Z.base
+	if not base or os.clock() - base.at > 120 or base.rebirths ~= N.rebirths() then
+		return nil
+	end
+	local zone = N.zoneProbeCandidate()
+	if not zone then
+		return nil
+	end
+	local key = zoneKey(zone.name)
+	Z.done[key] = true
+	local why = N.zoneLock(zone)
+	setStatus("Zone probe: " .. zone.name)
+	send("StopPractice", nil)
+	waitFor(function()
+		return N.activity() ~= "Practice"
+	end, 3)
+	local cf = N.zoneStand(zone)
+	if cf then
+		N.goTo(cf, 3)
+	end
+	local started = cf ~= nil and waitFor(function()
+		return N.activity() == "Practice"
+	end, 5)
+	if not started then
+		Z.last = zone.name .. ": the server did not start training (" .. tostring(why) .. ")"
+		log("TRAIN zone probe", zone.name, "started=false", "lock", tostring(why))
+		log("PROBE zone_" .. zone.name, "result=0", "base=" .. brief(base.rate))
+		N.Train.zone = nil
+		return false
+	end
+	local s0, t0, reb = N.skill(), os.clock(), N.rebirths()
+	waitFor(function()
+		return N.activity() ~= "Practice" or N.rebirths() ~= reb
+	end, 15)
+	local rate = (N.skill() - s0) / math.max(os.clock() - t0, 0.1)
+	local kept = N.activity() == "Practice" and N.rebirths() == reb and rate > base.rate * 1.05
+	log("TRAIN zone probe", zone.name, "started=true", "gain/s=" .. brief(rate), "vs", brief(base.rate), "at", base.zone, "kept=" .. tostring(kept), "activity", tostring(N.activity()), "secs", string.format("%.1f", os.clock() - t0))
+	log("PROBE zone_" .. zone.name, "result=" .. brief(rate), "base=" .. brief(base.rate))
+	if kept then
+		Z.keep[key] = true
+		-- The kept zone is the new baseline: a weaker locked zone is never probed against the old one.
+		Z.base, Z.sample = nil, nil
+		Z.last = string.format("%s kept: %s skill/s vs %s at %s", zone.name, formatNumber(rate), formatNumber(base.rate), tostring(base.zone))
+		N.Train.zone = zone.name
+		N.Train.bonus = zone.bonus
+		N.Train.startedAt = os.clock()
+		N.Train.last = zone.name .. " (+" .. formatNumber(zone.bonus) .. ", probe)"
+		return true
+	end
+	Z.last = string.format("%s locked: %s skill/s vs %s at %s", zone.name, formatNumber(rate), formatNumber(base.rate), tostring(base.zone))
+	send("StopPractice", nil)
+	N.Train.zone = nil
+	return false
+end
+-- Probe D: TravelWorld to the next world while it is still locked, once per session. Moved = measure 60 s of throwing
+-- there (Wins per throwing second) against the world we came from; keep it when it pays more, else travel back.
+-- Logs WORLD probe + PROBE world_<id>. Returns true while it acted.
+function N.worldProbeStep()
+	local Z = N.ZoneProbe
+	local W = Z.world
+	if W then
+		if not W.rate then
+			local secs = Session.throwSeconds - W.secs
+			if secs < 60 and os.clock() - W.at < 240 then
+				return false
+			end
+			W.rate = if secs > 0 then (Session.winsFromThrows - W.wins) / secs else 0
+			W.kept = secs >= 30 and W.rate > W.base
+			log("PROBE world_" .. W.id, "result=" .. brief(W.rate), "base=" .. brief(W.base), "kept=" .. tostring(W.kept), "throwing", string.format("%.0fs", secs))
+			if W.kept then
+				Z.world = nil
+				Z.keep[W.id] = true
+				Z.last = string.format("World %s kept: %s Wins/s vs %s", W.id, formatNumber(W.rate), formatNumber(W.base))
+				return false
+			end
+			Z.last = string.format("World %s: %s Wins/s vs %s, back to %s", W.id, formatNumber(W.rate), formatNumber(W.base), W.from)
+		end
+		-- Travel back only between throws.
+		if N.activity() ~= "Idle" then
+			return false
+		end
+		Z.world = nil
+		send("TravelWorld", W.from)
+		waitFor(function()
+			return N.worldId() == W.from
+		end, 4)
+		log("WORLD probe back", W.from, "moved=" .. tostring(N.worldId() == W.from))
+		return true
+	end
+	if not on("ZoneProbe") or N.activity() ~= "Idle" then
+		return false
+	end
+	local cfg = N.worldCfg()
+	local nextId = cfg and cfg.NextWorldId
+	local base = N.Rate.throwWins
+	if not nextId or Z.worldDone[nextId] or N.worldUnlocked(nextId) or not base or base <= 0 then
+		return false
+	end
+	Z.worldDone[nextId] = true
+	local from = N.worldId()
+	send("TravelWorld", nextId)
+	local moved = waitFor(function()
+		return N.worldId() == nextId
+	end, 3)
+	log("WORLD probe", nextId, "moved=" .. tostring(moved), "from", from)
+	if not moved then
+		Z.last = "World " .. nextId .. ": the server keeps it locked"
+		log("PROBE world_" .. nextId, "result=0", "base=" .. brief(base))
+		return false
+	end
+	Z.world = { id = nextId, from = from, base = base, secs = Session.throwSeconds, wins = Session.winsFromThrows, at = os.clock() }
+	Z.last = "World " .. nextId .. ": moved, measuring throws there"
+	return true
+end
 function N.trainStep()
 	local zone = N.bestZone()
 	if not zone then
@@ -33009,6 +33528,13 @@ function N.trainStep()
 					end
 					rest(named or zone, 120, "Practice on but the skill did not rise in 5 s")
 					return false
+				end
+			end
+			-- Zone Probe: a locked stand with a bigger bonus, measured once per session against this zone.
+			if not T.verifyAt then
+				local probe = N.zoneProbeStep()
+				if probe ~= nil then
+					return probe
 				end
 			end
 			setStatus("Training at " .. N.Train.zone)
@@ -33769,7 +34295,8 @@ N.World = { last = "", refusedAt = -1e9 }
 function N.highestWorld()
 	local best = "World1"
 	for _, def in ipairs(N.worldList()) do
-		if N.worldUnlocked(def.Id) then
+		-- A world the Zone Probe kept (the server let us in and it pays more) counts as open for this session.
+		if N.worldUnlocked(def.Id) or N.ZoneProbe.keep[def.Id] then
 			best = def.Id
 		end
 	end
@@ -35187,12 +35714,12 @@ do
 	do
 		-- Farm: Throw, Train and the Smart Planner.
 		local ThrowBox = Tabs.Farm:AddLeftGroupbox("Throw", "target")
-		ThrowBox:AddToggle("AutoThrow", { Text = "Auto Throw", Default = false, Tooltip = "Throws from the launch zone with the game's own Throw button" })
+		ThrowBox:AddToggle("AutoThrow", { Text = "Auto Throw", Default = false, Tooltip = "Throws from the launch zone for Wins. Throw Speed picks how fast" })
 		ThrowBox:AddDropdown("ThrowSpeed", {
 				Text = "Throw Speed",
-				Values = { "Legit (game pace)", "Max (Blatant)" },
-				Default = "Max (Blatant)",
-				Tooltip = "Max throws again the moment the game's 0.8 s cooldown ends (default). Legit waits like the game's own Auto Wins pass (about 2.4 s between throws)",
+				Values = { "Legit (game pace)", "Fast", "Blatant" },
+				Default = "Blatant",
+				Tooltip = "Blatant (default): throws again 0.15 s after a throw lands and tries a second throw in flight, keeps whatever the server accepts and measures best. Fast: throws again 0.15 s after a throw lands. Legit: the game's own button at its Auto Wins pace (about 2.4 s between throws)",
 			})
 			ThrowBox:AddDropdown("MoveMode", {
 				Text = "Movement",
@@ -35222,6 +35749,11 @@ do
 			Values = { "Best open", "TrainingZone", "TrainingZone_RareJade", "TrainingZone_EpicCrystal", "TrainingZone_LegendaryCelestial", "TrainingZone_Koi", "TrainingZone_Golden", "TrainingZone_Hacker" },
 			Default = "Best open",
 			Tooltip = "Best open = the biggest bonus you qualify for (rebirth zones, owned passes and the free Hacker event zone)",
+		})
+		TrainBox:AddToggle("ZoneProbe", {
+			Text = "Zone Probe",
+			Default = true,
+			Tooltip = "Once per session: tries the best locked training stand for 15 s and the next locked world for 60 s of throws. Keeps it only when the server pays more there, else goes back",
 		})
 		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
 		local PlanBox = Tabs.Farm:AddLeftGroupbox("Smart Planner", "brain")
@@ -36493,7 +37025,7 @@ do
 	send("PlayerGiftsReady", nil)
 	-- Chores that need the player Idle (the shop, eggs and equipping refuse during a throw or training).
 	local function idleChores()
-		if on("AutoWorld") and choreDue("world", 30) then
+		if on("AutoWorld") and not N.ZoneProbe.world and choreDue("world", 30) then
 			local best = N.highestWorld()
 			if best ~= N.worldId() and N.travel(best) then
 				return true
@@ -36577,6 +37109,10 @@ do
 			N.potionStep(mode)
 		end
 		if mode == "throw" then
+			-- Zone Probe D: a locked next world, once per session (needs a measured Wins rate first).
+			if N.worldProbeStep() then
+				return
+			end
 			N.throwStep()
 			return
 		elseif mode == "train" then
@@ -36700,8 +37236,18 @@ do
 				local upNext = N.upNext()
 				I.plan = if #upNext > 0 then "<b>Up next</b>\n" .. '<font transparency="0.2">\u{2022} ' .. table.concat(upNext, "\n\u{2022} ") .. "</font>" else "Up next: nothing running"
 				local base, dist = N.baseWins(N.skill())
+				local speed = N.throwSpeed()
+				local speedLine = if speed == "legit"
+					then "Speed: Legit, the game's button at its own pace"
+					else string.format(
+						"Speed: %s, now <b>%s</b>%s%s",
+						if speed == "blatant" then "Blatant" else "Fast",
+						N.throwMode(),
+						if N.ThrowProbe.say ~= "" then " (" .. N.ThrowProbe.say .. ")" else "",
+						if speed == "blatant" and N.Parallel.off then "\nSecond throw in flight: the server refuses it" elseif N.Parallel.ok > 0 then "\nSecond throw in flight: accepted " .. N.Parallel.ok .. "x" else ""
+					)
 				I.throw = string.format(
-					"Distance now ~<b>%d</b> studs, zone pays <b>%s</b> wins (x%s trail)\nLast: %s\nThrows <b>%d</b>, secret <b>%d</b>, refused <b>%d</b>\n%s",
+					"Distance now ~<b>%d</b> studs, zone pays <b>%s</b> wins (x%s trail)\nLast: %s\nThrows <b>%d</b>, secret <b>%d</b>, refused <b>%d</b>\n%s\n%s",
 					math.floor(dist or 0),
 					formatNumber(base or 0),
 					formatNumber(N.trailMult()),
@@ -36709,6 +37255,7 @@ do
 					Session.throws,
 					Session.secret + Session.colossus,
 					Session.rejected,
+					speedLine,
 					if N.planner() then string.format("Smart Planner: throwing %d%% of the time (%s)", math.floor(P.f * 100), P.why) else "Throw Share " .. math.floor(optionNumber("ThrowShare", 50)) .. "% when Auto Train is on too"
 				)
 				I.planner = if N.planner()
@@ -36716,11 +37263,12 @@ do
 					else "Off. Turn it on to let Corvus split throwing and training, buy stones, trails and eggs by payback and time rebirths around world unlocks. Your other toggles stay as they are"
 				local zone = N.bestZone()
 				I.train = string.format(
-					"%s\nTraining rate %s skill/s (game says %s)\nTrained %s this session",
+					"%s\nTraining rate %s skill/s (game says %s)\nTrained %s this session\nZone Probe: %s",
 					if zone then string.format("Best open: <b>%s</b> (+%s)", zone.name, formatNumber(zone.bonus)) else "No zone open",
 					formatNumber(N.Rate.trainSkill or 0),
 					formatNumber(tonumber(s.TrainingRate) or 0),
-					N.longTime(Session.trainSeconds)
+					N.longTime(Session.trainSeconds),
+					if not on("ZoneProbe") then "off" elseif N.ZoneProbe.last ~= "" then N.ZoneProbe.last elseif N.zoneProbeCandidate() then "next: " .. N.zoneProbeCandidate().name else "waiting for a 15 s training sample"
 				)
 				local _, stoneBest = N.bestOwnedStone()
 				local _, trailBest = N.bestOwnedTrail()
