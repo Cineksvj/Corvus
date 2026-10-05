@@ -27678,6 +27678,7 @@ local BootOk, BootError = xpcall(function()
 		Game.MutationConfig = safeRequire("Configs.MutationConfig")
 		Game.SizeConfig = safeRequire("Configs.SizeConfig")
 		Game.CollectEventConfig = safeRequire("Configs.CollectEventConfig")
+		Game.PotionsConfig = safeRequire("Configs.PotionsConfig")
 		Game.TraitsConfig = safeRequire("Configs.TraitsConfig")
 		Game.StaffConfig = safeRequire("Configs.StaffConfig")
 		Game.UpgradeConfig = safeRequire("Configs.UpgradeConfig")
@@ -29686,9 +29687,17 @@ local BootOk, BootError = xpcall(function()
 			end
 			local floor = Game.plotFloor and Game.plotFloor() or 0
 			local anyIndex = false
+			local rushing = Game.event ~= nil and Game.event.rushing()
+			local evCount = 0
 			for _, item in ipairs(list) do
 				item.gain = Game.itemGain and Game.itemGain(item.info, floor) or 0
 				item.idx = 0
+				-- Event Rush: missing event index animals and event eggs go before everything else
+				item.ev = rushing and Game.event.wanted(item.info) == true
+				if item.ev then
+					evCount += 1
+					anyIndex = true
+				end
 				if item.info.kind ~= "Egg" and not item.info.special and Game.indexGain then
 					item.idx = Game.indexGain(item.info.type, item.info.mutation)
 					if item.idx > 0 then
@@ -29697,6 +29706,9 @@ local BootOk, BootError = xpcall(function()
 				end
 			end
 			table.sort(list, function(a, b)
+				if a.ev ~= b.ev then
+					return a.ev == true
+				end
 				if a.gain ~= b.gain then
 					return a.gain > b.gain
 				end
@@ -29718,8 +29730,12 @@ local BootOk, BootError = xpcall(function()
 					local bestAt, bestGain
 					for i, item in ipairs(pool) do
 						local g = item.gain
-						if item.idx > 0 and seen[item.info.type .. "|" .. item.info.mutation] then
+						local dup = seen[item.info.type .. "|" .. item.info.mutation]
+						if item.idx > 0 and dup then
 							g -= item.idx
+						end
+						if item.ev and not dup then
+							g += 1e30
 						end
 						if not bestAt or g > bestGain then
 							bestAt, bestGain = i, g
@@ -29727,14 +29743,15 @@ local BootOk, BootError = xpcall(function()
 					end
 					local item = table.remove(pool, bestAt)
 					table.insert(chosen, item)
-					if item.idx > 0 then
+					if item.idx > 0 or item.ev then
 						seen[item.info.type .. "|" .. item.info.mutation] = true
 					end
 				end
 				list = chosen
 			end
 			local ids, infos = {}, {}
-			for _, id in ipairs(Game.lucky.take(blocks, capacity)) do
+			-- while rushing the event items keep their slots: lucky blocks only get what is left
+			for _, id in ipairs(Game.lucky.take(blocks, capacity - math.min(evCount, capacity))) do
 				table.insert(ids, id)
 			end
 			local blockCount = #ids
@@ -29799,7 +29816,7 @@ local BootOk, BootError = xpcall(function()
 			return folder and folder:FindFirstChild("Collect")
 		end
 		onEvent("CollectEventService", "OnPickupsCreated", function(payload)
-			if not on("AutoStars") or type(payload) ~= "table" or type(payload.events) ~= "table" then
+			if not (on("AutoStars") or (Game.event ~= nil and Game.event.rush)) or type(payload) ~= "table" or type(payload.events) ~= "table" then
 				return
 			end
 			for eventId, event in pairs(payload.events) do
@@ -30768,6 +30785,7 @@ local BootOk, BootError = xpcall(function()
 				and not isProtected(info)
 				and matches(info, "Sell", 0)
 				and (not below or info.value < below)
+				and not (Game.event ~= nil and Game.event.wanted(info))
 				then
 					table.insert(list, { key = key, info = info, kind = entry.itemType })
 				end
@@ -30781,7 +30799,7 @@ local BootOk, BootError = xpcall(function()
 				for key, entry in pairs(data and data.Inventory or {}) do
 					local info = entryInfo(entry)
 					local locked = info ~= nil and entry.innerEntity.locked == true
-					if info and not info.special and (not locked or isProtected(info)) then
+					if info and not info.special and (not locked or isProtected(info)) and not (Game.event ~= nil and Game.event.wanted(info)) then
 						table.insert(smart, { key = key, info = info, kind = entry.itemType, locked = locked })
 					end
 				end
@@ -31715,6 +31733,14 @@ local BootOk, BootError = xpcall(function()
 			if on("AutoFarmAll") and Game.trainSea and Game.trainSea.state == "works" and isBlatant() then
 				return false
 			end
+			if Game.event and Game.event.rushing() then
+				-- Event Rush: the stars come only from open waves, training waits for the goal
+				if Schedule.phase == "train" then
+					log("SCHEDULE sea, event rush (goal first)")
+					Schedule.phase, Schedule.since = "sea", os.clock()
+				end
+				return false
+			end
 			if on("AutoFarmAll") then
 				-- profit engine v2: train only while the next plate bought with sea time (gain/$ of Train) beats the best
 				-- money purchase and pays back inside the horizon (Game.plan, PLAN log)
@@ -32339,7 +32365,7 @@ local BootOk, BootError = xpcall(function()
 				end
 			end
 			local target = list[1]
-			local plan = { at = now, list = list, byKey = byKey, target = target, train = train, income = income, H = H }
+			local plan = { at = now, list = list, byKey = byKey, target = target, train = train, income = income, H = H, plot = plot, catch = catch, catchBase = catchBase, trainShare = share, together = together }
 			plan.trainNow = train ~= nil and train.payback + train.tp <= H and train.ratio > math.max(target and target.ratio or 0, 1 / H)
 			local all = table.clone(list)
 			if train then
@@ -32407,6 +32433,176 @@ local BootOk, BootError = xpcall(function()
 				return cash()
 			end
 			return math.max(cash() - target.cost, 0)
+		end
+		-- Event Rush (2026-10-05): the collect event (CollectEventConfig.EVENTS: Stars, Cake) gives 2-3 pickups per plate
+		-- in every wave and the server grants the milestones by itself (150 Cash potion, 350 Train potion, 500 and 1000
+		-- the event egg; the full index of that egg is +10% Strength Gain for good). Progress: Data().CollectEvents[id]
+		-- (Collected, SessionId must match ActiveEvents[id].SessionId), ActiveEvents[id].Value = seconds left.
+		-- Every unreached milestone is priced on the 24 h horizon (capped by the event end) and divided by the stars still
+		-- needed; the hub rushes while that is worth at least a minute of income and the goal is reachable in time.
+		local EventState = { at = -1e9, logAt = -1e9, rush = false, why = "not checked", rate = nil, rateN = 0, stars = nil, starsAt = nil, text = "" }
+		Game.event = EventState
+		local function eventIndexEggs()
+			local cfg = Game.CollectEventConfig
+			local set = {}
+			for id, ev in pairs(type(cfg) == "table" and type(cfg.EVENTS) == "table" and cfg.EVENTS or {}) do
+				if type(ev) == "table" and type(ev.index) == "table" and ev.index.egg ~= nil then
+					set[ev.index.egg] = id
+				end
+			end
+			return set
+		end
+		-- an event animal whose index entry is still missing, or an event egg while that index is not complete
+		function EventState.wanted(info)
+			if type(info) ~= "table" or not on("EventRush") then
+				return false
+			end
+			local data = Data()
+			if not data then
+				return false
+			end
+			if info.kind == "Egg" then
+				local id = eventIndexEggs()[info.type]
+				if not id then
+					return false
+				end
+				local cfg = Game.CollectEventConfig
+				local ok, complete = pcall(cfg.IsIndexComplete, data, id)
+				return not (ok and complete == true)
+			end
+			if info.special or not Game.isEventAnimal(info.type) then
+				return false
+			end
+			local unlocked = type(data.UnlockedBrainrots) == "table" and data.UnlockedBrainrots or {}
+			return unlocked[info.type] == nil
+		end
+		local function eventProgress(id)
+			local folder = ReplicatedStorage:FindFirstChild("ActiveEvents")
+			local child = folder and folder:FindFirstChild(id)
+			if not child then
+				return nil
+			end
+			local okLeft, left = pcall(function()
+				return tonumber(child.Value)
+			end)
+			local data = Data()
+			local slot = data and type(data.CollectEvents) == "table" and data.CollectEvents[id]
+			local collected = 0
+			if type(slot) == "table" then
+				local okSid, sid = pcall(child.GetAttribute, child, "SessionId")
+				if not okSid or (sid or 0) == slot.SessionId then
+					collected = tonumber(slot.Collected) or 0
+				end
+			end
+			return collected, if okLeft then left else nil
+		end
+		-- value of one milestone reward in $ over the horizon
+		local function rewardValue(reward, plan, horizon)
+			local element = type(reward) == "table" and reward.Element
+			local rd = type(reward) == "table" and type(reward.Data) == "table" and reward.Data or {}
+			local amount = tonumber(rd.amount) or 1
+			if element == "Potion" then
+				local pc = type(Game.PotionsConfig) == "table" and Game.PotionsConfig[rd.type]
+				local mult = math.max(tonumber(pc and pc.multiplier) or 2, 1)
+				local duration = math.min(tonumber(pc and pc.duration) or 600, horizon)
+				if rd.type == "Cash" then
+					-- x2 CashMulti on the plot for the potion time (sales assumed unchanged, like the rebirth estimate)
+					return (plan.plot or 0) * (mult - 1) * duration * amount
+				elseif rd.type == "Train" then
+					-- x2 power gain = that much training time the sea does not have to pay for (trainShare of sea income)
+					return (plan.catch or 0) * math.max(plan.trainShare or 0.3, 0.3) * duration * (mult - 1) / mult * amount
+				elseif rd.type == "Luck" then
+					return (plan.catch or 0) * (mult ^ 0.5 - 1) * duration * amount
+				end
+				return 0
+			elseif element == "Egg" then
+				local floor = Game.plotFloor and Game.plotFloor() or 0
+				local gain = Game.eggGain and Game.eggGain(rd.type, "NORMAL", floor) or 0
+				return gain * horizon * amount
+			elseif element == "Cash" or element == "Currency" then
+				return amount
+			end
+			return 0
+		end
+		function EventState.update()
+			local now = os.clock()
+			if now - EventState.at < 5 then
+				return
+			end
+			EventState.at = now
+			-- stars per second as the server really takes them (Session.stars), prior from the claim cap
+			local stars = tonumber(Session.stars) or 0
+			if EventState.stars and now > (EventState.starsAt or now) then
+				local r = (stars - EventState.stars) / (now - EventState.starsAt)
+				EventState.rate = if EventState.rate then EventState.rate * 0.8 + r * 0.2 else r
+				EventState.rateN += 1
+			end
+			EventState.stars, EventState.starsAt = stars, now
+			local rush, why, text = false, "no event", ""
+			local cfg = Game.CollectEventConfig
+			local events = type(cfg) == "table" and type(cfg.EVENTS) == "table" and cfg.EVENTS or {}
+			local plan = on("EventRush") and Game.plan and Game.plan() or nil
+			if not on("EventRush") then
+				why = "toggle off"
+			elseif not plan then
+				why = "no plan yet"
+			else
+				local income = math.max(plan.income or 0, 0)
+				local best = nil
+				for id, ev in pairs(events) do
+					local collected, left = eventProgress(id)
+					if collected and type(ev) == "table" and type(ev.milestones) == "table" then
+						local horizon = math.min(86400, left or 86400)
+						local prior = if isBlatant() then 20 else 3
+						local rate = if EventState.rateN >= 6 and EventState.rate and EventState.rate > 0.2 then EventState.rate else prior
+						local value, goal, eta, last = 0, nil, 0, 0
+						for _, m in ipairs(ev.milestones) do
+							local amount = tonumber(m.amount) or 0
+							if amount > collected then
+								local need = amount - collected
+								local t = need / rate
+								if not left or t <= left then
+									local v = rewardValue(m.reward, plan, math.max(horizon - t, 0))
+									if v > 0 then
+										value += v
+										goal, eta, last = amount, t, amount
+									end
+								end
+							end
+							last = math.max(last, amount)
+						end
+						local perStar = if goal then value / (goal - collected) else 0
+						if goal and not (best and best.value >= value) then
+							best = { id = id, collected = collected, goal = goal, value = value, perStar = perStar, eta = eta, left = left, rate = rate, last = last }
+						elseif not best and not goal then
+							best = { id = id, collected = collected, value = 0, last = last, left = left }
+						end
+					end
+				end
+				if not best then
+					why = "no event"
+				elseif not best.goal then
+					why = if best.collected >= best.last then "all milestones reached " .. best.collected .. "/" .. best.last else "no reachable milestone before the event ends"
+				elseif best.value < income * 60 then
+					why = string.format("value $%s < 1 min income $%s", formatNumber(best.value), formatNumber(income * 60))
+				else
+					rush = true
+					text = string.format("EVENT rush goal=%d/%d value/star=%s eta=%ds (%s, %.1f stars/s, left %s)", best.collected, best.goal, formatNumber(best.perStar), math.floor(best.eta), best.id, best.rate, if best.left then math.floor(best.left) .. "s" else "?")
+				end
+				if best then
+					EventState.best = best
+				end
+			end
+			local changed = rush ~= EventState.rush or why ~= EventState.why
+			EventState.rush, EventState.why = rush, why
+			if changed or now - EventState.logAt >= 60 then
+				EventState.logAt = now
+				log(if rush then text else "EVENT normal why=" .. why)
+			end
+		end
+		function EventState.rushing()
+			EventState.update()
+			return EventState.rush
 		end
 		function currentLuck()
 			local ok, luck = pcall(function()
@@ -32484,7 +32680,7 @@ local BootOk, BootError = xpcall(function()
 				"AutoSea", "AutoSell", "AutoEquipBest", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff",
 				"AutoEquipStaff", "AutoBuyDumbbell", "AutoEquipDumbbell", "AutoTrain", "AutoBonus", "AutoRebirth",
 				"AutoPotions", "SmartPotions", "AutoOffline", "SkipEmpty", "EquipBeforeSell", "SaveForRebirth",
-				"AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoCodes", "AutoStars", "AutoLucky",
+				"AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoCodes", "AutoStars", "AutoLucky", "EventRush",
 			}
 			local FarmAllMain = { "AutoSea", "AutoSell", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff", "AutoBuyDumbbell", "AutoTrain", "AutoRebirth", "AutoPotions" }
 			local FarmAllTurned = {}
@@ -32614,6 +32810,11 @@ local BootOk, BootError = xpcall(function()
 				Text = "Collect Stars (event)",
 				Default = true,
 				Tooltip = "During the Stars event, sweeps the stars in the open sea after the catch.",
+			})
+			TuneBox:AddToggle("EventRush", {
+				Text = "Event Rush",
+				Default = true,
+				Tooltip = "Values the event milestones (potions, event eggs) and rushes them when they pay: stars at the server limit, event animals and eggs first in every wave, no lucky blocks, ads, luck hops or training phases until the goal. Back to normal by itself.",
 			})
 			TuneBox:AddSlider("SeaMargin", {
 				Text = "Safety Margin",
@@ -34898,10 +35099,12 @@ local BootOk, BootError = xpcall(function()
 				end
 			end },
 		}
+		local RushPaused = { lucky = true, ad = true, luckhop = true }
 		while alive() do
 			if Data() then
+				local rushing = Game.event ~= nil and Game.event.rushing()
 				for _, job in ipairs(Jobs) do
-					if on(job[1]) and every(job[2], job[3]) then
+					if on(job[1]) and not (rushing and RushPaused[job[2]]) and every(job[2], job[3]) then
 						runJob(job[2], job[4])
 					end
 				end
