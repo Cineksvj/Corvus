@@ -30496,7 +30496,8 @@ do
 		return found
 	end
 	-- Only the job actions a worker sends. Never purchases, trading, admin or anything for other players.
-	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true }
+	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true }
+	local AllowedJobInvoke = { CleanSchoolJanitorObject = true }
 	function N.jobFire(packet)
 		local jh = N.jobHandler()
 		if not (jh and AllowedJob[packet.Type]) then
@@ -30510,6 +30511,27 @@ do
 			log("JOB", packet.Type, argsText({ packet.Workstation, packet.Order }, 1, 2), if ok then "" else "failed: " .. tostring(err))
 		end
 		return ok
+	end
+	-- Invoke version for the job actions the game asks with InvokeServer. Returns ok and the server answer.
+	function N.jobInvoke(packet)
+		local jh = N.jobHandler()
+		if not (jh and AllowedJobInvoke[packet.Type]) then
+			log("BLOCKED job", tostring(packet.Type))
+			return false, nil
+		end
+		local box = { done = false }
+		task.spawn(function()
+			box.ok, box.result = pcall(function()
+				return jh.net:InvokeServer(packet)
+			end)
+			box.done = true
+		end)
+		local started = os.clock()
+		while not box.done and os.clock() - started < 8 do
+			task.wait(0.03)
+		end
+		log("JOB", packet.Type, if box.done then brief(box.result) else "timed out")
+		return box.done and box.ok, box.result
 	end
 end
 local formatNumber, allows, selected, on, optionNumber, optionText, Status, setStatus, picked
@@ -30918,6 +30940,228 @@ do
 		log("HAIR", N.Hair.last, "dist", math.floor(item.dist))
 	end
 end
+-- School Janitor: messes sit on JanitorSpawns (GroundSpawn / WallSpawn parts). Cleaning one is
+-- net:InvokeServer({Type = "CleanSchoolJanitorObject", Spawn = <spawn part>}), the server answers true when it counted.
+-- The client draws the messes itself, so the hub goes by the spawn parts and the server's answer.
+N.Janitor = { skip = {}, last = "" }
+do
+	local function school()
+		local env = workspace:FindFirstChild("Environment")
+		local node = env and env:FindFirstChild("Locations")
+		node = node and node:FindFirstChild("SchoolArea")
+		return node and node:FindFirstChild("School")
+	end
+	function N.janitorStep()
+		if not N.ensureShift("SchoolJanitor") then
+			return
+		end
+		local area = school()
+		local spawns = area and area:FindFirstChild("JanitorSpawns")
+		local root = N.root()
+		if not (spawns and root) then
+			setStatus("Janitor: waiting for the school to load")
+			task.wait(1)
+			return
+		end
+		local list = {}
+		local now = os.clock()
+		for _, spawn in ipairs(spawns:GetChildren()) do
+			if spawn:IsA("BasePart") and (N.Janitor.skip[spawn] or 0) <= now then
+				-- messes drawn by the game first, then every other spot
+				local has = spawn:FindFirstChild("Object") ~= nil
+				table.insert(list, { spawn = spawn, dist = (spawn.Position - root.Position).Magnitude - (if has then 1000 else 0) })
+			end
+		end
+		if #list == 0 then
+			setStatus("Janitor: waiting for new messes")
+			task.wait(0.5)
+			return
+		end
+		table.sort(list, function(a, b)
+			return a.dist < b.dist
+		end)
+		local spawn = list[1].spawn
+		setStatus("Janitor: cleaning")
+		if (spawn.Position - root.Position).Magnitude > 7 then
+			N.walkTo(spawn.Position, 5, 10)
+		end
+		task.wait(N.actionDelay())
+		local ok, result = N.jobInvoke({ Type = "CleanSchoolJanitorObject", Spawn = spawn })
+		if ok and result then
+			Session.done += 1
+			Session.correct += 1
+			local object = spawn:FindFirstChild("Object")
+			if object then
+				object:Destroy()
+			end
+			N.Janitor.last = "cleaned"
+		else
+			N.Janitor.skip[spawn] = os.clock() + 15
+			N.Janitor.last = "nothing to clean there"
+		end
+	end
+end
+
+-- Supermarket Stocker: take a Food Crate inside the warehouse (Geometry.Crates, not BagCrate) with TakeFoodCrate,
+-- carry it out and RestockShelf on a shelf whose IsEmpty is true.
+N.Stocker = { last = "" }
+do
+	local function market()
+		local env = workspace:FindFirstChild("Environment")
+		local node = env and env:FindFirstChild("Locations")
+		node = node and node:FindFirstChild("City")
+		return node and node:FindFirstChild("Supermarket")
+	end
+	local function equipped()
+		local jh = N.jobHandler()
+		local item = isolated(function()
+			return jh.Shared.EquipmentService:GetEquipped(LocalPlayer)
+		end)
+		return item and tostring(item) or ""
+	end
+	local function nearest(list, root)
+		local best, bestDist
+		for _, part in ipairs(list) do
+			local ok, pivot = pcall(part.GetPivot, part)
+			if ok then
+				local d = (pivot.Position - root.Position).Magnitude
+				if not bestDist or d < bestDist then
+					best, bestDist = part, d
+				end
+			end
+		end
+		return best
+	end
+	function N.stockerStep()
+		if not N.ensureShift("SupermarketStocker") then
+			return
+		end
+		local shop, root = market(), N.root()
+		if not (shop and root) then
+			setStatus("Stocker: waiting for the supermarket to load")
+			task.wait(1)
+			return
+		end
+		local holding = equipped() == "Food Crate"
+		if not holding then
+			local geometry = shop:FindFirstChild("Geometry")
+			local crates = geometry and geometry:FindFirstChild("Crates")
+			local list = {}
+			for _, crate in ipairs(crates and crates:GetChildren() or {}) do
+				if crate.Name ~= "BagCrate" then
+					table.insert(list, crate)
+				end
+			end
+			local crate = nearest(list, root)
+			if not crate then
+				setStatus("Stocker: no crate in the warehouse")
+				task.wait(1)
+				return
+			end
+			setStatus("Stocker: taking a crate")
+			N.walkTo(crate:GetPivot().Position, 4, 12)
+			task.wait(N.actionDelay())
+			N.jobFire({ Type = "TakeFoodCrate", Object = crate })
+			waitFor(function()
+				return equipped() == "Food Crate"
+			end, 2)
+			return
+		end
+		local interior = shop:FindFirstChild("Interior")
+		local shelves = interior and interior:FindFirstChild("Shelves")
+		local empty = {}
+		for _, shelf in ipairs(shelves and shelves:GetChildren() or {}) do
+			local flag = shelf:FindFirstChild("IsEmpty")
+			if flag and flag.Value then
+				table.insert(empty, shelf)
+			end
+		end
+		local shelf = nearest(empty, root)
+		if not shelf then
+			setStatus("Stocker: every shelf is full, waiting")
+			task.wait(0.5)
+			return
+		end
+		setStatus("Stocker: restocking a shelf")
+		N.walkTo(shelf:GetPivot().Position, 4, 12)
+		task.wait(N.actionDelay())
+		N.jobFire({ Type = "RestockShelf", Shelf = shelf })
+		local flag = shelf:FindFirstChild("IsEmpty")
+		if waitFor(function()
+			return not (flag and flag.Value)
+		end, 2) then
+			Session.done += 1
+			Session.correct += 1
+		end
+	end
+end
+
+-- Real pay per job: the game keeps the current shift's pay in ClientStats "Job".ShiftEarnings. The hub turns it into
+-- $ per hour of work for every job you farmed and saves it, so the Jobs tab shows which job pays you the most.
+N.Pay = { file = "Corvus/WTB_job_pay.json", jobs = {}, shift = nil }
+do
+	pcall(function()
+		if isfile and isfile(N.Pay.file) then
+			local data = HttpService:JSONDecode(readfile(N.Pay.file))
+			if type(data) == "table" then
+				N.Pay.jobs = data
+			end
+		end
+	end)
+	function N.shiftEarnings()
+		local jh = N.jobHandler()
+		local value = isolated(function()
+			return jh.Modules.ClientStats:GetStat("Job"):FindFirstChild("ShiftEarnings").Value
+		end)
+		return tonumber(value) or 0
+	end
+	function N.paySample()
+		local job = N.currentJob()
+		local now = os.clock()
+		local S = N.Pay.shift
+		if job == "" then
+			N.Pay.shift = nil
+			return
+		end
+		local earned = N.shiftEarnings()
+		if not S or S.job ~= job or earned < S.last then
+			N.Pay.shift = { job = job, at = now, last = earned }
+			return
+		end
+		local gained, seconds = earned - S.last, now - S.at
+		S.at, S.last = now, earned
+		if seconds > 0 and seconds < 120 then
+			local entry = N.Pay.jobs[job] or { money = 0, seconds = 0 }
+			entry.money += math.max(gained, 0)
+			entry.seconds += seconds
+			N.Pay.jobs[job] = entry
+		end
+	end
+	function N.paySave()
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Corvus") then
+				makefolder("Corvus")
+			end
+			writefile(N.Pay.file, HttpService:JSONEncode(N.Pay.jobs))
+		end)
+	end
+	function N.payText()
+		local rows = {}
+		for job, entry in pairs(N.Pay.jobs) do
+			if entry.seconds >= 60 then
+				table.insert(rows, { job = job, rate = entry.money / entry.seconds * 3600, minutes = entry.seconds / 60 })
+			end
+		end
+		table.sort(rows, function(a, b)
+			return a.rate > b.rate
+		end)
+		local lines = {}
+		for i, row in ipairs(rows) do
+			table.insert(lines, string.format("%s%s  <b>$%s/h</b>  <font transparency=\"0.4\">(%d min)</font>", if i == 1 then "\u{2605} " else "", row.job, formatNumber(math.floor(row.rate)), math.floor(row.minutes)))
+		end
+		return if #lines > 0 then table.concat(lines, "\n") else '<font transparency="0.4">Work a few minutes in each job to see what it really pays you</font>'
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -30974,15 +31218,19 @@ do
 	})
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Hairdresser" },
+		Values = { "Hairdresser", "Janitor", "Stocker" },
 		Default = "Hairdresser",
-		Tooltip = "More jobs are coming",
+		Tooltip = "The Pay box shows what every job really paid you per hour",
 	})
 	JobBox:AddDropdown("JobSpeed", {
 		Text = "Speed",
 		Values = { "Blatant", "Fast", "Legit" },
 		Default = "Fast",
-		Tooltip = "Blatant finishes as fast as the game takes. Fast is a quick player. Legit waits like a person.",
+		Tooltip = "Blatant finishes as fast as the game takes: HIGH BAN RISK, Bloxburg bans fast workers. Fast is a quick player. Legit waits like a person and is the safest.",
+	})
+	JobBox:AddLabel({
+		Text = '<font color="#ff6b6b">Blatant has a high ban risk in Bloxburg.</font> <font transparency="0.35">Use Legit or Fast on an account you care about.</font>',
+		DoesWrap = true,
 	})
 	JobBox:AddButton({
 		Text = "End Shift",
@@ -30993,6 +31241,8 @@ do
 	local StatusBox = Tabs.Jobs:AddRightGroupbox("Status", "activity")
 	Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 	Labels.Job = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+	local PayBox = Tabs.Jobs:AddRightGroupbox("Pay Per Job", "coins")
+	Labels.Pay = PayBox:AddLabel({ Text = "-", DoesWrap = true })
 end
 N.StatRows = {}
 do
@@ -31673,7 +31923,7 @@ do
 	if not N.jobHandler() then
 		logProblem("The game's JobHandler was not found, job farms cannot start")
 	end
-	local JobSteps = { Hairdresser = N.hairStep }
+	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep }
 	local wasWorking = false
 	loop("main loop", function()
 		if N.manualRunning() then
@@ -31722,6 +31972,12 @@ do
 					rate = "$" .. formatNumber(math.floor(Session.earned / elapsed * 3600)) .. "/h",
 					time = string.format("%dh %02dm", elapsed // 3600, (elapsed % 3600) // 60),
 				}
+				N.paySample()
+				if os.clock() - (N.Pay.savedAt or 0) > 60 then
+					N.Pay.savedAt = os.clock()
+					N.paySave()
+				end
+				N.InfoText.pay = N.payText()
 				local job = N.currentJob()
 				N.InfoText.job = if job == "" then "not working" else job
 				N.InfoText.jobText = string.format(
@@ -31732,7 +31988,7 @@ do
 					Session.wrong,
 					N.InfoText.stats.earned,
 					N.InfoText.stats.rate,
-					if N.Hair.last ~= "" then "\nLast: " .. N.Hair.last else ""
+					if N.Hair.last ~= "" then "\nLast haircut: " .. N.Hair.last else ""
 				)
 			end)
 			if not ok then
@@ -31763,6 +32019,7 @@ do
 				group(function()
 					Labels.Status:SetText(Status)
 					Labels.Job:SetText(N.InfoText.jobText or "-")
+					Labels.Pay:SetText(N.InfoText.pay or "-")
 				end)
 			end
 			if shown(Tabs.Stats) then
