@@ -30452,6 +30452,7 @@ do
 		TreadmillSessionRemote = true,
 		DropCarriedRemote = true,
 		MergeMachineRemote = true,
+		DemonEventRequest = true,
 	}
 	local AllowedInvoke = { BackpackSellRemote = true }
 	local Quiet = { EggHitRequest = true }
@@ -32296,25 +32297,63 @@ do
 		end
 		return false
 	end
-	function N.sellPlan()
-		local list = {}
+	-- Surplus animals: with the plot full, a backpack animal that earns no more than the weakest placed one is never
+	-- placed by Equip Best. The sale price is 60 s of its income (BackpackSellConfig.PetValue), pure gain that feeds the
+	-- upgrades. The best of them stays as filler for the next plot slot.
+	function N.surplusPlan()
+		local worst = N.worstPlaced()
+		if worst <= 0 then
+			return {}
+		end
 		local keepMutated = on("SellKeepMutated")
-		local maxKg = optionNumber("SellMaxKg", 0)
+		local rows = {}
 		for _, entry in ipairs(N.animalTools()) do
-			if not entry.held and selected(Options.SellRarities, entry.rarity) and not (keepMutated and entry.mutation) and (maxKg <= 0 or entry.kg <= maxKg) then
-				table.insert(list, entry.tool)
+			if not entry.held and not (keepMutated and entry.mutation) then
+				local value = N.cashValue(entry)
+				if value > 0 and value <= worst then
+					table.insert(rows, { tool = entry.tool, value = value })
+				end
+			end
+		end
+		table.sort(rows, function(a, b)
+			return a.value > b.value
+		end)
+		table.remove(rows, 1)
+		local list = {}
+		for _, row in ipairs(rows) do
+			table.insert(list, row.tool)
+		end
+		return list
+	end
+	function N.sellPlan(surplusOnly)
+		local list, seen = {}, {}
+		if not surplusOnly then
+			local keepMutated = on("SellKeepMutated")
+			local maxKg = optionNumber("SellMaxKg", 0)
+			for _, entry in ipairs(N.animalTools()) do
+				if not entry.held and selected(Options.SellRarities, entry.rarity) and not (keepMutated and entry.mutation) and (maxKg <= 0 or entry.kg <= maxKg) then
+					table.insert(list, entry.tool)
+					seen[entry.tool] = true
+				end
+			end
+		end
+		if on("AutoSellSurplus") then
+			for _, tool in ipairs(N.surplusPlan()) do
+				if not seen[tool] then
+					table.insert(list, tool)
+				end
 			end
 		end
 		return list
 	end
 	function N.sellStep(force)
-		if not (force or on("AutoSell")) then
+		if not (force or on("AutoSell") or on("AutoSellSurplus")) then
 			return false
 		end
 		if not force and os.clock() - F.lastEquipBest < 3 then
 			return false
 		end
-		local tools = N.sellPlan()
+		local tools = N.sellPlan(not (force or on("AutoSell")))
 		if #tools == 0 then
 			if force then
 				notify("Sell", "Nothing matches your sell settings", 3)
@@ -32656,6 +32695,95 @@ do
 		end
 		return true
 	end
+	-- Satchel: every tier carries one more animal per trip. Prices from SatchelConfig (tier 2..6). The station is a
+	-- tagged part with a prompt, found at runtime. Bought only when the price is at most half of the cash, so the
+	-- pickaxe and plot upgrades are never starved by it.
+	N.SatchelPrices = { 60000, 10000000, 2000000000, 400000000000, 12000000000000 }
+	function N.satchelStep()
+		local tier = tonumber(LocalPlayer:GetAttribute("SatchelTier")) or 1
+		local price = N.SatchelPrices[tier]
+		if not price or N.cash() < price * 2 then
+			return false
+		end
+		local station = N.tagged("SatchelUpgrade")[1]
+		if not station then
+			N.Shop.lastAt.satchel = os.clock() + 120
+			return false
+		end
+		local prompt
+		if station:IsA("ProximityPrompt") then
+			prompt = station
+		else
+			for _, item in ipairs(station:GetDescendants()) do
+				if item:IsA("ProximityPrompt") then
+					prompt = item
+					break
+				end
+			end
+		end
+		local holder = if prompt then prompt.Parent else station
+		local position
+		if holder and holder:IsA("BasePart") then
+			position = holder.Position
+		else
+			local ok, pivot = pcall(function()
+				return (holder or station):GetPivot().Position
+			end)
+			position = if ok then pivot else nil
+		end
+		if not (prompt and position) then
+			N.Shop.lastAt.satchel = os.clock() + 120
+			return false
+		end
+		local function done()
+			return (tonumber(LocalPlayer:GetAttribute("SatchelTier")) or 1) > tier
+		end
+		setStatus("Walking to the satchel upgrade")
+		N.travelNear(position, 6)
+		N.triggerPrompt(prompt, done)
+		if done() then
+			Session.bought += 1
+			shopNote("Satchel upgraded to tier " .. (tier + 1))
+		else
+			N.Shop.lastAt.satchel = os.clock() + 120
+		end
+		return true
+	end
+	-- Fallen Tokens (Hell boss reward) buy 15 minute potions in the demon furnace shop (prices from DemonEventConfig).
+	-- Order by value: x2 cash for every placed animal first, then swing speed, walk speed, treadmill gain, egg growth.
+	N.DemonPotions = {
+		{ id = "Cash", price = 275 },
+		{ id = "Swing", price = 400 },
+		{ id = "WalkSpeed", price = 150 },
+		{ id = "Treadmill", price = 250, need = function()
+			return on("AutoTrain") and N.trainUseful()
+		end },
+		{ id = "EggGrowth", price = 325, need = function()
+			return #N.tagged("MergeEggPlaced") > 0
+		end },
+	}
+	N.Demon = { at = {}, bought = 0 }
+	function N.demonStep()
+		local tokens = tonumber(LocalPlayer:GetAttribute("DemonTokens")) or 0
+		if tokens <= 0 then
+			return false
+		end
+		local now = N.serverNow()
+		for _, potion in ipairs(N.DemonPotions) do
+			if tokens >= potion.price and (not potion.need or potion.need()) then
+				local ends = tonumber(LocalPlayer:GetAttribute("PotionEndsAt_" .. potion.id)) or 0
+				if ends <= now + 20 and os.clock() - (N.Demon.at[potion.id] or -1e9) > 30 then
+					N.Demon.at[potion.id] = os.clock()
+					fire("DemonEventRequest", "BuyPotion", potion.id)
+					N.Demon.bought += 1
+					shopNote("Fallen Tokens: " .. potion.id .. " potion")
+					task.wait(0.5)
+					return true
+				end
+			end
+		end
+		return false
+	end
 	function N.shopStep()
 		if N.tutorial() or N.carrying() then
 			return false
@@ -32665,6 +32793,8 @@ do
 			{ "AutoPlotUpgrade", "plot", N.plotStep },
 			{ "AutoTreadmill", "treadmill", N.treadmillStep },
 			{ "AutoTrail", "trail", N.trailStep },
+			{ "AutoSatchel", "satchel", N.satchelStep },
+			{ "AutoDemonShop", "demon", N.demonStep },
 		}
 		for _, step in ipairs(steps) do
 			if on(step[1]) and (N.Shop.lastAt[step[2]] or 0) < os.clock() then
@@ -32973,12 +33103,18 @@ do
 			})
 		end)
 	end
+	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
 	Tabs.Farm = N.addTab("Farm", "egg", "Break eggs and grab the animals")
-	Tabs.Base = N.addTab("Base", "house", "Placing, selling and the treadmill")
-	Tabs.Upgrades = N.addTab("Upgrades", "arrow-big-up", "Pickaxes, trails, plot and rewards")
-	Tabs.Movement = N.addTab("Movement", "wind", "Travel, speed, fly and noclip")
-	Tabs.Visuals = N.addTab("ESP", "eye", "Eggs, animals and guards")
+	Tabs.Plot = N.addTab("Plot", "layout-grid", "Placing animals and the treadmill")
+	Tabs.Base = Tabs.Plot
+	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Pickaxes, trails, plot, satchel and Fallen Tokens")
+	Tabs.Rewards = N.addTab("Rewards", "gift", "Index, offline cash and group rewards")
+	Tabs.Items = N.addTab("Items", "backpack", "Selling and merge eggs")
+	Tabs.Player = N.addTab("Player", "user", "Travel, speed, fly and ESP")
+	Tabs.Movement = Tabs.Player
+	Tabs.Visuals = Tabs.Player
 	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and rates")
+	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts")
 	if Window.AddMiscTab then
 		pcall(function()
 			Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
@@ -33003,13 +33139,14 @@ do
 	N.HitSpeeds = { "Slow", "Normal", "Fast", "Blatant (HIGH RISK OF BAN)" }
 	do
 		-- One switch for people who do not want to set anything: the safe, best settings for a full farm.
-		local QuickBox = Tabs.Farm:AddLeftGroupbox("Quick Farm", "sparkles")
-		N.FarmBestOn = { "AutoFarm", "GrabOwnHatch", "StealPickups", "OnlyBetter", "TitanicFirst", "AvoidGuards", "AutoPlace", "AutoTrain", "AutoMergeEggs", "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill", "AutoIndex", "AutoOffline" }
-		N.FarmBestOff = { "AutoFarm", "StealPickups", "AutoTrain" }
+		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
+		N.FarmBestOn = { "AutoFarm", "GrabOwnHatch", "StealPickups", "OnlyBetter", "TitanicFirst", "AvoidGuards", "AutoPlace", "AutoTrain", "AutoMergeEggs", "AutoSellSurplus", "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill", "AutoSatchel", "AutoDemonShop", "AutoIndex", "AutoOffline", "AutoGroup" }
+		-- Turning the quick farm off turns off everything it turned on (nothing keeps spending cash).
+		N.FarmBestOff = N.FarmBestOn
 		QuickBox:AddToggle("AutoFarmBest", {
-			Text = "Auto Farm Best",
+			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "Turns on everything for you: breaks eggs in the best zone (Titanic first), steals better animals, trains, places the best ones and buys upgrades. Walks safely",
+			Tooltip = "Turns on everything for you: breaks eggs in the best zone (Titanic first), steals better animals, trains, places the best ones, sells surplus animals, buys upgrades and potions, claims rewards. Walks safely",
 			Callback = function(value)
 				task.defer(function()
 					for _, name in ipairs(if value then N.FarmBestOn else N.FarmBestOff) do
@@ -33030,15 +33167,33 @@ do
 			end,
 		})
 		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">One switch for the whole farm. Everything below still works if you want to fine tune it.</font>',
+			Text = '<font transparency="0.35">One switch for the whole farm. Everything in the other tabs still works if you want to fine tune it.</font>',
 			DoesWrap = true,
 		})
-		local EggBox = Tabs.Farm:AddLeftGroupbox("Eggs", "egg")
-		EggBox:AddToggle("AutoFarm", {
+		QuickBox:AddToggle("AutoFarm", {
 			Text = "Break Eggs In Best Zone",
 			Default = false,
-			Tooltip = "Breaks eggs in the best zone your speed can escape and grabs the animal. Change the zone below if you want",
+			Tooltip = "Breaks eggs in the best zone your speed can escape and grabs the animal. Change the zone in the Farm tab if you want",
 		})
+		StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
+		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
+		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		StatusBox:AddButton({
+			Text = "Go Home",
+			Func = function()
+				task.spawn(N.runManual, function()
+					N.goHome("Going home")
+				end)
+			end,
+		}):AddButton({
+			Text = "Stop Everything",
+			Func = function()
+				if N.stopAll then
+					N.stopAll()
+				end
+			end,
+		})
+		local EggBox = Tabs.Farm:AddLeftGroupbox("Eggs", "egg")
 		EggBox:AddDropdown("ZoneMode", {
 			Text = "Zones",
 			Values = { "Best zone", "All I can escape", "Picked zones" },
@@ -33145,27 +33300,9 @@ do
 			Tooltip = "Goes for zones and animals above your speed, the guard will often catch you and you drop the animal",
 		})
 		Labels.Guards = GuardBox:AddLabel({ Text = "-", DoesWrap = true })
-		StatusBox = Tabs.Farm:AddRightGroupbox("Status", "activity")
-		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
-		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		StatusBox:AddButton({
-			Text = "Go Home",
-			Func = function()
-				task.spawn(N.runManual, function()
-					N.goHome("Going home")
-				end)
-			end,
-		}):AddButton({
-			Text = "Stop Everything",
-			Func = function()
-				if N.stopAll then
-					N.stopAll()
-				end
-			end,
-		})
 	end
 	do
-		local PlaceBox = Tabs.Base:AddLeftGroupbox("Placing", "layout-grid")
+		local PlaceBox = Tabs.Plot:AddLeftGroupbox("Placing", "layout-grid")
 		PlaceBox:AddToggle("AutoPlace", {
 			Text = "Auto Equip Best",
 			Default = true,
@@ -33181,46 +33318,7 @@ do
 			end,
 		})
 		Labels.Plot = PlaceBox:AddLabel({ Text = "-", DoesWrap = true })
-		local SellBox = Tabs.Base:AddRightGroupbox("Selling", "coins")
-		SellBox:AddToggle("AutoSell", {
-			Text = "Auto Sell",
-			Default = false,
-			Tooltip = "Sells animals left in your backpack after Equip Best, only the rarities you pick",
-		})
-		SellBox:AddDropdown("SellRarities", {
-			Text = "Sell Rarities",
-			Values = N.RarityOrder,
-			Default = {},
-			Multi = true,
-			AllowNull = true,
-		})
-		SellBox:AddSlider("SellMaxKg", {
-			Text = "Only Under Weight",
-			Default = 0,
-			Min = 0,
-			Max = 20000,
-			Rounding = 0,
-			Suffix = " kg",
-			Tooltip = "0 sells any weight",
-		})
-		SellBox:AddToggle("SellKeepMutated", { Text = "Keep Mutated Animals", Default = true })
-		SellBox:AddButton({
-			Text = "Sell Now",
-			Func = function()
-				task.spawn(N.runManual, function()
-					N.sellStep(true)
-				end)
-			end,
-		})
-		Labels.Sell = SellBox:AddLabel({ Text = "-", DoesWrap = true })
-		local MergeBox = Tabs.Base:AddRightGroupbox("Merge Eggs", "egg")
-		MergeBox:AddToggle("AutoMergeEggs", {
-			Text = "Auto Place And Hatch Merge Eggs",
-			Default = true,
-			Tooltip = "Puts eggs from the merge machine on your plot and hatches them when they are grown. Merging pets stays manual",
-		})
-		Labels.Merge = MergeBox:AddLabel({ Text = "-", DoesWrap = true })
-		local TrainBox = Tabs.Base:AddLeftGroupbox("Treadmill", "footprints")
+		local TrainBox = Tabs.Plot:AddRightGroupbox("Treadmill", "footprints")
 		TrainBox:AddToggle("AutoTrain", {
 			Text = "Auto Train",
 			Default = false,
@@ -33254,13 +33352,30 @@ do
 		BuyBox:AddToggle("AutoTrail", { Text = "Best Trail", Default = false, Tooltip = "Trails multiply the speed you get on the treadmill. Bought only while Auto Train is on and speed still helps" })
 		BuyBox:AddToggle("AutoPlotUpgrade", { Text = "Plot Upgrades", Default = false, Tooltip = "Every plot level holds one more animal. Bought when your plot and backpack have no free slot left" })
 		BuyBox:AddToggle("AutoTreadmill", { Text = "Treadmill Unlock And Upgrades", Default = false })
+		BuyBox:AddToggle("AutoSatchel", {
+			Text = "Satchel Upgrades",
+			Default = false,
+			Tooltip = "Every satchel tier carries one more animal per trip. Walks to the satchel station when the price is at most half of your cash",
+		})
 		BuyBox:AddToggle("ShopTravel", {
 			Text = "Walk To Shop If Needed",
 			Default = true,
 			Tooltip = "If the game only sells at the booth, Corvus walks there and buys",
 		})
 		Labels.Shop = BuyBox:AddLabel({ Text = "-", DoesWrap = true })
-		local RewardBox = Tabs.Upgrades:AddRightGroupbox("Rewards", "gift")
+		local TokenBox = Tabs.Upgrades:AddRightGroupbox("Fallen Tokens", "coins")
+		TokenBox:AddToggle("AutoDemonShop", {
+			Text = "Buy Potions With Fallen Tokens",
+			Default = false,
+			Tooltip = "Spends the Fallen Tokens you own in the demon shop on 15 minute potions: x2 cash first, then swing, walk speed, treadmill and egg growth. Buys again when a potion ends",
+		})
+		TokenBox:AddLabel({
+			Text = '<font transparency="0.35">Tokens drop from the Hell boss. Needs the demon furnace unlocked in the game.</font>',
+			DoesWrap = true,
+		})
+	end
+	do
+		local RewardBox = Tabs.Rewards:AddLeftGroupbox("Rewards", "gift")
 		RewardBox:AddToggle("AutoIndex", { Text = "Claim Index Rewards", Default = true, Tooltip = "Cash and speed for every new animal you bank" })
 		RewardBox:AddToggle("AutoOffline", { Text = "Claim Offline Cash", Default = true })
 		RewardBox:AddToggle("AutoGroup", { Text = "Claim Group Reward", Default = false, Tooltip = "Works after you join the game's group and like the game" })
@@ -33278,7 +33393,53 @@ do
 		Labels.Next = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
-		local MoveBox = Tabs.Movement:AddLeftGroupbox("Travel", "route")
+		local SellBox = Tabs.Items:AddLeftGroupbox("Selling", "coins")
+		SellBox:AddToggle("AutoSellSurplus", {
+			Text = "Sell Surplus Animals",
+			Default = false,
+			Tooltip = "When your plot is full, sells backpack animals that earn no more than your weakest placed one (they would never be placed). Pays 60 s of their income each. Keeps the best one for the next plot slot",
+		})
+		SellBox:AddToggle("AutoSell", {
+			Text = "Auto Sell By Rarity",
+			Default = false,
+			Tooltip = "Sells animals left in your backpack after Equip Best, only the rarities you pick",
+		})
+		SellBox:AddDropdown("SellRarities", {
+			Text = "Sell Rarities",
+			Values = N.RarityOrder,
+			Default = {},
+			Multi = true,
+			AllowNull = true,
+		})
+		SellBox:AddSlider("SellMaxKg", {
+			Text = "Only Under Weight",
+			Default = 0,
+			Min = 0,
+			Max = 20000,
+			Rounding = 0,
+			Suffix = " kg",
+			Tooltip = "0 sells any weight",
+		})
+		SellBox:AddToggle("SellKeepMutated", { Text = "Keep Mutated Animals", Default = true })
+		SellBox:AddButton({
+			Text = "Sell Now",
+			Func = function()
+				task.spawn(N.runManual, function()
+					N.sellStep(true)
+				end)
+			end,
+		})
+		Labels.Sell = SellBox:AddLabel({ Text = "-", DoesWrap = true })
+		local MergeBox = Tabs.Items:AddRightGroupbox("Merge Eggs", "egg")
+		MergeBox:AddToggle("AutoMergeEggs", {
+			Text = "Auto Place And Hatch Merge Eggs",
+			Default = true,
+			Tooltip = "Puts eggs from the merge machine on your plot and hatches them when they are grown. Merging pets stays manual",
+		})
+		Labels.Merge = MergeBox:AddLabel({ Text = "-", DoesWrap = true })
+	end
+	do
+		local MoveBox = Tabs.Player:AddLeftGroupbox("Movement", "route")
 		MoveBox:AddDropdown("MoveMode", {
 			Text = "Movement Type",
 			Values = { "Walk", "Fast", "Teleport" },
@@ -33321,7 +33482,7 @@ do
 			end,
 		})
 		Labels.Move = MoveBox:AddLabel({ Text = "-", DoesWrap = true })
-		local SpeedBox = Tabs.Movement:AddRightGroupbox("Player", "user")
+		local SpeedBox = Tabs.Player:AddRightGroupbox("Player", "user")
 		SpeedBox:AddToggle("WalkSpeedOn", { Text = "WalkSpeed", Default = false, Tooltip = "Overrides the run speed the game gives you. The game's anticheat catches this" })
 		SpeedBox:AddSlider("WalkSpeedValue", { Text = "Speed", Default = 60, Min = 16, Max = 200, Rounding = 0, Suffix = " studs/s" })
 		SpeedBox:AddToggle("FlyOn", { Text = "Fly", Default = false, Tooltip = "Space goes up, Ctrl or Q goes down. The game's anticheat catches flying" })
@@ -33332,13 +33493,11 @@ do
 			Text = '<font transparency="0.35">Right-click any toggle to give it a keybind.</font>',
 			DoesWrap = true,
 		})
-	end
-	do
-		local EspBox = Tabs.Visuals:AddLeftGroupbox("ESP", "eye")
+		local EspBox = Tabs.Player:AddLeftGroupbox("ESP", "eye")
 		EspBox:AddToggle("ESPEggs", { Text = "Egg ESP", Default = false })
 		EspBox:AddToggle("ESPPickups", { Text = "Animal ESP", Default = false })
 		EspBox:AddToggle("ESPGuards", { Text = "Guard ESP", Default = false })
-		local EspStyle = Tabs.Visuals:AddRightGroupbox("Style", "palette")
+		local EspStyle = Tabs.Player:AddRightGroupbox("Style", "palette")
 		EspStyle:AddToggle("ESPHighlight", { Text = "Highlight Models", Default = true })
 		EspStyle:AddToggle("ESPDistanceText", { Text = "Show Distance", Default = true })
 		EspStyle:AddSlider("ESPDistance", { Text = "Max Distance", Default = 1500, Min = 100, Max = 10000, Rounding = 0, Suffix = " studs" })
@@ -33542,15 +33701,19 @@ do
 	Log.header = Debug.header
 end
 N.AllAutoToggles = {
+	"AutoFarmBest",
 	"AutoFarm",
 	"StealPickups",
 	"AutoTrain",
 	"AutoPlace",
 	"AutoSell",
+	"AutoSellSurplus",
 	"AutoPickaxe",
 	"AutoTrail",
 	"AutoPlotUpgrade",
 	"AutoTreadmill",
+	"AutoSatchel",
+	"AutoDemonShop",
 }
 do
 	function N.manualRunning()
@@ -33843,13 +34006,13 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		end)
 	end
 	pcall(function()
-		local holder = Tabs.Misc or Tabs.Farm
+		local holder = Tabs.Misc or Tabs.Main
 		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
 		Labels.Perf = PerfBox:AddLabel({ Text = "Measuring...", DoesWrap = true })
 	end)
-	if Tabs.Misc then
+	if Tabs.Webhook then
 		pcall(function()
-			local HookBox = Tabs.Misc:AddLeftGroupbox("Discord Webhook", "webhook")
+			local HookBox = Tabs.Webhook:AddLeftGroupbox("Discord Webhook", "webhook")
 			HookBox:AddToggle("WebhookOn", {
 				Text = "Post to Discord",
 				Default = false,
@@ -33959,12 +34122,13 @@ do
 	end
 	if Library.AddCommand then
 		pcall(function()
+			toggleCommand("farmall", { "farmbest", "all", "everything", "bestfarm" }, { "AutoFarmBest" }, "Auto Farm Everything")
 			toggleCommand("farm", { "eggs", "autofarm" }, { "AutoFarm" }, "Break Eggs In Best Zone")
 			toggleCommand("steal", { "grab", "animals" }, { "StealPickups" }, "Steal Animals")
 			toggleCommand("train", { "treadmill" }, { "AutoTrain" }, "Auto Train")
 			toggleCommand("place", { "equipbest" }, { "AutoPlace" }, "Auto Equip Best")
-			toggleCommand("sell", { "autosell" }, { "AutoSell" }, "Auto Sell")
-			toggleCommand("upgrades", { "buy", "shop" }, { "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill" }, "Auto upgrades")
+			toggleCommand("sell", { "autosell" }, { "AutoSell", "AutoSellSurplus" }, "Auto Sell")
+			toggleCommand("upgrades", { "buy", "shop" }, { "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill", "AutoSatchel", "AutoDemonShop" }, "Auto upgrades")
 			toggleCommand("noclip", { "nc" }, { "Noclip" }, "Noclip")
 			toggleCommand("fly", {}, { "FlyOn" }, "Fly")
 			toggleCommand("esp", {}, { "ESPEggs", "ESPPickups" }, "Egg and animal ESP")
@@ -34072,7 +34236,7 @@ do
 	if Library.SetQuickBar then
 		pcall(function()
 			Library:SetQuickBar({
-				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm" },
+				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm All" },
 				{ Toggle = "AutoFarm", Icon = "egg", Label = "Eggs" },
 				{ Toggle = "StealPickups", Icon = "hand", Label = "Steal" },
 				{ Toggle = "AutoTrain", Icon = "footprints", Label = "Train" },
@@ -34112,8 +34276,9 @@ do
 					Description = "Pick everything you want running. Tap again to unpick.",
 					Multi = true,
 					Required = true,
-					Default = { "eggs", "place", "upgrades", "rewards" },
+					Default = { "farm" },
 					Choices = {
+						{ Id = "farm", Title = "Auto Farm Everything", Description = "One switch: eggs, stealing, training, placing, selling surplus, upgrades, potions and rewards, all picked for the best income", Icon = "sparkles", Color = "#60d696" },
 						{ Id = "eggs", Title = "Break eggs", Description = "Breaks eggs in the best zone you can escape and brings the animals home", Icon = "egg", Color = "#fab428" },
 						{ Id = "wild", Title = "Steal animals", Description = "Steals animals lying in the zones that make more money than your weakest pet", Icon = "hand", Color = "#3ccf91" },
 						{ Id = "train", Title = "Train speed", Description = "Uses your treadmill between egg runs, speed opens new zones", Icon = "footprints", Color = "#5fb8ff" },
@@ -34125,7 +34290,7 @@ do
 				{
 					Id = "move",
 					Title = "How should Corvus travel?",
-					Description = "You can change this later in the Movement tab.",
+					Description = "You can change this later in the Player tab.",
 					Default = "Walk",
 					SingleColumn = true,
 					ChoiceHeight = 54,
@@ -34138,7 +34303,10 @@ do
 			},
 			Finish = function(values)
 				local chosen = type(values.tasks) == "table" and values.tasks or {}
-				local groups = {
+				if chosen.farm then
+						setToggles({ "AutoFarmBest" }, { "on" })
+					end
+					local groups = {
 					eggs = { "AutoFarm" },
 					wild = { "StealPickups" },
 					train = { "AutoTrain" },
@@ -34146,7 +34314,7 @@ do
 					upgrades = { "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill" },
 					rewards = { "AutoIndex", "AutoOffline" },
 				}
-				for id, names in pairs(groups) do
+				for id, names in pairs(if chosen.farm then {} else groups) do
 					setToggles(names, { if chosen[id] then "on" else "off" })
 				end
 				if type(values.move) == "string" then
@@ -34261,12 +34429,15 @@ if Window.AddInfoTab then
 	}
 	for _, tab in ipairs({
 		Tabs.Info,
+		Tabs.Main,
 		Tabs.Farm,
-		Tabs.Base,
+		Tabs.Plot,
 		Tabs.Upgrades,
-		Tabs.Movement,
-		Tabs.Visuals,
+		Tabs.Rewards,
+		Tabs.Items,
+		Tabs.Player,
 		Tabs.Stats,
+		Tabs.Webhook,
 		Tabs.Misc,
 		Tabs.Settings,
 	}) do
@@ -34352,7 +34523,7 @@ do
 				if choreDue("place", 2) then
 					N.placeStep(false)
 				end
-				if on("AutoSell") and choreDue("sell", 10) and N.sellStep(false) then
+				if (on("AutoSell") or on("AutoSellSurplus")) and choreDue("sell", 10) and N.sellStep(false) then
 					return
 				end
 				if choreDue("shop", 4) and N.shopStep() then
@@ -34493,7 +34664,7 @@ do
 					formatNumber(income),
 					#tools
 				)
-				local sellList = N.sellPlan()
+				local sellList = N.sellPlan(false)
 				I.sell = string.format(
 					"%s\nSold <b>%d</b> this session for <b>$%s</b>",
 					if #sellList > 0 then "Will sell <b>" .. #sellList .. "</b> animals now" else '<font transparency="0.4">Nothing in the backpack matches</font>',
@@ -34595,29 +34766,41 @@ do
 			group(N.Esp.draw)
 			if frame % 3 == 0 then
 				local I = N.InfoText
-				if shown(Tabs.Farm) then
+				if shown(Tabs.Main) then
 					group(function()
 						Labels.Status:SetText(Status)
 						Labels.Info:SetText(I.info or "-")
+					end)
+				end
+				if shown(Tabs.Farm) then
+					group(function()
 						Labels.Guards:SetText(I.guards or "-")
 						Labels.Worst:SetText(I.worst or "-")
 					end)
 				end
-				if shown(Tabs.Base) then
+				if shown(Tabs.Plot) then
 					group(function()
 						Labels.Plot:SetText(I.plot or "-")
-						Labels.Sell:SetText(I.sell or "-")
 						Labels.Train:SetText(I.train or "-")
+					end)
+				end
+				if shown(Tabs.Items) then
+					group(function()
+						Labels.Sell:SetText(I.sell or "-")
 						Labels.Merge:SetText(I.merge or "-")
 					end)
 				end
 				if shown(Tabs.Upgrades) then
 					group(function()
 						Labels.Shop:SetText(I.shop or "-")
+					end)
+				end
+				if shown(Tabs.Rewards) then
+					group(function()
 						Labels.Next:SetText(I.next or "-")
 					end)
 				end
-				if shown(Tabs.Movement) then
+				if shown(Tabs.Player) then
 					group(function()
 						Labels.Move:SetText(I.move or "-")
 					end)
@@ -34679,7 +34862,7 @@ do
 		end
 	end)
 	pcall(function()
-		Tabs.Farm:Show()
+		Tabs.Main:Show()
 	end)
 	do
 		local key = "RightControl"
