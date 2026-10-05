@@ -30496,8 +30496,8 @@ do
 		return found
 	end
 	-- Only the job actions a worker sends. Never purchases, trading, admin or anything for other players.
-	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true, TakeOil = true, TakeWheel = true, TakePainter = true, FixBike = true, DeliverPizza = true, ExitWorkstation = true, UseFishingRod = true, UseHatchet = true }
-	local AllowedJobInvoke = { CleanSchoolJanitorObject = true, TakePizzaBox = true, MineBlock = true, TeacherJob_TaskComplete = true, TeacherJob_GetHallPass = true, TeacherJob_StartLectureStudent = true, TeacherJob_UseBoard = true, RequestCashierRole = true, ConfirmOrderCashier = true }
+	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true, TakeOil = true, TakeWheel = true, TakePainter = true, FixBike = true, DeliverPizza = true, ExitWorkstation = true, BurgerChoppingMinigameFinished = true, UseFishingRod = true, UseHatchet = true }
+	local AllowedJobInvoke = { CleanSchoolJanitorObject = true, TakePizzaBox = true, MineBlock = true, TeacherJob_TaskComplete = true, TeacherJob_GetHallPass = true, TeacherJob_StartLectureStudent = true, TeacherJob_UseBoard = true, RequestCashierRole = true, ConfirmOrderCashier = true, RequestStationRole = true, RequestIngredientSpawn = true, DragDropObject = true }
 	-- Build mode on YOUR OWN plot only, paid with your own money (the normal build packets the game's build menu sends).
 	local AllowedBuild = { EnterBuild = true, PlaceObject = true, PlaceWall = true, PlaceFloor = true, PlacePath = true }
 	function N.buildInvoke(packet)
@@ -31743,6 +31743,7 @@ do
 		N.Build.running, N.Build.stop = true, false
 		N.taxiRelease()
 		N.bbLeave()
+		N.cookLeave()
 		N.endShift()
 		task.wait(0.5)
 		local entered, enterResult = N.buildInvoke({ Type = "EnterBuild", Plot = plot })
@@ -33399,6 +33400,7 @@ N.JobKeys = {
 	["Pizza Delivery"] = "PizzaPlanetDelivery",
 	Miner = "CaveMiner",
 	["BloxBurgers Cashier"] = "BloxBurgersEmployee",
+	["BloxBurgers Line Cook (beta)"] = "BloxBurgersEmployee",
 	Teacher = "HighSchoolTeacher",
 	["Taxi (beta)"] = "TaxiJob",
 	["Fisherman (beta)"] = "HutFisherman",
@@ -34201,6 +34203,457 @@ do
 		return pick
 	end
 end
+-- BloxBurgers Line Cook (BETA, nothing here was tested in game). Same job as the Cashier (BloxBurgersEmployee), but you
+-- take a kitchen station: RequestStationRole {StationName = "Frying"|"Chopping"|"DeepFrying"|"Assembly", StationIndexName
+-- = "<Name>_01"|"<Name>_02"} (InvokeServer, true = you are attached to the station). Food is real physics objects:
+--   RequestIngredientSpawn {SpawnPosition, Container, ActiveIngredientsFolder} -> the new ingredient object
+--   DragDropObject {Object} picks it up, DragDropObject {Drop = true, Object, SnappedObject = snap part, CFrame} puts it
+--   on a Static snap part of the station's ActiveIngredients (Fryer, CuttingBoard, delivery spots).
+--   Frying: a patty on a Fryer cooks (attribute Cooking, ModelVariant Cooked after 5 s, Burned after 8 s).
+--   Chopping: veg on a CuttingBoard (CanChop), then FireServer BurgerChoppingMinigameFinished {TargetObject, StationName}.
+-- The hub rotates between Frying and Chopping (grill and chop tasks are paid on their own: ObjectivesData GrillBurger /
+-- ChoppedGreens). Assembly, DeepFrying and the trays are NOT automated yet. Every decision logs a COOK line.
+N.Cook = { station = nil, role = nil, roleSince = 0, idleSince = nil, layoutLogged = {}, hooked = false, sheet = 0, fails = 0, spawnFails = 0, events = 0, lastRole = nil }
+do
+	local CollectionService = game:GetService("CollectionService")
+	local Roles = { "Frying", "Chopping" }
+	local STINT = 100
+	local IDLE_SWITCH = 14
+
+	local function kitchen()
+		local node = workspace:FindFirstChild("Environment")
+		for _, name in ipairs({ "Locations", "City", "BloxBurgers", "Interior", "ScriptableObjects", "Kitchen" }) do
+			node = node and node:FindFirstChild(name)
+		end
+		return node
+	end
+	local function attrText(instance)
+		local parts = {}
+		local ok = pcall(function()
+			for key, value in pairs(instance:GetAttributes()) do
+				table.insert(parts, key .. "=" .. brief(value))
+			end
+		end)
+		table.sort(parts)
+		return if ok then table.concat(parts, " ") else "?"
+	end
+	local function ingredientAssets()
+		local node = LocalPlayer:FindFirstChild("PlayerScripts")
+		for _, name in ipairs({ "Modules", "JobHandler", "Assets", "Ingredients" }) do
+			node = node and node:FindFirstChild(name)
+		end
+		return node
+	end
+	local function hookEvents()
+		if N.Cook.hooked then
+			return
+		end
+		local jh = N.jobHandler()
+		if not jh then
+			return
+		end
+		N.Cook.hooked = true
+		for _, name in ipairs({ "LineCookFinishedTask", "LineCookFailedTask" }) do
+			local good = name == "LineCookFinishedTask"
+			local ok, unhook = pcall(function()
+				return jh.net:HookEvent(name, function(...)
+					N.Cook.events += 1
+					if good then
+						Session.done += 1
+						Session.correct += 1
+					else
+						Session.wrong += 1
+					end
+					if N.Cook.events <= 8 then
+						log("COOK event", name, brief({ ... }))
+					end
+				end)
+			end)
+			if not ok then
+				log("COOK hook failed", name, tostring(unhook))
+			elseif type(unhook) == "function" then
+				table.insert(N.Unhooks, unhook)
+			end
+		end
+	end
+
+	-- the game's assertSnapping for a Static snap part (RequiredAttribute / RequiredName / Active / Occupied)
+	local function snapOk(object, part)
+		if not part:IsA("BasePart") or part:GetAttribute("Static") == nil then
+			return false
+		end
+		if part:GetAttribute("Active") == false or part:GetAttribute("Occupied") then
+			return false
+		end
+		local reqAttr = part:GetAttribute("RequiredAttribute")
+		if reqAttr then
+			local value = object:GetAttribute(reqAttr)
+			if not value then
+				return false
+			end
+			local want = part:GetAttribute("RequiredAttributeValue")
+			if want and value ~= want then
+				return false
+			end
+		end
+		local reqName = part:GetAttribute("RequiredName")
+		if reqName and reqName ~= "" and not string.find(object.Name, reqName, 1, true) then
+			return false
+		end
+		return true
+	end
+	local function snapParts(active)
+		local list = {}
+		for _, d in ipairs(active:GetDescendants()) do
+			if d:IsA("BasePart") and d:GetAttribute("Static") ~= nil then
+				table.insert(list, d)
+			end
+		end
+		return list
+	end
+	local function partOf(instance)
+		if instance:IsA("BasePart") then
+			return instance
+		end
+		for _, d in ipairs(instance:GetDescendants()) do
+			if d:IsA("BasePart") and d:GetAttribute("Static") ~= nil then
+				return d
+			end
+		end
+		return instance:FindFirstChildWhichIsA("BasePart", true)
+	end
+	local function heightOf(object)
+		local model = object:FindFirstChildOfClass("Model")
+		local ok, size = pcall(function()
+			return (model or object):GetExtentsSize()
+		end)
+		return if ok then size.Y else 1
+	end
+	local function jobIngredientIn(node)
+		for _, d in ipairs(node:GetDescendants()) do
+			if CollectionService:HasTag(d, "JobIngredient") then
+				return d
+			end
+		end
+		return nil
+	end
+
+	-- Containers of a station: Models with Amount and ContentType (the ingredient asset name)
+	local function containers(stationModel)
+		local list = {}
+		for _, child in ipairs(stationModel:GetChildren()) do
+			if string.find(child.Name, "Container") then
+				for _, d in ipairs(child:GetDescendants()) do
+					if d:IsA("Model") and type(d:GetAttribute("Amount")) == "number" and type(d:GetAttribute("ContentType")) == "string" then
+						table.insert(list, d)
+					end
+				end
+			end
+		end
+		return list
+	end
+
+	local function layout(role, st)
+		if N.Cook.layoutLogged[role] then
+			return
+		end
+		N.Cook.layoutLogged[role] = true
+		local model = st.model
+		log("COOK layout", role, st.name, "model attrs:", attrText(model))
+		for _, c in ipairs(containers(model)) do
+			log("COOK container", c.Name, "| path", c.Parent and c.Parent.Name or "-", "|", attrText(c))
+		end
+		local active = model:FindFirstChild("ActiveIngredients")
+		if active then
+			for _, d in ipairs(active:GetChildren()) do
+				log("COOK active", d.ClassName, d.Name, "|", attrText(d))
+			end
+			for _, p in ipairs(snapParts(active)) do
+				log("COOK snap", (string.gsub(p:GetFullName(), "^.*Kitchen%.", "")), "|", attrText(p))
+			end
+		else
+			log("COOK layout: no ActiveIngredients in", model.Name)
+		end
+	end
+
+	local function stationOf(role)
+		local k = kitchen()
+		local ws = k and k:FindFirstChild("Workstations")
+		local group = ws and ws:FindFirstChild(role)
+		if not group then
+			return nil
+		end
+		for i = 1, 2 do
+			local name = role .. "_0" .. i
+			local model = group:FindFirstChild(name)
+			if model then
+				local inUse = model:FindFirstChild("InUse")
+				if not (inUse and inUse.Value and inUse.Value ~= LocalPlayer) then
+					return { role = role, name = name, model = model, index = i }
+				end
+			end
+		end
+		return nil
+	end
+
+	local function claim(role)
+		local st = stationOf(role)
+		if not st then
+			log("COOK no free station for", role)
+			return false
+		end
+		local origin = st.model:FindFirstChild("Origin")
+		local attach = origin and origin:FindFirstChild("AttachPos")
+		local spot = (attach and attach.WorldPosition) or N.posOf(origin) or N.posOf(st.model)
+		setStatus("Line Cook: going to " .. st.name)
+		if spot then
+			N.walkTo(spot, 4, 14)
+		end
+		task.wait(N.actionDelay())
+		local ok, result = N.jobInvoke({ Type = "RequestStationRole", StationName = role, StationIndexName = st.name })
+		if ok and result then
+			waitFor(function()
+				return N.attachWeld() ~= nil
+			end, 3)
+			N.Cook.station = st
+			N.Cook.role = role
+			N.Cook.roleSince = os.clock()
+			N.Cook.idleSince = nil
+			log("COOK claimed", st.name, "attached", tostring(N.attachWeld() ~= nil))
+			layout(role, st)
+			return true
+		end
+		log("COOK claim refused", st.name, brief(result))
+		return false
+	end
+
+	-- Spawns an ingredient out of a container and returns the object (nil when the game refused).
+	local function spawn(st, container)
+		local active = st.model:FindFirstChild("ActiveIngredients")
+		local assets = ingredientAssets()
+		local asset = assets and assets:FindFirstChild(container:GetAttribute("ContentType"))
+		local height = asset and select(2, pcall(function()
+			return asset:GetExtentsSize().Y
+		end)) or 1
+		if type(height) ~= "number" then
+			height = 1
+		end
+		local ok, box, size = pcall(container.GetBoundingBox, container)
+		local top = if ok then box.Position + Vector3.new(0, size.Y / 2, 0) else (N.posOf(container) or Vector3.zero)
+		local done, result = N.jobInvoke({ Type = "RequestIngredientSpawn", SpawnPosition = top + Vector3.new(0, height, 0), Container = container, ActiveIngredientsFolder = active })
+		if not (done and result) then
+			return nil
+		end
+		if typeof(result) == "Instance" then
+			return result
+		end
+		local jh = N.jobHandler()
+		local object = N.callModule(8, jh and jh.Shared and jh.Shared.StreamingService, "WaitForReferencedObject", result, 5)
+		return if typeof(object) == "Instance" then object else nil
+	end
+	-- pick up and put down on a snap part, the way the game's DragService does it
+	local function move(object, snap, why)
+		local height = heightOf(object)
+		local okPick, pick = N.jobInvoke({ Type = "DragDropObject", Object = object })
+		task.wait(N.actionDelay())
+		local target = if snap then CFrame.new(snap.Position + Vector3.new(0, height / 2, 0)) else object.CFrame
+		local okDrop, drop = N.jobInvoke({ Type = "DragDropObject", Drop = true, Object = object, SnappedObject = snap, CFrame = target })
+		log("COOK move", why, brief(object), "->", snap and snap.Name or "nowhere", "pick", brief(pick), "drop", brief(drop))
+		return okPick and okDrop
+	end
+
+	local function choppingTime()
+		local mode = optionText("JobSpeed", "Fast")
+		if mode == "Blatant" then
+			return 1.5
+		elseif mode == "Legit" then
+			return 6 + math.random() * 2
+		end
+		return 4.5 + math.random()
+	end
+
+	-- one pass at a Frying station: collect a cooked patty from a fryer, or load a raw patty
+	local function fryingStep(st)
+		local active = st.model:FindFirstChild("ActiveIngredients")
+		if not active then
+			return false
+		end
+		local worked = false
+		for _, fryer in ipairs(active:GetChildren()) do
+			if fryer.Name == "Fryer" then
+				local item = jobIngredientIn(fryer)
+				if item then
+					local variant = item:GetAttribute("ModelVariant")
+					if variant == "Cooked" then
+						local target
+						for _, p in ipairs(snapParts(active)) do
+							if p ~= partOf(fryer) and p.Name ~= "Fryer" and snapOk(item, p) then
+								target = p
+								break
+							end
+						end
+						setStatus("Line Cook: delivering a cooked patty")
+						log("COOK cooked", brief(item), "target", target and target.Name or "none found", attrText(item))
+						if target then
+							move(item, target, "cooked patty")
+							worked = true
+						elseif N.Cook.fails < 3 then
+							N.Cook.fails += 1
+							log("COOK no snap part accepts the cooked patty (see COOK snap lines)")
+						end
+					elseif variant == "Burned" then
+						log("COOK burned patty stays on the fryer", brief(item))
+					end
+				else
+					local pick
+					for _, c in ipairs(containers(st.model)) do
+						local kind = c:GetAttribute("ContentType")
+						if c:GetAttribute("Amount") > 0 and string.find(kind, "Patty") and not string.find(kind, "Cooked") and (not pick or string.find(kind, "Meat")) then
+							pick = c
+						end
+					end
+					if not pick then
+						log("COOK no raw patty in the containers")
+					else
+						setStatus("Line Cook: grilling a patty")
+						local object = spawn(st, pick)
+						if object then
+							move(object, partOf(fryer), "raw patty")
+							worked = true
+						else
+							N.Cook.spawnFails += 1
+							log("COOK spawn failed", pick.Name, attrText(pick))
+						end
+					end
+				end
+			end
+		end
+		return worked
+	end
+
+	-- one pass at a Chopping station: chop what lies on a board, or put a vegetable on a free board
+	local function choppingStep(st)
+		local active = st.model:FindFirstChild("ActiveIngredients")
+		if not active then
+			return false
+		end
+		local worked = false
+		for _, board in ipairs(active:GetChildren()) do
+			if board.Name == "CuttingBoard" then
+				local item = jobIngredientIn(board)
+				if item then
+					local variant = item:GetAttribute("ModelVariant")
+					if item:GetAttribute("CanChop") and variant ~= "Chopped" then
+						setStatus("Line Cook: chopping")
+						task.wait(choppingTime())
+						N.jobFire({ Type = "BurgerChoppingMinigameFinished", TargetObject = item, StationName = st.name })
+						log("COOK chop", brief(item))
+						task.wait(1)
+						worked = true
+					elseif variant == "Chopped" then
+						local target
+						for _, p in ipairs(snapParts(active)) do
+							if p ~= partOf(board) and p.Name ~= "CuttingBoard" and snapOk(item, p) then
+								target = p
+								break
+							end
+						end
+						log("COOK chopped", brief(item), "target", target and target.Name or "none found", attrText(item))
+						if target then
+							move(item, target, "chopped veg")
+							worked = true
+						elseif N.Cook.fails < 3 then
+							N.Cook.fails += 1
+							log("COOK no snap part accepts the chopped item (see COOK snap lines)")
+						end
+					end
+				else
+					local pick
+					for _, c in ipairs(containers(st.model)) do
+						local kind = c:GetAttribute("ContentType")
+						if c:GetAttribute("Amount") > 0 and not string.find(kind, "Chopped") and not string.find(kind, "Patty") and (string.find(kind, "Lettuce") or string.find(kind, "Tomato") or string.find(kind, "Onion")) then
+							pick = c
+							break
+						end
+					end
+					if not pick then
+						log("COOK no vegetable in the containers")
+					else
+						setStatus("Line Cook: preparing a vegetable")
+						local object = spawn(st, pick)
+						if object then
+							move(object, partOf(board), "raw vegetable")
+							worked = true
+						else
+							N.Cook.spawnFails += 1
+							log("COOK spawn failed", pick.Name, attrText(pick))
+						end
+					end
+				end
+			end
+		end
+		return worked
+	end
+
+	function N.cookLeave()
+		if N.Cook.station then
+			N.Cook.station = nil
+			N.Cook.role = nil
+			N.jobFire({ Type = "ExitWorkstation" })
+		end
+	end
+
+	function N.cookStep()
+		if not N.ensureShift("BloxBurgersEmployee") then
+			return
+		end
+		hookEvents()
+		local st = N.Cook.station
+		if not (st and st.model.Parent and N.attachWeld()) then
+			N.Cook.station = nil
+			-- try the roles in rotation order, the one we did not just use first
+			local order = {}
+			for _, r in ipairs(Roles) do
+				if r ~= N.Cook.lastRole then
+					table.insert(order, r)
+				end
+			end
+			if N.Cook.lastRole then
+				table.insert(order, N.Cook.lastRole)
+			end
+			for _, role in ipairs(order) do
+				if claim(role) then
+					return
+				end
+			end
+			setStatus("Line Cook: no free kitchen station, waiting")
+			task.wait(3)
+			return
+		end
+		local worked = false
+		if st.role == "Frying" then
+			worked = fryingStep(st)
+		elseif st.role == "Chopping" then
+			worked = choppingStep(st)
+		end
+		if worked then
+			N.Cook.idleSince = nil
+		else
+			N.Cook.idleSince = N.Cook.idleSince or os.clock()
+		end
+		setStatus(string.format("Line Cook (%s): %d tasks counted by the game, %d refused", st.role, Session.correct, Session.wrong))
+		local stint = os.clock() - N.Cook.roleSince
+		local idle = N.Cook.idleSince and os.clock() - N.Cook.idleSince or 0
+		if stint > STINT or idle > IDLE_SWITCH then
+			log("COOK switching station after", math.floor(stint), "s, idle", math.floor(idle), "s")
+			N.Cook.lastRole = st.role
+			N.cookLeave()
+			task.wait(1)
+			return
+		end
+		task.wait(if worked then N.actionDelay() else 0.25)
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -34298,7 +34751,7 @@ do
 	local JobBox = Tabs.Jobs:AddLeftGroupbox("Job Farm", "briefcase")
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Best Pay (auto)", "Hairdresser", "BloxBurgers Cashier", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Fisherman (beta)", "Woodcutter (beta)", "Taxi (beta)" },
+		Values = { "Best Pay (auto)", "Hairdresser", "BloxBurgers Cashier", "BloxBurgers Line Cook (beta)", "Teacher", "Pizza Baker", "Ice Cream", "Supermarket Cashier", "Mechanic", "Stocker", "Janitor", "Miner", "Pizza Delivery", "Fisherman (beta)", "Woodcutter (beta)", "Taxi (beta)" },
 		Default = "Hairdresser",
 		Tooltip = "Best Pay (auto) measures each job's real pay and level rewards, and keeps working the one worth the most over the next 24 h",
 	})
@@ -35080,11 +35533,12 @@ do
 	if not N.jobHandler() then
 		logProblem("The game's JobHandler was not found, job farms cannot start")
 	end
-	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep, ["Pizza Delivery"] = N.deliveryStep, Miner = N.minerStep, ["BloxBurgers Cashier"] = N.bbCashierStep, Teacher = N.teacherStep, ["Taxi (beta)"] = N.taxiStep, ["Fisherman (beta)"] = N.fishStep, ["Woodcutter (beta)"] = N.woodStep }
+	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep, ["Pizza Delivery"] = N.deliveryStep, Miner = N.minerStep, ["BloxBurgers Cashier"] = N.bbCashierStep, ["BloxBurgers Line Cook (beta)"] = N.cookStep, Teacher = N.teacherStep, ["Taxi (beta)"] = N.taxiStep, ["Fisherman (beta)"] = N.fishStep, ["Woodcutter (beta)"] = N.woodStep }
 	local wasWorking, lastPick = false, nil
 	local function leaveJob()
 		N.taxiRelease()
 		N.bbLeave()
+		N.cookLeave()
 		N.endShift()
 	end
 	loop("main loop", function()
@@ -35108,6 +35562,7 @@ do
 				-- switching jobs: leave the old one cleanly (taxi controls, till)
 				N.taxiRelease()
 				N.bbLeave()
+				N.cookLeave()
 			end
 			lastPick = pick
 			local step = JobSteps[pick]
