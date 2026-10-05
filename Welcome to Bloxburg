@@ -30496,7 +30496,7 @@ do
 		return found
 	end
 	-- Only the job actions a worker sends. Never purchases, trading, admin or anything for other players.
-	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true }
+	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true }
 	local AllowedJobInvoke = { CleanSchoolJanitorObject = true }
 	function N.jobFire(packet)
 		local jh = N.jobHandler()
@@ -31314,6 +31314,142 @@ do
 		log("ICE", table.concat(scoops, "+"), tostring(topping), N.Ice.last)
 	end
 end
+
+-- Supermarket Cashier: CashierWorkstations (Occupied = customer with Status "" -> "placed" -> "true"/"false",
+-- Status.ScannedObjects / PlacedObjects, BagsLeft, Bags, DroppedFood, Scanned part). Out of bags: TakeNewBags {Object
+-- = Geometry.Crates.BagCrate} then RestockBags {Workstation}. No open bag: TakeNewBag {Workstation}. Each item on the
+-- belt: ScanDroppedItem {Item}. All scanned: JobCompleted {Workstation}. The game says "too far" over 10 studs.
+N.Cashier = { last = "" }
+do
+	local function market()
+		local env = workspace:FindFirstChild("Environment")
+		local node = env and env:FindFirstChild("Locations")
+		node = node and node:FindFirstChild("City")
+		return node and node:FindFirstChild("Supermarket")
+	end
+	local function openBag(ws)
+		local bags = ws:FindFirstChild("Bags")
+		for _, bag in ipairs(bags and bags:GetChildren() or {}) do
+			if bag:IsA("BasePart") and bag.Transparency == 0 and #bag:GetChildren() <= 3 then
+				return bag
+			end
+		end
+		return nil
+	end
+	local function equippedName()
+		local jh = N.jobHandler()
+		local item = isolated(function()
+			return jh.Shared.EquipmentService:GetEquipped(LocalPlayer)
+		end)
+		return item and tostring(item) or ""
+	end
+	local function posOf(instance)
+		if not instance then
+			return nil
+		end
+		if instance:IsA("BasePart") then
+			return instance.Position
+		end
+		local ok, pivot = pcall(instance.GetPivot, instance)
+		return if ok then pivot.Position else nil
+	end
+	function N.marketCashierStep()
+		if not N.ensureShift("SupermarketCashier") then
+			return
+		end
+		local shop = market()
+		local interior = shop and shop:FindFirstChild("Interior")
+		local stations = interior and interior:FindFirstChild("CashierWorkstations")
+		if not stations then
+			setStatus("Cashier: waiting for the supermarket to load")
+			task.wait(1)
+			return
+		end
+		local ws, customer
+		for _, station in ipairs(stations:GetChildren()) do
+			local occ = station:FindFirstChild("Occupied")
+			local inUse = station:FindFirstChild("InUse")
+			if occ and occ.Value and not (inUse and inUse.Value and inUse.Value ~= LocalPlayer) then
+				ws, customer = station, occ.Value
+				break
+			end
+		end
+		if not ws then
+			setStatus(string.format("Cashier: waiting for customers (%d served)", Session.done))
+			task.wait(0.3)
+			return
+		end
+		local spot = posOf(ws:FindFirstChild("Scanned")) or posOf(ws)
+		-- out of bags: fetch a pack from the crates first
+		local bagsLeft = ws:FindFirstChild("BagsLeft")
+		if bagsLeft and bagsLeft.Value < 1 then
+			if equippedName() ~= "BFF Bags" then
+				local geometry = shop:FindFirstChild("Geometry")
+				local crates = geometry and geometry:FindFirstChild("Crates")
+				local crate = crates and crates:FindFirstChild("BagCrate")
+				if not crate then
+					setStatus("Cashier: no bag crate found")
+					task.wait(1)
+					return
+				end
+				setStatus("Cashier: getting new bags")
+				N.walkTo(posOf(crate), 4, 12)
+				task.wait(N.actionDelay())
+				N.jobFire({ Type = "TakeNewBags", Object = crate })
+				waitFor(function()
+					return equippedName() == "BFF Bags"
+				end, 2)
+			end
+			N.walkTo(spot, 4, 12)
+			task.wait(N.actionDelay())
+			N.jobFire({ Type = "RestockBags", Workstation = ws })
+			waitFor(function()
+				return bagsLeft.Value >= 1
+			end, 2)
+			return
+		end
+		if spot then
+			N.walkTo(spot, 4, 10)
+		end
+		if not openBag(ws) then
+			N.jobFire({ Type = "TakeNewBag", Workstation = ws })
+			waitFor(function()
+				return openBag(ws) ~= nil
+			end, 1.5)
+		end
+		local status = customer:FindFirstChild("Status")
+		local dropped = ws:FindFirstChild("DroppedFood")
+		setStatus("Cashier: scanning")
+		for _, item in ipairs(dropped and dropped:GetChildren() or {}) do
+			if not alive() then
+				return
+			end
+			task.wait(N.actionDelay() * 0.5)
+			N.jobFire({ Type = "ScanDroppedItem", Item = item })
+		end
+		local ready = waitFor(function()
+			local scanned = status and status:FindFirstChild("ScannedObjects")
+			local placed = status and status:FindFirstChild("PlacedObjects")
+			return status ~= nil and status.Value == "placed" and scanned ~= nil and placed ~= nil and scanned.Value == placed.Value
+		end, 3)
+		if not ready then
+			return
+		end
+		task.wait(N.actionDelay())
+		N.jobFire({ Type = "JobCompleted", Workstation = ws })
+		local answered = waitFor(function()
+			return status.Parent == nil or status.Value == "true" or status.Value == "false"
+		end, 3)
+		Session.done += 1
+		if answered and status.Value == "true" then
+			Session.correct += 1
+		elseif answered and status.Value == "false" then
+			Session.wrong += 1
+			logProblem("Supermarket cashier order judged wrong")
+		end
+		log("CASHIER served", if answered then status.Value else "no answer")
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -31370,7 +31506,7 @@ do
 	})
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream" },
+		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream", "Supermarket Cashier" },
 		Default = "Hairdresser",
 		Tooltip = "The Pay box shows what every job really paid you per hour",
 	})
@@ -32075,7 +32211,7 @@ do
 	if not N.jobHandler() then
 		logProblem("The game's JobHandler was not found, job farms cannot start")
 	end
-	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep }
+	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep }
 	local wasWorking = false
 	loop("main loop", function()
 		if N.manualRunning() then
