@@ -30496,7 +30496,7 @@ do
 		return found
 	end
 	-- Only the job actions a worker sends. Never purchases, trading, admin or anything for other players.
-	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true }
+	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true }
 	local AllowedJobInvoke = { CleanSchoolJanitorObject = true }
 	function N.jobFire(packet)
 		local jh = N.jobHandler()
@@ -31162,6 +31162,158 @@ do
 		return if #lines > 0 then table.concat(lines, "\n") else '<font transparency="0.4">Work a few minutes in each job to see what it really pays you</font>'
 	end
 end
+-- Ben's Ice Cream: TakeIceCreamCup at Interior.TableObjects.IceCreamCups, AddIceCreamScoop {Taste, Ball = cup.Ball1 /
+-- Ball2} at Vanilla/Chocolate/Strawberry, AddIceCreamTopping {Taste} at Sprinkles/Caramel/Nuts, then JobCompleted
+-- {Workstation = CustomerTargets child} at the customer. The order sits in the customer's "Order" value (attributes or
+-- children); the hub reads every flavor / topping name it finds there and logs it when it cannot.
+N.Ice = { last = "", unread = 0 }
+do
+	local Flavors = { Vanilla = true, Chocolate = true, Strawberry = true }
+	local Toppings = { Sprinkles = true, Caramel = true, Nuts = true }
+	local function shop()
+		local env = workspace:FindFirstChild("Environment")
+		local node = env and env:FindFirstChild("Locations")
+		node = node and node:FindFirstChild("Beach")
+		return node and node:FindFirstChild("BensIceCream")
+	end
+	local function cup()
+		local jh = N.jobHandler()
+		local item = isolated(function()
+			return jh.Shared.EquipmentService:GetEquipped(LocalPlayer)
+		end)
+		return if item and item.Name == "Ice Cream Cup" then item else nil
+	end
+	-- Every string the order carries (its value, attributes, child names and values), in order.
+	local function orderWords(order)
+		local words = {}
+		local function add(v)
+			if type(v) == "string" then
+				for word in string.gmatch(v, "%a+") do
+					table.insert(words, word)
+				end
+			end
+		end
+		add(order.Value)
+		for key, v in pairs(order:GetAttributes()) do
+			add(key)
+			add(v)
+		end
+		for _, child in ipairs(order:GetChildren()) do
+			add(child.Name)
+			pcall(function()
+				add(child.Value)
+			end)
+		end
+		return words
+	end
+	function N.iceOrder(order)
+		local scoops, topping = {}, nil
+		for _, word in ipairs(orderWords(order)) do
+			if Flavors[word] and #scoops < 2 then
+				table.insert(scoops, word)
+			elseif Toppings[word] then
+				topping = word
+			end
+		end
+		if #scoops == 1 then
+			scoops[2] = scoops[1]
+		end
+		return scoops, topping
+	end
+	local function stationPos(part)
+		local ok, pivot = pcall(part.GetPivot, part)
+		return if ok then pivot.Position else nil
+	end
+	function N.iceStep()
+		if not N.ensureShift("BensIceCreamSeller") then
+			return
+		end
+		local place = shop()
+		local interior = place and place:FindFirstChild("Interior")
+		local tables = interior and interior:FindFirstChild("TableObjects")
+		local targets = place and place:FindFirstChild("CustomerTargets")
+		if not (tables and targets) then
+			setStatus("Ice cream: waiting for the shop to load")
+			task.wait(1)
+			return
+		end
+		local target, customer, order
+		for _, t in ipairs(targets:GetChildren()) do
+			local occ = t:FindFirstChild("Occupied")
+			local c = occ and occ.Value
+			local o = c and c:FindFirstChild("Order")
+			if o and o.Value ~= "true" and o.Value ~= "false" then
+				target, customer, order = t, c, o
+				break
+			end
+		end
+		if not target then
+			setStatus(string.format("Ice cream: waiting for customers (%d served)", Session.done))
+			task.wait(0.3)
+			return
+		end
+		local scoops, topping = N.iceOrder(order)
+		if #scoops == 0 then
+			N.Ice.unread += 1
+			if N.Ice.unread % 10 == 1 then
+				log("ICE could not read the order", "value", order.Value, "words", table.concat(orderWords(order), ","))
+			end
+			task.wait(1)
+			return
+		end
+		setStatus("Ice cream: " .. table.concat(scoops, " + ") .. (if topping then " with " .. topping else ""))
+		local function use(name)
+			local part = tables:FindFirstChild(name)
+			local pos = part and stationPos(part)
+			if pos then
+				N.walkTo(pos, 5, 8)
+			end
+			task.wait(N.actionDelay())
+			return part
+		end
+		if not cup() then
+			use("IceCreamCups")
+			N.jobFire({ Type = "TakeIceCreamCup" })
+			if not waitFor(function()
+				return cup() ~= nil
+			end, 2) then
+				return
+			end
+		end
+		local held = cup()
+		for i, flavor in ipairs(scoops) do
+			local ball = held and held:FindFirstChild("Ball" .. i)
+			if ball and ball.Transparency == 1 then
+				use(flavor)
+				N.jobFire({ Type = "AddIceCreamScoop", Taste = flavor, Ball = ball })
+				ball.Transparency = 0
+			end
+		end
+		if topping then
+			use(topping)
+			N.jobFire({ Type = "AddIceCreamTopping", Taste = topping })
+		end
+		local pos = stationPos(customer)
+		if pos then
+			N.walkTo(pos, 5, 8)
+		end
+		task.wait(N.actionDelay())
+		N.jobFire({ Type = "JobCompleted", Workstation = target })
+		local answered = waitFor(function()
+			return order.Parent == nil or order.Value == "true" or order.Value == "false"
+		end, 3)
+		Session.done += 1
+		if answered and order.Value == "true" then
+			Session.correct += 1
+			N.Ice.last = "correct"
+		elseif answered and order.Value == "false" then
+			Session.wrong += 1
+			N.Ice.last = "WRONG"
+			logProblem("Ice cream order judged wrong: " .. table.concat(scoops, "+") .. " " .. tostring(topping) .. " | words " .. table.concat(orderWords(order), ","))
+		end
+		log("ICE", table.concat(scoops, "+"), tostring(topping), N.Ice.last)
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -31218,7 +31370,7 @@ do
 	})
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Hairdresser", "Janitor", "Stocker" },
+		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream" },
 		Default = "Hairdresser",
 		Tooltip = "The Pay box shows what every job really paid you per hour",
 	})
@@ -31923,7 +32075,7 @@ do
 	if not N.jobHandler() then
 		logProblem("The game's JobHandler was not found, job farms cannot start")
 	end
-	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep }
+	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep }
 	local wasWorking = false
 	loop("main loop", function()
 		if N.manualRunning() then
