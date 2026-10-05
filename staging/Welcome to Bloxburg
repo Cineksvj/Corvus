@@ -33055,6 +33055,9 @@ do
 			if N.planPay then
 				N.planPay(job, math.max(gained, 0), seconds)
 			end
+			if N.capRecord then
+				N.capRecord(job, math.max(gained, 0), seconds)
+			end
 		end
 	end
 	function N.paySave()
@@ -33810,7 +33813,235 @@ do
 		return false, "the game refused " .. math.min(#spots, 10) .. " spots (last answer " .. tostring(last) .. ")"
 	end
 end
--- Auto Garden (toggle AutoGarden, default OFF) and Skill breaks (toggle SkillBreaks, default OFF).
+-- Earnings cap (slider EarningsCap, default 90 % of a human's max $/h), enforced while Skill breaks is on (default ON).
+-- Why: Bloxburg staff read the server money logs, and Blatant job speed earns 2-3x a fast human (blatant.md section 0:
+-- Hairdresser lv6 ~$22k/h vs ~$15k/h for a human at lv10). The hub never idles at the job to slow down: when the
+-- measured job pay over the last 30 min is above the cap, it leaves for a useful session of 5-15 min (needs at home,
+-- Gardening for its level rewards, else a plain break at home) until the rolling rate is under the cap again.
+--   human max $/h(job) = pay per task (measured: ShiftEarnings delta / tasks done at the current job level, so it
+--   already holds level and efficiency) x human tasks per hour (blatant.md table), at most $15,000/h ($20,000/h at
+--   job level 10 with efficiency >= 0.95). Before 10 tasks are measured: the public Hairdresser tier list ($10 a task
+--   at level 0, $43 at level 10, 360 tasks/h) x efficiency. The dump has no pay tier list (pay is server-side).
+--   limit = human max x EarningsCap %. Smart Planner / Best Pay value every job at min(measured, limit).
+-- Log: `CAP rate=<x>/h limit=<y>/h action=garden|needs|break <min>m ...` and `CAP done ...`. "skill" sessions for the
+-- other skills are not possible: their XP comes from furniture minigames graded on the server (no verified action).
+N.Cap = { samples = {}, jobs = {}, firstAt = nil, active = false, untilAt = 0, breaks = 0, breakSeconds = 0, checkAt = -1e9, rate = 0, limit = nil, human = nil, src = "", lastJob = nil, lastDone = nil, status = "", action = nil }
+do
+	local C = N.Cap
+	local WINDOW = 1800
+	local MIN_SPAN = 600
+	local CHECK = 30
+	-- a fast legit player's tasks per hour (blatant.md, tune from logs)
+	local TasksPerHour = {
+		StylezHairdresser = 360,
+		SupermarketCashier = 300,
+		BensIceCreamSeller = 300,
+		BloxBurgersEmployee = 250,
+		PizzaPlanetBaker = 200,
+		MikesMechanic = 120,
+		SupermarketStocker = 200,
+		SchoolJanitor = 500,
+		CaveMiner = 700,
+		LumberWoodcutter = 100,
+		HutFisherman = 400,
+		PizzaPlanetDelivery = 40,
+		HighSchoolTeacher = 300,
+		TaxiJob = 30,
+	}
+	local LINE_COOK = 120
+	local function money(n)
+		return "$" .. formatNumber(math.floor(math.max(n or 0, 0) + 0.5))
+	end
+	function N.capOn()
+		return on("SkillBreaks")
+	end
+	local function pct()
+		return math.clamp(optionNumber("EarningsCap", 90), 10, 200) / 100
+	end
+	local function effNow()
+		local e = N.efficiency()
+		return if type(e) == "number" and e > 0 then e else 1
+	end
+	-- one pay sample from N.paySample (every second of a shift): money for the rolling rate, money per task per job
+	function N.capRecord(job, gained, seconds)
+		local now = os.clock()
+		C.firstAt = C.firstAt or now
+		if gained > 0 then
+			table.insert(C.samples, { t = now, m = gained })
+		end
+		local done = Session.done
+		if C.lastJob == job and C.lastDone and done >= C.lastDone then
+			local level = N.Levels and N.Levels[job]
+			local e = C.jobs[job]
+			if not e or (level and e.level ~= level) then
+				e = { level = level, m = 0, n = 0 }
+				C.jobs[job] = e
+			end
+			e.m += gained
+			e.n += done - C.lastDone
+		end
+		C.lastJob, C.lastDone = job, done
+	end
+	-- job pay per hour over the last 30 min of wall time (breaks count as 0), at least 10 min of span
+	function N.capRate()
+		local now = os.clock()
+		while C.samples[1] and now - C.samples[1].t > WINDOW do
+			table.remove(C.samples, 1)
+		end
+		if not C.firstAt then
+			return 0, 0
+		end
+		local sum = 0
+		for _, s in ipairs(C.samples) do
+			sum += s.m
+		end
+		local span = math.min(now - C.firstAt, WINDOW)
+		return sum / math.max(span, MIN_SPAN) * 3600, span
+	end
+	-- a human's max $/h on this job at your level and efficiency, and the cap; nil while the cap is off
+	function N.capHuman(key, name)
+		local tph = TasksPerHour[key] or 300
+		if key == "BloxBurgersEmployee" and string.find(tostring(name or ""), "Line Cook", 1, true) then
+			tph = LINE_COOK
+		end
+		local level = (N.Levels and N.Levels[key]) or N.jobLevel(key)
+		local eff = effNow()
+		local hard = if level >= 10 and eff >= 0.95 then 20000 else 15000
+		local e = C.jobs[key]
+		local human, src
+		if e and e.n >= 10 and e.m > 0 then
+			human = e.m / e.n * tph
+			src = string.format("%s/task x %d/h", money(e.m / e.n), tph)
+		else
+			human = 360 * (10 + 3.3 * level) * eff
+			src = string.format("tier lv%d eff %.2f", level, eff)
+		end
+		if human > hard then
+			human, src = hard, src .. ", hard " .. money(hard)
+		end
+		return human, src
+	end
+	function N.capLimit(key, name)
+		if not N.capOn() or not key then
+			return nil
+		end
+		return (N.capHuman(key, name)) * pct()
+	end
+	local function gardenable()
+		local G = N.Garden
+		local _, left = N.gardenValue()
+		return (left or 0) > 0 and not G.running and os.clock() >= (G.idleUntil or 0)
+	end
+	local function lowestMood()
+		local values = N.moods()
+		local low = 101
+		for _, name in ipairs(N.Needs.names or {}) do
+			local v = values and values[name]
+			if v and v < low then
+				low = v
+			end
+		end
+		return low
+	end
+	-- every 30 s of a shift: nil, or the session (action, seconds) that brings the rolling rate under the cap
+	function N.capDue()
+		local now = os.clock()
+		if not N.capOn() or C.active or now - C.checkAt < CHECK then
+			return nil
+		end
+		C.checkAt = now
+		local key = N.currentJob()
+		if key == "" then
+			return nil
+		end
+		local rate = N.capRate()
+		local human, src = N.capHuman(key, N.workPickName)
+		local limit = human * pct()
+		C.rate, C.limit, C.human, C.src = rate, limit, human, src
+		if rate <= limit then
+			return nil
+		end
+		-- uniform pay: after b seconds without pay the 30 min rate is rate * (W - b) / W; aim 5 % under the cap
+		local seconds = math.clamp(WINDOW * (1 - 0.95 * limit / rate), 300, 900)
+		local low = lowestMood()
+		local action
+		if low < 70 then
+			action = "needs"
+		elseif gardenable() then
+			action = "garden"
+		elseif low < 90 then
+			action = "needs"
+		else
+			action = "break"
+		end
+		log(string.format("CAP rate=%d/h limit=%d/h action=%s %dm", math.floor(rate), math.floor(limit), action, math.floor(seconds / 60 + 0.5)), "job=" .. key, "human=" .. money(human) .. "/h (" .. src .. ")", "cap=" .. math.floor(pct() * 100) .. "%", "lowest mood", math.floor(low))
+		return action, seconds
+	end
+	local function leaveJob()
+		if N.currentJob() ~= "" then
+			N.taxiRelease()
+			N.bbLeave()
+			N.cookLeave()
+			N.endShift("earnings cap")
+		end
+	end
+	local function keep()
+		return alive() and not N.dead() and N.capOn() and os.clock() < C.untilAt
+	end
+	-- the session: needs (to 90 %) and/or Gardening, the rest a plain break at home; then the main loop clocks in again
+	function N.capRun(action, seconds)
+		if C.active then
+			return
+		end
+		C.active, C.action = true, action
+		local t0 = os.clock()
+		C.untilAt = t0 + seconds
+		C.status = string.format("earnings cap break (%s), %s", action, N.longTime(seconds))
+		local done = {}
+		local ok, err = pcall(function()
+			if action == "needs" then
+				N.needsRun("cap")
+				table.insert(done, "needs")
+			end
+			if keep() and C.untilAt - os.clock() > 60 and gardenable() then
+				N.gardenRun(C.untilAt - os.clock(), "cap")
+				table.insert(done, "garden")
+			end
+			if keep() then
+				leaveJob()
+				N.goHome()
+				table.insert(done, "break")
+				while keep() and N.workOn() do
+					C.status = string.format("earnings cap break, %s left", N.longTime(C.untilAt - os.clock()))
+					setStatus("Earnings cap: break at home, " .. N.longTime(C.untilAt - os.clock()) .. " left")
+					task.wait(2)
+				end
+			end
+		end)
+		if not ok then
+			log("ERROR", "cap", tostring(err))
+		end
+		pcall(N.detach)
+		local dt = os.clock() - t0
+		C.breaks += 1
+		C.breakSeconds += dt
+		C.active, C.action = false, nil
+		C.checkAt = os.clock()
+		local rate = N.capRate()
+		log("CAP done", "action=" .. action, "did=" .. table.concat(done, "+"), "took", math.floor(dt), "s", string.format("rate=%d/h limit=%d/h", math.floor(rate), math.floor(C.limit or 0)), "breaks", C.breaks, "total", N.longTime(C.breakSeconds))
+		setStatus("Earnings cap break done, back to work")
+	end
+	-- Stats rows: measured $/h (30 min) vs the cap, and the time spent on cap breaks
+	function N.capStats()
+		if not N.capOn() then
+			return "-", "off (Skill breaks is off)", string.format("%d, %s", C.breaks, N.longTime(C.breakSeconds))
+		end
+		local rate = N.capRate()
+		local cap = if C.limit then string.format("%s/h (%d%% of %s/h)", money(C.limit), math.floor(pct() * 100), money(C.human)) else "measuring"
+		return money(rate) .. "/h", cap, string.format("%d, %s%s", C.breaks, N.longTime(C.breakSeconds), if C.active then " (on one now)" else "")
+	end
+end
+-- Auto Garden (toggle AutoGarden, default OFF) and Skill breaks (toggle SkillBreaks, default ON: also the Earnings cap's tool, p05_cap).
 -- Gardening skill levels pay $100 .. $21,000 (SkillData 361929-361965, $60,600 + 500 Blockbux to level 10), paid by
 -- the server on level up. XP per level (L+1)^2.2188 (362130). Every packet is the game's own (dump ObjectInteractions
 -- 276570-277070, GardeningService 260082-260440):
@@ -34200,7 +34431,7 @@ do
 		local spent0 = G.spent
 		local acted = 0
 		local function keep()
-			return alive() and not N.dead() and (N.gardenOn() or (why == "skill break" and N.skillBreaksOn()))
+			return alive() and not N.dead() and (N.gardenOn() or (why == "skill break" and N.skillBreaksOn()) or (why == "cap" and N.capOn()))
 		end
 		log("GARDEN start", why, "level", level0, "for up to", N.longTime(maxSeconds), "speed", if instantMode() then "Instant" else "Natural")
 		local okRun, err = pcall(function()
@@ -36517,6 +36748,11 @@ do
 			c.n = if w then w.n elseif entry then math.floor((entry.seconds or 0) / WINDOW) else 0
 			if entry and (entry.seconds or 0) > 0 and c.n >= 1 then
 				c.rate = entry.money / entry.seconds * 3600
+				-- Earnings cap: a job is never worth more than the pay the hub lets itself earn there
+				local capped = N.capLimit and N.capLimit(key, name)
+				if capped and c.rate > capped then
+					c.rate = capped
+				end
 				if w and w.n >= 2 then
 					c.sdw = math.sqrt(math.max(w.sxx - w.sx * w.sx / w.n, 0) / (w.n - 1))
 					sdSum += c.sdw
@@ -38614,7 +38850,8 @@ do
 		local isBreak = reason == "break"
 		local started = os.clock()
 		local breakSeconds = optionNumber("BreakMinutes", 20) * 60
-		local deadline = if isBreak then started + breakSeconds else started + 60 * 60
+		-- an earnings cap session (p05_cap) ends at its own time
+		local deadline = if isBreak then started + breakSeconds elseif reason == "cap" and N.Cap then math.min(N.Cap.untilAt, started + 60 * 60) else started + 60 * 60
 		log("NEEDS start", reason, N.moodText(), "money", N.money())
 		if isBreak then
 			Q.breaks += 1
@@ -38658,7 +38895,7 @@ do
 			values = values or {}
 			local order, firstBy = needOrder(effWhy, moodName)
 			log("NEEDS order", table.concat(order, ">"), "| reason '" .. tostring(effWhy) .. "' mood '" .. tostring(moodName) .. "'", if firstBy then "-> " .. firstBy .. " first" else "")
-			local limit = if isBreak or reason == "manual" or string.sub(tostring(reason), 1, 4) == "plan" then 90 else REFILL
+			local limit = if isBreak or reason == "manual" or reason == "cap" or string.sub(tostring(reason), 1, 4) == "plan" then 90 else REFILL
 			-- the daily objective meal: only the fridge, also when Hunger is full
 			Q.objMeal = reason == "objective meal"
 			if Q.objMeal then
@@ -39694,8 +39931,17 @@ do
 	})
 	GardenBox:AddToggle("SkillBreaks", {
 		Text = "Skill breaks",
-		Default = false,
-		Tooltip = "During long shifts: every few minutes of work, go home for a short garden session, then back to work",
+		Default = true,
+		Tooltip = "During long shifts: a short garden session every few minutes of work. Also keeps your job pay under the Earnings cap: above it, Corvus goes home for needs, gardening or a short break instead of earning faster than a human could",
+	})
+	GardenBox:AddSlider("EarningsCap", {
+		Text = "Earnings cap (% of human max)",
+		Default = 90,
+		Min = 50,
+		Max = 150,
+		Rounding = 0,
+		Suffix = "%",
+		Tooltip = "Job pay per hour (last 30 min) is kept under this share of what a fast human earns on that job at your level. Works while Skill breaks is on",
 	})
 	GardenBox:AddSlider("SkillBreakEvery", { Text = "Skill break every", Default = 60, Min = 10, Max = 240, Rounding = 0, Suffix = " min" })
 	GardenBox:AddSlider("SkillBreakMinutes", { Text = "Skill break length", Default = 8, Min = 2, Max = 30, Rounding = 0, Suffix = " min" })
@@ -39839,6 +40085,10 @@ do
 	N.StatRows.Done = statRow(WorkBox, "check", "Customers done", 28)
 	N.StatRows.Correct = statRow(WorkBox, "badge-check", "Correct / wrong", 22)
 	N.StatRows.Shifts = statRow(WorkBox, "briefcase", "Shifts started", 22)
+	local CapBox = Tabs.Stats:AddLeftGroupbox("Earnings Cap", "gauge")
+	N.StatRows.CapRate = statRow(CapBox, "activity", "Job pay, last 30 min", 22)
+	N.StatRows.CapLimit = statRow(CapBox, "gauge", "Cap", 22, "FontColor")
+	N.StatRows.CapBreaks = statRow(CapBox, "coffee", "Cap breaks", 22, "FontColor")
 	local PayBox = Tabs.Stats:AddRightGroupbox("Pay Per Job", "coins")
 	Labels.Pay = PayBox:AddLabel({ Text = "-", DoesWrap = true })
 	-- Numbers come from N.InfoText (built in the info thread), this only copies them.
@@ -39851,6 +40101,10 @@ do
 		N.StatRows.Done.set(formatNumber(Session.done))
 		N.StatRows.Correct.set(formatNumber(Session.correct) .. " / " .. formatNumber(Session.wrong))
 		N.StatRows.Shifts.set(formatNumber(Session.shifts))
+		local capRate, capLimit, capBreaks = N.capStats()
+		N.StatRows.CapRate.set(capRate)
+		N.StatRows.CapLimit.set(capLimit)
+		N.StatRows.CapBreaks.set(capBreaks)
 	end
 end
 local Debug = {}
@@ -40621,6 +40875,13 @@ do
 				N.cookLeave()
 			end
 			lastPick = pick
+			N.workPickName = pick
+			-- Earnings cap: above the cap's $/h a needs / garden / break session of 5-15 min instead of more work
+			local capAction, capSeconds = N.capDue()
+			if capAction then
+				N.capRun(capAction, capSeconds)
+				return
+			end
 			-- Skill breaks: a short garden session inside a long shift, then the next pass clocks in again
 			if N.skillBreakDue() then
 				N.gardenRun(optionNumber("SkillBreakMinutes", 8) * 60, "skill break")
@@ -40749,6 +41010,9 @@ do
 		end
 		if N.Garden.running then
 			table.insert(lines, "Now: gardening (" .. tostring(N.Garden.status) .. ")")
+		end
+		if N.Cap.active then
+			table.insert(lines, "Now: " .. N.Cap.status)
 		end
 		if N.planOn() and N.Smart.headline then
 			table.insert(lines, N.Smart.headline)
