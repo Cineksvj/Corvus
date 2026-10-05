@@ -30843,7 +30843,7 @@ do
 		if not frame then
 			return nil
 		end
-		local info = { words = {}, images = {}, colors = {}, text = {} }
+		local info = { words = {}, images = {}, colors = {}, text = {}, icons = {} }
 		local function add(instance)
 			table.insert(info.words, instance.Name)
 			for key, value in pairs(instance:GetAttributes()) do
@@ -30851,6 +30851,7 @@ do
 				table.insert(info.text, key .. "=" .. tostring(value))
 			end
 			if instance:IsA("ImageLabel") or instance:IsA("ImageButton") then
+				table.insert(info.icons, { image = instance.Image, color = instance.ImageColor3 })
 				table.insert(info.images, instance.Image)
 				table.insert(info.colors, instance.ImageColor3)
 				table.insert(info.text, instance.Name .. ".Image=" .. instance.Image .. " color=" .. tostring(instance.ImageColor3))
@@ -30874,8 +30875,55 @@ do
 		return if #info.text > 0 or #info.words > 0 then info else nil
 	end
 	N.bubbleOrder = bubbleOrder
+	N.HairLearn = { file = "Corvus/WTB_hair_icons.json", map = {}, wrong = {} }
+	pcall(function()
+		if isfile and isfile(N.HairLearn.file) then
+			local data = HttpService:JSONDecode(readfile(N.HairLearn.file))
+			if type(data) == "table" then
+				N.HairLearn.map = type(data.map) == "table" and data.map or {}
+				N.HairLearn.wrong = type(data.wrong) == "table" and data.wrong or {}
+			end
+		end
+	end)
+	local function saveLearn()
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Corvus") then
+				makefolder("Corvus")
+			end
+			writefile(N.HairLearn.file, HttpService:JSONEncode({ map = N.HairLearn.map, wrong = N.HairLearn.wrong }))
+		end)
+	end
+	-- the key of a style: the white (untinted) icons of the order
+	local function styleKey(order)
+		local parts = {}
+		for _, icon in ipairs(order.icons) do
+			local c = icon.color
+			if c.R > 0.97 and c.G > 0.97 and c.B > 0.97 then
+				table.insert(parts, icon.image)
+			end
+		end
+		return table.concat(parts, "+")
+	end
+	N.hairStyleKey = styleKey
+	-- after the game judged an order: remember what that icon means (or that it is not that style)
+	function N.hairLearn(key, style, correct)
+		if not key or key == "" or not style then
+			return
+		end
+		if correct then
+			N.HairLearn.map[key] = style
+		else
+			if N.HairLearn.map[key] == style then
+				N.HairLearn.map[key] = nil
+			end
+			N.HairLearn.wrong[key] = N.HairLearn.wrong[key] or {}
+			N.HairLearn.wrong[key][style] = true
+		end
+		saveLearn()
+	end
 	-- Returns the style and color names the customer wants, or nil.
 	function N.hairOrder(customer)
+		N.Hair.key = nil
 		local folder = assets()
 		local order = bubbleOrder(customer)
 		if folder and order then
@@ -30923,6 +30971,28 @@ do
 						end
 					end
 				end
+			end
+			if not style and color then
+				local key = styleKey(order)
+				style = N.HairLearn.map[key]
+				if not style and key ~= "" then
+					local names = {}
+					for _, child in ipairs(styles and styles:GetChildren() or {}) do
+						table.insert(names, child.Name)
+					end
+					table.sort(names)
+					local wrong = N.HairLearn.wrong[key] or {}
+					for _, name in ipairs(names) do
+						if not wrong[name] then
+							style = name
+							break
+						end
+					end
+					if style then
+						log("HAIR learning icon", key, "trying", style)
+					end
+				end
+				N.Hair.key = key
 			end
 			if style and color then
 				return style, color
@@ -31064,6 +31134,10 @@ do
 			return item.order.Parent == nil or item.order.Value ~= ""
 		end, 3)
 		Session.done += 1
+		if answered and (item.order.Value == "true" or item.order.Value == "false") then
+			N.hairLearn(N.Hair.key, style, item.order.Value == "true")
+		end
+		N.Hair.key = nil
 		if answered and item.order.Value == "true" then
 			Session.correct += 1
 			N.Hair.last = style .. " / " .. color .. " correct"
