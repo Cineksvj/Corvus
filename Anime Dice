@@ -32093,6 +32093,9 @@ do
 		local owned = N.field("OwnedDice", {}) or {}
 		return name == "Basic" or owned[name] == true
 	end
+	function N.farmActive()
+		return on("AutoFarmBest")
+	end
 	function N.diceStep()
 		local list = N.diceList()
 		local current = N.field("Dice", "Basic")
@@ -32103,7 +32106,14 @@ do
 					best = dice
 				end
 			end
-			if best and best.name ~= current then
+			-- Normal farm mode keeps the dice the player picked: we only switch from Basic or from a dice we equipped ourselves.
+			local pinned = N.farmActive() and optionText("FarmMode", "Normal") ~= "OP" and current ~= "Basic" and current ~= N.lastAutoDice
+			if pinned and N.dicePin ~= current then
+				N.dicePin = current
+				log("DICE", "keeping your pick", tostring(current))
+			end
+			if best and best.name ~= current and not pinned then
+				N.lastAutoDice = best.name
 				fire(R.equipDice, best.name)
 				task.wait(0.6)
 				return true
@@ -33696,6 +33706,7 @@ do
 	do
 		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
 		N.FarmBestOn = { "SmartSpend", "AutoRoll", "AutoCollect", "AutoEquipBest", "AutoLevel", "AutoSell", "AutoEquipDice", "AutoBuyDice", "AutoUpgrade", "AutoRebirth", "AutoGear", "AutoDaily", "AutoGroup", "AutoOffline", "AutoFriend", "AutoCodes", "AutoQuests", "AutoTicketPasses", "AutoTower", "TowerEquipTeam", "AutoSpin", "AutoBoosts" }
+		N.PlayerOwned = { AutoEquipDice = true, AutoSpin = true, AutoBoosts = true }
 		-- Turning the quick farm off turns off everything it turned on (nothing keeps spending cash).
 		N.FarmBestOff = N.FarmBestOn
 		QuickBox:AddToggle("AutoFarmBest", {
@@ -33704,13 +33715,27 @@ do
 			Tooltip = "Turns on everything: fast rolls, plot income, Smart Spending (levels, dice, upgrades and rebirths ranked by payback time), smart selling, rewards, quests and towers",
 			Callback = function(value)
 				task.defer(function()
+					if value then
+						log("MODE", optionText("FarmMode", "Normal"))
+					end
 					for _, name in ipairs(if value then N.FarmBestOn else N.FarmBestOff) do
 						local toggle = Toggles[name]
-						if toggle and toggle.Value ~= value then
+						-- Normal: choices the player owns (dice, spins, boosts) are never switched on by the farm.
+						local skip = value and N.PlayerOwned[name] and optionText("FarmMode", "Normal") ~= "OP"
+						if toggle and toggle.Value ~= value and not skip then
 							toggle:SetValue(value)
 						end
 					end
 				end)
+			end,
+		})
+		QuickBox:AddDropdown("FarmMode", {
+			Text = "Farm Mode",
+			Values = { "Normal", "OP" },
+			Default = "Normal",
+			Tooltip = "Normal = automate everything within your own picks (your dice, sell and keep filters, spend choices, spins and boosts stay yours). OP = the planner overrides every choice for max profit",
+			Callback = function(value)
+				log("MODE", tostring(value))
 			end,
 		})
 		QuickBox:AddLabel({
