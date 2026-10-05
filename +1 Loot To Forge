@@ -32682,8 +32682,11 @@ do
 		if list[2] then
 			text ..= string.format(" alt=%s:%.3g", tostring(list[2].row.ID), list[2].perCoin)
 		end
-		if N.Reward.shopText ~= text then
-			N.Reward.shopText = text
+		-- Logged when the best item changes, else once a minute (the gain number moves every call while training).
+		N.Reward.shopText = text
+		local key = tostring(best.row.ID)
+		if N.Reward.shopKey ~= key or os.clock() - (N.Reward.shopLogAt or -1e9) > 60 then
+			N.Reward.shopKey, N.Reward.shopLogAt = key, os.clock()
 			log("PLAN", text)
 		end
 		if coins >= best.price and once("shop" .. best.id, 6) then
@@ -33966,7 +33969,13 @@ do
 		end
 		C.last = coin
 		if now - C.windowAt >= 60 then
-			C.rate = ema(C.rate, C.window / (now - C.windowAt), 0.3)
+			-- The rate is the farm income: a minute spent only training keeps the last farm measurement (it is what
+			-- the rebirth boost applies to), the very first minute always measures.
+			local farmed = P.share.farm - (C.farmMark or 0)
+			if farmed > 5 or C.rate == nil then
+				C.rate = ema(C.rate, C.window / (now - C.windowAt), 0.3)
+			end
+			C.farmMark = P.share.farm
 			C.window = 0
 			C.windowAt = now
 		end
@@ -34030,8 +34039,10 @@ do
 		return s.farm / (s.farm + s.train)
 	end
 	function N.coinIncome()
-		if P.coin.rate and P.coin.rate > 0 then
-			return P.coin.rate
+		-- Measured while farming (a measured zero counts: a rebirth boosts nothing when nothing is earned, otherwise
+		-- the planner trains for ever on income it never collects).
+		if P.coin.rate then
+			return math.max(P.coin.rate, 0)
 		end
 		-- Before the first minute: what the best stage run would earn.
 		local best = 0
