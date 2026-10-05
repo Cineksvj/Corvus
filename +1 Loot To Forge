@@ -30453,6 +30453,7 @@ do
 		["Season/TryClaimAllRewardRE"] = true,
 		["Season/TryClaimDailyTicRE"] = true,
 		["Dungeon/TryClaimDailyDunTicRE"] = true,
+		["Dungeon/ExitDungeonRE"] = true,
 		["UpdateLog/TryClaimUPDRewardRE"] = true,
 		["EnhantEvent/TryClaimQuestRE"] = true,
 		["Player/TryJoinGroupRE"] = true,
@@ -31055,6 +31056,7 @@ N.R = {
 	seasonAll = "Season/TryClaimAllRewardRE",
 	seasonDaily = "Season/TryClaimDailyTicRE",
 	towerDaily = "Dungeon/TryClaimDailyDunTicRE",
+	towerExit = "Dungeon/ExitDungeonRE",
 	updateLog = "UpdateLog/TryClaimUPDRewardRE",
 	quest = "EnhantEvent/TryClaimQuestRE",
 	group = "Player/TryJoinGroupRE",
@@ -31614,7 +31616,12 @@ do
 					F.run = false
 					F.stage = 0
 				end
-				log("DEAD", kind)
+				if kind == "DungeonDead" and N.towerDied then
+						pcall(N.towerDied)
+					elseif kind == "WorldBossDead" and N.bossDied then
+						pcall(N.bossDied)
+					end
+					log("DEAD", kind)
 			end))
 		end
 	end)
@@ -31781,7 +31788,44 @@ do
 		return equipped
 	end
 	-- Selling gear: never equipped, locked, or at/above the kept rarity; keeps the best few of every kind.
-	N.Sell = { why = {}, log = {} }
+	N.Sell = { why = {}, log = {}, tried = {}, refused = 0 }
+	-- Every sale is remembered until the item is gone from the backpack. An item the server does not take is
+	-- tried once more and then left alone (the log had one uuid sold 486 times, every 5 s, for nothing).
+	local function sellable(uuid)
+		local entry = N.Sell.tried[uuid]
+		if not entry then
+			return true
+		end
+		if entry.count >= 2 then
+			return false
+		end
+		return os.clock() - entry.at > 8
+	end
+	local function markSold(uuid)
+		local entry = N.Sell.tried[uuid]
+		if not entry then
+			entry = { count = 0, at = 0 }
+			N.Sell.tried[uuid] = entry
+		end
+		local item = N.backpack().have[uuid]
+		entry.number = tonumber(type(item) == "table" and item.Number) or 1
+		entry.count += 1
+		entry.at = os.clock()
+	end
+	local function forgetGone()
+		local have = N.backpack().have
+		local refused = 0
+		for uuid, entry in pairs(N.Sell.tried) do
+			local item = have[uuid]
+			-- Gone, or the stack changed size: the sale (or a new drop) went through, start over.
+			if item == nil or (tonumber(type(item) == "table" and item.Number) or 1) ~= entry.number then
+				N.Sell.tried[uuid] = nil
+			elseif entry.count >= 2 then
+				refused += 1
+			end
+		end
+		N.Sell.refused = refused
+	end
 	function N.sellPlan()
 		local keepRank = N.rarityRank(optionText("SellKeepRarity", "Legendary"))
 		local keepBest = math.clamp(math.floor(optionNumber("SellKeepBest", 2)), 0, 50)
@@ -31797,7 +31841,7 @@ do
 				why.rarity += 1
 			elseif counts[g.kind] <= keepBest + 1 then
 				why.best += 1
-			else
+			elseif sellable(g.uuid) then
 				table.insert(plan, g)
 			end
 		end
@@ -31805,20 +31849,21 @@ do
 		return plan
 	end
 	function N.sellStep()
-		if not on("AutoSellGear") then
-			return 0
-		end
+		forgetGone()
 		local sold = 0
-		for _, g in ipairs(N.sellPlan()) do
-			if sold >= 10 then
-				break
-			end
-			fire(N.R.sell, g.uuid, 1)
-			sold += 1
-			Session.sold += 1
-			table.insert(N.Sell.log, 1, g.rarity .. " " .. g.name)
-			while #N.Sell.log > 5 do
-				table.remove(N.Sell.log)
+		if on("AutoSellGear") then
+			for _, g in ipairs(N.sellPlan()) do
+				if sold >= 10 then
+					break
+				end
+				fire(N.R.sell, g.uuid, 1)
+				markSold(g.uuid)
+				sold += 1
+				Session.sold += 1
+				table.insert(N.Sell.log, 1, g.rarity .. " " .. g.name)
+				while #N.Sell.log > 5 do
+					table.remove(N.Sell.log)
+				end
 			end
 		end
 		local oreRank = N.rarityRank(optionText("SellOresBelow", "Off"))
@@ -31827,8 +31872,9 @@ do
 				if sold >= 15 then
 					break
 				end
-				if not ore.locked and N.rarityRank(ore.rarity) < oreRank then
+				if not ore.locked and N.rarityRank(ore.rarity) < oreRank and sellable(ore.uuid) then
 					fire(N.R.sell, ore.uuid, ore.number)
+					markSold(ore.uuid)
 					sold += 1
 					Session.sold += ore.number
 				end
@@ -32009,13 +32055,41 @@ do
 	-- puts you in, the game spawns each floor's enemies here and pays every cleared floor by itself. Start floors
 	-- are 1, 6, 11... up to one past your best floor. Unlike stages the game does not auto attack here, so the
 	-- hub clicks the attack button for you.
-	N.Tower = { at = -1e9, last = "", startedAt = 0 }
+	N.Tower = {
+		at = -1e9,
+		last = "",
+		startedAt = 0,
+		round = nil,
+		emptySince = nil,
+		deathStreak = 0,
+		lastDeathRound = 0,
+		pauseUntil = 0,
+		stalls = 0,
+	}
 	function N.towerTickets()
 		return N.material("Dungeon_Ticket")
 	end
+	-- How many floors the game has (its round table). A run started past the last floor never spawns anything
+	-- and just hangs there (seen in the log: minutes on "floor 51" with 50 floors).
+	function N.towerFloors()
+		local config = N.call(N.G.Dungeon.GetConfig)
+		if type(config) ~= "table" then
+			return nil
+		end
+		local top = 0
+		for key in pairs(config) do
+			if type(key) == "number" and key > top then
+				top = key
+			end
+		end
+		return if top > 0 then top else nil
+	end
+	-- Start floors are 1, 6, 11... up to one past your best floor. With every floor cleared that would be past
+	-- the last one, so a run from floor 1 is used instead: it pays all floors for the same single ticket.
 	function N.towerFloor()
 		local best = tonumber(N.store("Dungeon").maxRound) or 0
-		if optionText("TowerStart", "Highest unlocked") == "Floor 1" then
+		local total = N.towerFloors()
+		if optionText("TowerStart", "Highest unlocked") == "Floor 1" or (total and best >= total) then
 			return 1
 		end
 		local floor = 1
@@ -32025,7 +32099,26 @@ do
 		return floor
 	end
 	function N.towerReady()
-		return N.rebirth() >= 2 and N.towerTickets() > 0 and os.clock() - N.Tower.at > 20
+		return N.rebirth() >= 2 and N.towerTickets() > 0 and os.clock() - N.Tower.at > 20 and os.clock() >= N.Tower.pauseUntil
+	end
+	-- Called by the game's death event. Two deaths in a row on the same floor or lower mean the tower is too
+	-- strong right now: every death costs a ticket and a long respawn, so the tower rests while you train.
+	function N.towerDied()
+		local T = N.Tower
+		local round = tonumber(T.round) or 0
+		if T.lastDeathRound > 0 and round > T.lastDeathRound then
+			T.deathStreak = 0
+		end
+		T.deathStreak += 1
+		T.lastDeathRound = round
+		if T.deathStreak >= 2 then
+			local rest = math.min(600 * (T.deathStreak - 1), 3600)
+			T.pauseUntil = os.clock() + rest
+			T.last = string.format("Died %d times around floor %d, resting %s", T.deathStreak, round, N.longTime(rest))
+			logProblem("Tower too strong around floor " .. round .. ", resting " .. N.longTime(rest))
+		else
+			T.last = "Died on floor " .. round
+		end
 	end
 	function N.towerStart()
 		N.Tower.at = os.clock()
@@ -32039,6 +32132,8 @@ do
 		end
 		Session.towerRuns += 1
 		N.Tower.startedAt = os.clock()
+		N.Tower.round = floor
+		N.Tower.emptySince = nil
 		N.Tower.last = "Run " .. Session.towerRuns .. " from floor " .. floor
 		waitFor(function()
 			return N.fightMode() == "Dungeon"
@@ -32046,9 +32141,17 @@ do
 		return true
 	end
 	function N.towerStep()
+		local T = N.Tower
 		local round = LocalPlayer:GetAttribute("CurrentRound")
+		if round ~= nil and round ~= T.round then
+			T.round = round
+			if T.lastDeathRound > 0 and (tonumber(round) or 0) > T.lastDeathRound then
+				T.deathStreak = 0
+			end
+		end
 		local enemies = N.enemies("EnemyFolder")
 		if #enemies > 0 then
+			T.emptySince = nil
 			setStatus(string.format("Tower floor %s: %d enemies", tostring(round or "?"), #enemies))
 			N.standAt(enemies[1].pos, 3.5)
 			N.attackClick()
@@ -32056,14 +32159,47 @@ do
 			task.wait(0.12)
 			return
 		end
+		-- Between floors the game needs about 3 s. Much longer with nobody to fight means the run is stuck, so
+		-- leave through the game's own exit instead of sitting there until the server gives up.
+		T.emptySince = T.emptySince or os.clock()
+		if os.clock() - T.emptySince > 30 then
+			T.stalls += 1
+			T.emptySince = nil
+			T.pauseUntil = os.clock() + 120
+			T.last = "Stuck on floor " .. tostring(round or "?") .. ", left the tower"
+			logProblem("Tower stuck on floor " .. tostring(round or "?") .. " with no enemies, leaving")
+			fire(N.R.towerExit)
+			waitFor(function()
+				return N.fightMode() ~= "Dungeon"
+			end, 5)
+			return
+		end
 		setStatus("Tower floor " .. tostring(round or "?") .. ": next floor soon")
 		task.wait(0.3)
 	end
 	-- World boss: a server boss in workspace.EnemyFolder_Server while workspace.CurrentWorldBoss is set. The
 	-- TOUCHED.WorldBoss pad joins the fight, the reward cards open after it dies.
-	N.Boss = { at = -1e9, last = "", joinedAt = 0 }
+	N.Boss = { at = -1e9, last = "", joinedAt = 0, deaths = 0, skip = false }
 	function N.bossActive()
 		return workspace:GetAttribute("CurrentWorldBoss") ~= nil and workspace:GetAttribute("CurrentWorldBoss") ~= false
+	end
+	-- True while there is a boss worth joining. The game puts you back into the arena after every death, so a
+	-- boss that kills you twice is skipped until it is gone (the log had six deaths in a row, 25 s each).
+	function N.bossWanted()
+		if not N.bossActive() then
+			N.Boss.deaths = 0
+			N.Boss.skip = false
+			return false
+		end
+		return not N.Boss.skip
+	end
+	function N.bossDied()
+		N.Boss.deaths += 1
+		if N.Boss.deaths >= 2 then
+			N.Boss.skip = true
+			N.Boss.last = "Too strong, skipped for now (" .. N.Boss.deaths .. " deaths)"
+			logProblem("World boss killed us " .. N.Boss.deaths .. " times, skipping it")
+		end
 	end
 	local function pad(name)
 		local touched = workspace:FindFirstChild("TOUCHED")
@@ -32102,6 +32238,12 @@ do
 		end
 	end
 	function N.bossStep()
+		if N.Boss.skip then
+			setStatus("World boss too strong, leaving")
+			N.bossLeave()
+			task.wait(1)
+			return
+		end
 		local bosses = N.enemies("EnemyFolder_Server")
 		if #bosses > 0 then
 			setStatus("Fighting the world boss")
@@ -32180,7 +32322,7 @@ do
 				end
 			end
 		end
-		if once("indexLevel", 90) then
+		if once("indexLevel", 300) then
 			invoke(N.R.indexLevel, 8)
 		end
 	end
@@ -32194,7 +32336,7 @@ do
 			fire(N.R.seasonDaily)
 			noteReward("Season daily ticket")
 		end
-		if season and once("seasonAll", 120) then
+		if season and once("seasonAll", 300) then
 			fire(N.R.seasonAll)
 		end
 	end
@@ -33541,7 +33683,7 @@ do
 		local mode = N.fightMode()
 		if mode == "Stage" then
 			if on("AutoStages") then
-				if on("AutoWorldBoss") and N.bossActive() and N.Fight.run then
+				if on("AutoWorldBoss") and N.bossWanted() and N.Fight.run then
 					N.bank("world boss is up")
 					return
 				end
@@ -33575,7 +33717,7 @@ do
 			N.forgeStep(6)
 			return
 		end
-		if on("AutoWorldBoss") and N.bossActive() and os.clock() - N.Boss.at > 15 then
+		if on("AutoWorldBoss") and N.bossWanted() and os.clock() - N.Boss.at > 15 then
 			N.bossJoin()
 			return
 		end
@@ -33624,7 +33766,7 @@ do
 		if on("AutoUpgrade") and choreDue("upgrade", 2) then
 			N.upgradeStep()
 		end
-		if on("AutoRebirth") and choreDue("rebirth", 5) then
+		if on("AutoRebirth") and choreDue("rebirth", 1) then
 			N.rebirthStep()
 		end
 		if choreDue("rewards", 5) then
@@ -33718,7 +33860,8 @@ do
 					why.rarity or 0,
 					why.locked or 0,
 					Session.sold,
-					if #N.Sell.log > 0 then "\nLast: " .. table.concat(N.Sell.log, ", ") else ""
+					(if N.Sell.refused > 0 then "\n" .. N.Sell.refused .. " item(s) the game would not sell are skipped" else "")
+							.. (if #N.Sell.log > 0 then "\nLast: " .. table.concat(N.Sell.log, ", ") else "")
 				)
 				local area = N.bestTrainArea()
 				I.train = string.format(
@@ -33741,7 +33884,7 @@ do
 					"Tickets <b>%d</b>  \u{00B7}  best floor <b>%d</b>%s\nRuns this session <b>%d</b>%s",
 					N.towerTickets(),
 					tonumber(N.store("Dungeon").maxRound) or 0,
-					if N.rebirth() < 2 then "\n<font color=\"#fab428\">Opens at rebirth 2</font>" else "",
+					if N.rebirth() < 2 then "\n<font color=\"#fab428\">Opens at rebirth 2</font>" elseif os.clock() < N.Tower.pauseUntil then "\n<font color=\"#fab428\">Resting " .. N.longTime(N.Tower.pauseUntil - os.clock()) .. " (too strong or stuck)</font>" else "",
 					Session.towerRuns,
 					if N.Tower.last ~= "" then "\n" .. N.Tower.last else ""
 				)
