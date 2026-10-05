@@ -28097,6 +28097,30 @@ end
 end
 return list
 end
+-- Placed pets: the game now draws them on the client (PlayerScripts.Game.Pets.PetRenderer, the plot's Pets
+-- folder stays empty), so the hub reads the renderer's list. Without this the plot looked empty (0/11) and every
+-- place was refused by the server because the ranch was full.
+local PetRendererModule = nil
+local function rendererPets()
+if PetRendererModule == nil then
+PetRendererModule = false
+local found = isolated(function()
+local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
+local game2 = scripts and scripts:FindFirstChild("Game")
+local pets = game2 and game2:FindFirstChild("Pets")
+local module = pets and pets:FindFirstChild("PetRenderer")
+return module and require(module)
+end)
+if type(found) == "table" and type(found.GetAll) == "function" then
+PetRendererModule = found
+end
+end
+if not PetRendererModule then
+return nil
+end
+local ok, all = pcall(PetRendererModule.GetAll)
+return if ok and type(all) == "table" then all else nil
+end
 function N.plotPets()
 local plot = N.myPlot()
 local folder = plot and plot:FindFirstChild("Pets")
@@ -28104,6 +28128,24 @@ local list = {}
 for _, model in ipairs(folder and folder:GetChildren() or {}) do
 if model:IsA("Model") and model:GetAttribute("PetKey") and model:GetAttribute("OwnerUserId") == LocalPlayer.UserId then
 table.insert(list, N.petInfoFrom(model, false))
+end
+end
+if #list == 0 then
+for _, entry in pairs(rendererPets() or {}) do
+if type(entry) == "table" and entry.OwnerUserId == LocalPlayer.UserId and typeof(entry.Model) == "Instance" and entry.Model.Parent then
+local model = entry.Model
+-- the rendered model may lack the attributes the hub reads: copy them from the renderer's entry (client only)
+for attr, value in pairs({ PetKey = entry.PetKey, PetName = entry.PetName, Weight = entry.Weight, Age = entry.Age, Mutation = entry.Mutation, SpawnMutation = entry.SpawnMutation, OwnerUserId = entry.OwnerUserId }) do
+if value ~= nil and model:GetAttribute(attr) == nil then
+pcall(model.SetAttribute, model, attr, value)
+end
+end
+local ok, info = pcall(N.petInfoFrom, model, false)
+if ok and info then
+info.key = info.key or entry.PetKey
+table.insert(list, info)
+end
+end
 end
 end
 return list
