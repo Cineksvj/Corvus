@@ -5609,11 +5609,12 @@ local CorvusBootOk, CorvusBootError = xpcall(function()
         if Library.ConfirmPrompt and Library.ConfirmPrompt.Parent then
             return
         end
+        local Extra = if Opts.Warning then 64 else 0
         local Root = New("Frame", {
             AnchorPoint = Vector2.new(1, 1),
             BackgroundTransparency = 1,
             Position = UDim2.new(1, 340, 1, -12),
-            Size = UDim2.fromOffset(320, 232),
+            Size = UDim2.fromOffset(320, 232 + Extra),
             ZIndex = 60,
             Parent = Library.ScreenGui,
         })
@@ -5679,13 +5680,29 @@ local CorvusBootOk, CorvusBootError = xpcall(function()
             ZIndex = 63,
             Parent = Content,
         })
+        if Opts.Warning then
+        	New("TextLabel", {
+        		BackgroundTransparency = 1,
+        		FontFace = GetBoldFont,
+        		Position = UDim2.fromOffset(14, 166),
+        		Size = UDim2.new(1, -28, 0, 60),
+        		Text = tostring(Opts.Warning),
+        		TextColor3 = Color3.fromRGB(255, 140, 60),
+        		TextSize = 12,
+        		TextWrapped = true,
+        		TextXAlignment = Enum.TextXAlignment.Left,
+        		TextYAlignment = Enum.TextYAlignment.Top,
+        		ZIndex = 63,
+        		Parent = Content,
+        	})
+        end
         local Confirm = New("TextButton", {
             AutoButtonColor = false,
             BackgroundColor3 = "AccentColor",
             FontFace = GetBoldFont,
-            Position = UDim2.fromOffset(12, 182),
+            Position = UDim2.fromOffset(12, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
-            Text = tostring(Opts.ConfirmText or "Confirm"),
+            Text = tostring(Opts.ConfirmText or "Confirm"), TextWrapped = true,
             TextColor3 = "BackgroundColor",
             TextSize = 14,
             ZIndex = 63,
@@ -5696,7 +5713,7 @@ local CorvusBootOk, CorvusBootError = xpcall(function()
             AutoButtonColor = false,
             BackgroundColor3 = "BackgroundColor",
             FontFace = GetBoldFont,
-            Position = UDim2.new(0.5, 4, 0, 182),
+            Position = UDim2.new(0.5, 4, 0, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
             Text = tostring(Opts.CancelText or "Cancel"),
             TextColor3 = "FontColor",
@@ -33541,7 +33558,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	Library:ShowConfirmPrompt({
     		Title = "Enable Auto Farm Everything OP?",
     		Text = "The planner will buy eggs, hatch, fuse and upgrade pets, craft, and spend your rubies and gems for maximum profit. This can change or use up your pets and items.",
-    		ConfirmText = "Enable OP",
+    		ConfirmText = "I understand, enable OP",
+		Warning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
     		CancelText = "Cancel",
     		OnConfirm = function()
     			Auto.log("OP", "confirmed")
@@ -33582,8 +33600,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     })
     FarmBox:AddToggle("AutoFarmOP", {
     	Text = "Auto Farm Everything OP",
-    	Description = "Full automatic: the planner buys eggs, hatches, fuses/upgrades pets, crafts, spends rubies and gems for max profit. Can change or use up your pets and items.",
-    	Tooltip = "Switches on every automation and lets the profit planner override your egg, world and upgrade picks. It asks for confirmation first.",
+    	Description = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
+    	Tooltip = "The planner buys eggs, hatches, fuses/upgrades pets, crafts and spends rubies and gems for max profit; it overrides your egg, world and upgrade picks and can use up pets and items. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt. It asks for confirmation first.",
     	Default = false,
     	Callback = function(v)
     		if v and not Auto.opGate then
