@@ -31253,6 +31253,7 @@ do
 						kg = tonumber(tool:GetAttribute("WeightKg")) or 0,
 						size = tonumber(tool:GetAttribute("SizeMult")) or 1,
 						mutation = tool:GetAttribute("Mutation"),
+						variant = tool:GetAttribute("Variant"),
 						held = held,
 					})
 				end
@@ -31266,6 +31267,15 @@ do
 			end
 		end
 		return list
+	end
+	function N.backpackCount()
+		local n = 0
+		for _, entry in ipairs(N.animalTools()) do
+			if not entry.held then
+				n += 1
+			end
+		end
+		return n
 	end
 	function N.placedAnimals()
 		local plot = N.plot()
@@ -31327,7 +31337,12 @@ do
 	function N.flung()
 		return os.clock() < N.Moves.flungUntil or N.ragdolled()
 	end
+	-- Built once a second: planning a trip raycasts up to 60 times and each build walks every player's character.
+	local RayCache = { params = nil, at = -1e9 }
 	local function rayParams()
+		if RayCache.params and RayCache.char == character() and os.clock() - RayCache.at < 1 then
+			return RayCache.params
+		end
 		local params = RaycastParams.new()
 		params.FilterType = Enum.RaycastFilterType.Exclude
 		local list = {}
@@ -31347,6 +31362,7 @@ do
 			params.RespectCanCollide = true
 			params.IgnoreWater = true
 		end)
+		RayCache.params, RayCache.at, RayCache.char = params, os.clock(), character()
 		return params
 	end
 	N.rayParams = rayParams
@@ -31565,9 +31581,6 @@ do
 		end
 		return placeRoot(target)
 	end
-	-- The game's server anticheat pulls back or explodes anyone who teleports, moves faster than their speed or flies.
-	-- Walk mode lets the Humanoid really walk along a computed path, so the server only sees normal running.
-	local PathOk, Pathfinding = pcall(game.GetService, game, "PathfindingService")
 	-- The Hell event portal stands in zone 7 (Build.ZoneBuilds.Zone7.JoinHell). Touching it sends you to the boss map,
 	-- far from every zone, so walking keeps clear of it.
 	local PortalCache = { part = nil, at = -1e9 }
@@ -31585,17 +31598,6 @@ do
 		end
 		local tp = node and node:FindFirstChild("TP", true)
 		PortalCache.part = if tp and tp:IsA("BasePart") then tp else nil
-		if PortalCache.part then
-			pcall(function()
-				if not PortalCache.part:FindFirstChild("CorvusAvoid") then
-					local modifier = Instance.new("PathfindingModifier")
-					modifier.Name = "CorvusAvoid"
-					modifier.Label = "CorvusAvoid"
-					modifier.PassThrough = false
-					modifier.Parent = PortalCache.part
-				end
-			end)
-		end
 		return PortalCache.part
 	end
 	local function nearPortal(from, to)
@@ -31612,190 +31614,6 @@ do
 		return (a + ab * t - p).Magnitude < radius
 	end
 	N.nearPortal = nearPortal
-	-- True when nothing solid stands between the two points at knee and chest height, so a straight run works.
-	local function lineClear(from, to)
-		if nearPortal(from, to) then
-			return false
-		end
-		local flatTo = Vector3.new(to.X, from.Y, to.Z)
-		local offset = flatTo - from
-		if offset.Magnitude < 1 or math.abs(to.Y - from.Y) > 6 then
-			return offset.Magnitude < 1
-		end
-		for _, height in ipairs({ -1.5, 1.5 }) do
-			local start = from + Vector3.new(0, height, 0)
-			local ok, hit = pcall(function()
-				return workspace:Raycast(start, offset, rayParams())
-			end)
-			if not ok or hit then
-				return false
-			end
-		end
-		return true
-	end
-	-- Only the corners of the path are kept, the Humanoid runs straight between them without slowing down.
-	local function simplify(from, list)
-		local out = {}
-		local prevPos = from
-		for index, point in ipairs(list) do
-			local nextPoint = list[index + 1]
-			local keep = nextPoint == nil or point.jump or nextPoint.jump or math.abs(nextPoint.position.Y - point.position.Y) > 2
-			if not keep then
-				local a = Vector3.new(point.position.X - prevPos.X, 0, point.position.Z - prevPos.Z)
-				local b = Vector3.new(nextPoint.position.X - point.position.X, 0, nextPoint.position.Z - point.position.Z)
-				keep = a.Magnitude < 0.1 or b.Magnitude < 0.1 or a.Unit:Dot(b.Unit) < 0.97
-			end
-			if keep then
-				table.insert(out, point)
-				prevPos = point.position
-			end
-		end
-		return out
-	end
-	local function pathPoints(from, target)
-		if lineClear(from, target) then
-			return { { position = target, jump = false } }
-		end
-		if PathOk and Pathfinding then
-			local ok, path = pcall(Pathfinding.CreatePath, Pathfinding, {
-				AgentRadius = 2.5,
-				AgentHeight = 5,
-				AgentCanJump = true,
-				WaypointSpacing = 12,
-				Costs = { CorvusAvoid = math.huge },
-			})
-			if ok and path and pcall(path.ComputeAsync, path, from, target) and path.Status == Enum.PathStatus.Success then
-				local list = {}
-				for index, point in ipairs(path:GetWaypoints()) do
-					if index > 1 then
-						table.insert(list, { position = point.Position, jump = point.Action == Enum.PathWaypointAction.Jump })
-					end
-				end
-				if #list > 0 then
-					return simplify(from, list)
-				end
-			end
-		end
-		return { { position = target, jump = false } }
-	end
-	local function canWalk(hum)
-		local ok, fn = pcall(function()
-			return hum.MoveTo
-		end)
-		return ok and type(fn) == "function"
-	end
-	-- Runs at the full WalkSpeed the server gives you (it follows your speed stat), the same as holding W.
-	-- The next corner is given before the current one is reached, so the character never stops on the way.
-	local function humanWalk(target, keepGoing)
-		local hum = humanoid()
-		if not hum or not rootPart() or not canWalk(hum) then
-			return nil
-		end
-		local function halt()
-			local root = rootPart()
-			if root and humanoid() then
-				pcall(hum.MoveTo, hum, root.Position)
-			end
-		end
-		local startPos, startAt, pathTime, legs, passes = rootPart().Position, os.clock(), 0, 0, 0
-		local function walkSpeed()
-			return math.max((tonumber(hum.WalkSpeed) or 16) * 0.95, 16)
-		end
-		-- Something blocks the way (fence, plot wall, decoration): pass it at your own WalkSpeed with collisions
-		-- off for that short bit, then walk on. Same speed as running, so the anticheat sees nothing odd.
-		local function passObstacle(goal)
-			local root = rootPart()
-			if not root then
-				return
-			end
-			local offset = Vector3.new(goal.X - root.Position.X, 0, goal.Z - root.Position.Z)
-			if offset.Magnitude < 1 then
-				return
-			end
-			local aim = root.Position + offset.Unit * math.min(offset.Magnitude, 30)
-			local ground = groundAt(aim.X, aim.Z, root.Position.Y + 4)
-			local y = if ground and math.abs(ground + N.standHeight() - root.Position.Y) < 8 then ground + N.standHeight() else root.Position.Y
-			passes += 1
-			N.Moves.pushes += 1
-			Noclip.travel = true
-			glideTo(Vector3.new(aim.X, y, aim.Z), walkSpeed, keepGoing)
-			Noclip.travel = false
-		end
-		for _ = 1, 2 do
-			local stuck = false
-			local computeAt = os.clock()
-			local points = pathPoints(rootPart().Position, target)
-			pathTime += os.clock() - computeAt
-			legs += #points
-			for index, point in ipairs(points) do
-				local last = index == #points
-				if point.jump then
-					hum.Jump = true
-				end
-				pcall(hum.MoveTo, hum, point.position)
-				local bestDistance, bestAt, issuedAt, jumped = math.huge, os.clock(), os.clock(), false
-				while true do
-					if not alive() or not rootPart() then
-						return false, "no character"
-					end
-					if keepGoing and not keepGoing() then
-						halt()
-						return false, "stopped"
-					end
-					if N.flung() then
-						return false, "flung"
-					end
-					local distance = flat(rootPart().Position, point.position)
-					-- Hand over to the next corner about a tenth of a second early.
-					local close = if last then 2.5 else math.max(3.5, (tonumber(hum.WalkSpeed) or 16) * 0.12)
-					if distance <= close then
-						break
-					end
-					local now = os.clock()
-					if distance < bestDistance - 0.5 then
-						bestDistance, bestAt = distance, now
-					elseif now - bestAt > 0.4 and not jumped then
-						hum.Jump = true
-						jumped = true
-					elseif now - bestAt > 0.9 then
-						if passes >= 40 or now - startAt > 180 then
-							stuck = true
-							break
-						end
-						passObstacle(point.position)
-						pcall(hum.MoveTo, hum, point.position)
-						issuedAt = os.clock()
-						bestDistance, bestAt, jumped = math.huge, os.clock(), false
-					end
-					-- MoveTo gives up on its own after 8 seconds.
-					if now - issuedAt > 6 then
-						issuedAt = now
-						pcall(hum.MoveTo, hum, point.position)
-					end
-					task.wait()
-				end
-				if stuck then
-					N.Moves.blocked += 1
-					log("WALK stuck", brief(rootPart().Position), "->", brief(point.position), "new path")
-					break
-				end
-			end
-			if not stuck then
-				break
-			end
-		end
-		local root = rootPart()
-		local took = os.clock() - startAt
-		local walked = if root then flat(startPos, root.Position) else 0
-		if walked > 30 then
-			log(string.format("WALK %d studs in %.1fs = %d/s (WalkSpeed %d, %d points, path %dms, %d obstacles passed)", walked, took, walked / math.max(took, 0.01), tonumber(hum.WalkSpeed) or 0, legs, pathTime * 1000, passes))
-		end
-		if root and flat(root.Position, target) <= 4 and math.abs(root.Position.Y - target.Y) < 8 then
-			return true
-		end
-		return false, "blocked"
-	end
-	N.humanWalk = humanWalk
 	-- Long trips go along the ground in a few legs so the character never cuts through the floor.
 	local function planPath(from, to, depth)
 		-- Go around the Hell portal in zone 7 instead of through it.
@@ -31984,14 +31802,24 @@ do
 	local function live(part)
 		return part ~= nil and part.Parent ~= nil and not part:GetAttribute("Broken") and not part:GetAttribute("Hatching") and not part:GetAttribute("Despawning")
 	end
-	local function othersNear(position, radius)
+	-- Other players' positions are read once per egg scan, not once per egg.
+	local function otherPositions()
+		local list = {}
 		for _, player in ipairs(Players:GetPlayers()) do
 			if player ~= LocalPlayer then
 				local char = player.Character
 				local root = char and char:FindFirstChild("HumanoidRootPart")
-				if root and flat(root.Position, position) <= radius then
-					return true
+				if root then
+					table.insert(list, root.Position)
 				end
+			end
+		end
+		return list
+	end
+	local function othersNear(list, position, radius)
+		for _, at in ipairs(list) do
+			if flat(at, position) <= radius then
+				return true
 			end
 		end
 		return false
@@ -32013,6 +31841,7 @@ do
 		local origin = root and root.Position
 		local maxHits = math.max(optionNumber("MaxHits", 80), 1)
 		local titanicFirst = on("TitanicFirst")
+		local others = if on("AvoidPlayers") then otherPositions() else {}
 		local best, bestScore
 		-- Eggs in your zones that only fail the hit limit: when nothing else fits, the fewest-hits one is broken anyway,
 		-- so the last zone is never skipped just because its eggs are tough.
@@ -32026,7 +31855,7 @@ do
 					and info.hits < toughHits
 					and (F.failedEggs[info.part] or 0) < os.clock()
 					and allows(Options.EggPick, info.kind)
-					and not (on("AvoidPlayers") and othersNear(info.position, 10))
+					and not (on("AvoidPlayers") and othersNear(others, info.position, 10))
 				then
 					tough, toughHits = info, info.hits
 				end
@@ -32040,7 +31869,7 @@ do
 				and info.hits <= (if event then maxHits * 10 else maxHits)
 				and (F.failedEggs[info.part] or 0) < os.clock()
 				and (event or allows(Options.EggPick, info.kind))
-				and not (not event and on("AvoidPlayers") and othersNear(info.position, 10))
+				and not (not event and on("AvoidPlayers") and othersNear(others, info.position, 10))
 			then
 				local score = N.eggScore(info, origin) + (if event then 2e15 elseif special then 1e15 else 0)
 				if not bestScore or score > bestScore then
@@ -32349,7 +32178,8 @@ do
 		end
 		N.holdAt(nil)
 		F.target = nil
-		if egg.Parent == nil or egg:GetAttribute("Broken") or egg:GetAttribute("Hatching") then
+		-- An egg that vanished without a single hit of ours was broken by another player: not ours, no hatch to wait for.
+		if egg:GetAttribute("Broken") or egg:GetAttribute("Hatching") or (egg.Parent == nil and hits > 0) then
 			Session.eggs += 1
 			table.insert(F.hatches, { position = info.position, at = os.clock(), zone = info.zone, before = before, kind = info.kind })
 			while #F.hatches > 8 do
@@ -32422,10 +32252,12 @@ do
 		if wild and N.cashValue(wild) > pickValue then
 			pick = wild
 		end
-		if F.readyHatched then
+		-- The animal stays on the list until the grab worked, so a failed grab is retried (it despawns after 45 s anyway).
+		local ok = N.stealPickup(pick, " from your egg")
+		if ok and F.readyHatched then
 			F.readyHatched[pick.model] = nil
 		end
-		return N.stealPickup(pick, " from your egg")
+		return ok
 	end
 	function N.placeStep(force)
 		if not (force or on("AutoPlace")) then
@@ -32434,10 +32266,16 @@ do
 		if not force and os.clock() - F.lastEquipBest < 8 then
 			return false
 		end
+		-- Equip Best only changes something when a backpack animal beats the weakest placed one (any animal, while
+		-- the plot has room). Otherwise the call and its 1 s wait are skipped, the worse ones wait for Auto Sell.
 		local tools = 0
+		local worst = if force then 0 else (N.worstPlaced())
 		for _, entry in ipairs(N.animalTools()) do
 			if not entry.held then
-				tools += 1
+				local value = if force then 0 else N.cashValue(entry)
+				if value <= 0 or value > worst then
+					tools += 1
+				end
 			end
 		end
 		if tools == 0 and not force then
@@ -32459,7 +32297,7 @@ do
 		return false
 	end
 	function N.sellPlan()
-		local list, value = {}, 0
+		local list = {}
 		local keepMutated = on("SellKeepMutated")
 		local maxKg = optionNumber("SellMaxKg", 0)
 		for _, entry in ipairs(N.animalTools()) do
@@ -32467,7 +32305,7 @@ do
 				table.insert(list, entry.tool)
 			end
 		end
-		return list, value
+		return list
 	end
 	function N.sellStep(force)
 		if not (force or on("AutoSell")) then
@@ -32596,10 +32434,23 @@ do
 		task.wait(1)
 		return true
 	end
+	-- True while more speed still helps: a zone is still locked, or WalkSpeed is below the game's cap.
+	function N.trainUseful()
+		if N.nextZone() then
+			return true
+		end
+		local cap = tonumber(N.G.Speed.MaxWalkSpeed) or 120
+		return N.walkSpeed() < cap - 1
+	end
 	-- Decides farm vs train when both are on.
 	function N.wantTrain(farmHadWork)
 		local farmOn = on("AutoFarm") or on("StealPickups")
 		if not on("AutoTrain") then
+			return false
+		end
+		-- Speed only buys new zones and a faster WalkSpeed (capped). With both done, time on the treadmill earns nothing
+		-- while the farm is running, so the farm gets all of it.
+		if farmOn and not N.trainUseful() then
 			return false
 		end
 		if not farmOn or farmHadWork == false then
@@ -32695,7 +32546,7 @@ do
 			return false
 		end
 		local owned = N.ownedList("OwnedTrails")
-		local equipped = tonumber(LocalPlayer:GetAttribute("EquippedTrail")) or 0
+		local equipped =tonumber(LocalPlayer:GetAttribute("EquippedTrail")) or 0
 		local bestId, bestMult = nil, 0
 		local equippedMult = 0
 		for _, trail in ipairs(trails) do
@@ -32710,6 +32561,10 @@ do
 			fire("TrailShopRequest", "Equip", bestId)
 			task.wait(0.5)
 			return true
+		end
+		-- Trails only multiply training speed: no buying unless the hub trains and speed still helps.
+		if not (on("AutoTrain") and N.trainUseful()) then
+			return false
 		end
 		local cash = N.cash()
 		local pick
@@ -32750,6 +32605,12 @@ do
 		if not cost or level >= (tonumber(N.G.Plot.MaxLevel) or 9) or N.cash() < cost then
 			return false
 		end
+		-- A new level only adds one slot. While slots stand empty and no animal waits in the backpack, it earns nothing,
+		-- so the cash goes to the pickaxe or stays for later.
+		local maxAnimals = tonumber(N.plotAttr("MaxAnimals", 0)) or 0
+		if maxAnimals > 0 and #N.placedAnimals() + N.backpackCount() < maxAnimals then
+			return false
+		end
 		fire("UpgradePlotRequest")
 		if waitFor(function()
 			return (tonumber(N.plotAttr("PlotLevel", 1)) or 1) > level
@@ -32771,6 +32632,10 @@ do
 				end
 				return true
 			end
+			return false
+		end
+		-- Treadmill levels only multiply training, so they are bought only while the hub trains and speed still helps.
+		if not (on("AutoTrain") and N.trainUseful()) then
 			return false
 		end
 		local level = tonumber(N.plotAttr("TreadmillLevel", 1)) or 1
@@ -33386,8 +33251,8 @@ do
 	do
 		local BuyBox = Tabs.Upgrades:AddLeftGroupbox("Auto Buy", "shopping-cart")
 		BuyBox:AddToggle("AutoPickaxe", { Text = "Best Pickaxe", Default = false, Tooltip = "Buys and equips the best pickaxe you can afford" })
-		BuyBox:AddToggle("AutoTrail", { Text = "Best Trail", Default = false, Tooltip = "Trails multiply the speed you get on the treadmill" })
-		BuyBox:AddToggle("AutoPlotUpgrade", { Text = "Plot Upgrades", Default = false, Tooltip = "Every plot level holds one more animal" })
+		BuyBox:AddToggle("AutoTrail", { Text = "Best Trail", Default = false, Tooltip = "Trails multiply the speed you get on the treadmill. Bought only while Auto Train is on and speed still helps" })
+		BuyBox:AddToggle("AutoPlotUpgrade", { Text = "Plot Upgrades", Default = false, Tooltip = "Every plot level holds one more animal. Bought when your plot and backpack have no free slot left" })
 		BuyBox:AddToggle("AutoTreadmill", { Text = "Treadmill Unlock And Upgrades", Default = false })
 		BuyBox:AddToggle("ShopTravel", {
 			Text = "Walk To Shop If Needed",
@@ -34559,6 +34424,10 @@ do
 					end
 				end
 				lastBest = best
+				-- The labels below are only for the open menu: with it hidden nothing is scanned (AFK farming).
+				if Library.Toggled == false then
+					return
+				end
 				local nextZone = N.nextZone()
 				local zone = N.Cat.zones[best]
 				I.info = string.format(
@@ -34694,7 +34563,7 @@ do
 				)
 			end)
 			Perf.work.info = (Perf.work.info or 0) + (os.clock() - started)
-			task.wait(0.5)
+			task.wait(if Library.Toggled == false then 1.5 else 0.5)
 		end
 	end)
 	local function shown(tab)
