@@ -30444,6 +30444,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     
     local S = {
     	autoFarm = false,
+    	farmAll = false,
+    	worldSave = 0,
     	autoTap = true,
     	farmWorldOn = false,
     	farmWorld = "Best unlocked",
@@ -31779,7 +31781,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	local paid = price ~= nil and price > 0 and not free
     	local currency = Auto.eggCurrency(name)
     	local balance = getStat(currency) or 0
-    	local keep = if currency == "Rubies" then (S.rubyReserve or 0) else (S.hatchKeepCoins or 0)
+    	local keep = if currency == "Rubies" then (S.rubyReserve or 0) else math.max(S.hatchKeepCoins or 0, S.worldSave or 0)
     	local canBuy = if paid then math.min(maxOpen, math.floor(balance / price)) else maxOpen
     	local budget = math.huge
     	if paid and keep > 0 then
@@ -32215,14 +32217,17 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	DiscordDescription = "Keyless scripts, updates and support",
     })
     
-    Tabs.Farm = Window:AddTab({ Name = "Farm", Icon = "swords", Description = "Auto farm at maximum speed" })
-    Tabs.Rewards = Window:AddTab({ Name = "Rewards", Icon = "gift", Description = "Gifts, chests and the fruit machine" })
+    Tabs.Main = Window:AddTab({ Name = "Main", Icon = "house", Description = "Auto Farm Everything, farm and status" })
+    Tabs.Farm = Tabs.Main
     Tabs.Eggs = Window:AddTab({ Name = "Eggs", Icon = "egg", Description = "Auto buy eggs and index hunter" })
     Tabs.Fishing = Window:AddTab({ Name = "Fishing", Icon = "fish", Description = "Auto fish, bait, merchant and tokens" })
+    Tabs.Ufo = Window:AddTab({ Name = "UFO", Icon = "rocket", Description = "UFO event and server hop" })
+    Tabs.Upgrades = Window:AddTab({ Name = "Upgrades", Icon = "trending-up", Description = "Spawn machine, trees, worlds and Moon shops" })
+    Tabs.Rewards = Window:AddTab({ Name = "Rewards", Icon = "gift", Description = "Gifts, chests and the fruit machine" })
     Tabs.Items = Window:AddTab({ Name = "Items", Icon = "backpack", Description = "Fruits, potions, lucky blocks" })
-    Tabs.Upgrades = Window:AddTab({ Name = "Upgrades", Icon = "trending-up", Description = "Spawn machine, trees and Moon shops" })
-    Tabs.Stats = Window:AddTab({ Name = "Stats", Icon = "chart-column", Description = "Earnings, rewards and items" })
-    Tabs.Analytics = Window:AddTab({ Name = "Analytics", Icon = "chart-spline", Description = "Live rates, trends and luck" })
+    Tabs.Player = Window:AddTab({ Name = "Player", Icon = "user", Description = "Worlds and travel" })
+    Tabs.Stats = Window:AddTab({ Name = "Stats", Icon = "chart-column", Description = "Earnings, rewards, items and live analytics" })
+    Tabs.Analytics = Tabs.Stats
     Tabs.Webhook = Window:AddTab({ Name = "Webhook", Icon = "webhook", Description = "Discord posts, pings and a live profile card" })
     Tabs.Misc = Window:AddMiscTab({
     	Description = "Performance, AFK, friends and webhook",
@@ -32428,7 +32433,53 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	end,
     })
     
+    Auto.farmNames = {
+    	"AutoFarm", "AutoTap", "FarmWorldOn", "AutoUfo", "UfoTravel", "AutoBuyWorlds",
+    	"AutoGift", "AutoPartyEgg", "AutoFruitMachine", "AutoGroupChest", "AutoMoonChest", "AutoKeyCraft",
+    	"AutoVipChest", "AutoPartner", "AutoUniverseZone", "AutoQuests", "AutoBen", "AutoCodes",
+    	"AutoHatch", "EggAutoTravel", "AutoInvEggs", "IndexHunter", "AutoFruits", "AutoPotions",
+    	"AutoLucky", "AutoEquipBest", "AutoGolden", "AutoDiamond", "AutoFish", "FishIndexHunt",
+    	"FishIndexGolden", "FishTap", "AutoWorms", "AutoHooks", "AutoSellFish", "AutoMerchantBuy",
+    	"AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoMoonPerm", "AutoMoonIncr",
+    	"MoonGameAuto", "AutoRebirth", "RebirthWaitPerm", "AutoServerLuck", "SkipHatchAnim", "SkipLuckyAnim",
+    }
+    Auto.farmSet = {}
+    function Auto.farmAll(value)
+    	S.farmAll = value == true
+    	if value then
+    		for _, name in ipairs(Auto.farmNames) do
+    			local toggle = Toggles[name]
+    			if toggle and not toggle.Value and not (name == "AutoHatch" and S.hatchEggName == "") then
+    				Auto.farmSet[name] = true
+    				pcall(function() toggle:SetValue(true) end)
+    			end
+    		end
+    		if S.hatchEggName == "" then
+    			notify("Auto Farm Everything", "Pick an egg in the Eggs tab and it will start opening eggs too", 6)
+    		end
+    	else
+    		for name in pairs(Auto.farmSet) do
+    			local toggle = Toggles[name]
+    			if toggle and toggle.Value then
+    				pcall(function() toggle:SetValue(false) end)
+    			end
+    		end
+    		Auto.farmSet = {}
+    		S.worldSave = 0
+    	end
+    end
+    
     local FarmBox = Tabs.Farm:AddLeftGroupbox("Auto Farm", "swords")
+    FarmBox:AddToggle("FarmAll", {
+    	Text = "Auto Farm Everything",
+    	Description = "One switch for the whole farm",
+    	Tooltip = "Turns on every automation: farm, eggs, index, fishing, rewards, upgrades, worlds, UFO and Moon. Spending is planned: it saves coins for the next world once you are halfway there, and buys the cheapest upgrade first. Turning it off only switches off what it switched on.",
+    	Default = false,
+    	Callback = function(v)
+    		task.spawn(Auto.farmAll, v)
+    	end,
+    })
+    FarmBox:AddDivider()
     FarmBox:AddToggle("AutoFarm", {
     	Text = "Auto Farm",
     	Description = "Breaks everything at full speed",
@@ -32501,7 +32552,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     local TargetRow = StatusBox:AddStat({ Icon = CurrencyIcons.Coins, Text = "No target", Value = "", Size = 26 })
     local AreaRow = StatusBox:AddStat({ Icon = "map-pin", Text = "Area", Value = "unknown", Size = 22, ValueColor = "FontColor" })
     UI.FarmWorldRow = StatusBox:AddStat({ Icon = "globe", Text = "Farm world", Value = "Off", Size = 22, ValueColor = "FontColor" })
-    UI.UfoBox = Tabs.Farm:AddLeftGroupbox("UFO Event", "rocket")
+    UI.UfoBox = Tabs.Ufo:AddLeftGroupbox("UFO Event", "rocket")
     UI.UfoBox:AddToggle("AutoUfo", {
     	Text = "Auto Break UFO",
     	Description = "Hits the Alien Egg as fast as the game allows",
@@ -32557,7 +32608,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     UI.UfoHopRow = UI.UfoBox:AddStat({ Icon = "radar", Text = "Hop", Value = "Off", Size = 22, ValueColor = "FontColor" })
     UI.UfoTimerRow = UI.UfoBox:AddStat({ Icon = "globe", Text = "Timer", Value = "checking...", Size = 22, ValueColor = "FontColor" })
     
-    UI.WorldBox = Tabs.Farm:AddRightGroupbox("Worlds", "globe")
+    UI.WorldBox = Tabs.Player:AddLeftGroupbox("Worlds & Travel", "globe")
     UI.WorldList = {}
     UI.WorldKeys = {}
     UI.WorldOrder = {}
@@ -32616,16 +32667,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     		end
     	end,
     })
-    UI.WorldBox:AddToggle("AutoBuyWorlds", {
-    	Text = "Auto Buy Worlds",
-    	Description = "Unlocks the next world once you can afford it",
-    	Default = false,
-    	Callback = function(v)
-    		S.autoBuyWorlds = v
-    	end,
-    })
-    UI.WorldNextRow = UI.WorldBox:AddStat({ Icon = CurrencyIcons.Coins, Text = "Next world", Value = "...", Size = 28, Progress = 0 })
-    UI.WorldOwnedRow = UI.WorldBox:AddStat({ Icon = "globe", Text = "Unlocked", Value = "...", Size = 22 })
     UI.WorldHereRow = UI.WorldBox:AddStat({ Icon = "map-pin", Text = "You are in", Value = "...", Size = 22, ValueColor = "FontColor" })
     
     if #MissingRemotes > 0 then
@@ -33828,7 +33869,18 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     })
     UI.RubiesRow = UI.BudgetBox:AddStat({ Icon = CurrencyIcons.Rubies, Text = "Rubies", Value = "...", Size = 26 })
     UI.MoonGemsRow = UI.BudgetBox:AddStat({ Icon = CurrencyIcons.Gems, Text = "Gems", Value = "...", Size = 26 })
-    
+    UI.WorldBuyBox = Tabs.Upgrades:AddRightGroupbox("Worlds", "globe")
+    UI.WorldBuyBox:AddToggle("AutoBuyWorlds", {
+    	Text = "Auto Buy Worlds",
+    	Description = "Unlocks the next world once you can afford it",
+    	Default = false,
+    	Callback = function(v)
+    		S.autoBuyWorlds = v
+    	end,
+    })
+    UI.WorldNextRow = UI.WorldBuyBox:AddStat({ Icon = CurrencyIcons.Coins, Text = "Next world", Value = "...", Size = 28, Progress = 0 })
+    UI.WorldOwnedRow = UI.WorldBuyBox:AddStat({ Icon = "globe", Text = "Unlocked", Value = "...", Size = 22 })
+        
     UI.SpawnBox = Tabs.Upgrades:AddLeftGroupbox("Spawn Upgrades", "circle-arrow-up")
     UI.SpawnBox:AddToggle("AutoSpawnUpgrades", {
     	Text = "Auto Upgrade",
@@ -36684,6 +36736,10 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				task.wait(2)
     				local ok, err = pcall(function()
     					local info = worldInfo()
+    					S.worldSave = 0
+    					if S.farmAll and S.autoBuyWorlds and info.next and info.currency == "Coins" and info.price and Worlds.fails < 2 and (info.balance or 0) >= info.price * 0.5 then
+    						S.worldSave = info.price
+    					end
     					if not S.autoBuyWorlds then
     						Worlds.status = ""
     						return
@@ -42504,6 +42560,18 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     })
     
     Library:AddCommand({
+    	Name = "farmall",
+    	Aliases = { "everything", "afk" },
+    	Args = "[on/off]",
+    	Description = "Starts or stops Auto Farm Everything",
+    	Callback = function(Args)
+    		local State = if Args[1] then Args[1] == "on" else not Toggles.FarmAll.Value
+    		Toggles.FarmAll:SetValue(State)
+    		return "Auto Farm Everything " .. (if State then "on" else "off")
+    	end,
+    })
+    
+    Library:AddCommand({
     	Name = "farm",
     	Args = "[on/off]",
     	Description = "Starts or stops the auto farm",
@@ -42731,6 +42799,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     
     if Library.SetQuickBar then
     	Library:SetQuickBar({
+    		{ Toggle = "FarmAll", Icon = "rocket", Label = "Farm All" },
     		{ Toggle = "AutoFarm", Icon = "swords", Label = "Farm" },
     		{ Toggle = "AutoHatch", Icon = "egg", Label = "Eggs" },
     		{ Toggle = "AutoUfo", Icon = "rocket", Label = "UFO" },
@@ -43132,16 +43201,19 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     		equip = { "AutoEquipBest" },
     		fish = { "AutoFish" },
     	}
-    	if tasks.hatch and type(values.egg) == "string" and Options.HatchEgg then
+    	if (tasks.hatch or tasks.everything) and type(values.egg) == "string" and Options.HatchEgg then
     		pcall(Options.HatchEgg.SetValue, Options.HatchEgg, values.egg)
     	end
-    	for key, ids in pairs(map) do
+    	for key, ids in pairs(if tasks.everything then {} else map) do
     		for _, id in ipairs(ids) do
     			local toggle = Toggles[id]
     			if toggle and (key ~= "hatch" or id ~= "EggAutoTravel" or tasks.hatch) then
     				pcall(toggle.SetValue, toggle, tasks[key] == true)
     			end
     		end
+    	end
+    	if tasks.everything then
+    		pcall(function() Toggles.FarmAll:SetValue(true) end)
     	end
     	local function set(id, value)
     		local element = Toggles[id] or Options[id]
@@ -43165,9 +43237,9 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	Saved.setupDone = true
     	SaveDirty = true
     	saveStats(true)
-    	local labels = { farm = "Farm", hatch = "Eggs", index = "Index", rewards = "Rewards", upgrades = "Upgrades", worlds = "Worlds", ufo = "UFO", equip = "Best pets", fish = "Fishing" }
+    	local labels = { everything = "Everything", farm = "Farm", hatch = "Eggs", index = "Index", rewards = "Rewards", upgrades = "Upgrades", worlds = "Worlds", ufo = "UFO", equip = "Best pets", fish = "Fishing" }
     	local picked = {}
-    	for _, key in ipairs({ "farm", "hatch", "index", "rewards", "upgrades", "worlds", "ufo", "equip", "fish" }) do
+    	for _, key in ipairs({ "everything", "farm", "hatch", "index", "rewards", "upgrades", "worlds", "ufo", "equip", "fish" }) do
     		if tasks[key] then
     			table.insert(picked, labels[key])
     		end
@@ -43202,8 +43274,9 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				Description = "Pick everything you want running. Tap again to unpick.",
     				Multi = true,
     				Required = true,
-    				Default = { "farm", "hatch", "rewards", "equip" },
+    				Default = { "everything" },
     				Choices = {
+    					{ Id = "everything", Title = "Auto Farm Everything", Description = "One switch: every automation below, with planned spending", Icon = "rocket", Color = "#60d696" },
     					{ Id = "farm", Title = "Farm coins", Description = "Breaks coins and chests at full speed", Icon = "swords", Color = "#e0a526" },
     					{ Id = "hatch", Title = "Open eggs", Description = "Buys your egg whenever you can afford it", Icon = "egg", Color = "#3ccf91" },
     					{ Id = "index", Title = "Complete the index", Description = "Hunts missing pets, crafts Golden and Diamond", Icon = "book-open", Color = "#5fb8ff" },
@@ -43222,7 +43295,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				Default = defaultEgg,
     				Choices = eggChoices,
     				Visible = function(state)
-    					return type(state.tasks) == "table" and state.tasks.hatch == true and #eggChoices > 0
+    					return type(state.tasks) == "table" and (state.tasks.hatch == true or state.tasks.everything == true) and #eggChoices > 0
     				end,
     			},
     			{
@@ -43268,7 +43341,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	{ Id = "SOL", Icon = "pay-sol", Symbol = "SOL", Name = "Solana", Network = "Solana", Address = "4UriDCT4iBsLAuzLdowpSEL4mZq7Ecrxs4pNrV5ztHxW", Color = "#9945ff", Note = "Only send SOL or Solana tokens" },
     	{ Id = "BNB", Icon = "pay-bnb", Symbol = "BNB", Name = "BNB", Network = "BNB Smart Chain", Address = "0xBa0e07FdDB15fe3c9B7CE42F76cef8F09FEdAB64", Color = "#f0b90b", Note = "Only send on BNB Smart Chain (BEP20)" },
     }
-    for _, tab in ipairs({ Tabs.Info, Tabs.Farm, Tabs.Rewards, Tabs.Eggs, Tabs.Fishing, Tabs.Items, Tabs.Upgrades, Tabs.Stats, Tabs.Analytics, Tabs.Webhook, Tabs.Misc, Tabs.Settings }) do
+    for _, tab in ipairs({ Tabs.Info, Tabs.Main, Tabs.Eggs, Tabs.Fishing, Tabs.Ufo, Tabs.Upgrades, Tabs.Rewards, Tabs.Items, Tabs.Player, Tabs.Stats, Tabs.Webhook, Tabs.Misc, Tabs.Settings }) do
     	pcall(function()
     		local left = tab == Tabs.Info and tab.Groupboxes.Community or nil
     		if left then
@@ -43286,7 +43359,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	end)
     end
     
-    Tabs.Farm:Show()
+    Tabs.Main:Show()
     
     do
     	local key = "Z"
