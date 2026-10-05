@@ -4991,6 +4991,9 @@ local CorvusBootOk, CorvusBootError = xpcall(function()
             local Toggle = Library.Toggles[Entry.Target]
             if Toggle and not Toggle.Disabled then
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Entry.Target) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Entry.Target, Toggle.Value)
+                end
                 Library:Notify({ Title = tostring(Toggle.Text), Description = if Toggle.Value then "ON" else "OFF", Time = 1.5 })
             end
         elseif Entry.Kind == "Button" then
@@ -5701,6 +5704,7 @@ local CorvusBootOk, CorvusBootError = xpcall(function()
 				Close(false, "outside")
 			end)
 		end
+		local ModalOpenedAt = os.clock()
 		pcall(function()
 			KeyConnection = UserInputService.InputBegan:Connect(function(Input, Processed)
 				if Input.UserInputType ~= Enum.UserInputType.Keyboard then
@@ -5708,7 +5712,7 @@ local CorvusBootOk, CorvusBootError = xpcall(function()
 				end
 				if Input.KeyCode == Enum.KeyCode.Escape then
 					Close(false, "close")
-				elseif not Processed and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
+				elseif not Processed and not Opts.Warning and os.clock() - ModalOpenedAt > 0.8 and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
 					Close(true, "key")
 				end
 			end)
@@ -10756,6 +10760,9 @@ local CorvusBootOk, CorvusBootError = xpcall(function()
                 end
     
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Idx) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+                end
             end))
     
             if typeof(Toggle.Tooltip) == "string" or typeof(Toggle.DisabledTooltip) == "string" then
@@ -11071,6 +11078,9 @@ local CorvusBootOk, CorvusBootError = xpcall(function()
                 end
     
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Idx) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+                end
             end))
     
             table.insert(Toggle.Connections, Button.MouseButton1Down:Connect(function()
@@ -17639,6 +17649,28 @@ local CorvusBootOk, CorvusBootError = xpcall(function()
             return nil, false
         end
     
+        function Library:ResetHubOptions(Ignore: any): (boolean, any)
+        	local Ok, Json = pcall(HttpService.JSONEncode, HttpService, { v = 1, g = game.GameId, d = {} })
+        	if not Ok then
+        		return false, "Could not reset"
+        	end
+        	return Library:ImportShareCode("CORVUS-" .. Library.Base64Encode(Json), Ignore)
+        end
+
+        function Library:AskResetHubOptions(Ignore: any)
+        	return Library:ShowModal({
+        		Icon = "rotate-ccw",
+        		Title = "Reset all options to defaults?",
+        		Text = "Every toggle, dropdown, slider and input of this hub goes back to its default value. Saved configs are not deleted.",
+        		ConfirmText = "Reset",
+        		CancelText = "Cancel",
+        		OnConfirm = function()
+        			local Ok, Result = Library:ResetHubOptions(Ignore)
+        			Library:Notify({ Title = "Reset Hub Options", Description = if Ok then string.format("%d options reset", Result) else tostring(Result), Time = 4 })
+        		end,
+        	})
+        end
+
         function Library:ExportShareCode(Ignore: any): (string?, any)
             local Changed = {}
             local Count = 0
@@ -27404,7 +27436,6 @@ end
                     "CorvusConfigList",
                     "CorvusShareCode",
                     "CorvusAutoSave",
-                    "FarmAll",
                 })
                 SaveManager:SetFolder(Folder)
                 if Info.SubFolder then
@@ -27609,6 +27640,7 @@ end
                 if Info.AutoLoad ~= false then
                     task.defer(function()
                         pcall(SaveManager.LoadAutoloadConfig, SaveManager)
+                        if Library.OnAutoload then pcall(Library.OnAutoload) end
                     end)
                 end
             end
@@ -29979,6 +30011,9 @@ end
                         local Toggle = Library.Toggles[Item.Toggle]
                         if Toggle and not Toggle.Disabled then
                             Toggle:SetValue(not Toggle.Value)
+                            if typeof(Item.Toggle) == "string" and Library.OnUserToggle then
+                            	pcall(Library.OnUserToggle, Item.Toggle, Toggle.Value)
+                            end
                         end
                     end)
                     table.insert(DockButtons, Entry)
@@ -31525,20 +31560,10 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	end
     	pcall(Auto.flushLog, true)
     end)
-    -- Exclude: valuable things Auto Farm Everything never opens, fuses, sells or spends.
-    -- keys: egg:<name>, rarity:<Rarity>, convert, rubies, gems, potions, fruits, lucky
     Auto.bootAt = os.clock()
-    Auto.Excl = { set = {}, last = {} }
-    function Auto.excluded(key)
-    	if not (Auto.Excl.set[key] and Auto.farmOP and Auto.farmOP()) then
-    		return false
-    	end
-    	local now = os.clock()
-    	if now - (Auto.Excl.last[key] or -1e9) >= 120 then
-    		Auto.Excl.last[key] = now
-    		Auto.log("EXCLUDE", key)
-    	end
-    	return true
+    -- No exclude list any more: every sell, fuse, convert and spend is its own switch with its own filters.
+    function Auto.excluded()
+    	return false
     end
     function Auto.petRarity(name)
     	local multi = Auto.lazyRequire("PetsMulti", function()
@@ -33326,7 +33351,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	ToggleKeybind = Enum.KeyCode.Z,
     })
     
-    Library.ShareIgnore = { WebhookUrl = true, WebhookPingId = true, FeedbackText = true, CodeInput = true, GoalKind = true, GoalTarget = true, HatchEgg = true, FarmAll = true }
+    Library.ShareIgnore = { WebhookUrl = true, WebhookPingId = true, FeedbackText = true, CodeInput = true, GoalKind = true, GoalTarget = true, HatchEgg = true }
     
     local Tabs = {}
     
@@ -33341,7 +33366,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	end,
     })
     
-    Tabs.Main = Window:AddTab({ Name = "Main", Icon = "house", Description = "Auto Farm Everything, farm, UFO, worlds and status" })
+    Tabs.Main = Window:AddTab({ Name = "Main", Icon = "house", Description = "Quick start, farm, UFO, worlds and status" })
     Tabs.Farm = Tabs.Main
     Tabs.Eggs = Window:AddTab({ Name = "Eggs", Icon = "egg", Description = "Auto buy eggs and index hunter" })
     Tabs.Fishing = Window:AddTab({ Name = "Fishing", Icon = "fish", Description = "Auto fish, bait, merchant and tokens" })
@@ -33569,96 +33594,20 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	"MoonGameAuto", "AutoRebirth", "AutoServerLuck", "SkipHatchAnim", "SkipLuckyAnim",
     	"AutoAdminChat", "AutoItemCraft", "AutoEventCraft",
     }
-    -- Auto Farm Everything = one toggle, full automatic (the planner). Exclude protects valuable things.
-    -- { label in the dropdown, key, excluded by default }
-    Auto.excludeEntries = {
-    	{ "Egg: Alien Egg", "egg:Alien Egg", true },
-    	{ "Egg: Galaxy Egg", "egg:Galaxy Egg", true },
-    	{ "Egg: Gummy Egg", "egg:Gummy Egg", true },
-    	{ "Egg: Party Egg", "egg:Party Egg", true },
-    	{ "Egg: Astral Egg", "egg:Astral Egg", true },
-    	{ "Egg: VIP Chest Egg", "egg:VIP Chest Egg", true },
-    	{ "Egg: Cupcake Gift", "egg:Cupcake Gift", true },
-    	{ "Egg: Ruby Egg", "egg:Ruby Egg", false },
-    	{ "Egg: Ruby Egg x2Luck", "egg:Ruby Egg x2Luck", false },
-    	{ "Egg: Ruby Egg x5Luck", "egg:Ruby Egg x5Luck", false },
-    	{ "Pets: Mythical", "rarity:Mythical", true },
-    	{ "Pets: Exclusive", "rarity:Exclusive", true },
-    	{ "Pets: Secret", "rarity:Secret", true },
-    	{ "Pets: Legendary", "rarity:Legendary", false },
-    	{ "Golden and Diamond conversion", "convert", false },
-    	{ "Rubies", "rubies", false },
-    	{ "Gems", "gems", false },
-    	{ "Potions", "potions", false },
-    	{ "Fruits", "fruits", false },
-    	{ "Lucky Blocks", "lucky", false },
+    Auto.farmNames = {
+    	"AutoFarm", "AutoTap", "FarmWorldOn", "AutoUfo", "UfoTravel", "AutoBuyWorlds",
+    	"AutoGift", "AutoPartyEgg", "AutoFruitMachine", "AutoGroupChest", "AutoMoonChest", "AutoKeyCraft",
+    	"AutoVipChest", "AutoPartner", "AutoUniverseZone", "AutoQuests", "AutoBen", "AutoCodes", "AutoFriend",
+    	"AutoHatch", "EggAutoTravel", "AutoInvEggs", "IndexHunter", "AutoFruits", "AutoPotions",
+    	"AutoLucky", "AutoEquipBest", "AutoGolden", "AutoDiamond", "AutoFish", "FishIndexHunt",
+    	"FishIndexGolden", "FishTap", "AutoWorms", "AutoHooks", "AutoSellFish", "AutoMerchantBuy",
+    	"AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoMoonPerm", "AutoMoonIncr",
+    	"MoonGameAuto", "AutoRebirth", "AutoServerLuck", "SkipHatchAnim", "SkipLuckyAnim",
+    	"AutoAdminChat", "AutoItemCraft", "AutoEventCraft",
     }
-    Auto.excludeLabels, Auto.excludeDefaults, Auto.excludeKey = {}, {}, {}
-    for _, entry in ipairs(Auto.excludeEntries) do
-    	table.insert(Auto.excludeLabels, entry[1])
-    	Auto.excludeKey[entry[1]] = entry[2]
-    	if entry[3] then
-    		table.insert(Auto.excludeDefaults, entry[1])
-    		Auto.Excl.set[entry[2]] = true
-    	end
-    end
-    Auto.farmSets = { OP = {} }
+    -- No master switch: every automation is its own toggle. The Smart Planner is one of them.
     function Auto.farmOP()
     	return S.farmOP == true
-    end
-    -- My filters: the loops the player can pick in "Run". Nothing here opens inventory eggs, fuses, converts, crafts, sells or spends rubies/gems.
-    -- { label, toggle key, on by default }
-    Auto.runEntries = {
-    	{ "Auto Farm", "AutoFarm", true },
-    	{ "Auto Tap", "AutoTap", true },
-    	{ "Farm In Best World", "FarmWorldOn", true },
-    	{ "Auto Buy Egg (chosen egg)", "AutoHatch", false },
-    	{ "Go to egg automatically", "EggAutoTravel", false },
-    	{ "Auto Fish", "AutoFish", false },
-    	{ "Auto Tap (fishing)", "FishTap", false },
-    	{ "Auto Break UFO", "AutoUfo", true },
-    	{ "Travel to the UFO", "UfoTravel", true },
-    	{ "Auto Claim Gifts", "AutoGift", true },
-    	{ "Auto Claim Party Egg", "AutoPartyEgg", true },
-    	{ "Auto Claim Group Chest", "AutoGroupChest", true },
-    	{ "Auto Claim Moon Chest", "AutoMoonChest", true },
-    	{ "Auto Claim Partner Rewards", "AutoPartner", true },
-    	{ "Auto Claim Quests", "AutoQuests", true },
-    	{ "Auto redeem known codes", "AutoCodes", true },
-    	{ "Auto Friend", "AutoFriend", true },
-    	{ "Auto Type Admin Phrases", "AutoAdminChat", true },
-    	{ "Auto Find Bens", "AutoBen", false },
-    	{ "Auto Equip Best", "AutoEquipBest", true },
-    	{ "Skip hatch animation", "SkipHatchAnim", false },
-    	{ "Auto Buy Worlds", "AutoBuyWorlds", false },
-    	{ "Auto Upgrade", "AutoSpawnUpgrades", false },
-    	{ "Auto Upgrade Tree", "AutoTree", false },
-    }
-    Auto.runLabels, Auto.runDefaults, Auto.runKey = {}, {}, {}
-    for _, entry in ipairs(Auto.runEntries) do
-    	table.insert(Auto.runLabels, entry[1])
-    	Auto.runKey[entry[1]] = entry[2]
-    	if entry[3] then
-    		table.insert(Auto.runDefaults, entry[1])
-    	end
-    end
-    function Auto.myFilters()
-    	local mode = Options.FarmMode and Options.FarmMode.Value
-    	return mode == "My filters"
-    end
-    -- the toggle keys picked in Run
-    function Auto.runWanted()
-    	local wanted = {}
-    	local value = Options.FarmRun and Options.FarmRun.Value
-    	if type(value) == "table" then
-    		for label, on in pairs(value) do
-    			local key = on and Auto.runKey[label]
-    			if key then
-    				wanted[key] = true
-    			end
-    		end
-    	end
-    	return wanted
     end
     -- the budget reserve of a currency; an excluded currency is fully reserved (never spent)
     function Auto.reserve(currency)
@@ -33669,70 +33618,9 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	end
     	return 0
     end
-    -- switches on what is wanted (remembering what we flipped) and off what we flipped but is no longer wanted
-    function Auto.farmTurn(kind, wanted)
-    	local set = Auto.farmSets[kind]
-    	for name in pairs(wanted) do
-    		local toggle = Toggles[name]
-    		if toggle and not toggle.Value then
-    			set[name] = true
-    			pcall(function() toggle:SetValue(true) end)
-    		end
-    	end
-    	for name in pairs(set) do
-    		if not wanted[name] then
-    			set[name] = nil
-    			local toggle = Toggles[name]
-    			if toggle and toggle.Value then
-    				pcall(function() toggle:SetValue(false) end)
-    			end
-    		end
-    	end
-    end
-    function Auto.farmOPSet(value)
-    	local filters = Auto.myFilters()
-    	S.farmOP = value == true and not filters
-    	S.farmAll = S.farmOP
-    	if value and filters then
-    		Auto.farmTurn("OP", Auto.runWanted())
-    		Auto.log("FARMALL", "on, My filters")
-    	elseif value then
-    		local all = {}
-    		for _, name in ipairs(Auto.farmNames) do
-    			all[name] = true
-    		end
-    		Auto.farmTurn("OP", all)
-    		Auto.log("FARMALL", "on, Best value")
-    	else
-    		Auto.log("FARMALL", "off")
-    		Auto.farmTurn("OP", {})
-    		S.worldSave = 0
-    	end
-    end
-    function Auto.opAsk()
-    	if not Library.ShowConfirmPrompt then
-    		return
-    	end
-    	Library:ShowConfirmPrompt({
-    		Title = "Start Auto Farm Everything?",
-    		Text = "The planner buys eggs, hatches, fuses and upgrades pets, crafts, and spends your rubies and gems for maximum profit. Anything you put in Exclude is never touched.",
-    		ConfirmText = "I understand, start it",
-    		Warning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
-    		CancelText = "Cancel",
-    		OnConfirm = function()
-    			Auto.log("FARMALL", "confirmed")
-    			Auto.opGate = true
-    			local toggle = Toggles.FarmAll
-    			if toggle then
-    				pcall(function() toggle:SetValue(true) end)
-    			end
-    			Auto.opGate = false
-    		end,
-    	})
-    end
     function Auto.stopEverything()
     	Auto.log("STOP", "everything")
-    	pcall(function() Toggles.FarmAll:SetValue(false) end)
+    	pcall(function() Toggles.SmartPlan:SetValue(false) end)
     	for _, name in ipairs(Auto.farmNames) do
     		local toggle = Toggles[name]
     		if toggle and toggle.Value then
@@ -33742,132 +33630,51 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	pcall(function() Toggles.UfoHop:SetValue(false) end)
     	notify("Auto Farm", "Everything stopped", 4)
     end
-    -- sensible defaults for a long AFK run
-    function Auto.recommended()
-    	local function set(id, value)
-    		local element = Toggles[id] or Options[id]
-    		if element then
-    			pcall(element.SetValue, element, value)
-    		end
-    	end
-    	set("FarmExclude", Auto.excludeDefaults)
-    	set("AutoTap", true)
-    	set("TargetMode", "Highest HP")
-    	set("HatchMode", "Max")
-    	set("SkipHatchAnim", true)
-    	set("AutoCodes", true)
-    	set("AutoAdminChat", true)
-    	set("AutoFriend", true)
-    	set("CorvusAntiAFK", true)
-    	set("KeepOnTeleport", true)
-    	Auto.log("RECOMMENDED", "applied")
-    	notify("Auto Farm", "Recommended settings applied", 4)
-    end
-
-    UI.AllBox = Tabs.Farm:AddLeftGroupbox("Auto Farm Everything", "rocket")
-    UI.AllBox:AddToggle("FarmAll", {
-    	Text = "Auto Farm Everything",
-    	Description = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
-    	Tooltip = "The planner buys eggs, hatches, fuses/upgrades pets, crafts and spends rubies and gems for max profit; it overrides your egg, world and upgrade picks and can use up pets and items. Anything in Exclude is never touched. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt. It asks for confirmation first.",
+    UI.AllBox = Tabs.Farm:AddLeftGroupbox("Quick Start", "rocket")
+    UI.AllBox:AddToggle("SmartPlan", {
+    	Text = "Smart Planner (best value)",
+    	Tooltip = "Lets the planner pick the egg, world and upgrade by payback over the next 24 hours, with real game odds. It overrides your egg, world and upgrade picks while on. Fusing, converting and selling stay on their own switches.",
     	Default = false,
     	Callback = function(v)
-    		if Auto.reverting then
-    			return
-    		end
-    		if v and not Auto.opGate and not Auto.myFilters() then
-    			task.defer(function()
-    				Auto.reverting = true
-    				pcall(function() Toggles.FarmAll:SetValue(false) end)
-    				Auto.reverting = false
-    				if os.clock() - Auto.bootAt >= 10 then
-    					Auto.opAsk()
-    				else
-    					Auto.log("FARMALL", "not started at launch")
-    				end
-    			end)
-    			return
-    		end
-    		task.spawn(Auto.farmOPSet, v)
-    	end,
-    })
-    UI.AllBox:AddDropdown("FarmMode", {
-    	Text = "Mode",
-    	Values = { "Best value", "My filters" },
-    	Default = "Best value",
-    	Tooltip = "Best value: the planner picks and spends for maximum profit (asks to confirm, respects Exclude). My filters: no planner and nothing destructive, it only runs the loops you pick in Run and keeps your egg, world and upgrade choices.",
-    	Callback = function(v)
-    		local filters = tostring(v) == "My filters"
-    		if UI.FarmRunDropdown then
-    			pcall(function() UI.FarmRunDropdown:SetVisible(filters) end)
-    		end
-    		if UI.FarmExcludeDropdown then
-    			pcall(function() UI.FarmExcludeDropdown:SetVisible(not filters) end)
-    		end
-    		if Toggles.FarmAll and Toggles.FarmAll.Value then
-    			-- switching the mode while running: stop the old set, start the new one (Best value asks again)
-    			Auto.reverting = true
-    			pcall(function() Toggles.FarmAll:SetValue(false) end)
-    			Auto.reverting = false
-    			task.spawn(Auto.farmOPSet, false)
-    			if filters then
-    				Auto.opGate = true
-    				pcall(function() Toggles.FarmAll:SetValue(true) end)
-    				Auto.opGate = false
-    			end
+    		S.farmOP = v == true
+    		S.farmAll = S.farmOP
+    		if not S.farmOP then
+    			S.worldSave = 0
     		end
     	end,
     })
-    UI.FarmRunDropdown = UI.AllBox:AddDropdown("FarmRun", {
-    	Text = "Run",
-    	Values = Auto.runLabels,
-    	Default = Auto.runDefaults,
-    	Multi = true,
-    	Searchable = true,
-    	AllowNull = true,
-    	Visible = false,
-    	Tooltip = "My filters runs only these loops when you switch on Auto Farm Everything. The list has no action that opens inventory eggs, fuses, converts, crafts, sells or spends rubies and gems. Buying eggs, fishing, worlds and upgrades are off until you pick them and follow your own egg, world and upgrade choices.",
-    	Callback = function(value)
-    		if Toggles.FarmAll and Toggles.FarmAll.Value and Auto.myFilters() then
-    			task.spawn(function()
-    				Auto.farmTurn("OP", Auto.runWanted())
-    			end)
-    		end
-    	end,
-    })
-    UI.FarmExcludeDropdown = UI.AllBox:AddDropdown("FarmExclude", {
-    	Text = "Exclude",
-    	Values = Auto.excludeLabels,
-    	Default = Auto.excludeDefaults,
-    	Multi = true,
-    	Searchable = true,
-    	AllowNull = true,
-    	Tooltip = "Things Auto Farm Everything never opens, fuses, sells or spends: premium eggs, top pet rarities, Golden and Diamond conversion, rubies, gems, potions, fruits and lucky blocks. Every skipped action is written to the log as EXCLUDE.",
-    	Callback = function(value)
-    		local set = {}
-    		if type(value) == "table" then
-    			for label, on in pairs(value) do
-    				local key = on and Auto.excludeKey[label]
-    				if key then
-    					set[key] = true
-    				end
-    			end
-    		end
-    		Auto.Excl.set = set
-    	end,
+    UI.AllBox:AddLabel({
+    	Text = '<font transparency="0.4">Every automation is its own switch in the tabs. The Smart Planner is the one that plans by payback.</font>',
+    	DoesWrap = true,
     })
     UI.AllBox:AddButton({
-    	Text = "Recommended Settings",
-    	Tooltip = "Protects premium eggs and the top pet rarities and turns on the settings that suit a long AFK run",
-    	Func = function()
-    		Auto.recommended()
-    	end,
-    }):AddButton({
     	Text = "Stop Everything",
-    	Tooltip = "Switches off Auto Farm Everything and every automatic toggle",
+    	Tooltip = "Switches off the Smart Planner and every automatic toggle",
     	Func = function()
     		Auto.stopEverything()
     	end,
     })
+    UI.AllBox:AddButton({
+    	Text = "Reset Hub Options",
+    	Tooltip = "Puts every toggle, dropdown, slider and input back to its default value. Saved configs are not deleted.",
+    	Func = function()
+    		Library:AskResetHubOptions(Library.ShareIgnore)
+    	end,
+    })
+    -- what changed a toggle is always in the log: the saved config at start (AUTOLOAD) or the player (CLICK)
+    Library.OnAutoload = function()
+    	local names = {}
+    	for name, toggle in pairs(Toggles) do
+    		if toggle.Value == true then
+    			table.insert(names, name)
+    		end
+    	end
+    	table.sort(names)
+    	Auto.log("AUTOLOAD", "toggles=" .. table.concat(names, ","))
+    end
+    Library.OnUserToggle = function(name, value)
+    	Auto.log("CLICK", name .. "=" .. tostring(value))
+    end
 
     local FarmBox = Tabs.Farm:AddLeftGroupbox("Farming", "swords")
     FarmBox:AddToggle("AutoFarm", {
@@ -33943,7 +33750,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     local AreaRow = StatusBox:AddStat({ Icon = "map-pin", Text = "Area", Value = "unknown", Size = 22, ValueColor = "FontColor" })
     UI.FarmWorldRow = StatusBox:AddStat({ Icon = "globe", Text = "Farm world", Value = "Off", Size = 22, ValueColor = "FontColor" })
     UI.UpNextBox = Tabs.Farm:AddRightGroupbox("Up next", "list-checks")
-    UI.UpNextLabel = UI.UpNextBox:AddLabel({ Text = "Switch on Auto Farm Everything and the next steps show here.", DoesWrap = true })
+    UI.UpNextLabel = UI.UpNextBox:AddLabel({ Text = "Switch on Smart Planner (or Auto Upgrade, Auto Buy Worlds) and the next steps show here.", DoesWrap = true })
     UI.UfoBox = Tabs.Ufo:AddRightGroupbox("UFO Event", "rocket")
     UI.UfoBox:AddToggle("AutoUfo", {
     	Text = "Auto Break UFO",
@@ -39802,7 +39609,7 @@ end
     				-- plain words for the UI; the raw numbers stay in the log (PLAN lines)
     				function Auto.upNextText()
     					if not Auto.farmOP() then
-    						return "Switch on Auto Farm Everything and the next steps show here."
+    						return "Switch on Smart Planner (or Auto Upgrade, Auto Buy Worlds) and the next steps show here."
     					end
     					if not P.ready then
     						return "Measuring your income, the plan shows up in a minute."
@@ -39954,11 +39761,33 @@ end
     					end
     				end
     
+    				-- the planner runs only while a switch that uses it is on
+    				function P.wanted()
+    					if Auto.farmOP() then
+    						return true
+    					end
+    					for _, name in ipairs({ "AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoBuyWorlds", "AutoHatch", "AutoRebirth", "AutoMoonPerm", "AutoMoonIncr", "AutoGolden", "AutoDiamond", "AutoInvEggs", "IndexHunter" }) do
+    						local toggle = Toggles[name]
+    						if toggle and toggle.Value then
+    							return true
+    						end
+    					end
+    					return false
+    				end
+
     				task.spawn(function()
     					while alive() do
     						task.wait(5)
     						local ok, err = pcall(function()
     							local now = os.clock()
+    							if not P.wanted() then
+    								-- idle hub: no planner maths, no PLAN/RATE log lines
+    								P.ready = false
+    								if UI.UpNextLabel then
+    									setLabel(UI.UpNextLabel, Auto.upNextText())
+    								end
+    								return
+    							end
     							P.compute()
     							plTrack(now)
     							if UI.UpNextLabel then
@@ -45335,21 +45164,14 @@ end
     })
     
     Library:AddCommand({
-    	Name = "farmall",
-    	Aliases = { "everything", "afk" },
+    	Name = "planner",
+    	Aliases = { "smart", "plan" },
     	Args = "[on/off]",
-    	Description = "Starts or stops Auto Farm Everything",
+    	Description = "Turns the Smart Planner on or off",
     	Callback = function(Args)
-    		local State = if Args[1] then Args[1] == "on" else not Toggles.FarmAll.Value
-    		if State then
-    			if Toggles.FarmAll.Value then
-    				return "Auto Farm Everything is already on"
-    			end
-    			Auto.opAsk()
-    			return "Confirm in the card to start Auto Farm Everything"
-    		end
-    		Toggles.FarmAll:SetValue(false)
-    		return "Auto Farm Everything off"
+    		local State = if Args[1] then Args[1] == "on" else not Toggles.SmartPlan.Value
+    		Toggles.SmartPlan:SetValue(State)
+    		return "Smart Planner " .. (if State then "on" else "off")
     	end,
     })
     
@@ -45581,7 +45403,7 @@ end
     
     if Library.SetQuickBar then
     	Library:SetQuickBar({
-    		{ Toggle = "FarmAll", Icon = "rocket", Label = "Farm All" },
+    		{ Toggle = "SmartPlan", Icon = "rocket", Label = "Planner" },
     		{ Toggle = "AutoFarm", Icon = "swords", Label = "Farm" },
     		{ Toggle = "AutoHatch", Icon = "egg", Label = "Eggs" },
     		{ Toggle = "AutoUfo", Icon = "rocket", Label = "UFO" },
@@ -45594,14 +45416,6 @@ end
     	})
     end
     
-    if not Saved.farmOneToast then
-    	Saved.farmOneToast = true
-    	pcall(saveStats, true)
-    	task.delay(4, function()
-    		notify("Auto Farm", "Auto Farm Everything is now one switch: full automatic. Protect valuable things in Exclude.", 9)
-    	end)
-    end
-
     UI.ExecBox = Tabs.Misc:AddRightGroupbox("Auto Execute", "zap")
     UI.ExecBox:AddToggle("KeepOnTeleport", {
     	Text = "Keep after teleport",
@@ -45994,16 +45808,13 @@ end
     	if tasks.hatch and type(values.egg) == "string" and Options.HatchEgg then
     		pcall(Options.HatchEgg.SetValue, Options.HatchEgg, values.egg)
     	end
-    	for key, ids in pairs(if tasks.everything then {} else map) do
+    	for key, ids in pairs(map) do
     		for _, id in ipairs(ids) do
     			local toggle = Toggles[id]
     			if toggle and (key ~= "hatch" or id ~= "EggAutoTravel" or tasks.hatch) then
     				pcall(toggle.SetValue, toggle, tasks[key] == true)
     			end
     		end
-    	end
-    	if tasks.everything then
-    		task.defer(Auto.opAsk)
     	end
     	local function set(id, value)
     		local element = Toggles[id] or Options[id]
@@ -46027,9 +45838,9 @@ end
     	Saved.setupDone = true
     	SaveDirty = true
     	saveStats(true)
-    	local labels = { everything = "Everything", farm = "Farm", hatch = "Eggs", index = "Index", rewards = "Rewards", upgrades = "Upgrades", worlds = "Worlds", ufo = "UFO", equip = "Best pets", fish = "Fishing" }
+    	local labels = { farm = "Farm", hatch = "Eggs", index = "Index", rewards = "Rewards", upgrades = "Upgrades", worlds = "Worlds", ufo = "UFO", equip = "Best pets", fish = "Fishing" }
     	local picked = {}
-    	for _, key in ipairs({ "everything", "farm", "hatch", "index", "rewards", "upgrades", "worlds", "ufo", "equip", "fish" }) do
+    	for _, key in ipairs({ "farm", "hatch", "index", "rewards", "upgrades", "worlds", "ufo", "equip", "fish" }) do
     		if tasks[key] then
     			table.insert(picked, labels[key])
     		end
@@ -46064,9 +45875,8 @@ end
     				Description = "Pick everything you want running. Tap again to unpick.",
     				Multi = true,
     				Required = true,
-    				Default = { "everything" },
+    				Default = { "farm", "hatch", "rewards", "upgrades", "equip" },
     				Choices = {
-    					{ Id = "everything", Title = "Auto Farm Everything", Description = "Full automatic with planned spending. Asks to confirm. Protect things in Exclude", Icon = "rocket", Color = "#60d696" },
     					{ Id = "farm", Title = "Farm coins", Description = "Breaks coins and chests at full speed", Icon = "swords", Color = "#e0a526" },
     					{ Id = "hatch", Title = "Open eggs", Description = "Buys your egg whenever you can afford it", Icon = "egg", Color = "#3ccf91" },
     					{ Id = "index", Title = "Complete the index", Description = "Hunts missing pets, crafts Golden and Diamond", Icon = "book-open", Color = "#5fb8ff" },
