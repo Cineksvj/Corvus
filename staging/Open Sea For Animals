@@ -31861,7 +31861,16 @@ end
 				if remote then
 					Library:GiveSignal(remote.OnClientEvent:Connect(function(...)
 						local args = table.pack(...)
-						log("EVENT", service .. "." .. name .. "(" .. argsText(args, 1, args.n) .. ")")
+						if service == "NotificationService" and name == "NotifySignal" and tostring(args[1]) == "Error" then
+							-- server refusals the hub already backs off from: log once per text per session as INFO (not a problem)
+							local key = string.gsub(tostring(args[2]), "%d+", "<n>")
+							if not NoticeSeen[key] then
+								NoticeSeen[key] = true
+								log("INFO", "game notice (seen once per session): " .. tostring(args[2]))
+							end
+						else
+							log("EVENT", service .. "." .. name .. "(" .. argsText(args, 1, args.n) .. ")")
+						end
 						task.spawn(function()
 							local ok, err = pcall(fn, table.unpack(args, 1, args.n))
 							if not ok then
