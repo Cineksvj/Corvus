@@ -27288,6 +27288,7 @@ end
                     "CorvusConfigList",
                     "CorvusShareCode",
                     "CorvusAutoSave",
+                    "FarmAll",
                 })
                 SaveManager:SetFolder(Folder)
                 if Info.SubFolder then
@@ -31656,12 +31657,12 @@ do
 		local value = option and option.Value
 		return if type(value) == "string" and value ~= "" then value else default
 	end
-	-- Auto Farm Everything (Normal) runs the player's own toggles and picks. Only "Auto Farm Everything OP" lets the planner override picks.
+	-- Auto Farm Everything = full automatic: the planner overrides the manual picks (stage, forge kind, class target).
 	function N.opActive()
-		return on("AutoFarmOP")
+		return on("AutoFarmBest")
 	end
 	function N.farmMode()
-		return if N.opActive() then "OP" else "Normal"
+		return if N.opActive() then "Auto Farm Everything" else "Manual"
 	end
 	function N.pickText(name, default)
 		if N.opActive() then
@@ -31863,6 +31864,47 @@ do
 			return N.rarityText(call(N.G.Weapon.GetRarity, item.ID))
 		end
 		return N.rarityText(call(N.G.Armor.GetRarity, item.ID))
+	end
+	-- Exclude (Main tab): resources the planner and the manual sell/forge/enhance/spend toggles never touch.
+	N.ExcludeValues = { "Ores: Legendary", "Ores: Eternal", "Ores: Secret", "Gear: Epic and better", "Gear: Legendary and better", "Season Coins", "Potions" }
+	N.ExcludeDefault = { "Ores: Eternal", "Ores: Secret", "Gear: Legendary and better" }
+	N.GearTiers = { { "Gear: Epic and better", "Epic" }, { "Gear: Legendary and better", "Legendary" } }
+	local ExcludeSeen = {}
+	function N.excludeNote(item)
+		local now = os.clock()
+		if now - (ExcludeSeen[item] or -1e9) > 120 then
+			ExcludeSeen[item] = now
+			log("EXCLUDE", item)
+		end
+	end
+	function N.oreExcluded(rarity, quiet)
+		if selected(Options.FarmExclude, "Ores: " .. tostring(rarity)) then
+			if not quiet then
+				N.excludeNote("ore " .. tostring(rarity))
+			end
+			return true
+		end
+		return false
+	end
+	function N.gearExcluded(rarity, quiet)
+		local rank = N.rarityRank(rarity)
+		for _, tier in ipairs(N.GearTiers) do
+			if selected(Options.FarmExclude, tier[1]) and rank >= N.rarityRank(tier[2]) then
+				if not quiet then
+					N.excludeNote("gear " .. tostring(rarity))
+				end
+				return true
+			end
+		end
+		return false
+	end
+	-- "Season Coins" and "Potions": the whole spending/using loop stays off.
+	function N.keepExcluded(name)
+		if selected(Options.FarmExclude, name) then
+			N.excludeNote(string.lower(name))
+			return true
+		end
+		return false
 	end
 	function N.gear()
 		local bp = N.backpack()
@@ -32773,7 +32815,7 @@ do
 	function N.forgePlanFor(kind, count)
 		local usable = {}
 		for _, ore in ipairs(N.ores()) do
-			if not ore.locked and not selected(Options.ForgeKeepRarities, ore.rarity) then
+			if not ore.locked and not selected(Options.ForgeKeepRarities, ore.rarity) and not N.oreExcluded(ore.rarity) then
 				table.insert(usable, ore)
 			end
 		end
@@ -32966,7 +33008,7 @@ do
 				why.equipped += 1
 			elseif g.locked then
 				why.locked += 1
-			elseif N.rarityRank(g.rarity) >= keepRank then
+			elseif N.rarityRank(g.rarity) >= keepRank or N.gearExcluded(g.rarity) then
 				why.rarity += 1
 			elseif counts[g.kind] <= keepBest + 1 then
 				why.best += 1
@@ -33001,7 +33043,7 @@ do
 				if sold >= 15 then
 					break
 				end
-				if not ore.locked and N.rarityRank(ore.rarity) < oreRank and sellable(ore.uuid) then
+				if not ore.locked and N.rarityRank(ore.rarity) < oreRank and not N.oreExcluded(ore.rarity) and sellable(ore.uuid) then
 					fire(N.R.sell, ore.uuid, ore.number)
 					markSold(ore.uuid)
 					sold += 1
@@ -33593,6 +33635,9 @@ do
 		return list, tonumber(mine.SeasonCoin) or 0
 	end
 	function N.seasonShopStep()
+		if N.keepExcluded("Season Coins") then
+			return false
+		end
 		local list, coins = N.seasonShopRanked()
 		local best = list[1]
 		if not best then
@@ -33684,7 +33729,7 @@ do
 	-- Potions: keeps one of each picked kind running while you have them.
 	N.PotionNames = { CoinPotion = "Coin", TrainPotion = "Train", LuckPotion = "Luck", DamagePotion = "Damage", HPPotion = "HP" }
 	function N.potionStep()
-		if not on("AutoPotions") then
+		if not on("AutoPotions") or N.keepExcluded("Potions") then
 			return
 		end
 		local buffs = N.store("Buff")
@@ -33741,6 +33786,125 @@ do
 		Session.classRolls += 1
 		N.ClassRoll.last = string.format("Rolled slot %s (was %s %s, %d rolls left)", tostring(index), rarity, tostring(class), rolls - 1)
 	end
+	-- Codes: the list lives in the repo (HubRepo .. "Codes", game name -> codes). Each code is tried once per account,
+	-- the outcome is remembered in Corvus/LTF_codes_<UserId>.txt ("R code" redeemed, "I code" invalid).
+	N.Codes = { redeemed = {}, invalid = {}, nRed = 0, nBad = 0, lastRun = -1e9, loaded = false, running = false }
+	local CodesFile = "Corvus/LTF_codes_" .. tostring(LocalPlayer.UserId) .. ".txt"
+	local function codesLoad()
+		local C = N.Codes
+		if C.loaded then
+			return
+		end
+		C.loaded = true
+		local ok, text = pcall(function()
+			return if isfile(CodesFile) then readfile(CodesFile) else ""
+		end)
+		if ok and type(text) == "string" then
+			for kind, code in string.gmatch(text, "(%u) (%S+)") do
+				local set = if kind == "R" then C.redeemed else C.invalid
+				if not set[code] then
+					set[code] = true
+					if kind == "R" then
+						C.nRed += 1
+					else
+						C.nBad += 1
+					end
+				end
+			end
+		end
+	end
+	local function codesSave()
+		local C = N.Codes
+		local out = {}
+		for code in pairs(C.redeemed) do
+			table.insert(out, "R " .. code)
+		end
+		for code in pairs(C.invalid) do
+			table.insert(out, "I " .. code)
+		end
+		table.sort(out)
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Corvus") then
+				makefolder("Corvus")
+			end
+			writefile(CodesFile, table.concat(out, "\n"))
+		end)
+	end
+	local function codeTry(code)
+		local C = N.Codes
+		local ok, result = invoke(N.R.code, 10, code)
+		Session.codes += 1
+		if not ok then
+			log("CODE", code, "no answer, will retry")
+			return nil
+		end
+		if result and result ~= false then
+			if not C.redeemed[code] then
+				C.redeemed[code] = true
+				C.nRed += 1
+			end
+			log("CODE", code, "redeemed")
+		else
+			if not C.invalid[code] then
+				C.invalid[code] = true
+				C.nBad += 1
+			end
+			log("CODE", code, "invalid")
+		end
+		codesSave()
+		return result and result ~= false
+	end
+	function N.codesList()
+		if N.CodeSource then
+			return N.CodeSource()
+		end
+		local ok, body = pcall(function()
+			return game:HttpGet(HubRepo .. "Codes")
+		end)
+		if not ok or type(body) ~= "string" or body == "" then
+			log("CODES list not available, skipped")
+			return nil
+		end
+		local ok2, data = pcall(function()
+			return HttpService:JSONDecode(body)
+		end)
+		if not ok2 or type(data) ~= "table" then
+			log("CODES list unreadable, skipped")
+			return nil
+		end
+		local list = data["+1 Loot To Forge"] or data["Loot To Forge"]
+		return if type(list) == "table" then list else nil
+	end
+	-- One pass over the known codes (2 s apart). Called at start and every 6 h.
+	function N.codesRun()
+		local C = N.Codes
+		if C.running then
+			return
+		end
+		C.running = true
+		C.lastRun = os.clock()
+		codesLoad()
+		local list = N.codesList()
+		local tried = 0
+		for _, code in ipairs(list or {}) do
+			if not alive() or not on("AutoCodes") then
+				break
+			end
+			if type(code) == "string" and not C.redeemed[code] and not C.invalid[code] then
+				if tried > 0 then
+					task.wait(2)
+				end
+				tried += 1
+				codeTry(code)
+			end
+		end
+		C.running = false
+		log("CODES pass", tried, "tried, redeemed", C.nRed, "invalid", C.nBad)
+	end
+	function N.codesText()
+		codesLoad()
+		return string.format("Codes redeemed %d / invalid %d", N.Codes.nRed, N.Codes.nBad)
+	end
 	function N.redeemCode(code)
 		code = tostring(code or ""):gsub("^%s+", ""):gsub("%s+$", "")
 		if code == "" then
@@ -33748,9 +33912,9 @@ do
 			return
 		end
 		task.spawn(function()
-			local ok, result = invoke(N.R.code, 10, code)
-			Session.codes += 1
-			notify("Codes", if ok and result then "Code sent: " .. code else "The game did not accept " .. code, 4)
+			codesLoad()
+			local result = codeTry(code)
+			notify("Codes", if result then "Code redeemed: " .. code elseif result == nil then "No answer from the game for " .. code else "The game did not accept " .. code, 4)
 		end)
 	end
 end
@@ -33797,15 +33961,11 @@ do
 			})
 		end)
 	end
-	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
-	Tabs.Farm = N.addTab("Farm", "swords", "Stage farm, ore pickup, Super Loot and Kill Aura")
+	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything, status and what comes next")
+	Tabs.Farm = N.addTab("Farm", "swords", "Stages, training, tower, world boss, Kill Aura and player")
 	Tabs.Forge = N.addTab("Forge", "hammer", "Forging, best gear and selling")
-	Tabs.Train = N.addTab("Train", "dumbbell", "Training areas")
-	Tabs.Events = N.addTab("Events", "castle", "Frostbound Tower and the world boss")
-	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Upgrades, rebirth and gear enhance")
-	Tabs.Rewards = N.addTab("Rewards", "gift", "Gifts, season luck and shop, index, quests and codes")
-	Tabs.Items = N.addTab("Items", "backpack", "Potions and class rolls")
-	Tabs.Player = N.addTab("Player", "user", "God mode, untouchable and walk speed")
+	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Upgrades, rebirth, gear enhance, potions and class rolls")
+	Tabs.Rewards = N.addTab("Rewards", "gift", "Gifts, season, index, quests and codes")
 	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and rates")
 	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts")
 	if Window.AddMiscTab then
@@ -33815,79 +33975,28 @@ do
 	end
 	Labels = {}
 	do
-		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
-		-- Every main farm toggle with its visible name; safe = nothing that sells, forges, enhances or spends the player's items or currency.
-		N.FarmSetItems = {
-			{ "Kill Aura", "KillAura", true },
-			{ "God Mode", "GodMode", true },
-			{ "Untouchable", "Untouchable", true },
-			{ "Auto Farm Stages", "AutoStages", true },
-			{ "Hunt Super Loot Runners", "AutoSuperLoot", true },
-			{ "Auto Train", "AutoTrain", true },
-			{ "Auto Forge", "AutoForge", false },
-			{ "Auto Equip Best Gear", "AutoEquip", true },
-			{ "Auto Sell Weak Gear", "AutoSellGear", false },
-			{ "Auto Buy Upgrades", "AutoUpgrade", false },
-			{ "Auto Enhance Equipped Gear", "AutoEnhance", false },
-			{ "Auto Rebirth", "AutoRebirth", false },
-			{ "Auto Tower", "AutoTower", true },
-			{ "Auto World Boss", "AutoWorldBoss", true },
-			{ "Claim Online Gifts", "AutoOnline", true },
-			{ "Claim Offline Reward", "AutoOffline", true },
-			{ "Auto Friend", "AutoFriend", true },
-			{ "Claim Index EXP And Levels", "AutoIndex", true },
-			{ "Claim Season Rewards", "AutoSeason", true },
-			{ "Spin Season Luck", "AutoSeasonLuck", false },
-			{ "Spend Season Coins", "AutoSeasonShop", false },
-			{ "Claim Daily Tower Ticket", "AutoTowerTicket", true },
-			{ "Claim Event Quests", "AutoQuests", true },
-			{ "Claim Update And Group Gifts", "AutoUpdateRewards", true },
-			{ "Auto Use Potions", "AutoPotions", false },
-			{ "Auto Class Roll", "AutoClassRoll", false },
+		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm Everything", "sparkles")
+		N.BootAt = os.clock()
+		-- Start-up guard: nothing may switch Auto Farm Everything on in the first 10 s (a loaded config, a stray call).
+		N.FarmGuard = true
+		task.delay(10, function()
+			N.FarmGuard = false
+		end)
+		-- Every toggle the planner runs while Auto Farm Everything is on. Exclude keeps the valuables out of selling, forging, enhancing and spending.
+		N.FarmOPOn = {
+			"KillAura", "GodMode", "Untouchable", "AutoStages", "AutoSuperLoot", "AutoTrain", "AutoForge", "AutoEquip", "AutoSellGear", "AutoUpgrade",
+			"AutoEnhance", "AutoRebirth", "AutoTower", "AutoWorldBoss", "AutoOnline", "AutoOffline", "AutoFriend", "AutoIndex", "AutoSeason",
+			"AutoSeasonLuck", "AutoSeasonShop", "AutoTowerTicket", "AutoQuests", "AutoUpdateRewards", "AutoPotions", "AutoClassRoll",
 		}
-		N.FarmSetKey, N.FarmSetNames, N.FarmSetSafe = {}, {}, {}
-		N.FarmBestOn = {}
-		for _, item in ipairs(N.FarmSetItems) do
-			N.FarmSetKey[item[1]] = item[2]
-			table.insert(N.FarmSetNames, item[1])
-			if item[3] then
-				table.insert(N.FarmSetSafe, item[1])
-			end
-			-- OP = everything the planner runs (the old Auto Farm Everything list; class rolls are new in it).
-			table.insert(N.FarmBestOn, item[2])
-		end
-		N.FarmOPOn = N.FarmBestOn
-		-- Plain (Normal) mode runs exactly the toggles picked in "Farm Everything includes", OP runs every toggle with the planner in charge.
-		N.FarmApplied = {}
-		function N.farmNormalKeys()
-			local keys = {}
-			for _, name in ipairs(picked(Options.FarmSet)) do
-				local key = N.FarmSetKey[name]
-				if key then
-					table.insert(keys, key)
-				end
-			end
-			return keys
-		end
-		function N.applyFarm(kind, value)
-			local other = if kind == "op" then "AutoFarmBest" else "AutoFarmOP"
-			if value and on(other) then
-				-- The two modes exclude each other: switching one on switches the other (and what it turned on) off.
-				N.applyFarm(if kind == "op" then "normal" else "op", false)
-				local t = Toggles[other]
-				if t and t.Value then
-					N.FarmQuiet = true
-					t:SetValue(false)
-					N.FarmQuiet = false
-				end
-			end
+		N.FarmApplied = nil
+		function N.applyFarm(value)
 			local list
 			if value then
-				list = if kind == "op" then N.FarmOPOn else N.farmNormalKeys()
-				N.FarmApplied[kind] = list
+				list = N.FarmOPOn
+				N.FarmApplied = list
 			else
-				list = N.FarmApplied[kind] or {}
-				N.FarmApplied[kind] = nil
+				list = N.FarmApplied or {}
+				N.FarmApplied = nil
 			end
 			for _, name in ipairs(list) do
 				local toggle = Toggles[name]
@@ -33895,36 +34004,123 @@ do
 					toggle:SetValue(value)
 				end
 			end
-			log("FARM", kind, if value then "on" else "off", #list)
+			log("FARM", if value then "on" else "off", #list)
 		end
+		-- Remember Auto Farm Everything (default off): neither switch is part of a saved config (SaveManager ignore list),
+		-- the state lives in Corvus/LTF_auto_farm.txt and is restored only when Remember is on.
+		local FarmFile = "Corvus/LTF_auto_farm.txt"
+		function N.saveFarmState()
+			if N.FarmGuard or N.FarmRestoring then
+				return
+			end
+			pcall(function()
+				if makefolder and isfolder and not isfolder("Corvus") then
+					makefolder("Corvus")
+				end
+				local remember = on("RememberFarm")
+				writefile(FarmFile, string.format("remember=%d farm=%d", if remember then 1 else 0, if remember and on("AutoFarmBest") then 1 else 0))
+			end)
+		end
+		function N.farmEnable()
+			N.FarmQuiet = true
+			Toggles.AutoFarmBest:SetValue(true)
+			N.FarmQuiet = false
+			N.applyFarm(true)
+			N.saveFarmState()
+		end
+		function N.restoreFarm()
+			local ok, text = pcall(function()
+				return readfile(FarmFile)
+			end)
+			if not ok or type(text) ~= "string" or string.find(text, "remember=1", 1, true) == nil or not alive() then
+				return
+			end
+			N.FarmRestoring = true
+			pcall(function()
+				Toggles.RememberFarm:SetValue(true)
+			end)
+			N.FarmRestoring = false
+			if string.find(text, "farm=1", 1, true) and not on("AutoFarmBest") then
+				log("REMEMBER restore Auto Farm Everything")
+				N.farmEnable()
+			end
+		end
+		N.OPText = "Full automatic: the planner trains, farms, forges, enhances, rolls classes and spends for max profit. Can consume or sell your items (Exclude protects the ones you pick)."
+		N.OPWarn = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
 		QuickBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "Turns on exactly the toggles picked below, with your own settings (stage, forge kind, class target). No planner overrides. Turning it off turns them off again",
+			Tooltip = N.OPText .. " " .. N.OPWarn,
 			Callback = function(value)
 				if N.FarmQuiet then
 					return
 				end
+				if value and N.FarmGuard then
+					task.defer(function()
+						N.FarmQuiet = true
+						Toggles.AutoFarmBest:SetValue(false)
+						N.FarmQuiet = false
+					end)
+					log("FARM blocked by the start-up guard")
+					return
+				end
 				task.defer(function()
-					N.applyFarm("normal", value)
+					if not value then
+						N.applyFarm(false)
+						N.saveFarmState()
+						return
+					end
+					-- The toggle stays off until the card is confirmed.
+					N.FarmQuiet = true
+					Toggles.AutoFarmBest:SetValue(false)
+					N.FarmQuiet = false
+					N.confirmOP(function()
+						log("OP confirmed")
+						N.farmEnable()
+					end)
 				end)
 			end,
 		})
-		QuickBox:AddDropdown("FarmSet", {
-			Text = "Farm Everything includes",
-			Values = N.FarmSetNames,
-			Default = N.FarmSetSafe,
+		QuickBox:AddToggle("RememberFarm", {
+			Text = "Remember Auto Farm Everything",
+			Default = false,
+			Tooltip = "Starts Auto Farm Everything again the next time the hub loads. " .. N.OPWarn,
+			Callback = function()
+				task.defer(N.saveFarmState)
+			end,
+		})
+		QuickBox:AddDropdown("FarmExclude", {
+			Text = "Exclude",
+			Values = N.ExcludeValues,
+			Default = N.ExcludeDefault,
 			Multi = true,
 			AllowNull = true,
-			Tooltip = "The toggles Auto Farm Everything switches on. The default is everything safe: nothing that sells, forges, enhances or spends your items and coins. Add those yourself if you want them",
+			Tooltip = "Never sold, forged, enhanced or spent, by Auto Farm Everything or by any toggle: ores and gear of the picked tiers, Season Coins (no Season Shop buys) and potions (none used)",
+		})
+		QuickBox:AddButton({
+			Text = "Recommended Settings",
+			Tooltip = "Sets every option to the values the planner works best with. Does not switch Auto Farm Everything on",
+			Func = function()
+				N.recommended()
+			end,
+		})
+		QuickBox:AddButton({
+			Text = "Stop Everything",
+			Func = function()
+				N.stopAll()
+			end,
+		})
+		QuickBox:AddLabel({
+			Text = '<font transparency="0.35">One switch, fully automatic. Everything in the other tabs still works on its own when this is off.</font>',
+			DoesWrap = true,
 		})
 		-- The confirmation card (Library:ShowDiscordPrompt style). Library:ShowConfirm is used when the library has it.
 		function N.confirmOP(onYes)
 			if Library.ShowConfirm then
 				local ok = pcall(Library.ShowConfirm, Library, {
-					Title = "Auto Farm Everything OP",
+					Title = "Auto Farm Everything",
 					Description = N.OPText .. "\n\n" .. N.OPWarn,
-					ConfirmText = "I understand, enable OP",
+					ConfirmText = "I understand, enable",
 					CancelText = "Cancel",
 					Callback = onYes,
 				})
@@ -33963,7 +34159,7 @@ do
 					l.Parent = root
 					return l
 				end
-				text("Auto Farm Everything OP", 12, 20, 16, true)
+				text("Auto Farm Everything", 12, 20, 16, true)
 				text(N.OPText, 38, 88, 13, false)
 				text(N.OPWarn, 128, 64, 12, true).TextColor3 = Color3.fromRGB(255, 140, 60)
 				local function button(label, x, accent, fn)
@@ -33988,70 +34184,66 @@ do
 					end)
 					b.Parent = root
 				end
-				button("I understand, enable OP", 0, true, onYes)
+				button("I understand, enable", 0, true, onYes)
 				button("Cancel", 0.5, false, nil)
 				root.Parent = Library.ScreenGui
 				N.OPCard = root
 			end)
 			if not ok then
-				notify("Auto Farm Everything OP", "The confirmation could not be shown, nothing was changed", 5)
+				notify("Auto Farm Everything", "The confirmation could not be shown, nothing was changed", 5)
 			end
 		end
-		N.OPText = "Full automatic: the planner trains, farms, forges, enhances, rolls classes and spends for max profit. Can consume or sell your items."
-		N.OPWarn = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt."
-		QuickBox:AddToggle("AutoFarmOP", {
-			Text = "Auto Farm Everything OP",
-			Default = false,
-			Tooltip = N.OPText .. " " .. N.OPWarn,
-			Callback = function(value)
-				if N.FarmQuiet then
-					return
+		-- Recommended Settings: the values the planner works best with (no automation is switched on or off here).
+		function N.recommended()
+			local function set(name, value)
+				local holder = Toggles[name] or Options[name]
+				if holder then
+					pcall(holder.SetValue, holder, value)
 				end
-				task.defer(function()
-					if not value then
-						N.applyFarm("op", false)
-						return
-					end
-					-- The toggle stays off until the card is confirmed.
-					N.FarmQuiet = true
-					Toggles.AutoFarmOP:SetValue(false)
-					N.FarmQuiet = false
-					N.confirmOP(function()
-						log("OP confirmed")
-						N.FarmQuiet = true
-						Toggles.AutoFarmOP:SetValue(true)
-						N.FarmQuiet = false
-						N.applyFarm("op", true)
-					end)
-				end)
-			end,
-		})
-		QuickBox:AddLabel({
-			Text = '<font transparency="0.35">Normal runs the toggles you picked above with your own settings. OP is the full planner. Everything in the other tabs still works on its own.</font>',
-			DoesWrap = true,
-		})
-		QuickBox:AddToggle("AutoStages", {
-			Text = "Auto Farm Stages",
-			Default = false,
-			Tooltip = "Runs the stages in order up to the best one you can clear, picks up every ore and banks the pack when it is full",
-		})
+			end
+			set("StageMode", "Auto (by power)")
+			set("StageMargin", 100)
+			set("BankHP", 35)
+			set("PickOres", "Deepest stage only")
+			set("StuckSeconds", 20)
+			set("AuraMode", "Real damage")
+			set("ForgeType", "Auto (best value)")
+			set("SellKeepBest", 2)
+			set("SellKeepRarity", "Legendary")
+			set("SellOresBelow", "Off")
+			set("TrainArea", "Best open")
+			set("TowerStart", "Highest unlocked")
+			set("UpgradeKinds", { ["Ore Pack"] = true, Train = true, Luck = true })
+			set("EnhanceMax", 20)
+			set("ClassTarget", "Auto (expected value)")
+			set("PotionKinds", { Train = true, Coin = true, Luck = true, Damage = true, HP = true })
+			local exclude = {}
+			for _, name in ipairs(N.ExcludeDefault) do
+				exclude[name] = true
+			end
+			set("FarmExclude", exclude)
+			set("AutoEquip", true)
+			set("AutoCodes", true)
+			log("RECOMMENDED settings applied")
+			notify("Recommended Settings", "Options set. Switch Auto Farm Everything on when you are ready.", 5)
+		end
 		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		Labels.Plan = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 		StatusBox:AddButton({
 			Text = "Bank Ores Now",
 			Func = function()
 				task.spawn(N.bank, "button")
 			end,
 		})
-		StatusBox:AddButton({
-			Text = "Stop Everything",
-			Func = function()
-				N.stopAll()
-			end,
-		})
+		local NextBox = Tabs.Main:AddRightGroupbox("Up next", "list-checks")
+		Labels.Next = NextBox:AddLabel({ Text = "-", DoesWrap = true })
 		local StageBox = Tabs.Farm:AddLeftGroupbox("Stage Farm", "swords")
+		StageBox:AddToggle("AutoStages", {
+			Text = "Auto Farm Stages",
+			Default = false,
+			Tooltip = "Runs the stages in order up to the best one you can clear, picks up every ore and banks the pack when it is full",
+		})
 		StageBox:AddDropdown("StageMode", {
 			Text = "Deepest Stage",
 			Values = { "Auto (by power)", "Pick a stage" },
@@ -34175,7 +34367,7 @@ do
 		Labels.Sell = SellBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
-		local TrainBox = Tabs.Train:AddLeftGroupbox("Training", "dumbbell")
+		local TrainBox = Tabs.Farm:AddLeftGroupbox("Training", "dumbbell")
 		TrainBox:AddToggle("AutoTrain", {
 			Text = "Auto Train",
 			Default = false,
@@ -34191,7 +34383,7 @@ do
 		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
-		local TowerBox = Tabs.Events:AddLeftGroupbox("Frostbound Tower", "castle")
+		local TowerBox = Tabs.Farm:AddLeftGroupbox("Frostbound Tower", "castle")
 		TowerBox:AddToggle("AutoTower", {
 			Text = "Auto Tower",
 			Default = false,
@@ -34199,7 +34391,7 @@ do
 		})
 		TowerBox:AddDropdown("TowerStart", { Text = "Start At", Values = { "Highest unlocked", "Floor 1" }, Default = "Highest unlocked" })
 		Labels.Tower = TowerBox:AddLabel({ Text = "-", DoesWrap = true })
-		local BossBox = Tabs.Events:AddRightGroupbox("World Boss", "skull")
+		local BossBox = Tabs.Farm:AddRightGroupbox("World Boss", "skull")
 		BossBox:AddToggle("AutoWorldBoss", {
 			Text = "Auto World Boss",
 			Default = false,
@@ -34351,6 +34543,12 @@ do
 		SeasonBox:AddToggle("AutoSeasonShop", { Text = "Spend Season Coins", Default = false, Tooltip = "Prices every Season Shop item in coins and buys the best value per Season Coin, saving for it when needed" })
 		Labels.Season = SeasonBox:AddLabel({ Text = "-", DoesWrap = true })
 		local CodeBox = Tabs.Rewards:AddLeftGroupbox("Codes", "ticket")
+		CodeBox:AddToggle("AutoCodes", {
+			Text = "Auto redeem known codes",
+			Default = true,
+			Tooltip = "Fetches the list of known codes at start and every 6 hours and redeems each one once per account",
+		})
+		Labels.Codes = CodeBox:AddLabel({ Text = "-", DoesWrap = true })
 		CodeBox:AddInput("CodeText", { Text = "Code", Placeholder = "Type a code from the game's socials", Finished = false, Default = "" })
 		CodeBox:AddButton({
 			Text = "Redeem",
@@ -34360,7 +34558,7 @@ do
 		})
 	end
 	do
-		local PotionBox = Tabs.Items:AddLeftGroupbox("Potions", "flask-conical")
+		local PotionBox = Tabs.Upgrades:AddRightGroupbox("Potions", "flask-conical")
 		PotionBox:AddToggle("AutoPotions", { Text = "Auto Use Potions", Default = false, Tooltip = "Keeps one potion of each picked kind running while you have them" })
 		PotionBox:AddDropdown("PotionKinds", {
 			Text = "Potion Kinds",
@@ -34369,7 +34567,7 @@ do
 			Multi = true,
 			AllowNull = true,
 		})
-		local ClassBox = Tabs.Items:AddRightGroupbox("Class Rolls", "wand-sparkles")
+		local ClassBox = Tabs.Upgrades:AddLeftGroupbox("Class Rolls", "wand-sparkles")
 		ClassBox:AddToggle("AutoClassRoll", {
 			Text = "Auto Class Roll",
 			Default = false,
@@ -34384,10 +34582,10 @@ do
 		Labels.Class = ClassBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
-		local PowerBox = Tabs.Player:AddLeftGroupbox("Player", "shield-plus")
+		local PowerBox = Tabs.Farm:AddRightGroupbox("Player", "shield-plus")
 		PowerBox:AddToggle("GodMode", { Text = "God Mode", Default = false, Tooltip = "Your HP becomes a trillion and stays full, nothing can kill you, so ores are never lost" })
 		PowerBox:AddToggle("Untouchable", { Text = "Untouchable", Default = false, Tooltip = "Enemy attacks never hit you at all (stages, the tower and the world boss)" })
-		local MoveBox = Tabs.Player:AddRightGroupbox("Movement", "activity")
+		local MoveBox = Tabs.Farm:AddRightGroupbox("Movement", "activity")
 		MoveBox:AddToggle("SpeedHack", { Text = "Walk Speed", Default = false })
 		MoveBox:AddSlider("WalkSpeed", { Text = "Speed", Default = 60, Min = 16, Max = 250, Rounding = 0 })
 	end
@@ -34569,7 +34767,6 @@ do
 end
 N.AllAutoToggles = {
 	"AutoFarmBest",
-	"AutoFarmOP",
 	"KillAura",
 	"GodMode",
 	"Untouchable",
@@ -35683,7 +35880,9 @@ do
 			for _, slot in ipairs({ "Weapon", "Hat" }) do
 				local uuid = bp.equiped[slot]
 				local item = uuid and bp.have[uuid]
-				if type(item) == "table" then
+				if type(item) == "table" and N.gearExcluded(N.gearRarity(item)) then
+					-- excluded tier: never enhanced
+				elseif type(item) == "table" then
 					local step = N.enhanceNext(item)
 					if step and step.level < N.enhanceMaxLevel() and N.material("EnhantStone_1") >= step.stone1 and N.material("EnhantStone_2") >= step.stone2 then
 						local protect = step.level >= failLevel and N.material("EnhantProtect") > 0
@@ -35715,6 +35914,7 @@ do
 		local best = list[1]
 		if not best then
 			P.spendText = "nothing pays back within 24 h"
+			P.spendNext = nil
 			return nil
 		end
 		local coins = N.coin()
@@ -35735,6 +35935,11 @@ do
 					break
 				end
 			end
+		end
+		do
+			local target = pick or best
+			local what = if target.kind == "upgrade" then string.format("%s upgrade level %d", N.UpgradeNames[target.up.kind] or target.up.kind, target.up.level + 1) else string.format("%s enhance to +%d", target.slot, target.step.level + 1)
+			P.spendNext = if pick then "Buy " .. what .. " now" else "Buy " .. what .. (if eta == math.huge then " when coins allow" else " in " .. N.longTime(eta))
 		end
 		local alt = {}
 		for i = 2, math.min(#list, 3) do
@@ -35954,8 +36159,7 @@ do
 			toggleCommand("rebirth", {}, { "AutoRebirth" }, "Auto Rebirth")
 			toggleCommand("tower", { "dungeon" }, { "AutoTower" }, "Auto Tower")
 			toggleCommand("boss", { "worldboss" }, { "AutoWorldBoss" }, "Auto World Boss")
-			toggleCommand("farmall", { "farmbest", "all", "farm" }, { "AutoFarmBest" }, "Auto Farm Everything")
-			toggleCommand("farmop", { "op" }, { "AutoFarmOP" }, "Auto Farm Everything OP")
+			toggleCommand("farmall", { "farmbest", "all", "farm", "op", "farmop" }, { "AutoFarmBest" }, "Auto Farm Everything")
 			Library:AddCommand({
 				Name = "bank",
 				Description = "Banks the ores in your pack and leaves the stage",
@@ -36019,7 +36223,6 @@ do
 		pcall(function()
 			Library:SetQuickBar({
 				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm All" },
-				{ Toggle = "AutoFarmOP", Icon = "zap", Label = "OP" },
 				{ Toggle = "AutoStages", Icon = "swords", Label = "Stages" },
 				{ Toggle = "AutoTrain", Icon = "dumbbell", Label = "Train" },
 				{ Toggle = "AutoForge", Icon = "hammer", Label = "Forge" },
@@ -36059,7 +36262,7 @@ do
 			writefile(flag, "1")
 		end)
 		if N.setupDone() then
-			notify("Auto Farm Everything", "Auto Farm Everything is now on Main. Normal = your toggles, OP = full automatic.", 9)
+			notify("Auto Farm Everything", "Auto Farm Everything on Main is now one full-automatic switch. Exclude keeps your valuables safe.", 9)
 		end
 	end
 	function N.openWizard()
@@ -36078,8 +36281,7 @@ do
 					Required = true,
 					Default = { "farm" },
 					Choices = {
-						{ Id = "farm", Title = "Auto Farm Everything", Description = "One switch for the safe toggles you pick on Main: stages, Super Loot, training, gear, tower, world boss and rewards. Never sells or spends your items", Icon = "sparkles", Color = "#60d696" },
-						{ Id = "op", Title = "OP preset", Description = "Auto Farm Everything OP: the planner trains, farms, forges, enhances, rolls classes and spends for max profit. Can consume or sell your items, you confirm it first", Icon = "zap", Color = "#ff6b6b" },
+						{ Id = "farm", Title = "Auto Farm Everything", Description = "Full automatic: the planner trains, farms, forges, enhances, rolls classes and spends for max profit. Can consume or sell your items (Exclude on Main protects the ones you pick), you confirm it first", Icon = "sparkles", Color = "#60d696" },
 						{ Id = "stages", Title = "Farm stages", Description = "Fights the best stage for your power, picks every ore and banks them safely", Icon = "swords", Color = "#fab428" },
 						{ Id = "train", Title = "Train", Description = "Trains in the best open area when the next rebirth pays more than a run", Icon = "dumbbell", Color = "#3ccf91" },
 						{ Id = "forge", Title = "Forge and gear", Description = "Forges from your strongest ores and equips the best weapon, armor and hat", Icon = "hammer", Color = "#5fb8ff" },
@@ -36100,12 +36302,12 @@ do
 					rewards = { "AutoOnline", "AutoOffline", "AutoIndex", "AutoSeason", "AutoSeasonLuck", "AutoSeasonShop", "AutoTowerTicket", "AutoQuests", "AutoUpdateRewards", "AutoPotions" },
 				}
 				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] and not chosen.farm and not chosen.op then "on" else "off" })
+					setToggles(names, { if chosen[id] and not chosen.farm then "on" else "off" })
 				end
 				N.markSetupDone()
-				setToggles({ "AutoFarmBest" }, { if chosen.farm and not chosen.op then "on" else "off" })
-				if chosen.op then
-					setToggles({ "AutoFarmOP" }, { "on" })
+				if chosen.farm then
+					N.FarmGuard = false
+					setToggles({ "AutoFarmBest" }, { "on" })
 				end
 				notify("Quick setup done", "Change anything in the tabs any time", 5)
 			end,
@@ -36116,6 +36318,14 @@ do
 		})
 	end
 end
+-- Auto Farm Everything and its Remember switch are never part of a saved config (see Remember in p06).
+pcall(function()
+	if type(SaveManager) == "table" then
+		SaveManager.Ignore = SaveManager.Ignore or {}
+		SaveManager.Ignore.AutoFarmBest = true
+		SaveManager.Ignore.RememberFarm = true
+	end
+end)
 if Window.AddSettingsTab then
 	local ok, tab = pcall(Window.AddSettingsTab, Window, {
 		ThemeManager = ThemeManager,
@@ -36392,6 +36602,50 @@ do
 		end
 		task.wait(0.25)
 	end)
+	-- "Up next" in plain words (3-5 lines); the raw planner numbers stay in the PLAN log lines.
+	function N.upNextText()
+		local Pl = N.Plan
+		local next = {}
+		local r = N.rebirth()
+		local function describe(o)
+			if o.kind == "train" then
+				if o.eta and o.eta ~= math.huge then
+					return "Train " .. N.longTime(o.eta) .. " to rebirth " .. (r + 1)
+				end
+				return "Train toward rebirth " .. (r + 1)
+			elseif o.kind == "farm" then
+				return "Farm stage " .. tostring(o.stage) .. " for ores"
+			elseif o.kind == "tower" then
+				return "Run the tower (tickets ready)"
+			end
+			return "Fight the world boss"
+		end
+		for i = 1, math.min(#Pl.options, 2) do
+			table.insert(next, (if i == 1 then "Now: " else "Then: ") .. describe(Pl.options[i]))
+		end
+		if Pl.spendNext and (on("AutoUpgrade") or on("AutoEnhance")) then
+			table.insert(next, Pl.spendNext)
+		end
+		if on("AutoForge") then
+			local kind = N.forgeKind()
+			local per = math.max(N.forgeCount(kind), 1)
+			local usable = 0
+			for _, ore in ipairs(N.ores()) do
+				if not ore.locked and not selected(Options.ForgeKeepRarities, ore.rarity) and not N.oreExcluded(ore.rarity, true) then
+					usable += ore.number
+				end
+			end
+			local times = math.floor(usable / per)
+			table.insert(next, if times >= 1 then string.format("Forge %s x%d", string.lower(kind), times) else string.format("Forge %s when %d ores are ready", string.lower(kind), per))
+		end
+		if on("AutoRebirth") then
+			local m = N.rebirthMath()
+			if m then
+				table.insert(next, "Rebirth " .. (r + 1) .. " at level " .. tostring(m.need))
+			end
+		end
+		return if #next > 0 then "\u{2022} " .. table.concat(next, "\n\u{2022} ") else "Turn on Auto Farm Everything to get a plan"
+	end
 	-- Builds every label text here, the draw thread below only copies strings.
 	N.InfoText = {}
 	task.spawn(function()
@@ -36431,6 +36685,7 @@ do
 					end
 					I.plan = if #lines > 0 then '<font transparency="0.3">Plan  \u{00B7}  ' .. table.concat(lines, "\n") .. "</font>" else "Plan: measuring"
 				end
+				I.upnext = N.upNextText()
 				-- Every stage with your odds: green you clear it, yellow close, red too strong for now.
 				local rows = {}
 				local now = os.clock()
@@ -36577,6 +36832,27 @@ do
 			task.wait(0.5)
 		end
 	end)
+	-- Auto redeem known codes: once shortly after start, then every 6 hours.
+	task.spawn(function()
+		task.wait(20)
+		while alive() do
+			if on("AutoCodes") and os.clock() - N.Codes.lastRun >= 21600 then
+				local ok, err = pcall(N.codesRun)
+				if not ok then
+					N.Codes.running = false
+					N.Codes.lastRun = os.clock()
+					log("ERROR", "codes", tostring(err))
+				end
+			end
+			task.wait(10)
+		end
+	end)
+	-- Remember Auto Farm Everything: restored once the start-up guard is over.
+	task.delay(10.5, function()
+		if alive() then
+			pcall(N.restoreFarm)
+		end
+	end)
 	local function shown(tab)
 		if tab == nil or Library.Toggled == false then
 			return false
@@ -36609,15 +36885,16 @@ do
 					group(function()
 						Labels.Status:SetText(Status)
 						Labels.Info:SetText(I.info or "-")
-						if Labels.Plan then
-							Labels.Plan:SetText(I.plan or "-")
-						end
+						Labels.Next:SetText(I.upnext or "-")
 					end)
 				end
 				if shown(Tabs.Farm) then
 					group(function()
 						Labels.Stages:SetText(I.stages or "-")
 						Labels.Super:SetText(I.super or "-")
+						Labels.Train:SetText(I.train or "-")
+						Labels.Tower:SetText(I.tower or "-")
+						Labels.Boss:SetText(I.boss or "-")
 					end)
 				end
 				if shown(Tabs.Forge) then
@@ -36627,33 +36904,19 @@ do
 						Labels.Sell:SetText(I.sell or "-")
 					end)
 				end
-				if shown(Tabs.Train) then
-					group(function()
-						Labels.Train:SetText(I.train or "-")
-					end)
-				end
 				if shown(Tabs.Upgrades) then
 					group(function()
 						Labels.Upgrades:SetText(I.upgrades or "-")
 						Labels.Rebirth:SetText(I.rebirth or "-")
 						Labels.Enhance:SetText(I.enhance or "-")
-					end)
-				end
-				if shown(Tabs.Events) then
-					group(function()
-						Labels.Tower:SetText(I.tower or "-")
-						Labels.Boss:SetText(I.boss or "-")
+						Labels.Class:SetText(I.class or "-")
 					end)
 				end
 				if shown(Tabs.Rewards) then
 					group(function()
 						Labels.Rewards:SetText(I.rewards or "-")
 						Labels.Season:SetText(I.season or "-")
-					end)
-				end
-				if shown(Tabs.Items) then
-					group(function()
-						Labels.Class:SetText(I.class or "-")
+						Labels.Codes:SetText(N.codesText())
 					end)
 				end
 				if shown(Tabs.Stats) then
@@ -36735,7 +36998,7 @@ do
 	end)
 	if Library.ShowWizard and not N.setupDone() then
 		task.delay(1.5, function()
-			if on("AutoStages") or on("AutoFarmBest") or on("AutoFarmOP") or on("AutoTrain") then
+			if on("AutoStages") or on("AutoFarmBest") or on("AutoTrain") then
 				N.markSetupDone()
 				return
 			end
