@@ -28664,9 +28664,42 @@ local BootOk, BootError = xpcall(function()
 			end
 			return v == value
 		end
+		-- Smart Planner runs its own sea, training, selling, eggs and spending; the player's own toggles are never flipped
+		local PlannerDrives = {
+			AutoSea = "sea", AutoTrain = "train", TrainSea = "train", AutoSell = "sell", AutoPlaceEggs = "eggs", AutoHatch = "eggs",
+			AutoEquipBest = "spend", AutoUpgrade = "spend", AutoBuyStaff = "spend", AutoEquipStaff = "spend",
+			AutoBuyDumbbell = "spend", AutoEquipDumbbell = "spend", AutoRebirth = "spend",
+		}
 		function on(name)
 			local t = Toggles[name]
-			return t ~= nil and t.Value == true
+			if t ~= nil and t.Value == true then
+				return true
+			end
+			if t ~= nil and PlannerDrives[name] then
+				local p = Toggles.AutoPlanner
+				return p ~= nil and p.Value == true
+			end
+			return false
+		end
+		function Game.drivenBy(name)
+			local t = Toggles[name]
+			local p = Toggles.AutoPlanner
+			return PlannerDrives[name] ~= nil and not (t ~= nil and t.Value == true) and p ~= nil and p.Value == true
+		end
+		function Game.drives()
+			local parts, seen, names = {}, {}, {}
+			for name, part in pairs(PlannerDrives) do
+				if Game.drivenBy(name) then
+					table.insert(names, name)
+					if not seen[part] then
+						seen[part] = true
+						table.insert(parts, part)
+					end
+				end
+			end
+			table.sort(parts)
+			table.sort(names)
+			return parts, names
 		end
 		-- No master switch. Smart Planner (AutoPlanner) lets the planner decide; there is no exclude list any more.
 		function Game.myFilters()
@@ -29981,7 +30014,7 @@ local BootOk, BootError = xpcall(function()
 							if pos then
 								local boss = model:GetAttribute("BossId")
 								if boss then
-									if on("BossItems") and mode == "Teleport" then
+									if on("BossItems") and mode == "Teleport" and not Game.bossBlocked(boss) then
 										local stand = Vector3.new(pos.X, groundY(pos.X, pos.Z, pos.Y + 8, pos.Y - 1) + hrpOffset(), pos.Z)
 										table.insert(list, {
 											model = model,
@@ -30372,6 +30405,24 @@ local BootOk, BootError = xpcall(function()
 		function isBlatant()
 			return (Options.SeaMove and Options.SeaMove.Value) == "Blatant" and not Sea.instant.off
 		end
+		local BossLogAt = {}
+		function Game.bossLeft(id)
+			if id == nil then
+				return 0
+			end
+			local data = Data()
+			local cds = type(data) == "table" and data.BossCooldowns
+			local readyAt = type(cds) == "table" and tonumber(cds[id]) or nil
+			return if readyAt then math.max(0, readyAt - os.time()) else 0
+		end
+		function Game.bossBlocked(id)
+			local left = Game.bossLeft(id)
+			if left > 0 and os.clock() - (BossLogAt[id] or -1e9) > 60 then
+				BossLogAt[id] = os.clock()
+				log("BOSS", tostring(id), "reward on cooldown for", math.floor(left) .. "s, its item is skipped until then")
+			end
+			return left > 0
+		end
 		local function spawnInfo(spawn)
 			local e = type(spawn) == "table" and spawn.entity
 			if type(e) ~= "table" or e.id == nil then
@@ -30579,7 +30630,7 @@ local BootOk, BootError = xpcall(function()
 				local info = if blockKey then nil else spawnInfo(spawn)
 				if info then
 					total += 1
-					if matches(info, "Catch", minValue) then
+					if matches(info, "Catch", minValue) and not (spawn.isBossItem and Game.bossBlocked(spawn.bossId)) then
 						table.insert(list, { id = spawn.entity.id, info = info, boss = spawn.isBossItem, plate = tonumber(spawn.wavePart) })
 					end
 				end
@@ -31702,14 +31753,14 @@ local BootOk, BootError = xpcall(function()
 			table.sort(list, function(a, b)
 				return a.info.value < b.info.value
 			end)
-			if (Options.SellMode and Options.SellMode.Value) == "Smart" then
+			if Game.sellMode() == "Smart" then
 				-- Smart ignores the sell filters: the best eggs (two plot loads) and a few animals stay, the rest is cash
 				local smart = {}
 				for key, entry in pairs(data and data.Inventory or {}) do
 					local info = entryInfo(entry)
 					local locked = info ~= nil and entry.innerEntity.locked == true
 					local cap = parseAmount(Options.SellBelow and Options.SellBelow.Value)
-					local mine = info ~= nil and not Game.opMode() and (isProtected(info) or (cap ~= nil and info.value >= cap))
+					local mine = info ~= nil and (isProtected(info) or (not Game.opMode() and cap ~= nil and info.value >= cap))
 					if info and not info.special and (not locked or isProtected(info)) and not mine and not Game.opExcluded(info) and not (Game.event ~= nil and Game.event.wanted(info)) then
 						table.insert(smart, { key = key, info = info, kind = entry.itemType, locked = locked })
 					end
@@ -31739,6 +31790,12 @@ local BootOk, BootError = xpcall(function()
 			end
 			return list
 		end
+		function Game.sellMode()
+			if Game.drivenBy("AutoSell") then
+				return "Smart"
+			end
+			return Options.SellMode and Options.SellMode.Value or "Filtered"
+		end
 		Sea.fullHint = function()
 			if not on("AutoSell") then
 				return ", turn on Auto Sell or sell some items"
@@ -31757,7 +31814,7 @@ local BootOk, BootError = xpcall(function()
 				equipBest(false)
 				task.wait(0.6)
 			end
-			local mode = Options.SellMode and Options.SellMode.Value or "Filtered"
+			local mode = Game.sellMode()
 			if mode == "Sell All Unlocked" and Game.opMode() and type(Options.OPExclude and Options.OPExclude.Value) == "table" and next(Options.OPExclude.Value) ~= nil then
 				-- the game's Sell All cannot skip excluded items: sell one by one instead
 				mode = "Filtered"
@@ -33606,9 +33663,13 @@ local BootOk, BootError = xpcall(function()
 	do
 		do
 			local setIdentity = setthreadidentity or set_thread_identity or setidentity or (syn and syn.set_thread_identity)
-			if setIdentity then
-				pcall(setIdentity, 8)
+			-- a thread resumed by a game script runs with the game's rights and cannot touch the hub UI any more
+			function Game.fixIdentity()
+				if setIdentity then
+					pcall(setIdentity, 8)
+				end
 			end
+			Game.fixIdentity()
 		end
 		Window = Library:CreateWindow({
 			Title = "Corvus",
@@ -33671,10 +33732,10 @@ local BootOk, BootError = xpcall(function()
 			SeaBox:AddToggle("AutoPlanner", {
 				Text = "Smart Planner (best value)",
 				Default = false,
-				Tooltip = "Lets the planner pick what to catch, sell, spend and train by payback, with the real game odds: Smart Sell budget, upgrade and rebirth order, TRAIN and SEA split. It overrides the catch, egg and priority picks while on. Auto Sell, upgrades and potions still need their own switches.",
+				Tooltip = "Runs the farm by itself with the real game odds: opens the sea, trains (TRAIN and SEA split), places and hatches eggs, Smart Sells (your Protect lists stay) and spends on upgrades, staffs, dumbbells and rebirth by payback. Your own switches are not changed. Potions and rewards keep their own switches.",
 			})
 			SeaBox:AddLabel({
-				Text = '<font transparency="0.35">Every automation is its own switch in the tabs and nothing turns on by itself. Smart Planner only decides how the switches you turned on spend and train.</font>',
+				Text = '<font transparency="0.35">Every automation is its own switch in the tabs and nothing turns on by itself. Smart Planner alone runs the sea, training, eggs, selling and spending for you; turn it off and only your own switches run.</font>',
 				DoesWrap = true,
 			})
 			SeaBox:AddButton({
@@ -35954,6 +36015,7 @@ local BootOk, BootError = xpcall(function()
 	end
 	task.spawn(function()
 		while alive() do
+			Game.fixIdentity()
 			local ok, err = xpcall(function()
 				if manualRunning() then
 					return
@@ -36000,6 +36062,7 @@ local BootOk, BootError = xpcall(function()
 			task.wait(if isBlatant() then 0.02 else 0.2)
 		end
 	end)
+	local PlannerDriveKey, PlannerProblem = nil, false
 	task.spawn(function()
 		local last = {}
 		local function every(key, seconds)
@@ -36068,6 +36131,24 @@ local BootOk, BootError = xpcall(function()
 						runJob(job[2], job[4])
 					end
 				end
+				if Game.opMode() then
+					if every("plan", 5) then
+						local parts, names = Game.drives()
+						local key = table.concat(names, ",")
+						if key ~= PlannerDriveKey then
+							PlannerDriveKey = key
+							log("PLAN drive " .. (if #parts > 0 then table.concat(parts, "|") else "none") .. (if #names > 0 then " (toggles off: " .. key .. ")" else ""))
+						end
+						local okPlan, errPlan = xpcall(Game.plan, debug.traceback)
+						if not okPlan and not PlannerProblem then
+							PlannerProblem = true
+							log("PROBLEM planner", tostring(errPlan))
+							logProblem("planner: " .. (string.match(tostring(errPlan), "^[^\n]*") or "error"))
+						end
+					end
+				else
+					PlannerDriveKey = nil
+				end
 				if on("AutoEquipBest") and not isWaveActive() and every("equip", 12) then
 					runJob("equip", function()
 						equipBest(false)
@@ -36089,8 +36170,33 @@ local BootOk, BootError = xpcall(function()
 	end)
 	task.spawn(function()
 		local uiErrorAt = -1e9
+		-- UI writes that fail for missing thread rights run again on the frame thread (connected here, with the hub's rights)
+		local UiQueue, uiMoved = {}, false
+		pcall(function()
+			game:GetService("RunService").Heartbeat:Connect(function()
+				if #UiQueue == 0 then
+					return
+				end
+				local queue = UiQueue
+				UiQueue = {}
+				for _, fn in ipairs(queue) do
+					pcall(fn)
+				end
+			end)
+		end)
 		local function group(fn)
+			Game.fixIdentity()
 			local ok, err = xpcall(fn, debug.traceback)
+			if not ok and string.find(tostring(err), "lacking capability", 1, true) then
+				if #UiQueue < 20 then
+					table.insert(UiQueue, fn)
+				end
+				if not uiMoved then
+					uiMoved = true
+					log("UI thread lost its rights, UI updates now run on the frame thread")
+				end
+				return
+			end
 			if not ok and os.clock() - uiErrorAt > 30 then
 				uiErrorAt = os.clock()
 				local lines = {}
@@ -36133,6 +36239,13 @@ local BootOk, BootError = xpcall(function()
 					end
 					local plan = Game.lastPlan
 					local lines = {}
+					local parts = Game.drives()
+					if #parts > 0 then
+						table.insert(lines, "Planner runs " .. table.concat(parts, ", ") .. " for you")
+					end
+					if plan and plan.best and plan.best.ratio and plan.best.ratio > 0 then
+						table.insert(lines, "Best use of money: " .. plan.best.name .. ", pays back in ~" .. clockText(1 / plan.best.ratio))
+					end
 					if plan then
 						local target = plan.target
 						if target then
