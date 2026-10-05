@@ -27970,6 +27970,29 @@ local BootOk, BootError = xpcall(function()
 		local function kindLabel(info)
 			return if info.kind == "Egg" then "Eggs" else "Animals"
 		end
+		-- event animals (CollectEventConfig.EVENTS[*].index lists) always pass the animal picker
+		local EventAnimals, EventAnimalsAt = {}, -1e9
+		function Game.isEventAnimal(typeName)
+			if os.clock() - EventAnimalsAt > 30 then
+				EventAnimalsAt = os.clock()
+				local cfg = Game.CollectEventConfig
+				local set = {}
+				if type(cfg) == "table" and type(cfg.EVENTS) == "table" and type(cfg.GetIndexItems) == "function" then
+					for id, ev in pairs(cfg.EVENTS) do
+						if type(ev) == "table" and ev.index then
+							local ok, items = pcall(cfg.GetIndexItems, id)
+							for _, item in ipairs(ok and type(items) == "table" and items or {}) do
+								if type(item) == "table" and item.id ~= nil then
+									set[item.id] = true
+								end
+							end
+						end
+					end
+				end
+				EventAnimals = set
+			end
+			return EventAnimals[typeName] == true
+		end
 		function matches(info, prefix, minValue)
 			if not info then
 				return false
@@ -27982,7 +28005,7 @@ local BootOk, BootError = xpcall(function()
 			end
 			if prefix == "Catch" and info.kind ~= "Egg" then
 				local pick = Options.CatchAnimals and Options.CatchAnimals.Value
-				if type(pick) == "table" and next(pick) ~= nil and pick[info.name] ~= true then
+				if type(pick) == "table" and next(pick) ~= nil and pick[info.name] ~= true and not Game.isEventAnimal(info.type) then
 					return false
 				end
 			end
@@ -29456,7 +29479,17 @@ local BootOk, BootError = xpcall(function()
 				end
 			end
 		end
+		local instantCycleInner
 		local function instantCycle()
+			Sea.instantBusy = true
+			local ok, result = pcall(instantCycleInner)
+			Sea.instantBusy = false
+			if not ok then
+				error(result, 0)
+			end
+			return result
+		end
+		function instantCycleInner()
 			local I = Sea.instant
 			Game.callGap = 0.03
 			if not inSpawn() then
@@ -29628,7 +29661,7 @@ local BootOk, BootError = xpcall(function()
 			return folder and folder:FindFirstChild("Collect")
 		end
 		onEvent("CollectEventService", "OnPickupsCreated", function(payload)
-			if not (on("AutoStars") and isBlatant()) or type(payload) ~= "table" or type(payload.events) ~= "table" then
+			if not on("AutoStars") or type(payload) ~= "table" or type(payload.events) ~= "table" then
 				return
 			end
 			for eventId, event in pairs(payload.events) do
@@ -29642,11 +29675,15 @@ local BootOk, BootError = xpcall(function()
 		task.spawn(function()
 			while alive() do
 				local now = os.clock()
-				while #Stars.claims > 0 and Stars.claims[1] < now - 20 do
+				if now - (Stars.logAt or 0) >= 60 then
+						Stars.logAt = now
+						log("STARS mode=" .. tostring(Options.SeaMove and Options.SeaMove.Value) .. " queued=" .. #Stars.queue)
+					end
+					while #Stars.claims > 0 and Stars.claims[1] < now - 20 do
 					table.remove(Stars.claims, 1)
 				end
 				-- pickups vanish with their wave: drop the ones older than 15 s
-				while #Stars.queue > 0 and Stars.queue[1][3] < now - 15 do
+				while #Stars.queue > 0 and Stars.queue[1][3] < now - 60 do
 					table.remove(Stars.queue, 1)
 				end
 				local remote = collectRemote()
@@ -29671,7 +29708,7 @@ local BootOk, BootError = xpcall(function()
 							end
 						end
 					end)
-					task.wait(0.045)
+					task.wait(0.046) -- even pacing, just under 450 claims per 20 s
 				else
 					task.wait(0.1)
 				end
@@ -30904,15 +30941,16 @@ local BootOk, BootError = xpcall(function()
 				return ids
 			end
 			local names = {}
+			local cap = math.max(math.min(2, capacity - 1), 0)
 			for _, block in ipairs(blocks) do
-				if #ids < capacity and block.cfg.type == "Admin" then
+				if #ids < cap and block.cfg.type == "Admin" then
 					table.insert(ids, block.id)
 					table.insert(names, block.key)
 				end
 			end
 			if #ids > 0 then
 				Lucky.taken += #ids
-				log("LUCKY take", table.concat(names, ","), "event", Game.activeEvent("adminEvent") or "none", "of", #blocks, "blocks in the wave")
+				log("LUCKY take n=" .. #ids .. " cap=" .. cap, table.concat(names, ","), "event", Game.activeEvent("adminEvent") or "none", "of", #blocks, "blocks in the wave")
 			end
 			return ids
 		end
@@ -30930,7 +30968,7 @@ local BootOk, BootError = xpcall(function()
 			return n
 		end
 		function Lucky.open()
-			if os.clock() < Lucky.backoffUntil or isWaveActive() then
+			if os.clock() < Lucky.backoffUntil or isWaveActive() or isTraining() or Sea.instantBusy then
 				return false
 			end
 			local owned = luckyInventory()
@@ -30968,11 +31006,6 @@ local BootOk, BootError = xpcall(function()
 					task.wait(0.08)
 				end
 				ok = tool.Parent == nil or luckyInventory() < owned
-				pcall(function()
-					if hum then
-						hum:UnequipTools()
-					end
-				end)
 			end
 			log(string.format("LUCKY found=%d open=%s ok=%s", Lucky.found, name, tostring(ok)))
 			if ok then
