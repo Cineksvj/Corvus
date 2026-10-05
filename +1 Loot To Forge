@@ -30668,6 +30668,11 @@ do
 	N.G.SuperLoot = N.tableOr(safeRequire("Config.SuperLoot.Helper"))
 	N.G.Enhant = N.tableOr(safeRequire("Config.Enhant.Helper"))
 	N.G.Season = N.tableOr(safeRequire("Config.Season.Helper"))
+	-- Profit engine v2 inputs: the stage loot rolls, the forge roll and the training formula, all the game's own.
+	N.G.StageLoots = N.tableOr(safeRequire("Config.Stage.Loots"))
+	N.G.OreLoots = N.tableOr(safeRequire("Config.Stage.OreLoots"))
+	N.G.Calc = N.tableOr(safeRequire("Utils.CalculateUtils"))
+	N.G.ForgeUtils = N.tableOr(safeRequire("Utils.ForgeUtils"))
 end
 local formatNumber, allows, selected, on, optionNumber, optionText, Status, setStatus, picked
 do
@@ -31141,7 +31146,20 @@ do
 	end
 	-- The deepest stage worth farming: the game's recommended power against yours, minus any stage that beat
 	-- the hub recently (too slow to kill or the HP guard pulled out).
+	-- The stage a run goes to: the deepest one the power allows (below), or the one with the best coins per second
+	-- below it when the profit planner has run data (p09_plan). A run keeps the target it started with.
 	function N.stageTarget()
+		local cap = N.stageTargetByPower()
+		if optionText("StageMode", "Auto (by power)") ~= "Auto (by power)" then
+			return cap
+		end
+		local planned = if F.run and F.runTarget then F.runTarget elseif N.Plan then N.Plan.stage else nil
+		if planned then
+			return math.max(1, math.min(cap, planned))
+		end
+		return cap
+	end
+	function N.stageTargetByPower()
 		local list = N.stageList()
 		if #list == 0 then
 			return 1
@@ -31571,12 +31589,19 @@ do
 			return N.fightMode() ~= "Stage"
 		end, 4)
 		Session.banks += 1
+		-- A full pack is a complete run: it calibrates the planner's run model (seconds per run at this depth).
+		if reason == "pack full" and F.runStartedAt and N.planNoteRun then
+			pcall(N.planNoteRun, F.runTarget or F.stage, os.clock() - F.runStartedAt, packNow)
+		end
 		F.lastBank = reason
 		F.run = false
 		F.stage = 0
+		F.runTarget = nil
+		F.runStartedAt = nil
 		table.clear(F.seen)
-		if on("AutoTrain") then
-			F.trainUntil = os.clock() + math.clamp(optionNumber("TrainBetween", 90), 0, 1800)
+		-- No fixed training break: the planner compares the next run with training right away.
+		if N.planRefresh then
+			pcall(N.planRefresh, true)
 		end
 	end
 	function N.enterStage(n)
@@ -31608,10 +31633,14 @@ do
 		if N.fightMode() ~= nil or N.dead() then
 			return false
 		end
+		F.run = false
+		F.runTarget = nil
+		local target = N.stageTarget()
 		F.run = true
+		F.runTarget = target
+		F.runStartedAt = os.clock()
 		F.seen = {}
 		Session.runs += 1
-		local target = N.stageTarget()
 		F.lastRun = string.format("target stage %d, power %s", target, formatNumber(N.power()))
 		log("RUN", Session.runs, F.lastRun)
 		N.enterStage(1)
@@ -31644,6 +31673,9 @@ do
 		local packNow, packMax = N.pack()
 		local enemies = N.enemies("EnemyFolder", F.stage)
 		if #enemies > 0 then
+			if not F.seen[F.stage] then
+				F.fightStart = os.clock()
+			end
 			F.seen[F.stage] = true
 			F.idleSince = nil
 			F.clearedAt = nil
@@ -31687,13 +31719,23 @@ do
 		-- The pack is small and deeper stages drop better ores, so ores are only picked on the deepest stage of
 		-- the run (unless every stage is picked on purpose). Low stages are just cleared to unlock the next one.
 		local pickHere = optionText("PickOres", "Deepest stage only") == "Every stage" or F.stage >= target or os.clock() < N.Super.pickUntil
+		local pickStart = os.clock()
 		if pickHere and N.collectOne() then
+			if N.planNotePick then
+				N.planNotePick(os.clock() - pickStart)
+			end
 			setStatus(string.format("Stage %d: picking ores  \u{00B7}  pack %d/%d", F.stage, N.pack()))
 			return
 		end
 		if F.seen[F.stage] then
 			-- The ores drop once the server answers, give them a moment before moving on.
-			F.clearedAt = F.clearedAt or os.clock()
+			if not F.clearedAt then
+				F.clearedAt = os.clock()
+				if F.fightStart and N.planNoteClear then
+					N.planNoteClear(F.clearedAt - F.fightStart)
+				end
+				F.fightStart = nil
+			end
 			if pickHere and os.clock() - F.clearedAt < 2.5 then
 				setStatus(string.format("Stage %d: cleared, waiting for the drops", F.stage))
 				task.wait(0.2)
@@ -31771,14 +31813,30 @@ do
 		local forge = world and world:FindFirstChild("ForgeTable")
 		return forge and (forge:FindFirstChild("Part") or forge:FindFirstChildWhichIsA("BasePart", true))
 	end
+	-- "Auto (best value)": the profit planner prices every kind and ore count with the game's own forge roll
+	-- (N.forgeChoice). Without the game's forge module it falls back to alternating with the slider count.
+	local function autoChoice()
+		if optionText("ForgeType", "Auto (best value)") ~= "Auto (best value)" or not N.forgeChoice then
+			return nil
+		end
+		return N.forgeChoice()
+	end
 	function N.forgeKind()
-		local pick = optionText("ForgeType", "Alternate")
+		local pick = optionText("ForgeType", "Auto (best value)")
 		if pick == "Weapon" or pick == "Armor" then
 			return pick
+		end
+		local choice = autoChoice()
+		if choice then
+			return choice.kind
 		end
 		return Fo.alternate
 	end
 	function N.forgeCount(kind)
+		local choice = autoChoice()
+		if choice and choice.kind == kind then
+			return choice.count
+		end
 		local count = math.clamp(math.floor(optionNumber("ForgeOres", 8)), 4, 23)
 		if kind == "Weapon" then
 			count = math.min(count, 13)
@@ -31790,7 +31848,9 @@ do
 	-- (seen in the log as "Forge refused: nil" every time the plan used 5 or 6 stacks).
 	N.ForgeSlots = 4
 	function N.forgePlan(kind)
-		local count = N.forgeCount(kind)
+		return N.forgePlanFor(kind, N.forgeCount(kind))
+	end
+	function N.forgePlanFor(kind, count)
 		local usable = {}
 		for _, ore in ipairs(N.ores()) do
 			if not ore.locked and not selected(Options.ForgeKeepRarities, ore.rarity) then
@@ -31865,6 +31925,17 @@ do
 			if not plan then
 				break
 			end
+			-- When the expected forged item is worth less than the same ores sold, the ores are sold.
+			local choice = autoChoice()
+			if choice and choice.perOre < choice.salePerOre then
+				log("PLAN forge", "selling", total, "ores: forged item", formatNumber(choice.perOre), "per ore < sale", formatNumber(choice.salePerOre))
+				for uuid, n in pairs(plan) do
+					fire(N.R.sell, uuid, n)
+					Session.sold += n
+				end
+				N.Plan.forge.at = -1e9
+				break
+			end
 			local table_ = N.forgeTable()
 			if table_ and N.myPos() and (N.myPos() - table_.Position).Magnitude > 12 then
 				setStatus("Going to the forge table")
@@ -31881,8 +31952,12 @@ do
 			Session.forged += 1
 			Fo.at = os.clock()
 			noteForge(result, kind)
-			if optionText("ForgeType", "Alternate") == "Alternate" then
+			if optionText("ForgeType", "Auto (best value)") ~= "Weapon" and optionText("ForgeType", "Auto (best value)") ~= "Armor" then
 				Fo.alternate = if kind == "Weapon" then "Armor" else "Weapon"
+			end
+			if choice then
+				log("PLAN forge", kind, "x" .. total, "value per ore", formatNumber(choice.perOre), "sale per ore", formatNumber(choice.salePerOre))
+				N.Plan.forge.at = -1e9
 			end
 			-- Wait for the backpack update so the next plan does not reuse the same ores.
 			local pushes = N.Store.pushes
@@ -32032,48 +32107,24 @@ do
 		end
 		return { kind = kind, level = level, price = tonumber(row.Price) or math.huge, number = row.Number }
 	end
-	-- How much one level improves its stat, relative to what you have now, per coin:
-	--   Ore Pack: +1 slot = (cap+1)/cap more ores every run.
-	--   Train: +x% train boost on top of (1 + current) = relative gain in training speed.
-	--   Luck: same for ore luck.
-	-- The best gain per coin is bought first (saving for it), cheap ones only while they pay back as well.
-	function N.upgradeValue(nextUp)
-		local levels = N.G.Upgrade[nextUp.kind] or {}
-		local now = levels[nextUp.level] or {}
-		local nowNumber = tonumber(now.Number) or 0
-		local nextNumber = tonumber(nextUp.number) or nowNumber
-		if nextUp.kind == "OrePack" then
-			local _, cap = N.pack()
-			return (nextNumber - nowNumber) / math.max(cap, 1)
-		end
-		return (nextNumber - nowNumber) / (1 + nowNumber)
-	end
+	-- The upgrades the planner can price right now (N.upgradeGain in p09_plan: Ore Pack = more ores per run from the
+	-- run model, Luck = better ore odds from the game's loot roll, Train = more rebirths), best gain per coin first.
 	function N.upgradeOptions()
 		local list = {}
-		for _, kind in ipairs(N.UpgradeKinds) do
-			if allows(Options.UpgradeKinds, N.UpgradeNames[kind]) then
-				local nextUp = N.upgradeNext(kind)
-				if nextUp then
-					nextUp.gain = N.upgradeValue(nextUp)
-					nextUp.perCoin = nextUp.gain / math.max(nextUp.price, 1)
-					table.insert(list, nextUp)
-				end
+		for _, option in ipairs(N.spendOptions()) do
+			if option.kind == "upgrade" then
+				option.up.gain = option.gain
+				option.up.perCoin = option.perCoin
+				table.insert(list, option.up)
 			end
 		end
-		table.sort(list, function(a, b)
-			return a.perCoin > b.perCoin
-		end)
 		return list
 	end
+	-- Buys only what the profit planner picks (N.spendPick): the best gain per coin among upgrades and enhance
+	-- tries, saving for it unless a cheaper option pays back before the saving is done.
 	function N.upgradeStep()
-		local best
-		local options = N.upgradeOptions()
-		for _, option in ipairs(options) do
-			if option.price <= N.coin() then
-				best = option
-				break
-			end
-		end
+		local pick = N.spendPick()
+		local best = if pick and pick.kind == "upgrade" then pick.up else nil
 		if best and best.price <= N.coin() then
 			fire(N.R.upgrade, best.kind)
 			log("UPGRADE", best.kind, "to", best.level + 1, "for", best.price)
@@ -32088,14 +32139,13 @@ do
 	-- Gear enhance (Backpack/EnhantEquipmentRF(uuid, useProtect), opens at rebirth 6). Level L -> L+1 costs coins
 	-- and EnhantStone_1/_2 (the stones fall from every stage for free, the pack never holds them, so they are idle
 	-- capital) and succeeds with the chance in Config.Enhant.Config. Every level adds a boost to the item's main
-	-- stat, which the gear score already includes. Levels 1-5 are the cheap ones (26k coins and 135 stones in all,
-	-- 100%/100%/85%/75%/65%, about 6 tries for 5 levels) and a failed try below level 6 loses nothing but the cost, so the
-	-- default stops at +5. From +6 a failure can lower the item, so deeper levels are only tried on purpose (the
-	-- slider) and then with a Protection Scroll whenever one is in the pack. Only equipped gear is enhanced, the
-	-- weapon first (Train power), and a try needs coins x3 in the bank so upgrades stay funded.
+	-- stat, which the gear score already includes. Which try is worth its coins is the planner's call (N.spendPick):
+	-- success chance x the training the level adds (weapon Train power, hat Train boost), minus the level a failure
+	-- takes from +6 on (no scroll), against every other use of the coins. Body armor only adds defence, so it is
+	-- not enhanced. The slider is only a ceiling.
 	N.Enhance = { last = "", tried = {}, pauseUntil = 0, refused = 0, tries = 0 }
 	function N.enhanceMaxLevel()
-		return math.clamp(math.floor(optionNumber("EnhanceMax", 5)), 1, 20)
+		return math.clamp(math.floor(optionNumber("EnhanceMax", 20)), 1, 20)
 	end
 	function N.enhanceNext(item)
 		local config = N.call(N.G.Enhant.GetConfig)
@@ -32123,18 +32173,13 @@ do
 			return false
 		end
 		local bp = N.backpack()
-		local maxLevel = N.enhanceMaxLevel()
-		local failLevel = tonumber(N.call(N.G.Enhant.GetFailLevel)) or 6
-		for _, slot in ipairs({ "Weapon", "Armor", "Hat" }) do
-			local uuid = bp.equiped[slot]
-			local item = uuid and bp.have[uuid]
-			if type(item) == "table" then
-				local step = N.enhanceNext(item)
-				local last = E.tried[uuid]
-				if step and step.level < maxLevel and (not last or os.clock() - last > 5)
-					and N.material("EnhantStone_1") >= step.stone1 and N.material("EnhantStone_2") >= step.stone2
-					and N.coin() >= step.coin * 3 then
-					local protect = step.level >= failLevel and N.material("EnhantProtect") > 0
+		local pick = N.spendPick()
+		if pick and pick.kind == "enhance" and pick.step.coin <= N.coin() then
+			local slot, uuid, step, protect = pick.slot, pick.uuid, pick.step, pick.protect
+			local item = bp.have[uuid]
+			local last = E.tried[uuid]
+			if type(item) == "table" and (not last or os.clock() - last > 5) then
+				do
 					local coinBefore, stonesBefore = N.coin(), N.material("EnhantStone_1") + N.material("EnhantStone_2")
 					E.tried[uuid] = os.clock()
 					local ok, result = invoke(N.R.enhance, 10, uuid, protect)
@@ -32252,13 +32297,13 @@ do
 		end
 		N.Train.area = area.id
 		N.Train.since = N.Train.since or os.clock()
-		local left = N.Fight.trainUntil - os.clock()
+		local best = N.Plan and N.Plan.best
 		setStatus(string.format(
 			"Training in area %d (x%s)  \u{00B7}  level %d%s",
 			area.id,
 			formatNumber(area.basic),
 			N.level(),
-			if on("AutoStages") and left > 0 then "  \u{00B7}  next run in " .. N.longTime(left) else ""
+			if best and best.kind == "train" and best.eta then "  \u{00B7}  rebirth in " .. N.longTime(best.eta) else ""
 		))
 		task.wait(1)
 		Session.trainSeconds += 1
@@ -32313,11 +32358,29 @@ do
 		end
 		return floor
 	end
+	-- Power needed before the tower is worth a ticket again after it beat us (0 = no block).
+	N.Tower.needPower = 0
 	function N.towerReady()
-		return N.rebirth() >= 2 and N.towerTickets() > 0 and os.clock() - N.Tower.at > 20 and os.clock() >= N.Tower.pauseUntil
+		return N.rebirth() >= 2
+			and N.towerTickets() > 0
+			and os.clock() - N.Tower.at > 20
+			and os.clock() >= N.Tower.pauseUntil
+			and N.power() >= (N.Tower.needPower or 0)
+	end
+	-- Enemy HP of one floor (the game's round table, mobs and boss).
+	function N.towerFloorHP(round)
+		local config = N.call(N.G.Dungeon.GetConfig)
+		local row = type(config) == "table" and config[round]
+		if type(row) ~= "table" then
+			return nil
+		end
+		local hp = math.max(tonumber(row.MobHP) or 0, tonumber(row.BossHP) or 0)
+		return if hp > 0 then hp else nil
 	end
 	-- Called by the game's death event. Two deaths in a row on the same floor or lower mean the tower is too
-	-- strong right now: every death costs a ticket and a long respawn, so the tower rests while you train.
+	-- strong: every death costs a ticket and a long respawn. No fixed rest: the tower waits until the power has
+	-- grown by the floor's HP step (HP of the floor that killed us / HP of the floor before, from the game's round
+	-- table), because damage grows with power and that floor was out of reach at today's power.
 	function N.towerDied()
 		local T = N.Tower
 		local round = tonumber(T.round) or 0
@@ -32327,10 +32390,11 @@ do
 		T.deathStreak += 1
 		T.lastDeathRound = round
 		if T.deathStreak >= 2 then
-			local rest = math.min(600 * (T.deathStreak - 1), 3600)
-			T.pauseUntil = os.clock() + rest
-			T.last = string.format("Died %d times around floor %d, resting %s", T.deathStreak, round, N.longTime(rest))
-			logProblem("Tower too strong around floor " .. round .. ", resting " .. N.longTime(rest))
+			local hp, before = N.towerFloorHP(round), N.towerFloorHP(round - 1)
+			local step = if hp and before and before > 0 then math.max(hp / before, 1.01) else 2
+			T.needPower = math.max(N.power(), 1) * step
+			T.last = string.format("Died %d times around floor %d, waiting for power %s", T.deathStreak, round, formatNumber(T.needPower))
+			logProblem(string.format("Tower too strong around floor %d, waiting for power %s (x%.2f)", round, formatNumber(T.needPower), step))
 		else
 			T.last = "Died on floor " .. round
 		end
@@ -32380,7 +32444,8 @@ do
 		if os.clock() - T.emptySince > 30 then
 			T.stalls += 1
 			T.emptySince = nil
-			T.pauseUntil = os.clock() + 120
+			-- Retry after as long as this run lasted (a server hang, not a power problem).
+			T.pauseUntil = os.clock() + math.max(os.clock() - T.startedAt, 30)
 			T.last = "Stuck on floor " .. tostring(round or "?") .. ", left the tower"
 			logProblem("Tower stuck on floor " .. tostring(round or "?") .. " with no enemies, leaving")
 			fire(N.R.towerExit)
@@ -32571,36 +32636,61 @@ do
 			noteReward("Season luck x" .. n)
 		end
 	end
-	-- Season Shop: Season Coins have no other use, so everything is spent, strictly in this order (saving for the
-	-- first item that still has stock, 2-day stock refresh): tower ticket (one ticket = up to 50 floors of
-	-- rewards), Train potion, Class roll, Damage potion, Enhance stones (feed the gear enhance), Protection
-	-- Scroll, then the Season weapon and hats (bought last, the best gear is equipped by score anyway). The 2000
-	-- coin deal and the extra Season Ticket (800 coins for a spin worth less than that) are skipped.
-	N.SeasonShopOrder = { "12", "9", "5", "10", "8", "6", "4", "3", "2", "1" }
-	function N.seasonShopStep()
+	-- Season Shop: every good with stock is priced in coins by the planner (N.seasonGoodValue: tower ticket = the
+	-- measured value of a tower run, Train potion = 300 s of faster training, Class roll = what one more roll adds
+	-- by the game's class odds, stones / scroll = the enhance they unlock, Season gear = the training it adds or its
+	-- sale price, Season Ticket = the expected spin, the coin deal = its coins). The best value per Season Coin is
+	-- bought, saving for it when it is short (Season Coins have no other use).
+	function N.seasonShopRanked()
 		local season = workspace:GetAttribute("Season")
 		local data = N.store("Season")
 		local mine = if season and type(data[season]) == "table" then data[season] else {}
-		local coins = tonumber(mine.SeasonCoin) or 0
 		local goods = if type(mine.Goods) == "table" then mine.Goods else {}
 		local config = N.call(N.G.Season.GetGoodsConfig)
+		local list = {}
 		if type(config) ~= "table" then
-			return false
+			return list, tonumber(mine.SeasonCoin) or 0
 		end
-		for _, id in ipairs(N.SeasonShopOrder) do
-			local row = config[id]
+		for id, row in pairs(config) do
 			if type(row) == "table" then
 				local left = (tonumber(row.Store) or 0) - (tonumber(goods[id]) or 0)
-				if left > 0 then
-					if coins >= (tonumber(row.NeedSeasonCoin) or math.huge) and once("shop" .. id, 6) then
-						fire(N.R.seasonShop, id)
-						Session.shopBuys += 1
-						noteReward("Season shop " .. tostring(row.ID) .. " x" .. tostring(row.Number))
-						return true
+				local price = tonumber(row.NeedSeasonCoin) or math.huge
+				if left > 0 and price > 0 and price < math.huge then
+					local ok, value = pcall(N.seasonGoodValue, row)
+					value = if ok then tonumber(value) or 0 else 0
+					if value > 0 then
+						table.insert(list, { id = tostring(id), row = row, price = price, value = value, perCoin = value / price })
 					end
-					return false
 				end
 			end
+		end
+		table.sort(list, function(a, b)
+			if a.perCoin ~= b.perCoin then
+				return a.perCoin > b.perCoin
+			end
+			return a.id < b.id
+		end)
+		return list, tonumber(mine.SeasonCoin) or 0
+	end
+	function N.seasonShopStep()
+		local list, coins = N.seasonShopRanked()
+		local best = list[1]
+		if not best then
+			return false
+		end
+		local text = string.format("best=Season %s gain/SC=%.3g", tostring(best.row.ID), best.perCoin)
+		if list[2] then
+			text ..= string.format(" alt=%s:%.3g", tostring(list[2].row.ID), list[2].perCoin)
+		end
+		if N.Reward.shopText ~= text then
+			N.Reward.shopText = text
+			log("PLAN", text)
+		end
+		if coins >= best.price and once("shop" .. best.id, 6) then
+			fire(N.R.seasonShop, best.id)
+			Session.shopBuys += 1
+			noteReward("Season shop " .. tostring(best.row.ID) .. " x" .. tostring(best.row.Number))
+			return true
 		end
 		return false
 	end
@@ -32710,7 +32800,17 @@ do
 		if rolls <= 0 or index == nil or locked then
 			return
 		end
-		if N.rarityRank(rarity) >= N.rarityRank(optionText("ClassTarget", "Legendary")) then
+		local target = optionText("ClassTarget", "Auto (expected value)")
+		local W = if target == "Auto (expected value)" then N.classThreshold(rolls) else nil
+		if W then
+			-- Optimal stopping: roll only while the class is worth less than what the rolls left are expected to reach.
+			local record = data.recored
+			local rec = type(record) == "table" and record[class]
+			local now = N.classValue(class, tonumber(type(rec) == "table" and rec.Level) or 1) or 0
+			if now >= W then
+				return
+			end
+		elseif N.rarityRank(rarity) >= N.rarityRank(if target == "Auto (expected value)" then "Legendary" else target) then
 			return
 		end
 		N.ClassRoll.at = os.clock()
@@ -32821,7 +32921,7 @@ do
 		QuickBox:AddToggle("AutoFarmBest", {
 			Text = "Auto Farm Everything",
 			Default = false,
-			Tooltip = "Turns on everything: stage farm with ore pickup and Super Loot hunting, training between runs, forging, best gear, selling, upgrades, gear enhance, rebirths, the tower, the world boss, season luck and shop and every reward",
+			Tooltip = "Turns on everything: stage farm with ore pickup and Super Loot hunting, training whenever it pays more than a run, forging, best gear, selling, upgrades, gear enhance, rebirths, the tower, the world boss, season luck and shop and every reward",
 			Callback = function(value)
 				task.defer(function()
 					for _, name in ipairs(if value then N.FarmBestOn else N.FarmBestOff) do
@@ -32845,6 +32945,7 @@ do
 		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		Labels.Plan = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
 		StatusBox:AddButton({
 			Text = "Bank Ores Now",
 			Func = function()
@@ -32931,9 +33032,9 @@ do
 		})
 		ForgeBox:AddDropdown("ForgeType", {
 			Text = "Forge",
-			Values = { "Alternate", "Weapon", "Armor" },
-			Default = "Alternate",
-			Tooltip = "Weapons add Train power, armor and hats add their stat. Alternate keeps both growing",
+			Values = { "Auto (best value)", "Alternate", "Weapon", "Armor" },
+			Default = "Auto (best value)",
+			Tooltip = "Auto prices every kind and ore count with the game's own forge odds (the training the item adds, or its sale price) and sells the ores instead when that pays more. The slider below is for the other modes",
 		})
 		ForgeBox:AddSlider("ForgeOres", {
 			Text = "Ores Per Forge",
@@ -32985,7 +33086,7 @@ do
 		TrainBox:AddToggle("AutoTrain", {
 			Text = "Auto Train",
 			Default = false,
-			Tooltip = "Stands in the best training area you unlocked, the game trains by itself there. With Auto Farm Stages on it trains between runs",
+			Tooltip = "Stands in the best training area you unlocked, the game trains by itself there. With Auto Farm Stages on it trains whenever the next rebirth is worth more per second than a stage run",
 		})
 		local areaNames = { "Best open" }
 		for _, area in ipairs(N.trainAreas()) do
@@ -32994,15 +33095,6 @@ do
 			end
 		end
 		TrainBox:AddDropdown("TrainArea", { Text = "Area", Values = areaNames, Default = "Best open" })
-		TrainBox:AddSlider("TrainBetween", {
-			Text = "Train Between Runs",
-			Default = 90,
-			Min = 0,
-			Max = 900,
-			Rounding = 0,
-			Suffix = " s",
-			Tooltip = "How long to train after banking before the next stage run",
-		})
 		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
@@ -33024,7 +33116,7 @@ do
 	end
 	do
 		local UpgradeBox = Tabs.Upgrades:AddLeftGroupbox("Upgrades", "arrow-big-up")
-		UpgradeBox:AddToggle("AutoUpgrade", { Text = "Auto Buy Upgrades", Default = false, Tooltip = "Buys the upgrade with the best gain per coin: more pack slots, faster training or more luck" })
+		UpgradeBox:AddToggle("AutoUpgrade", { Text = "Auto Buy Upgrades", Default = false, Tooltip = "Buys the upgrade that adds the most coins per second per coin spent: more pack slots, faster training or more luck" })
 		UpgradeBox:AddDropdown("UpgradeKinds", {
 			Text = "Upgrades (none = all)",
 			Values = { "Ore Pack", "Train", "Luck" },
@@ -33044,16 +33136,16 @@ do
 		EnhanceBox:AddToggle("AutoEnhance", {
 			Text = "Auto Enhance Equipped Gear",
 			Default = false,
-			Tooltip = "Spends the Enhance stones that drop on every stage (they have no other use) plus a few coins on your equipped weapon, armor and hat. Opens at rebirth 6",
+			Tooltip = "Enhances your equipped weapon and hat when a try is worth its coins (training gained x success chance). Opens at rebirth 6",
 		})
 		EnhanceBox:AddSlider("EnhanceMax", {
 			Text = "Enhance Up To",
-			Default = 5,
+			Default = 20,
 			Min = 1,
 			Max = 20,
 			Rounding = 0,
 			Prefix = "+",
-			Tooltip = "+1 to +5 are cheap and a failed try loses only the cost. From +6 a failed try can lower the item, and Protection Scrolls are used when you have them",
+			Tooltip = "Only a ceiling: a try is bought when its chance x the training it adds beats every other use of the coins. From +6 a failed try can lower the item, Protection Scrolls are used then",
 		})
 		Labels.Enhance = EnhanceBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
@@ -33069,7 +33161,7 @@ do
 		Labels.Rewards = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
 		local SeasonBox = Tabs.Rewards:AddRightGroupbox("Season", "ticket")
 		SeasonBox:AddToggle("AutoSeasonLuck", { Text = "Spin Season Luck", Default = true, Tooltip = "Spends the Season Tickets from the daily claim and the pass on the Season Luck wheel (stones, class rolls, scrolls, Season Coins, a weapon). Never spins without tickets, so it never opens a Robux prompt" })
-		SeasonBox:AddToggle("AutoSeasonShop", { Text = "Spend Season Coins", Default = true, Tooltip = "Buys from the Season Shop in a fixed best-first order: tower ticket, Train potion, Class roll, Damage potion, Enhance stones, scroll, then the Season gear" })
+		SeasonBox:AddToggle("AutoSeasonShop", { Text = "Spend Season Coins", Default = true, Tooltip = "Prices every Season Shop item in coins and buys the best value per Season Coin, saving for it when needed" })
 		Labels.Season = SeasonBox:AddLabel({ Text = "-", DoesWrap = true })
 		local CodeBox = Tabs.Rewards:AddLeftGroupbox("Codes", "ticket")
 		CodeBox:AddInput("CodeText", { Text = "Code", Placeholder = "Type a code from the game's socials", Finished = false, Default = "" })
@@ -33096,7 +33188,12 @@ do
 			Default = false,
 			Tooltip = "Rerolls your equipped class slot with the rolls you have until it reaches the target. Locked slots are skipped",
 		})
-		ClassBox:AddDropdown("ClassTarget", { Text = "Stop At", Values = { "Rare", "Epic", "Legendary", "Mythic" }, Default = "Legendary" })
+		ClassBox:AddDropdown("ClassTarget", {
+			Text = "Stop At",
+			Values = { "Auto (expected value)", "Rare", "Epic", "Legendary", "Mythic" },
+			Default = "Auto (expected value)",
+			Tooltip = "Auto keeps rolling only while your class is worth less than what the rolls left are expected to reach",
+		})
 		Labels.Class = ClassBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
@@ -33258,6 +33355,24 @@ do
 				N.Store.pushes
 			),
 			"Perf: " .. Debug.perfText(),
+			(function()
+				local Pl = N.Plan
+				if not Pl then
+					return "Plan: -"
+				end
+				return string.format(
+					"Plan: %s | %s | coins/s %s, exp unit %s, clear %ss, pick %ss, run fit %s (%d runs), farm share %d%%",
+					Pl.text ~= "" and Pl.text or "-",
+					Pl.spendText ~= "" and Pl.spendText or "-",
+					formatNumber(Pl.coin.rate or 0),
+					formatNumber(Pl.exp.unit or 0),
+					string.format("%.1f", Pl.clearSec or 0),
+					string.format("%.2f", Pl.pickSec or 0),
+					string.format("%.2f", Pl.runFit or 0),
+					Pl.runs,
+					math.floor(N.farmShare() * 100)
+				)
+			end)(),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
 			string.rep("-", 70),
 		}
@@ -33644,6 +33759,958 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 	end
 end
 do
+	-- Profit engine v2 (CLAUDE.md.txt 8.00). Every time option (training, a stage run at each depth, the tower, the
+	-- world boss) and every money option (upgrades, gear enhance, forge choice, Season Shop, class rolls) is turned
+	-- into one unit: coins of value, per second of time or per coin spent. The horizon is ROLLING: always the next
+	-- 24 h from now (the hub farms forever), so it never counts down.
+	--   coins:   income = ore sale price x the game's Coin boost (BalanceUtils.GetStatsBoost "Coin", rebirth CoinBasic
+	--            inside), ore odds from Stage.Loots / Stage.OreLoots with the game's own luck rule (rows <= 1000
+	--            weight get x luck x 1.3, Stage.Helper.GetRandRootID).
+	--   rebirth: worth the extra coin boost on the measured income for 24 h, plus its tower tickets, plus a newly
+	--            opened training area. Exp to the next rebirth = Level.GetTotalPower(need) - (level exp + Eco.power).
+	--   training speed: x(1+g) on the exp rate gives ln(1+g)/ln(q) more rebirths in 24 h, where q is how much the
+	--            next rebirth costs more than this one after its own exp boost (Level and Rebirth configs). Weapons,
+	--            hats, Train upgrades, enhance levels, class rolls and Train potions are valued this way.
+	-- Rates are measured live (moving averages): coins earned per second, exp per second while training, seconds
+	-- per stage clear and per ore pick, the whole run against the model, tower and boss value per second. An option
+	-- that was never measured is tried once ("explore") instead of being guessed.
+	local P = {
+		H = 86400,
+		Respawn = 30, -- the game respawns a cleared stage 30 s later (StageManager: RebirthTick = ServerTime + 30)
+		at = -1e9,
+		logAt = -1e9,
+		lastKey = "",
+		options = {},
+		best = nil,
+		stage = nil,
+		text = "",
+		spendText = "",
+		spendKey = "",
+		coin = { last = nil, window = 0, windowAt = nil, rate = nil, earned = 0 },
+		exp = { last = nil, lastAt = nil, unit = nil },
+		clearSec = nil,
+		pickSec = nil,
+		runFit = nil,
+		runs = 0,
+		act = {},
+		share = { train = 0, farm = 0 },
+		shareAt = nil,
+		mode = nil,
+		modeSnap = nil,
+		forge = { at = -1e9, choice = nil, lift = 1 },
+	}
+	N.Plan = P
+	local function ema(old, new, alpha)
+		if old == nil then
+			return new
+		end
+		return old + (alpha or 0.25) * (new - old)
+	end
+	local function num(value, default)
+		value = tonumber(value)
+		if value == nil or value ~= value or value == math.huge or value == -math.huge then
+			return default
+		end
+		return value
+	end
+	P.ema = ema
+	local function split(text)
+		local out = {}
+		for piece in string.gmatch(tostring(text or ""), "[^,]+") do
+			table.insert(out, (string.gsub(piece, "^%s+", "")))
+		end
+		return out
+	end
+	-- Game multipliers -------------------------------------------------------------------------------------------
+	function N.coinMult()
+		local boost = num(N.call(N.G.Balance.GetStatsBoost, LocalPlayer, "Coin"), nil)
+		if boost and boost > 0 then
+			return boost
+		end
+		return num(N.call(N.G.Rebirth.GetCoinBasic, N.rebirth()), 1)
+	end
+	local function upgradeNumber(kind)
+		local data = N.store("Upgrade")[kind]
+		local level = tonumber(type(data) == "table" and data.Level) or 0
+		local row = (N.G.Upgrade[kind] or {})[level]
+		return num(type(row) == "table" and row.Number, 0)
+	end
+	N.upgradeNumber = upgradeNumber
+	function N.luckMult()
+		local boost = num(N.call(N.G.Balance.GetStatsBoost, LocalPlayer, "Luck"), nil)
+		if boost and boost > 0 then
+			return boost
+		end
+		return 1 + upgradeNumber("Luck")
+	end
+	local function expBasic(r)
+		return num(N.call(N.G.Rebirth.GetExpBasic, r), 1)
+	end
+	local function coinBasic(r)
+		return num(N.call(N.G.Rebirth.GetCoinBasic, r), 1)
+	end
+	local function totalExp(level)
+		return num(N.call(N.G.Level.GetTotalPower, level), 0)
+	end
+	local function areaBasic(id)
+		local row = N.G.TrainArea[id]
+		return num(type(row) == "table" and row.Basic, 1)
+	end
+	local function bestAreaAt(rebirth)
+		local best = 1
+		for _, area in ipairs(N.trainAreas()) do
+			if not area.pay and area.need <= rebirth and area.basic > best then
+				best = area.basic
+			end
+		end
+		return best
+	end
+	-- Ore odds per stage -----------------------------------------------------------------------------------------
+	local LootCache = {}
+	function N.lootOreEV(lootId)
+		if LootCache[lootId] then
+			return LootCache[lootId].price, LootCache[lootId].power, LootCache[lootId].ores
+		end
+		local row = N.G.OreLoots[lootId]
+		if type(row) ~= "table" then
+			return nil
+		end
+		local ids, chances = split(row.OreTab), split(row.Chance)
+		local total, price, power, ores = 0, 0, 0, {}
+		for i, id in ipairs(ids) do
+			local c = num(chances[i], 0)
+			if c > 0 then
+				total += c
+				price += c * num(N.call(N.G.Ore.GetSellPrice, id), 0)
+				power += c * num(N.call(N.G.Ore.GetPower, id), 0)
+				ores[id] = c
+			end
+		end
+		if total <= 0 then
+			return nil
+		end
+		LootCache[lootId] = { price = price / total, power = power / total, ores = ores }
+		return price / total, power / total, ores
+	end
+	-- Expected sale price of one ore from stage d (before the Coin boost), ores per clear, and the ore mix of the
+	-- loot row that drops most often (used to price what the forge makes from this stage).
+	function N.stageOreEV(d, luck)
+		local row = N.G.StageLoots["Stage_" .. tostring(d)]
+		if type(row) ~= "table" or row.LootTab == nil then
+			return nil
+		end
+		luck = luck or N.luckMult()
+		local loots, chances = split(row.LootTab), split(row.Chance)
+		local total, sum, mainW, main = 0, 0, -1, nil
+		for i, lootId in ipairs(loots) do
+			local w = num(chances[i], 0)
+			if w > 0 then
+				local raw = w
+				if w <= 1000 then
+					w = w * luck * 1.3
+				end
+				local price, _, ores = N.lootOreEV(lootId)
+				if price then
+					total += w
+					sum += w * price
+					if raw > mainW then
+						mainW, main = raw, ores
+					end
+				end
+			end
+		end
+		if total <= 0 then
+			return nil
+		end
+		return sum / total, num(row.LootNumber, 6), main
+	end
+	-- Live measurements -------------------------------------------------------------------------------------------
+	function N.planNoteClear(seconds)
+		if seconds and seconds > 0 and seconds < 120 then
+			P.clearSec = ema(P.clearSec, seconds, 0.2)
+		end
+	end
+	function N.planNotePick(seconds)
+		if seconds and seconds > 0 and seconds < 20 then
+			P.pickSec = ema(P.pickSec, seconds, 0.2)
+		end
+	end
+	-- Seconds for one run to stage d with a pack of cap: clear stages 1..d, then clear d again after each 30 s
+	-- respawn until the pack is full, plus every pick. The measured runs scale the model (runFit).
+	function N.runModel(d, cap)
+		if not P.clearSec or not P.pickSec then
+			return nil
+		end
+		local _, perClear = N.stageOreEV(d)
+		perClear = math.max(perClear or 6, 1)
+		local clears = math.ceil(cap / perClear)
+		return d * P.clearSec + (clears - 1) * (P.Respawn + P.clearSec) + cap * P.pickSec
+	end
+	function N.planNoteRun(d, seconds, ores)
+		local _, cap = N.pack()
+		local model = N.runModel(d, math.max(ores or cap, 1))
+		if model and seconds and seconds > 0 and (ores or 0) > 0 then
+			P.runFit = ema(P.runFit, math.clamp(seconds / model, 0.3, 5), 0.3)
+			P.runs += 1
+		end
+	end
+	-- Coins earned per second (spending is not income), exp per second while training, and the time split.
+	local function sample()
+		local now = os.clock()
+		local coin = N.coin()
+		local C = P.coin
+		C.windowAt = C.windowAt or now
+		if C.last and coin > C.last then
+			C.window += coin - C.last
+			C.earned += coin - C.last
+		end
+		C.last = coin
+		if now - C.windowAt >= 60 then
+			C.rate = ema(C.rate, C.window / (now - C.windowAt), 0.3)
+			C.window = 0
+			C.windowAt = now
+		end
+		local area = tonumber(LocalPlayer:GetAttribute("AutoTrainAreaID"))
+		local mode = N.fightMode()
+		local dt = if P.shareAt then math.min(now - P.shareAt, 5) else 0
+		P.shareAt = now
+		if mode == "Stage" then
+			P.share.farm += dt
+		elseif mode == nil and area then
+			P.share.train += dt
+		end
+		local E = P.exp
+		local power = N.power()
+		if mode == nil and area then
+			if E.last and E.lastAt and power >= E.last and now - E.lastAt >= 5 then
+				local rate = (power - E.last) / (now - E.lastAt)
+				if rate > 0 then
+					E.unit = ema(E.unit, rate / (areaBasic(area) * expBasic(N.rebirth())), 0.3)
+				end
+				E.last, E.lastAt = power, now
+			elseif not E.last or power < E.last then
+				E.last, E.lastAt = power, now
+			end
+		else
+			E.last, E.lastAt = nil, nil
+		end
+		-- Tower and world boss: value = coins earned + ore value gained during the visit, per second inside.
+		if mode ~= P.mode then
+			if P.modeSnap and (P.mode == "Dungeon" or P.mode == "WorldBoss") then
+				local snap = P.modeSnap
+				local secs = now - snap.at
+				if secs > 3 then
+					local value = (C.earned - snap.earned) + (N.oreValue() - snap.ores) * N.coinMult()
+					local key = if P.mode == "Dungeon" then "tower" else "boss"
+					local A = P.act[key] or {}
+					P.act[key] = A
+					A.perSec = ema(A.perSec, math.max(value, 0) / secs, 0.3)
+					A.perRun = ema(A.perRun, math.max(value, 0), 0.3)
+					A.secs = ema(A.secs, secs, 0.3)
+					A.n = (A.n or 0) + 1
+					log("PLAN measured", key, "value", math.floor(value), "in", math.floor(secs), "s")
+				end
+			end
+			P.modeSnap = if mode == "Dungeon" or mode == "WorldBoss" then { at = now, earned = C.earned, ores = N.oreValue() } else nil
+			P.mode = mode
+		end
+	end
+	function N.oreValue()
+		local total = 0
+		for _, ore in ipairs(N.ores()) do
+			total += ore.price * ore.number
+		end
+		return total
+	end
+	function N.farmShare()
+		local s = P.share
+		if s.farm + s.train <= 0 then
+			return 0.5 -- nothing measured yet: no reason to favour either
+		end
+		return s.farm / (s.farm + s.train)
+	end
+	function N.coinIncome()
+		if P.coin.rate and P.coin.rate > 0 then
+			return P.coin.rate
+		end
+		-- Before the first minute: what the best stage run would earn.
+		local best = 0
+		for _, o in ipairs(P.options) do
+			if o.kind == "farm" and o.gain and o.gain < math.huge then
+				best = math.max(best, o.gain)
+			end
+		end
+		return best
+	end
+	-- Training ---------------------------------------------------------------------------------------------------
+	-- Exp per second in the best open area: measured (per area x rebirth multiplier) or the game's formula
+	-- (CalculateUtils.CCTrainOncePower, one train every 0.2 s, crits x1.5).
+	function N.expRate()
+		local area = N.bestTrainArea()
+		local basic = if area then area.basic else 1
+		if P.exp.unit then
+			return P.exp.unit * basic * expBasic(N.rebirth())
+		end
+		local once = num(N.call(N.G.Calc.CCTrainOncePower, LocalPlayer), nil)
+		if not once or once <= 0 then
+			return nil
+		end
+		local inArea = tonumber(LocalPlayer:GetAttribute("AutoTrainAreaID"))
+		if inArea then
+			once = once / areaBasic(inArea)
+		end
+		local crit = math.clamp(num(N.call(N.G.Calc.CCCrit, LocalPlayer), 0), 0, 1)
+		return once * basic * 5 * (1 + 0.5 * crit)
+	end
+	-- Exp left to the next rebirth and the cost growth q between this rebirth and the next one.
+	-- Cached for one second: the forge pricing asks for it once per possible item.
+	local MathCache = { at = -1e9, key = nil, value = nil }
+	function N.rebirthMath()
+		local key = tostring(N.rebirth()) .. ":" .. tostring(N.level()) .. ":" .. tostring(N.eco("power"))
+		if MathCache.key == key and os.clock() - MathCache.at < 1 then
+			return MathCache.value
+		end
+		local value = N.rebirthMathNow()
+		MathCache.at, MathCache.key, MathCache.value = os.clock(), key, value
+		return value
+	end
+	function N.rebirthMathNow()
+		local r = N.rebirth()
+		local need1 = tonumber(N.call(N.G.Rebirth.GetNeedLevel, r + 1))
+		if not need1 then
+			return nil
+		end
+		local need2 = tonumber(N.call(N.G.Rebirth.GetNeedLevel, r + 2))
+		local cost1 = totalExp(need1)
+		local left = math.max(cost1 - N.power(), 0)
+		local q = 2
+		if need2 then
+			local cost2 = totalExp(need2)
+			local speedUp = expBasic(r + 2) / math.max(expBasic(r + 1), 1e-9) * bestAreaAt(r + 1) / math.max(bestAreaAt(r), 1e-9)
+			q = (cost2 / math.max(cost1, 1)) / math.max(speedUp, 1e-9)
+		end
+		return { need = need1, cost = cost1, left = left, q = math.max(q, 1.01) }
+	end
+	-- Coin value of the next rebirth over the rolling 24 h.
+	function N.rebirthValue(math_)
+		math_ = math_ or N.rebirthMath()
+		if not math_ then
+			return 0
+		end
+		local r = N.rebirth()
+		local coinUp = coinBasic(r + 1) / math.max(coinBasic(r), 1e-9) - 1
+		local base = coinUp * N.coinIncome() * P.H
+		local tickets = num(N.call(N.G.Rebirth.GetDungeonTicket, r + 1), 0)
+		local tower = P.act.tower
+		if tickets > 0 and tower and tower.perRun then
+			base += tickets * tower.perRun
+		end
+		local areaUp = bestAreaAt(r + 1) / math.max(bestAreaAt(r), 1e-9)
+		local extra = if areaUp > 1 then math.log(areaUp) / math.log(math_.q) else 0
+		return base / (1 - math.min(extra, 0.9))
+	end
+	-- Coin value over 24 h of training x(1+g) faster: ln(1+g)/ln(q) more rebirths, never more than g x the rebirths
+	-- that fit in 24 h at today's speed.
+	function N.trainValue(g)
+		if not g or g <= 0 then
+			return 0
+		end
+		local m = N.rebirthMath()
+		local rate = N.expRate()
+		if not m or not rate or rate <= 0 then
+			return 0
+		end
+		local perDay = P.H / math.max(m.cost / rate, 1)
+		local more = math.min(math.log(1 + g) / math.log(m.q), g * perDay)
+		return more * N.rebirthValue(m)
+	end
+	-- Stage runs -------------------------------------------------------------------------------------------------
+	-- Coins per second of a run to stage d with a pack of cap (ore sale value x Coin boost x the forge lift).
+	function N.farmValue(d, cap, luck)
+		local ev = N.stageOreEV(d, luck)
+		local seconds = N.runModel(d, cap)
+		if not ev or not seconds then
+			return nil
+		end
+		seconds *= P.runFit or 1
+		return cap / math.max(seconds, 1) * ev * N.coinMult() * math.max(P.forge.lift or 1, 1), seconds
+	end
+	-- The deepest stage the power allows (old rule) is the upper bound, the planner picks the best value below it.
+	function N.planStage(maxStage)
+		local _, cap = N.pack()
+		local best, bestGain = nil, -1
+		for d = math.max(1, maxStage - 4), maxStage do
+			local gain = N.farmValue(d, cap)
+			if gain and gain > bestGain then
+				best, bestGain = d, gain
+			end
+		end
+		return best
+	end
+	-- Time options -----------------------------------------------------------------------------------------------
+	local function fmt(x)
+		if x == math.huge then
+			return "explore"
+		end
+		return formatNumber(x)
+	end
+	function N.planOptions()
+		local list = {}
+		local maxStage = N.stageTargetByPower()
+		if on("AutoStages") then
+			local _, cap = N.pack()
+			local any = false
+			for d = math.max(1, maxStage - 4), maxStage do
+				local gain, seconds = N.farmValue(d, cap)
+				if gain then
+					any = true
+					table.insert(list, { key = "farm" .. d, kind = "farm", stage = d, gain = gain, eta = seconds })
+				end
+			end
+			if not any then
+				table.insert(list, { key = "farm" .. maxStage, kind = "farm", stage = maxStage, gain = math.huge, eta = nil })
+			end
+		end
+		if on("AutoTrain") then
+			local m = N.rebirthMath()
+			local rate = N.expRate()
+			if m and rate and rate > 0 then
+				local eta = m.left / rate
+				-- At the rebirth level more training adds nothing until the rebirth is done (Auto Rebirth does it).
+				local gain = if m.left <= 0 then (if on("AutoRebirth") then math.huge else 0) else N.rebirthValue(m) / math.max(eta, 1)
+				table.insert(list, { key = "train", kind = "train", gain = gain, eta = eta })
+			elseif m then
+				table.insert(list, { key = "train", kind = "train", gain = math.huge, eta = nil })
+			else
+				table.insert(list, { key = "train", kind = "train", gain = 0, eta = nil })
+			end
+		end
+		if on("AutoTower") and N.towerReady() then
+			local A = P.act.tower
+			table.insert(list, { key = "tower", kind = "tower", gain = if A and A.perSec then A.perSec else math.huge, eta = A and A.secs })
+		end
+		if on("AutoWorldBoss") and N.bossWanted() then
+			local A = P.act.boss
+			table.insert(list, { key = "boss", kind = "boss", gain = if A and A.perSec then A.perSec else math.huge, eta = A and A.secs })
+		end
+		table.sort(list, function(a, b)
+			if a.gain ~= b.gain then
+				return a.gain > b.gain
+			end
+			return a.key < b.key
+		end)
+		return list
+	end
+	function N.planRefresh(force)
+		local now = os.clock()
+		if not force and now - P.at < 5 then
+			return P.best
+		end
+		P.at = now
+		P.options = N.planOptions()
+		P.best = P.options[1]
+		local farm
+		for _, o in ipairs(P.options) do
+			if o.kind == "farm" then
+				farm = o
+				break
+			end
+		end
+		P.stage = farm and farm.gain < math.huge and farm.stage or nil
+		local best = P.best
+		if best then
+			local alt = {}
+			for i = 2, math.min(#P.options, 3) do
+				table.insert(alt, P.options[i].key .. ":" .. fmt(P.options[i].gain))
+			end
+			P.text = string.format(
+				"best=%s gain/s=%s eta=%s alt=%s",
+				best.key,
+				fmt(best.gain),
+				if best.eta then N.longTime(best.eta) else "?",
+				if #alt > 0 then table.concat(alt, ",") else "-"
+			)
+			if best.key ~= P.lastKey or now - P.logAt > 60 then
+				P.lastKey = best.key
+				P.logAt = now
+				log("PLAN", P.text)
+			end
+		else
+			P.text = ""
+		end
+		return best
+	end
+	-- The first of the given kinds in the current ranking (nil when the planner has none of them).
+	function N.planFirst(kinds)
+		for _, o in ipairs(P.options) do
+			if table.find(kinds, o.kind) then
+				return o.kind
+			end
+		end
+		return nil
+	end
+	function N.planTick()
+		local ok, err = pcall(sample)
+		if not ok then
+			log("ERROR", "plan sample", tostring(err))
+		end
+		ok, err = pcall(N.planRefresh)
+		if not ok then
+			log("ERROR", "plan", tostring(err))
+		end
+	end
+	-- Gear value ---------------------------------------------------------------------------------------------------
+	local function equippedValue(slot)
+		local bp = N.backpack()
+		local uuid = bp.equiped[slot]
+		local item = uuid and bp.have[uuid]
+		if type(item) == "table" then
+			return N.gearScore(item, bp)
+		end
+		return 0
+	end
+	-- Coin value of owning one item: the training it adds when it beats the equipped one (weapon = Train power,
+	-- hat = Train boost x(1+value), body armor only defence), else its sale price x Coin boost.
+	function N.itemValue(kind, id)
+		local configType = if kind == "Weapon" then "Weapon" else "Armor"
+		local sale = num(N.call(N.G.Any.GetSellPrice, configType, id), 0) * N.coinMult()
+		local bp = N.backpack()
+		local slot = kind
+		if kind ~= "Weapon" then
+			slot = tostring(N.call(N.G.Armor.GetBigType, id) or kind)
+		end
+		local g = 0
+		if slot == "Weapon" then
+			local new = num(N.call(N.G.Balance.GetWeaponTrainValue, LocalPlayer, { ID = id, Type = "Weapon", Level = 0 }, bp), 0)
+			local cur = math.max(equippedValue("Weapon"), 1)
+			g = new / cur - 1
+		elseif slot == "Hat" then
+			local new = num(N.call(N.G.Balance.GetArmorValue, LocalPlayer, { ID = id, Type = "Hat", Level = 0 }, bp), 0)
+			g = (1 + new) / (1 + equippedValue("Hat")) - 1
+		end
+		return math.max(sale, N.trainValue(g)), sale
+	end
+	-- Forge choice ---------------------------------------------------------------------------------------------------
+	-- For every kind and ore count the game allows: the expected value of the item the game's own forge roll gives
+	-- (ForgeUtils.GetForgeOreResult + GetEquPercent for every item type it can pick), per ore used, against selling
+	-- the same ores. Cached 20 s.
+	local function oreTable(plan)
+		local have = N.backpack().have
+		local out = {}
+		for uuid, n in pairs(plan) do
+			local item = have[uuid]
+			if type(item) == "table" and item.ID then
+				out[item.ID] = (out[item.ID] or 0) + n
+			end
+		end
+		return out
+	end
+	function N.forgeEV(kind, count, ores)
+		local FU = N.G.ForgeUtils
+		if type(FU.GetForgeOreResult) ~= "function" or type(FU.GetEquPercent) ~= "function" then
+			return nil
+		end
+		local okR, tMin, tMax = pcall(FU.GetForgeOreResult, ores)
+		local okA, avg = pcall(FU.GetOreAvgPower, ores)
+		if not okR or not tMin or not okA then
+			return nil
+		end
+		local helper = if kind == "Weapon" then N.G.Weapon else N.G.Armor
+		local types = N.call(helper.GetForgePercentByNumber, count)
+		if type(types) ~= "table" then
+			return nil
+		end
+		local total, chances = 0, 0
+		for _, chance in pairs(types) do
+			chances += math.max(num(chance, 0), 0)
+		end
+		if chances <= 0 then
+			return nil
+		end
+		for kindName, chance in pairs(types) do
+			chance = num(chance, 0) / chances
+			chance = num(chance, 0)
+			if chance > 0 then
+				local okE, items = pcall(FU.GetEquPercent, kind, count, tMin, tMax, avg, kindName)
+				if okE and type(items) == "table" then
+					-- Normalised here, so 0..1 and 0..100 percent tables both work.
+					local share, sub = 0, 0
+					for id, p in pairs(items) do
+						p = num(p, 0)
+						if p > 0 then
+							share += p
+							sub += p * (N.itemValue(kind, id))
+						end
+					end
+					if share > 0 then
+						total += chance * sub / share
+					end
+				end
+			end
+		end
+		return total
+	end
+	function N.forgeChoice(force)
+		local F = P.forge
+		if not force and os.clock() - F.at < 20 then
+			return F.choice
+		end
+		F.at = os.clock()
+		F.choice = nil
+		local pick = optionText("ForgeType", "Auto (best value)")
+		local kinds = if pick == "Weapon" or pick == "Armor" then { pick } else { "Weapon", "Armor" }
+		local best
+		for _, kind in ipairs(kinds) do
+			local top = if kind == "Weapon" then 13 else 23
+			for count = 4, top do
+				local plan, total = N.forgePlanFor(kind, count)
+				if plan and total == count then
+					local ores = oreTable(plan)
+					local ev = N.forgeEV(kind, count, ores)
+					if ev then
+						local sale = 0
+						for id, n in pairs(ores) do
+							sale += num(N.call(N.G.Ore.GetSellPrice, id), 0) * n
+						end
+						sale *= N.coinMult()
+						local option = { kind = kind, count = count, plan = plan, ev = ev, perOre = ev / count, salePerOre = sale / count }
+						if not best or option.perOre > best.perOre then
+							best = option
+						end
+					end
+				end
+			end
+		end
+		F.choice = best
+		if best then
+			F.lift = math.max(best.perOre / math.max(best.salePerOre, 1e-9), 1)
+		end
+		return best
+	end
+	-- Money options ----------------------------------------------------------------------------------------------
+	-- Every option: dI = coins per second it adds (24 h average for lump values), cost = coins. Bought in falling
+	-- dI/cost order; a cheaper one is bought while saving only when it pays back before the saving is done.
+	function N.upgradeGain(nextUp)
+		local levels = N.G.Upgrade[nextUp.kind] or {}
+		local now = levels[nextUp.level] or {}
+		local delta = num(nextUp.number, 0) - num(now.Number, 0)
+		if delta <= 0 then
+			return 0
+		end
+		local d = P.stage or N.stageTargetByPower()
+		if nextUp.kind == "OrePack" then
+			-- A slot only pays when the pack still fills from the clears it already waits for (one more clear means a
+			-- 30 s respawn), so the next few levels are looked at together: the best gain per coin of buying up
+			-- to level k, priced at all k levels.
+			local _, cap = N.pack()
+			local a = N.farmValue(d, cap)
+			if not a then
+				return nil
+			end
+			local bestGain, bestCost, bestRatio = 0, nextUp.price, 0
+			local cost, number = 0, num(now.Number, 0)
+			for k = nextUp.level + 1, nextUp.level + 8 do
+				local row = levels[k]
+				if type(row) ~= "table" then
+					break
+				end
+				cost += num(row.Price, math.huge)
+				local b = N.farmValue(d, cap + num(row.Number, number) - num(now.Number, 0))
+				local gain = if b then (b - a) * N.farmShare() else 0
+				if gain > 0 and gain / math.max(cost, 1) > bestRatio then
+					bestGain, bestCost, bestRatio = gain, cost, gain / math.max(cost, 1)
+				end
+			end
+			return bestGain, bestCost
+		elseif nextUp.kind == "Luck" then
+			local luck = N.luckMult()
+			local base = 1 + upgradeNumber("Luck")
+			local a = N.stageOreEV(d, luck)
+			local b = N.stageOreEV(d, luck * (base + delta) / base)
+			local v = N.farmValue(d, (select(2, N.pack())))
+			if not a or not b or not v then
+				return nil
+			end
+			return v * (b / a - 1) * N.farmShare()
+		elseif nextUp.kind == "Train" then
+			return N.trainValue(delta / (1 + upgradeNumber("Train"))) / P.H
+		end
+		return 0
+	end
+	-- One enhance try on an equipped weapon or hat: the success chance x the training the level adds, minus the
+	-- level a failure takes away from +failLevel on (assumed one level, no scroll).
+	function N.enhanceGain(slot, item, step, failLevel, protect)
+		if slot == "Armor" then
+			return 0 -- body armor only adds defence
+		end
+		local config = N.call(N.G.Enhant.GetConfig) or {}
+		local function boost(level)
+			local row = config[level]
+			return num(type(row) == "table" and row.Boost, 0)
+		end
+		local L = step.level
+		local function gain(from, to)
+			local up = (1 + boost(to)) / (1 + boost(from))
+			if slot == "Weapon" then
+				return up - 1
+			end
+			local h = N.gearScore(item, N.backpack())
+			return (1 + h * up) / (1 + h) - 1
+		end
+		local value = step.percent * N.trainValue(gain(L, L + 1))
+		if L >= failLevel and not protect and L > 0 then
+			value -= (1 - step.percent) * N.trainValue(gain(L - 1, L))
+		end
+		return value / P.H
+	end
+	function N.spendOptions()
+		local list = {}
+		if on("AutoUpgrade") then
+			for _, kind in ipairs(N.UpgradeKinds) do
+				if allows(Options.UpgradeKinds, N.UpgradeNames[kind]) then
+					local nextUp = N.upgradeNext(kind)
+					if nextUp then
+						local gain, total = N.upgradeGain(nextUp)
+						if gain then
+							-- cost = every level the gain needs (Ore Pack look-ahead), the purchase itself is the next level
+							table.insert(list, { key = "Upgrade " .. kind, kind = "upgrade", up = nextUp, cost = total or nextUp.price, price = nextUp.price, gain = gain })
+						end
+					end
+				end
+			end
+		end
+		if on("AutoEnhance") and N.rebirth() >= 6 then
+			local bp = N.backpack()
+			local failLevel = tonumber(N.call(N.G.Enhant.GetFailLevel)) or 6
+			for _, slot in ipairs({ "Weapon", "Hat" }) do
+				local uuid = bp.equiped[slot]
+				local item = uuid and bp.have[uuid]
+				if type(item) == "table" then
+					local step = N.enhanceNext(item)
+					if step and step.level < N.enhanceMaxLevel() and N.material("EnhantStone_1") >= step.stone1 and N.material("EnhantStone_2") >= step.stone2 then
+						local protect = step.level >= failLevel and N.material("EnhantProtect") > 0
+						local gain = N.enhanceGain(slot, item, step, failLevel, protect)
+						table.insert(list, { key = "Enhance " .. slot .. " +" .. (step.level + 1), kind = "enhance", slot = slot, uuid = uuid, step = step, protect = protect, cost = step.coin, gain = gain })
+					end
+				end
+			end
+		end
+		local keep = {}
+		for _, o in ipairs(list) do
+			-- Never buy what does not pay back within the rolling 24 h.
+			if o.gain > 0 and o.cost / o.gain <= P.H then
+				o.perCoin = o.gain / math.max(o.cost, 1)
+				table.insert(keep, o)
+			end
+		end
+		table.sort(keep, function(a, b)
+			if a.perCoin ~= b.perCoin then
+				return a.perCoin > b.perCoin
+			end
+			return a.key < b.key
+		end)
+		return keep
+	end
+	-- Picks what to buy now (or nil while saving), logs the PLAN line for money.
+	function N.spendPick()
+		local list = N.spendOptions()
+		local best = list[1]
+		if not best then
+			P.spendText = "nothing pays back within 24 h"
+			return nil
+		end
+		local coins = N.coin()
+		local pick
+		local eta = 0
+		local function now(o)
+			return o.price or o.cost
+		end
+		if now(best) <= coins then
+			pick = best
+		else
+			local income = N.coinIncome()
+			eta = if income > 0 then (now(best) - coins) / income else math.huge
+			for i = 2, #list do
+				local o = list[i]
+				if now(o) <= coins and o.cost / o.gain <= eta then
+					pick = o
+					break
+				end
+			end
+		end
+		local alt = {}
+		for i = 2, math.min(#list, 3) do
+			table.insert(alt, string.format("%s:%.3g", list[i].key, list[i].perCoin))
+		end
+		P.spendText = string.format(
+			"best=%s gain/$=%.3g eta=%s alt=%s%s",
+			best.key,
+			best.perCoin,
+			if eta == math.huge then "?" else N.longTime(eta),
+			if #alt > 0 then table.concat(alt, ",") else "-",
+			if pick and pick ~= best then " buying=" .. pick.key else ""
+		)
+		local key = best.key .. (if pick then "+" .. pick.key else "")
+		if key ~= P.spendKey then
+			P.spendKey = key
+			log("PLAN", P.spendText)
+		end
+		return pick
+	end
+	-- Season Shop goods in coins (lump value). The 2000 coin deal sets the floor: 10 coins per Season Coin.
+	function N.seasonGoodValue(row)
+		local id, n = tostring(row.ID), num(row.Number, 1)
+		if row.Type == "Eco" and id == "coin" then
+			return n
+		elseif id == "Dungeon_Ticket" then
+			local A = P.act.tower
+			return n * (A and A.perRun or 0)
+		elseif id == "TrainPotion" then
+			-- +1 to the Train factor for 300 s, used while training.
+			local m = N.rebirthMath()
+			local rate = N.expRate()
+			if not m or not rate or rate <= 0 then
+				return 0
+			end
+			local g = 1 / (1 + upgradeNumber("Train"))
+			local gainPerSec = N.rebirthValue(m) / math.max(m.cost / rate, 1)
+			return n * 300 * g * gainPerSec * (1 - N.farmShare())
+		elseif id == "ClassRoll" then
+			return n * N.classRollValue()
+		elseif id == "EnhantStone_1" or id == "EnhantStone_2" then
+			-- Worth the next enhance it unlocks when stones are what is missing.
+			local bp = N.backpack()
+			local best = 0
+			for _, slot in ipairs({ "Weapon", "Hat" }) do
+				local uuid = bp.equiped[slot]
+				local item = uuid and bp.have[uuid]
+				local step = type(item) == "table" and N.enhanceNext(item)
+				if step then
+					local need = if id == "EnhantStone_1" then step.stone1 else step.stone2
+					local missing = need - N.material(id)
+					if missing > 0 then
+						local gain = N.enhanceGain(slot, item, step, 6, false) * P.H
+						best = math.max(best, gain * math.min(n / missing, 1))
+					end
+				end
+			end
+			return best
+		elseif id == "EnhantProtect" then
+			local bp = N.backpack()
+			local uuid = bp.equiped.Weapon
+			local item = uuid and bp.have[uuid]
+			local step = type(item) == "table" and N.enhanceNext(item)
+			local failLevel = tonumber(N.call(N.G.Enhant.GetFailLevel)) or 6
+			if step and step.level >= failLevel then
+				local without = N.enhanceGain("Weapon", item, step, failLevel, false)
+				local with = N.enhanceGain("Weapon", item, step, failLevel, true)
+				return math.max(with - without, 0) * P.H
+			end
+			return 0
+		elseif row.Type == "Weapon" or row.Type == "Hat" or row.Type == "Armor" then
+			return n * (N.itemValue(if row.Type == "Weapon" then "Weapon" else "Armor", id))
+		elseif id == "SeasonTicket" then
+			return n * N.seasonSpinValue()
+		end
+		return 0
+	end
+	function N.seasonSpinValue()
+		local config = N.call(N.G.Season.GetLuckConfig)
+		if type(config) ~= "table" then
+			return 0
+		end
+		local total, sum = 0, 0
+		for _, prize in pairs(config) do
+			if type(prize) == "table" then
+				local w = num(prize.Weight, 0)
+				total += w
+				local value = 0
+				if prize.ID == "SeasonCoin" then
+					value = num(prize.Number, 0) * 10
+				elseif prize.Type ~= "EnchStone" then
+					value = N.seasonGoodValue(prize)
+				end
+				sum += w * value
+			end
+		end
+		return if total > 0 then sum / total else 0
+	end
+	-- Class rolls: the class boost multiplies training (1+Train) and luck (1+Luck). A roll replaces the class, so
+	-- with k rolls left the hub rolls only while the class is worth less than what k rolls are expected to reach
+	-- (backward induction over the game's class weights).
+	function N.classValue(classId, level)
+		local boosts = N.call(N.G.Class.GetClassBoosts, classId, level or 1)
+		if type(boosts) ~= "table" then
+			return nil
+		end
+		local train = num(boosts.Train, 0)
+		local luck = num(boosts.Luck, 0)
+		local value = N.trainValue(train)
+		if luck > 0 then
+			local d = P.stage or N.stageTargetByPower()
+			local l0 = N.luckMult()
+			local a = N.stageOreEV(d, l0)
+			local b = N.stageOreEV(d, l0 * (1 + luck))
+			local v = N.farmValue(d, (select(2, N.pack())))
+			if a and b and v then
+				value += v * (b / a - 1) * N.farmShare() * P.H
+			end
+		end
+		return value
+	end
+	local function classTable()
+		local config = N.call(N.G.Class.GetConfig)
+		if type(config) ~= "table" then
+			return nil
+		end
+		local record = N.store("Class").recored
+		record = if type(record) == "table" then record else {}
+		local list, total = {}, 0
+		for id, row in pairs(config) do
+			local w = num(type(row) == "table" and row.Weight, 0)
+			local rec = record[id]
+			local value = N.classValue(id, tonumber(type(rec) == "table" and rec.Level) or 1)
+			if w > 0 and value then
+				total += w
+				table.insert(list, { w = w, value = value })
+			end
+		end
+		if total <= 0 then
+			return nil
+		end
+		for _, c in ipairs(list) do
+			c.p = c.w / total
+		end
+		return list
+	end
+	-- W[k] = expected class value when k rolls are left and used optimally.
+	function N.classThreshold(k)
+		local list = classTable()
+		if not list or k <= 0 then
+			return nil
+		end
+		local W = -math.huge
+		for _ = 1, k do
+			local e = 0
+			for _, c in ipairs(list) do
+				e += c.p * math.max(c.value, W)
+			end
+			W = e
+		end
+		return W
+	end
+	function N.classRollValue()
+		local rolls = tonumber(N.store("Class").luckTimes) or 0
+		local _, class = N.classNow()
+		local record = N.store("Class").recored
+		local rec = type(record) == "table" and record[class]
+		local now = N.classValue(class, tonumber(type(rec) == "table" and rec.Level) or 1) or 0
+		local a = math.max(N.classThreshold(rolls) or now, now)
+		local b = math.max(N.classThreshold(rolls + 1) or now, now)
+		return math.max(b - a, 0)
+	end
+end
+do
 	local function setToggles(names, args)
 		local word = args and args[1] and string.lower(tostring(args[1])) or ""
 		local first = Toggles[names[1]]
@@ -33794,7 +34861,7 @@ do
 					Choices = {
 						{ Id = "farm", Title = "Auto Farm Everything", Description = "One switch: stage farm, Super Loot runners, training, forging, gear, upgrades and enhance, rebirths, tower, world boss, season and every reward", Icon = "sparkles", Color = "#60d696" },
 						{ Id = "stages", Title = "Farm stages", Description = "Fights the best stage for your power, picks every ore and banks them safely", Icon = "swords", Color = "#fab428" },
-						{ Id = "train", Title = "Train", Description = "Trains in the best open area between runs", Icon = "dumbbell", Color = "#3ccf91" },
+						{ Id = "train", Title = "Train", Description = "Trains in the best open area when the next rebirth pays more than a run", Icon = "dumbbell", Color = "#3ccf91" },
 						{ Id = "forge", Title = "Forge and gear", Description = "Forges from your strongest ores and equips the best weapon, armor and hat", Icon = "hammer", Color = "#5fb8ff" },
 						{ Id = "upgrades", Title = "Upgrades and rebirth", Description = "Ore Pack, Train and Luck upgrades, rebirths when your level allows", Icon = "arrow-big-up", Color = "#ff9a3c" },
 						{ Id = "events", Title = "Tower and world boss", Description = "Uses your tower tickets and joins every world boss", Icon = "castle", Color = "#c77dff" },
@@ -34013,7 +35080,7 @@ do
 		local mode = N.fightMode()
 		if mode == "Stage" then
 			if on("AutoStages") then
-				if on("AutoWorldBoss") and N.bossWanted() and N.Fight.run then
+				if on("AutoWorldBoss") and N.bossWanted() and N.Fight.run and N.planFirst({ "boss", "farm" }) ~= "farm" then
 					N.bank("world boss is up")
 					return
 				end
@@ -34047,18 +35114,20 @@ do
 			N.forgeStep(6)
 			return
 		end
-		if on("AutoWorldBoss") and N.bossWanted() and os.clock() - N.Boss.at > 15 then
+		-- The profit planner (p09_plan) ranks every time option by coins of value per second; the boss and the tower
+		-- go first only when they rank above both a stage run and training (never measured = tried once).
+		if on("AutoWorldBoss") and N.bossWanted() and os.clock() - N.Boss.at > 15 and N.planFirst({ "boss", "farm", "train" }) ~= "farm" and N.planFirst({ "boss", "farm", "train" }) ~= "train" then
 			N.bossJoin()
 			return
 		end
-		if on("AutoTower") and N.towerReady() then
+		if on("AutoTower") and N.towerReady() and N.planFirst({ "tower", "farm", "train" }) ~= "farm" and N.planFirst({ "tower", "farm", "train" }) ~= "train" then
 			N.towerStart()
 			return
 		end
 		local training = on("AutoTrain")
-		-- A Super Loot runner is worth more than the rest of the training break (it expires in minutes).
+		-- A Super Loot runner is worth more than training (one Legendary+ ore for about 2 s, gone in minutes).
 		local superUp = on("AutoStages") and on("AutoSuperLoot") and N.superPick() ~= nil
-		if on("AutoStages") and (not training or os.clock() >= N.Fight.trainUntil or superUp) then
+		if on("AutoStages") and (not training or superUp or N.planFirst({ "farm", "train" }) ~= "train") then
 			if not N.startRun() then
 				task.wait(1)
 			end
@@ -34089,6 +35158,7 @@ do
 			task.wait(0.3)
 			return
 		end
+		N.planTick()
 		if on("AutoEquip") and choreDue("equip", 3) then
 			N.equipStep()
 		end
@@ -34144,6 +35214,17 @@ do
 				)
 				if N.Fight.lastBank ~= "" then
 					I.info ..= "\nLast bank: " .. N.Fight.lastBank
+				end
+				do
+					local Pl = N.Plan
+					local lines = {}
+					if Pl.text ~= "" then
+						table.insert(lines, "Time: " .. Pl.text)
+					end
+					if Pl.spendText ~= "" then
+						table.insert(lines, "Coins: " .. Pl.spendText)
+					end
+					I.plan = if #lines > 0 then '<font transparency="0.3">Plan  \u{00B7}  ' .. table.concat(lines, "\n") .. "</font>" else "Plan: measuring"
 				end
 				-- Every stage with your odds: green you clear it, yellow close, red too strong for now.
 				local rows = {}
@@ -34262,7 +35343,7 @@ do
 					"Tickets <b>%d</b>  \u{00B7}  best floor <b>%d</b>%s\nRuns this session <b>%d</b>%s",
 					N.towerTickets(),
 					tonumber(N.store("Dungeon").maxRound) or 0,
-					if N.rebirth() < 2 then "\n<font color=\"#fab428\">Opens at rebirth 2</font>" elseif os.clock() < N.Tower.pauseUntil then "\n<font color=\"#fab428\">Resting " .. N.longTime(N.Tower.pauseUntil - os.clock()) .. " (too strong or stuck)</font>" else "",
+					if N.rebirth() < 2 then "\n<font color=\"#fab428\">Opens at rebirth 2</font>" elseif os.clock() < N.Tower.pauseUntil then "\n<font color=\"#fab428\">Resting " .. N.longTime(N.Tower.pauseUntil - os.clock()) .. " (stuck)</font>" elseif N.power() < (N.Tower.needPower or 0) then "\n<font color=\"#fab428\">Too strong, waiting for power " .. formatNumber(N.Tower.needPower) .. "</font>" else "",
 					Session.towerRuns,
 					if N.Tower.last ~= "" then "\n" .. N.Tower.last else ""
 				)
@@ -34323,6 +35404,9 @@ do
 					group(function()
 						Labels.Status:SetText(Status)
 						Labels.Info:SetText(I.info or "-")
+						if Labels.Plan then
+							Labels.Plan:SetText(I.plan or "-")
+						end
 					end)
 				end
 				if shown(Tabs.Farm) then
