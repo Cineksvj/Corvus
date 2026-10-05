@@ -27303,9 +27303,7 @@ local BootOk, BootError = xpcall(function()
 			["QuestService.ClaimReward"] = true,
 			["BrainrotsEventService.ClaimReward"] = true,
 			["BaseEventService.ClaimReward"] = true,
-			["SpinWheelService.SpinWheel"] = true,
-			["SpinWheelService.SpinAll"] = true,
-		}
+				}
 		local NextCallAt = 0
 		local function remoteOf(service, kind, name)
 			local folder = KnitServices and KnitServices:FindFirstChild(service)
@@ -29279,6 +29277,51 @@ local BootOk, BootError = xpcall(function()
 			end
 			return describe("Brainrot", e.brainrotType, e.mutation, e.size, e.level, e.traits)
 		end
+		-- Training is a server state (TrainingService.StartTraining), the sea is only remotes. If the server keeps the
+		-- training on while Blatant opens waves, power grows all the time and the sea never pauses. Tried once per
+		-- server: kept only if power rises AND waves keep paying, otherwise stopped and the normal schedule runs.
+		local TS = { state = nil, restarts = 0 }
+		Game.trainSea = TS
+		local function trainAlongside(I)
+			if not (on("AutoFarmAll") and on("AutoTrain")) or TS.state == "no" then
+				return
+			end
+			local now = os.clock()
+			if TS.state == nil then
+				local ok, result = call("TrainingService", "StartTraining")
+				if ok and result then
+					TS.state, TS.at, TS.power, TS.waves, TS.fails = "trying", now, power(), I.ok, I.fails
+					log("TRAIN+SEA trying, power", power())
+				else
+					TS.state = "no"
+					log("TRAIN+SEA the server did not start training here")
+				end
+			elseif TS.state == "trying" then
+				if I.fails - TS.fails >= 3 then
+					TS.state = "no"
+					call("TrainingService", "StopTraining")
+					log("TRAIN+SEA off: the sea does not open while training")
+				elseif now - TS.at >= 20 then
+					if power() > TS.power and I.ok > TS.waves then
+						TS.state, TS.at, TS.power = "works", now, power()
+						log("TRAIN+SEA works: power and waves at the same time")
+						notify("Corvus", "Training and farming at the same time", 5)
+					else
+						TS.state = "no"
+						call("TrainingService", "StopTraining")
+						log("TRAIN+SEA off: power", TS.power, "->", power(), "waves", TS.waves, "->", I.ok)
+					end
+				end
+			elseif TS.state == "works" and now - TS.at >= 60 then
+				if power() <= TS.power then
+					TS.restarts += 1
+					TS.state = if TS.restarts > 3 then "no" else nil
+					log("TRAIN+SEA power stopped rising, restart", TS.restarts)
+				else
+					TS.at, TS.power = now, power()
+				end
+			end
+		end
 		local function instantCycle()
 			local I = Sea.instant
 			Game.callGap = 0.03
@@ -29291,6 +29334,7 @@ local BootOk, BootError = xpcall(function()
 					return false
 				end
 			end
+			trainAlongside(I)
 			local before = inventoryCount()
 			local capacity = math.min(maxPickup(), math.max(inventoryLimit() - before, 0))
 			if capacity <= 0 then
@@ -30846,6 +30890,9 @@ local BootOk, BootError = xpcall(function()
 			if (Options.TrainMode and Options.TrainMode.Value) ~= "Alternate with the sea" then
 				return false
 			end
+			if on("AutoFarmAll") and Game.trainSea and Game.trainSea.state == "works" and isBlatant() then
+				return false
+			end
 			if on("AutoFarmAll") then
 				local now = os.clock()
 				if Schedule.phase == "sea" then
@@ -31410,7 +31457,7 @@ local BootOk, BootError = xpcall(function()
 				"AutoSea", "AutoSell", "AutoEquipBest", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff",
 				"AutoEquipStaff", "AutoBuyDumbbell", "AutoEquipDumbbell", "AutoTrain", "AutoBonus", "AutoRebirth",
 				"AutoPotions", "SmartPotions", "AutoOffline", "SkipEmpty", "EquipBeforeSell", "SaveForRebirth",
-				"AutoPlaytime", "AutoDaily", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoCodes", "AutoStars",
+				"AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoCodes", "AutoStars",
 			}
 			local FarmAllMain = { "AutoSea", "AutoSell", "AutoPlaceEggs", "AutoHatch", "AutoUpgrade", "AutoBuyStaff", "AutoBuyDumbbell", "AutoTrain", "AutoRebirth", "AutoPotions" }
 			local FarmAllTurned = {}
@@ -31879,6 +31926,7 @@ local BootOk, BootError = xpcall(function()
 			local FreeBox = Tabs.Rewards:AddLeftGroupbox("Free Rewards", "gift")
 			FreeBox:AddToggle("AutoPlaytime", { Text = "Auto Claim Playtime Gifts", Default = true })
 			FreeBox:AddToggle("AutoDaily", { Text = "Auto Claim Daily Reward", Default = true })
+			FreeBox:AddToggle("AutoSpin", { Text = "Auto Spin Lucky Wheel", Default = true, Tooltip = "Spins the game's wheel whenever you have 25 Luminous Coins" })
 			FreeBox:AddToggle("AutoSeasonPass", { Text = "Auto Claim Season Pass (free)", Default = true })
 			FreeBox:AddToggle("AutoFreeShop", { Text = "Auto Claim Free Shop Animal", Default = true })
 			FreeBox:AddToggle("AutoForever", { Text = "Auto Claim Free Forever Pack", Default = true })
@@ -32550,7 +32598,7 @@ local BootOk, BootError = xpcall(function()
 				toggleCommand(
 					"rewards",
 					{ "free" },
-					{ "AutoPlaytime", "AutoDaily", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoGroup", "AutoCodes" },
+					{ "AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoGroup", "AutoCodes" },
 					"Every free reward"
 				)
 				Library:AddCommand({
@@ -33757,6 +33805,16 @@ local BootOk, BootError = xpcall(function()
 			{ "AutoSeasonPass", "season", 15, seasonTick },
 			{ "AutoCodes", "codes", 20, codesTick },
 			{ "AutoPotions", "potions", 10, potionTick },
+			{ "AutoSpin", "spin", 5, function()
+				-- the game's lucky wheel: 25 LuminousCoins a spin (10M cash 55%, demonic/angelic animals, Luminous Trident)
+				if currency("LuminousCoins") >= 25 then
+					local ok, result = call("SpinWheelService", "SpinWheel")
+					if ok and result then
+						Session.claimed += 1
+						Track.event("Spin", "Lucky wheel spin", nil, "gift", "#ffd166")
+					end
+				end
+			end },
 		}
 		while alive() do
 			if Data() then
