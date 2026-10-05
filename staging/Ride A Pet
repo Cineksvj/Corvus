@@ -23274,15 +23274,12 @@ end,
 local SupportedGames = Info.SupportedGames or {
 	{ Name = "+1 Stone Skipping", PlaceId = 111543903102439 },
 	{ Name = "Anime Dice", PlaceId = 113290951185459 },
-	{ Name = "Bizarre", PlaceId = 135621866300031 },
 	{ Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
 	{ Name = "Loot To Forge", PlaceId = 118805555015549 },
 	{ Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
 	{ Name = "Pets Universe", PlaceId = 74629631798007 },
 	{ Name = "Ride A Pet", PlaceId = 124216119978534 },
-	{ Name = "Steal An Egg", PlaceId = 107778070777162 },
 	{ Name = "Steal From The Rich", PlaceId = 120475074479690 },
-	{ Name = "Voltline Electric Scooters", PlaceId = 118315378611589 },
 	{ Name = "Welcome to Bloxburg", PlaceId = 185655149 },
 }
 local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
@@ -30260,8 +30257,12 @@ Farm.skip[id] = nil
 return false
 end
 -- Farm Mode: Normal keeps the player's own picks authoritative, OP lets the planner override every choice.
+function N.farmMode()
+local option = Options.FarmMode
+return if option and option.Value == "My filters" then "My filters" else "Best value"
+end
 function N.farmOP()
-return on("AutoFarmOP")
+return on("AutoFarmOP") and N.farmMode() == "Best value"
 end
 function N.farmAny()
 return on("AutoFarmOP")
@@ -30269,7 +30270,7 @@ end
 -- Exclude from OP: while Auto Farm Everything OP runs, anything picked in OPExclude is never sold, fed, used or spent.
 N.opLogged = {}
 function N.opExcluded(key)
-if not on("AutoFarmOP") or not selected(Options.OPExclude, key) then
+if not N.farmOP() or not selected(Options.OPExclude, key) then
 return false
 end
 if not N.opLogged[key] then
@@ -30972,7 +30973,7 @@ end
 do
 local PlotState = { hatchAt = {}, seenPets = {}, hatchFiredAt = -1e9, lanternUntil = 0, placeFails = {}, favAt = {} }
 local function reserveCash()
-if on("AutoFarmOP") and not N.opExcluded("Money reserve") then
+if N.farmOP() and not N.opExcluded("Money reserve") then
 return 0
 end
 local option = Options.KeepCash
@@ -32498,7 +32499,7 @@ local opKeys = { food = "Food items", lantern = "Lanterns", shop = "Shop items",
 if opKeys[kind] and N.opExcluded(opKeys[kind]) then
 return false
 end
-local have = if kind == "rebirth" and not (on("AutoFarmOP") and N.opExcluded("Money reserve")) then N.cash() else N.spendable()
+local have = if kind == "rebirth" and not (N.farmOP() and N.opExcluded("Money reserve")) then N.cash() else N.spendable()
 if have < cost then
 return false
 end
@@ -32867,52 +32868,103 @@ end
 do
 local OPBox = Tabs.Main:AddLeftGroupbox("Auto Farm Everything", "zap")
 N.EverythingBox = OPBox
-N.opBoot = tick()
+N.FarmRunMap = {
+{ "Auto Farm eggs", "AutoFarm" },
+{ "Pause Egg Timer", "PauseEggTimer" },
+{ "Remote Collect", "RemoteCollect" },
+{ "Remote Egg Pickup", "RemotePickup" },
+{ "Place eggs in nests", "AutoPlaceEggs" },
+{ "Hatch eggs", "AutoHatch" },
+{ "Place best pets", "AutoPlacePets" },
+{ "Collect pet cash", "AutoCollect" },
+{ "Claim index rewards", "AutoIndex" },
+{ "Collect fusions", "AutoFusionCollect" },
+{ "Claim offline cash", "AutoOffline" },
+{ "Claim event boost", "AutoEventBoost" },
+{ "Claim group meat", "AutoGroupMeat" },
+{ "Auto favorite", "AutoFavorite" },
+{ "Place lanterns", "AutoLanterns" },
+{ "Use radars", "AutoRadar" },
+{ "Dip eggs in the volcano", "VolcanoDip" },
+{ "Buy nests (spends cash)", "AutoBuyNests" },
+{ "Upgrade luck (spends cash)", "AutoLuck" },
+{ "Rebirth (spends cash)", "AutoRebirth" },
+{ "Shop (spends cash)", "AutoShop" },
+{ "Feed pets (uses food)", "AutoFeed" },
+{ "Sell eggs (sells)", "AutoSell" },
+}
+N.FarmRunValues = {}
+for _, entry in ipairs(N.FarmRunMap) do
+table.insert(N.FarmRunValues, entry[1])
+end
+function N.myRunNames()
+local names = {}
+for _, entry in ipairs(N.FarmRunMap) do
+if selected(Options.FarmRun, entry[1]) then
+table.insert(names, entry[2])
+end
+end
+return names
+end
 OPBox:AddToggle("AutoFarmOP", {
 Text = "Auto Farm Everything",
 Default = false,
-Tooltip = "The planner buys, feeds, sells and spends for max profit and can sell your pets and eggs. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
+Tooltip = "Runs the farm in the Mode below. Never saved: it always starts switched off. Best value: the planner buys, feeds, sells and spends for max profit and can sell your pets and eggs. My filters: only the loops you pick in Run, with your own filters, nothing is sold, fed or spent unless you pick it.",
 Callback = function(value)
 if N.opBusy or not Toggles.AutoFarmOP then
 return
 end
-if value and not N.opOk then
-local flagOk = false
-pcall(function()
-flagOk = isfile("Corvus/RAP_op_ok.txt")
-end)
-if flagOk and on("RememberOP") and tick() - N.opBoot < 20 then
-N.opOk = true
-else
+if value and N.farmMode() == "Best value" and not N.opConfirmed then
 N.opBusy = true
 Toggles.AutoFarmOP:SetValue(false)
 N.opBusy = false
-if tick() - N.opBoot > 8 then
 N.askOP()
-else
-log("OP not restored (Remember Auto Farm Everything is off)")
-end
 return
 end
-end
-N.opOk = false
-pcall(function()
-if makefolder and isfolder and not isfolder("Corvus") then
-makefolder("Corvus")
-end
-writefile("Corvus/RAP_op_on.txt", if value then "1" else "0")
-end)
 task.spawn(N.farmAll, value, true)
 end,
 })
-OPBox:AddToggle("RememberOP", {
-Text = "Remember Auto Farm Everything",
-Default = false,
-Tooltip = "Off (default): Auto Farm Everything always starts switched off, even if your saved config had it on. On: it switches itself back on at the next start. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
+OPBox:AddDropdown("FarmMode", {
+Text = "Mode",
+Values = { "Best value", "My filters" },
+Default = "Best value",
+Tooltip = "Best value: the planner picks the most profitable action for you (Exclude applies). My filters: no planner, runs only the loops picked in Run with your own egg filters, priorities and switches. Change the mode while it runs and Auto Farm Everything switches itself off, turn it on again.",
+Callback = function(value)
+if Options.FarmRun and Options.FarmRun.SetVisible then
+pcall(Options.FarmRun.SetVisible, Options.FarmRun, value == "My filters")
+end
+if Options.OPExclude and Options.OPExclude.SetVisible then
+pcall(Options.OPExclude.SetVisible, Options.OPExclude, value ~= "My filters")
+end
+if Toggles.AutoFarmOP and Toggles.AutoFarmOP.Value and not N.opBusy then
+log("FARM mode changed to", tostring(value), "while on: switched off")
+Toggles.AutoFarmOP:SetValue(false)
+notify("Corvus", "Mode changed, Auto Farm Everything switched off. Turn it on again.", 5)
+end
+end,
 })
-OPBox:AddLabel({
-Text = "Warning: with Remember Auto Farm Everything on, the hub starts the full automatic planner by itself next time. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
-DoesWrap = true,
+OPBox:AddDropdown("FarmRun", {
+Text = "Run",
+Values = N.FarmRunValues,
+Default = {
+"Auto Farm eggs",
+"Place eggs in nests",
+"Hatch eggs",
+"Place best pets",
+"Collect pet cash",
+"Claim index rewards",
+"Collect fusions",
+"Claim offline cash",
+},
+Multi = true,
+AllowNull = true,
+Visible = false,
+Tooltip = "My filters mode only: the loops that run when you turn Auto Farm Everything on. Auto Farm eggs follows your Target Pets, rarity filters and priority. Safe defaults: nothing is sold, fed, consumed or spent. Items marked in brackets are optional and use cash, food or eggs.",
+Callback = function()
+if N.farmMode() == "My filters" and Toggles.AutoFarmOP and Toggles.AutoFarmOP.Value then
+N.applyRun()
+end
+end,
 })
 N.OPExcludeValues = {}
 for _, rarity in ipairs(N.RarityList) do
@@ -34435,30 +34487,48 @@ end
 Library:ShowConfirmCard({
 Title = "Enable Auto Farm Everything?",
 Text = "Full automatic: the planner buys, feeds, sells and spends for max profit. It can sell your pets and eggs. If you only want parts of it, use the single switches in the other tabs.",
-ConfirmText = "I understand, enable OP",
+ConfirmText = "I understand, enable",
 Warning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
 CancelText = "Cancel",
 OnConfirm = function()
 log("OP confirmed")
-pcall(function()
-if makefolder and isfolder and not isfolder("Corvus") then
-makefolder("Corvus")
-end
-writefile("Corvus/RAP_op_ok.txt", "1")
-end)
-N.opOk = true
+N.opConfirmed = true
 if Toggles.AutoFarmOP then
 Toggles.AutoFarmOP:SetValue(true)
 end
 end,
 })
 end
+function N.applyRun()
+local want = {}
+for _, name in ipairs(N.myRunNames()) do
+want[name] = true
+end
+for name in pairs(N.FarmOPSet) do
+local toggle = Toggles[name]
+if not want[name] and toggle and toggle.Value then
+toggle:SetValue(false)
+end
+if not want[name] then
+N.FarmOPSet[name] = nil
+end
+end
+for name in pairs(want) do
+local toggle = Toggles[name]
+if toggle and not toggle.Value then
+N.FarmOPSet[name] = true
+toggle:SetValue(true)
+end
+end
+log("FARM MY FILTERS run list updated")
+end
 function N.farmAll(value, op)
 local set = if op then N.FarmOPSet else N.FarmAllSet
 local tag = if op then "FARM OP" else "FARM ALL"
 if value then
-local names = N.FarmAllNames
-if op and Options.MoveMode then
+local best = not op or N.farmMode() == "Best value"
+local names = if best then N.FarmAllNames else N.myRunNames()
+if op and best and Options.MoveMode then
 N.opPrevMove = N.opPrevMove or Options.MoveMode.Value
 pcall(Options.MoveMode.SetValue, Options.MoveMode, "Blatant")
 log("OP movement Blatant (fastest the server allows)")
@@ -35561,7 +35631,11 @@ end,
 end)
 end
 end
-N.opBoot = tick()
+pcall(function()
+local mine = N.farmMode() == "My filters"
+Options.FarmRun:SetVisible(mine)
+Options.OPExclude:SetVisible(not mine)
+end)
 pcall(function()
 Library.ShareIgnore = Library.ShareIgnore or {}
 Library.ShareIgnore.AutoFarmOP = true
@@ -36538,20 +36612,6 @@ end
 end)
 Perf.work.stats = (Perf.work.stats or 0) + (os.clock() - statsStarted)
 task.wait(0.5)
-end
-end)
-task.spawn(function()
-task.wait(4)
-if on("RememberOP") and not on("AutoFarmOP") and Toggles.AutoFarmOP then
-local was = false
-pcall(function()
-was = isfile("Corvus/RAP_op_ok.txt") and readfile("Corvus/RAP_op_on.txt") == "1"
-end)
-if was then
-log("OP restored (Remember Auto Farm Everything)")
-N.opOk = true
-Toggles.AutoFarmOP:SetValue(true)
-end
 end
 end)
 pcall(function()
