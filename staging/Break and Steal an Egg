@@ -23441,14 +23441,10 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                 }
     
                 local ResizeTween
+                local ResizeTarget
                 local CollapseArrowTween
-    
+
                 function Groupbox:Resize()
-                    if ResizeTween then
-                        StopTween(ResizeTween, true)
-                        ResizeTween = nil
-                    end
-    
                     local TopSize = (GroupboxTop.AbsoluteSize.Y / Library.DPIScale)
                     local ContainerSize = (GroupboxList.AbsoluteContentSize.Y / Library.DPIScale) + 14
                     if Groupbox.PoppedOut then
@@ -23458,7 +23454,19 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                     local TargetSize = UDim2.new(1, 0, 0, if Groupbox.Collapsed then TopSize else (TopSize + 1 + ContainerSize))
                     GroupboxContainer.Size = UDim2.new(1, 0, 0, ContainerSize)
                     GroupboxLine.Visible = not Groupbox.Collapsed
-    
+
+                    -- live labels fire AbsoluteContentSize often: keep a running tween to the same size, skip a resize to the current size
+                    if ResizeTween then
+                        if ResizeTarget == TargetSize then
+                            return
+                        end
+                        StopTween(ResizeTween, true)
+                        ResizeTween = nil
+                    elseif GroupboxHolder.Size == TargetSize then
+                        return
+                    end
+                    ResizeTarget = TargetSize
+
                     if Library.Animations and Library.Animations.Groupbox then
                         local TweenInfo = Library.GroupboxTweenInfo or TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
                         local Tween = TweenService:Create(GroupboxHolder, TweenInfo, { Size = TargetSize })
@@ -27676,7 +27684,7 @@ end
                 if Info.AutoLoad ~= false then
                     task.defer(function()
                         pcall(SaveManager.LoadAutoloadConfig, SaveManager)
-                        if Library.OnAutoload then pcall(Library.OnAutoload) end
+                        Library:FireAutoload()
                     end)
                 end
             end
@@ -31422,6 +31430,147 @@ end
 			end
 			return Result
 		end
+	end
+	-- CORVUS-STARTLOG: standard owner log lines for every hub. The hub sets Library.LoadLogger (its log function);
+	-- BOOT comes from the hub, START + AUTOLOAD + CLICK come from here unless the hub set its own OnAutoload/OnUserToggle.
+	-- A hub that logs these itself opts out with Library.OnAutoload = false / Library.OnUserToggle = nil.
+	function Library:CorvusLog(Line: string)
+		if typeof(Library.LoadLogger) == "function" then
+			pcall(Library.LoadLogger, tostring(Line))
+		end
+	end
+	local function TogglesOn(): { string }
+		local Names = {}
+		for Name, Toggle in Library.Toggles do
+			if typeof(Name) == "string" and typeof(Toggle) == "table" and Toggle.Value == true then
+				table.insert(Names, Name)
+			end
+		end
+		table.sort(Names)
+		return Names
+	end
+	function Library:LogStart()
+		if Library.StartLogged then
+			return
+		end
+		Library.StartLogged = true
+		local Total, On = 0, #TogglesOn()
+		for Name in Library.Toggles do
+			if typeof(Name) == "string" then
+				Total += 1
+			end
+		end
+		local Shown = CorvusLoadTimes.shown
+		Library:CorvusLog(string.format(
+			"START hub loaded | place %s | toggles %d on of %d | window %ss",
+			tostring(game.PlaceId), On, Total, if Shown then string.format("%.1f", Shown - CorvusLoadT0) else "-"
+		))
+	end
+	function Library:FireAutoload()
+		if Library.AutoloadFired then
+			return
+		end
+		Library.AutoloadFired = true
+		Library:LogStart()
+		local Hook = Library.OnAutoload
+		if Hook == false then
+			return
+		end
+		if typeof(Hook) == "function" then
+			pcall(Hook)
+			return
+		end
+		local Names = TogglesOn()
+		Library:CorvusLog("AUTOLOAD toggles=" .. (if #Names > 0 then table.concat(Names, ",") else "-"))
+	end
+	Library.OnUserToggle = function(Name, Value)
+		Library:CorvusLog("CLICK " .. tostring(Name) .. "=" .. tostring(Value))
+	end
+	do
+		local BaseCreateWindowLog = Library.CreateWindow
+		function Library:CreateWindow(...)
+			local Window = BaseCreateWindowLog(self, ...)
+			if not Library.StartFallback then
+				Library.StartFallback = true
+				task.delay(20, function()
+					if not Library.Unloaded then
+						Library:LogStart()
+					end
+				end)
+			end
+			return Window
+		end
+	end
+	-- Quick Start rule: a second control for an existing toggle in another groupbox. Both stay in sync both ways,
+	-- the original keeps the only callback and the only config key (the mirror is not in Library.Toggles).
+	function Library:MirrorToggle(Idx: string, Box: any, Opts: any?)
+		Opts = if typeof(Opts) == "table" then Opts else {}
+		local Original = Library.Toggles[Idx]
+		if typeof(Original) ~= "table" or typeof(Box) ~= "table" or typeof(Box.AddToggle) ~= "function" then
+			return nil
+		end
+		local Key = {}
+		local Mirror = Box:AddToggle(Key, {
+			Text = Opts.Text or Original.Text,
+			Description = Opts.Description,
+			Tooltip = Opts.Tooltip or Original.Tooltip,
+			DisabledTooltip = Original.DisabledTooltip,
+			Risky = Original.Risky,
+			Default = Original.Value == true,
+		})
+		Library.Toggles[Key] = nil
+		if not Mirror then
+			return nil
+		end
+		Mirror.MirrorOf = Idx
+		local ShowValue = Mirror.SetValue
+		local Syncing = false
+		local function Sync()
+			if Syncing or Mirror.Destroyed then
+				return
+			end
+			Syncing = true
+			if Mirror.Value ~= Original.Value then
+				pcall(ShowValue, Mirror, Original.Value)
+			end
+			Syncing = false
+		end
+		local BaseSet = Original.SetValue
+		Original.SetValue = function(Self, Value)
+			BaseSet(Self, Value)
+			Sync()
+		end
+		local BaseDisabled = Original.SetDisabled
+		if typeof(BaseDisabled) == "function" then
+			Original.SetDisabled = function(Self, Disabled)
+				BaseDisabled(Self, Disabled)
+				if not Mirror.Destroyed then
+					pcall(Mirror.SetDisabled, Mirror, Disabled)
+				end
+			end
+			if Original.Disabled then
+				pcall(Mirror.SetDisabled, Mirror, true)
+			end
+		end
+		-- the mirror's own switch (click, quick bar) drives the original; Sync then repaints the mirror
+		Mirror.SetValue = function(_, Value)
+			Original:SetValue(Value)
+		end
+		local Holder = Mirror.Holder
+		if typeof(Holder) == "Instance" and Holder:IsA("GuiButton") then
+			table.insert(Mirror.Connections, Holder.MouseButton1Click:Connect(function()
+				-- deferred so the value is the one after the click, whatever order the connections fire in
+				task.defer(function()
+					if not Original.Disabled and Library.OnUserToggle then
+						pcall(Library.OnUserToggle, Idx, Original.Value)
+					end
+				end)
+			end))
+			table.insert(Mirror.Connections, Holder.MouseButton2Click:Connect(function()
+				Library:StartQuickBind("Toggle", Idx, tostring(Original.Text))
+			end))
+		end
+		return Mirror
 	end
 	getgenv().CorvusLibrary = Library
     return Library
