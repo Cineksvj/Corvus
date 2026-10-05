@@ -31874,6 +31874,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	autoPartyEgg = false,
     	autoHatch = false,
     	eggSmart = false,
+    	farmOP = false,
     	fishSmart = false,
     	rebirthSmart = false,
     	autoAdminChat = false,
@@ -33869,7 +33870,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	"AutoFruits", "AutoPotions", "AutoLucky", "AutoEquipBest", "AutoGolden", "AutoDiamond", "AutoFish", "FishSmart",
     	"FishIndexHunt", "FishIndexGolden", "FishTap", "AutoWorms", "AutoHooks", "AutoSellFish", "AutoMerchantBuy",
     	"AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoMoonPerm", "AutoMoonIncr",
-    	"MoonGameAuto", "AutoRebirth", "RebirthSmart", "AutoServerLuck", "AutoAdminChat", "AutoItemCraft", "AutoEventCraft",
+    	"MoonGameAuto", "AutoRebirth", "RebirthSmart", "SmartPlan", "AutoServerLuck", "AutoAdminChat", "AutoItemCraft", "AutoEventCraft",
     }
     -- the budget reserve of a currency (Rubies / Gems reserve inputs)
     function Auto.reserve(currency)
@@ -33891,6 +33892,19 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	notify("Auto Farm", "Everything stopped", 4)
     end
     UI.AllBox = Tabs.Farm:AddLeftGroupbox("Quick Start", "rocket")
+    -- one planner for the whole game: it decides and spends by payback on its own, it never switches other toggles
+    UI.AllBox:AddToggle("SmartPlan", {
+    	Text = "Smart Planner",
+    	Description = "Plans and buys everything by payback",
+    	Tooltip = "Runs the profit engine on the whole game with real odds and prices: picks and hatches the egg that adds the most income per coin, walks to it, equips the best team, farms in the best world, buys worlds (The Moon too), spawn, tree, special and Moon upgrades only when they pay back within 24 hours, times Moon rebirths, pauses fishing when farming pays more and uses admin events (luck, free eggs). Your upgrade picks and the ruby / gem reserves are respected. Auto Farm, fusing, selling and items stay on their own switches.",
+    	Default = false,
+    	Callback = function(v)
+    		S.farmOP = v == true
+    		if not S.farmOP then
+    			S.worldSave = 0
+    		end
+    	end,
+    })
     -- what changed a toggle is always in the log: the saved config at start (AUTOLOAD) or the player (CLICK)
     Library.OnAutoload = function()
     	local names = {}
@@ -33980,7 +33994,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     local AreaRow = StatusBox:AddStat({ Icon = "map-pin", Text = "Area", Value = "unknown", Size = 22, ValueColor = "FontColor" })
     UI.FarmWorldRow = StatusBox:AddStat({ Icon = "globe", Text = "Farm world", Value = "Off", Size = 22, ValueColor = "FontColor" })
     UI.UpNextBox = Tabs.Farm:AddRightGroupbox("Up next", "list-checks")
-    UI.UpNextLabel = UI.UpNextBox:AddLabel({ Text = "Switch on Smart Egg Pick, Auto Upgrade, Auto Buy Worlds or Smart Fishing and the next steps show here.", DoesWrap = true })
+    UI.UpNextLabel = UI.UpNextBox:AddLabel({ Text = "Switch on Smart Planner (or Smart Egg Pick, Auto Upgrade, Auto Buy Worlds) and the next steps show here.", DoesWrap = true })
     UI.UfoBox = Tabs.Ufo:AddRightGroupbox("UFO Event", "rocket")
     UI.UfoBox:AddToggle("AutoUfo", {
     	Text = "Auto Break UFO",
@@ -38050,7 +38064,7 @@ end
     				folder = "UpgradesData",
     				service = "UpgradesService",
     				names = UI.SpawnUpgradeNames,
-    				enabled = S.autoSpawnUp,
+    				enabled = S.autoSpawnUp or S.farmOP,
     				pick = S.spawnPick,
     				maxLevel = function(name)
     					return tonumber(module.MaxLevels and module.MaxLevels[name]) or 0
@@ -38094,7 +38108,7 @@ end
     				folder = folder,
     				service = if shopKey == "Permanent" then "MoonPermUpgradesService" else "MoonUpgradesService",
     				names = shop.Order or {},
-    				enabled = if shopKey == "Permanent" then S.autoMoonPerm else S.autoMoonIncr,
+    				enabled = S.farmOP or (if shopKey == "Permanent" then S.autoMoonPerm else S.autoMoonIncr),
     				pick = if shopKey == "Permanent" then S.moonPermPick else S.moonIncrPick,
     				maxLevel = function(name)
     					return tonumber(shop.MaxLevels and shop.MaxLevels[name]) or 0
@@ -38141,7 +38155,7 @@ end
     			local balance = getStat(shop.currency) or 0
     			local reserve = Auto.reserve(shop.currency)
     			local plan = Auto.Plan
-    			local planOn = plan ~= nil and plan.ready and S.upgradeOrder == "Best value"
+    			local planOn = plan ~= nil and plan.ready and (S.farmOP or S.upgradeOrder == "Best value")
     			local bestValue = -math.huge
     			for index, name in ipairs(shop.names) do
     				local level = readLevel(shop.folder, name)
@@ -38327,10 +38341,10 @@ end
     				local ok, err = pcall(function()
     					local info = worldInfo()
     					S.worldSave = 0
-    					if S.autoBuyWorlds and info.next and info.currency == "Coins" and info.price and Auto.Plan and Auto.Plan.ready then
+    					if (S.autoBuyWorlds or S.farmOP) and info.next and info.currency == "Coins" and info.price and Auto.Plan and Auto.Plan.ready then
     						S.worldSave = Auto.Plan.keep.Coins or 0
     					end
-    					if not S.autoBuyWorlds then
+    					if not (S.autoBuyWorlds or S.farmOP) then
     						Worlds.status = ""
     						return
     					end
@@ -38856,7 +38870,7 @@ end
     				local best, bestCost, bestIndex
     				local now = os.clock()
     				local plan = Auto.Plan
-    				local planOn = plan ~= nil and plan.ready and S.treeOrder == "Best value"
+    				local planOn = plan ~= nil and plan.ready and (S.farmOP or S.treeOrder == "Best value")
     				local bestValue = -math.huge
     				for index, group in ipairs(tree.Groups) do
     					if group.parent then
@@ -38956,7 +38970,7 @@ end
     						info.allDone = false
     						if row.locked then
     							info.anyLocked = true
-    						elseif anchor and (Special.blocked[entry.name] or 0) < now and (info.next == nil or entry.price < info.next.price) and not (Auto.Plan and Auto.Plan.on() and S.upgradeOrder == "Best value" and not Auto.Plan.allows("special:" .. entry.name, entry.price)) then
+    						elseif anchor and (Special.blocked[entry.name] or 0) < now and (info.next == nil or entry.price < info.next.price) and not (Auto.Plan and Auto.Plan.on() and (S.farmOP or S.upgradeOrder == "Best value") and not Auto.Plan.allows("special:" .. entry.name, entry.price)) then
     							info.next = row
     						end
     					end
@@ -39486,7 +39500,7 @@ end
     					end
     					-- spawn machine (rubies)
     					local spawn = Auto.GameData.spawnUpgrades
-    					if spawn and S.autoSpawnUp then
+    					if spawn and (S.autoSpawnUp or S.farmOP) then
     						for _, track in ipairs(UI.SpawnUpgradeNames or {}) do
     							if S.spawnPick[track] then
     								local lvl = readLevel("UpgradesData", track)
@@ -39503,7 +39517,7 @@ end
     					if moonCfg then
     						for _, shopKey in ipairs({ "Permanent", "Incremental" }) do
     							local shop = moonCfg[shopKey]
-    							local on = if shopKey == "Permanent" then S.autoMoonPerm else S.autoMoonIncr
+    							local on = S.farmOP or (if shopKey == "Permanent" then S.autoMoonPerm else S.autoMoonIncr)
     							local pick = if shopKey == "Permanent" then S.moonPermPick else S.moonIncrPick
     							local folder = moonCfg.DataFolders and moonCfg.DataFolders[shopKey] or (if shopKey == "Permanent" then "MoonPermUpgradesData" else "MoonUpgradesData")
     							if shop and on then
@@ -39528,7 +39542,7 @@ end
     					end
     					-- Upgrade Tree (rubies), one level of lookahead through nodes that only open branches
     					local tree = Auto.GameData.tree
-    					if tree and S.autoTree and flag(Auto.GameData.treeFlag or "SP13") then
+    					if tree and (S.autoTree or S.farmOP) and flag(Auto.GameData.treeFlag or "SP13") then
     						local folder = getDataFolder(Auto.GameData.treeFolder or "TreeData")
     						local levels = {}
     						for _, group in ipairs(tree.Groups) do
@@ -39575,7 +39589,7 @@ end
     						end
     					end
     					-- Special upgrades (rubies)
-    					if S.autoSpecial then
+    					if S.autoSpecial or S.farmOP then
     						local special = specialInfo()
     						for _, row in ipairs(special.rows) do
     							if row.picked and not row.owned and not row.locked then
@@ -39885,7 +39899,7 @@ end
     				-- plain words for the UI; the raw numbers stay in the log (PLAN lines)
     				function Auto.upNextText()
     					if not P.ready and not P.wanted() then
-						return "Switch on Smart Egg Pick, Auto Upgrade, Auto Buy Worlds or Smart Fishing and the next steps show here."
+						return "Switch on Smart Planner (or Smart Egg Pick, Auto Upgrade, Auto Buy Worlds) and the next steps show here."
 					end
     					if not P.ready then
     						return "Measuring your income, the plan shows up in a minute."
@@ -39972,7 +39986,7 @@ end
     					P.last = { t = now, value = value, activity = activity }
     					-- fishing vs farming: measure both, keep the better one (tokens from fish are not counted as money)
     					local farm, fishAct = P.act.Farm, P.act.Fish
-    					if not (S.fishSmart and S.autoFish) then
+    					if not ((S.fishSmart or S.farmOP) and S.autoFish) then
     						P.fishOff = false
     					elseif P.evt and P.evt.fishBoost then
     						P.fishOff = false
@@ -40007,7 +40021,7 @@ end
     						plLog("TIME", table.concat(parts, " "), "fishOff=" .. tostring(P.fishOff))
     						local rb = P.rebirth
     						local rbKey = if rb then tostring(rb.ready) .. "|" .. tostring(P.rebirthNow) .. "|" .. tostring(P.rebirthWhy) .. "|" .. tostring(P.rebirthPath) else ""
-    						if rb and (S.autoRebirth or S.rebirthSmart) and (rbKey ~= P.lastLog.rbKey or now - (P.lastLog.rbAt or -1e9) >= 900) then
+    						if rb and (S.autoRebirth or S.rebirthSmart or S.farmOP) and (rbKey ~= P.lastLog.rbKey or now - (P.lastLog.rbAt or -1e9) >= 900) then
     							P.lastLog.rbKey = rbKey
     							P.lastLog.rbAt = now
     							plLog("REBIRTH", "ready=" .. tostring(rb.ready), "now=" .. tostring(P.rebirthNow), "why=" .. tostring(P.rebirthWhy), "net=" .. plFmt(rb.net), "gain=" .. plFmt(rb.gain), "loss=" .. plFmt(rb.loss), "rebuildT=" .. plFmt(rb.T), "remain=" .. plFmt(rb.remain), "path=" .. tostring(P.rebirthPath))
@@ -40042,7 +40056,7 @@ end
     
     				-- the planner runs only while a switch that uses it is on
     				function P.wanted()
-    					for _, name in ipairs({ "EggSmart", "FishSmart", "RebirthSmart", "AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoBuyWorlds", "AutoHatch", "AutoRebirth", "AutoMoonPerm", "AutoMoonIncr", "AutoGolden", "AutoDiamond", "AutoInvEggs", "IndexHunter" }) do
+    					for _, name in ipairs({ "SmartPlan", "EggSmart", "FishSmart", "RebirthSmart", "AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoBuyWorlds", "AutoHatch", "AutoRebirth", "AutoMoonPerm", "AutoMoonIncr", "AutoGolden", "AutoDiamond", "AutoInvEggs", "IndexHunter" }) do
     						local toggle = Toggles[name]
     						if toggle and toggle.Value then
     							return true
@@ -40066,14 +40080,20 @@ end
     							end
     							P.compute()
     							plTrack(now)
+    							local upNext = Auto.upNextText()
     							if UI.UpNextLabel then
-    								setLabel(UI.UpNextLabel, Auto.upNextText())
+    								setLabel(UI.UpNextLabel, upNext)
+    							end
+    							if S.farmOP and P.ready and (upNext ~= P.lastLog.doText or now - (P.lastLog.doAt or -1e9) >= 600) then
+    								P.lastLog.doText = upNext
+    								P.lastLog.doAt = now
+    								plLog("PLAN", "do: " .. string.gsub(upNext, "\n", "; "))
     							end
     							if P.ready then
     								plReport(now)
     								-- Moon world: progress, bought with rubies as soon as it is affordable
     								local moonOpt = P.byId.moonworld
-    								if S.autoBuyWorlds and moonOpt and moonOpt.eta <= 0 and not Mover.busy and now - P.moonTry > 30 then
+    								if (S.autoBuyWorlds or S.farmOP) and moonOpt and moonOpt.eta <= 0 and not Mover.busy and now - P.moonTry > 30 then
     									P.moonTry = now
     									plLog("BUY", "moon world for", moonOpt.cost, "rubies")
     									buyWorld({ next = moonOpt.name, moon = true, from = moonOpt.from, price = moonOpt.cost, currency = "Rubies" }, Worlds.fails >= 2)
@@ -40088,24 +40108,24 @@ end
     
     				-- Normal: the player's egg stays unless it is empty or still the list default
     				function P.eggAuto()
-    					if not (P.ready and S.eggSmart) then
+    					if not (P.ready and (S.eggSmart or S.farmOP)) then
     						return false
     					end
     					return true
     				end
 
     				function Auto.effectiveEgg()
-    					if P.eggAuto() then
-    						return P.egg or ""
+    					if S.farmOP or S.eggSmart then
+    						return if P.ready then P.egg or "" else ""
     					end
     					return S.hatchEggName
     				end
     			end
 
     			Extra.nextErrand = function(now)
-    				if S.autoRebirth and now - Rebirth.lastTry > 12 and now >= Rebirth.blockedUntil then
+    				if (S.autoRebirth or S.farmOP) and now - Rebirth.lastTry > 12 and now >= Rebirth.blockedUntil then
     					local info = rebirthInfo()
-    					local planWait = if S.rebirthSmart and Auto.Plan and Auto.Plan.on() then not Auto.Plan.rebirthNow else (S.rebirthWaitPerm and Auto.permMaxed and not Auto.permMaxed())
+    					local planWait = if (S.rebirthSmart or S.farmOP) and Auto.Plan and Auto.Plan.on() then not Auto.Plan.rebirthNow else (S.rebirthWaitPerm and Auto.permMaxed and not Auto.permMaxed())
     					if info.available and info.ready and info.moonUnlocked and info.nextNumber and not info.stopped and not planWait then
     						return "Moon rebirth", function()
     							local travel = Rebirth.needsTravel == true
@@ -40126,7 +40146,7 @@ end
     						end
     					end
     				end
-    				if S.autoSpecial and now - Special.lastTry > 8 then
+    				if (S.autoSpecial or S.farmOP) and now - Special.lastTry > 8 then
     					local info = specialInfo()
     					if info.next and info.affordable then
     						local row = info.next
@@ -40280,7 +40300,7 @@ end
     						Codes.result = value
     					end)
     					local ok, err = pcall(function()
-    						if not S.autoTree then
+    						if not (S.autoTree or S.farmOP) then
     							Tree.status = "Off"
     							return
     						end
@@ -40339,7 +40359,7 @@ end
     				while alive() do
     					task.wait(1)
     					local ok, err = pcall(function()
-    						if not S.autoSpecial then
+    						if not (S.autoSpecial or S.farmOP) then
     							Special.status = "Off"
     						else
     							local info = specialInfo()
@@ -40362,7 +40382,7 @@ end
     								Special.doneToast = false
     							end
     						end
-    						if not S.autoRebirth then
+    						if not (S.autoRebirth or S.farmOP) then
     							Rebirth.status = "Off"
     						else
     							local info = rebirthInfo()
@@ -40374,7 +40394,7 @@ end
     								Rebirth.status = "Max rebirths"
     							elseif info.stopped then
     								Rebirth.status = "Stopped at " .. tostring(S.rebirthStopAt)
-    							elseif info.ready and S.rebirthSmart and Auto.Plan and Auto.Plan.on() and not Auto.Plan.rebirthNow then
+    							elseif info.ready and (S.rebirthSmart or S.farmOP) and Auto.Plan and Auto.Plan.on() and not Auto.Plan.rebirthNow then
     								Rebirth.status = "Waiting: " .. tostring(Auto.Plan.rebirthWhy or "waiting")
     							elseif info.ready and S.rebirthWaitPerm and Auto.permMaxed and not Auto.permMaxed() then
     								local _, owned, cap = Auto.permMaxed()
@@ -40825,7 +40845,7 @@ end
     		end
     
     		local function eggTravelWanted(now)
-    			if not (S.autoHatch and S.eggAutoTravel and EggTravel.need) then return false end
+    			if not (((S.autoHatch and S.eggAutoTravel) or S.farmOP) and EggTravel.need) then return false end
     			if S.autoFish and S.fishPriority == "Fishing first" then return false end
     			if S.indexHunt and Hunter.egg then return false end
     			if EggTravel.need ~= (if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName) then
@@ -41219,7 +41239,7 @@ end
     					end
     				end
     			end
-    			if S.autoEquip then
+    			if S.autoEquip or S.farmOP then
     				local total = petSignature()
     				if total and ((Equip.lastSig ~= total and (not Equip.fired or now - Equip.lastFire >= 6)) or now - Equip.lastFire >= 90) then
     					if Auto.equipBestNow(false) then
@@ -42417,7 +42437,7 @@ end
     					return "Index Hunter"
     				end
     				local hatchEgg = if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName
-    				if S.autoHatch and S.eggAutoTravel and hatchEgg ~= "" then
+    				if ((S.autoHatch and S.eggAutoTravel) or S.farmOP) and hatchEgg ~= "" then
     					local eggWorld = Auto.eggWorld(hatchEgg)
     					if eggWorld ~= target then
     						return "Hatching in " .. prettyWorld(eggWorld)
@@ -42429,7 +42449,7 @@ end
     				return nil
     			end
     			Auto.farmWorldStep = function(now)
-    				if not (S.autoFarm and S.farmWorldOn) then
+    				if not (S.autoFarm and (S.farmWorldOn or S.farmOP)) then
     					return false
     				end
     				local target = farmTarget()
@@ -43649,7 +43669,7 @@ end
     			end
     
     			Auto.eggsActive = function()
-    				local wants = (S.autoHatch and (if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName) ~= "") or (S.indexHunt and Hunter.egg ~= nil) or S.autoInvEggs
+    				local wants = ((S.autoHatch or S.farmOP) and (if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName) ~= "") or (S.indexHunt and Hunter.egg ~= nil) or S.autoInvEggs
     				if not wants then
     					return false
     				end
@@ -44340,7 +44360,7 @@ end
     -- Luck Combo (EggLuckComboConfig): the combo drops after 150 s without a hatch, one cheap egg keeps it
     local ComboKeep = { last = -1e9, count = 0 }
     local function comboKeep(now)
-    	if not (S.autoHatch and EggHatch) then
+    	if not ((S.autoHatch or S.farmOP) and EggHatch) then
     		return false
     	end
     	if now - HatchState.lastFire < 110 or now - ComboKeep.last < 20 then
@@ -44390,8 +44410,8 @@ end
 
     function hatchStepInner()
     	local huntEgg = if S.indexHunt then Auto.Hunter.egg else nil
-    	local eggName = huntEgg or (if S.autoHatch then (if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName) else nil)
-    	if eggName == "" and not huntEgg and S.autoHatch and Auto.Plan and Auto.Plan.eggAuto and Auto.Plan.eggAuto() then
+    	local eggName = huntEgg or (if S.autoHatch or S.farmOP then (if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName) else nil)
+    	if eggName == "" and not huntEgg and (S.autoHatch or S.farmOP) and Auto.Plan and Auto.Plan.eggAuto and Auto.Plan.eggAuto() then
     		HatchState.status = "Waiting: " .. Auto.Plan.eggWhy
     		HatchState.waiting = false
     		return
@@ -45119,7 +45139,7 @@ end
     				if worlds.next then
     					local icon = CurrencyIcons[worlds.currency or "Coins"] or CurrencyIcons.Coins
     					local label = prettyWorld(worlds.next)
-    					if S.autoBuyWorlds and worlds.status and worlds.status ~= "" then
+    					if (S.autoBuyWorlds or S.farmOP) and worlds.status and worlds.status ~= "" then
     						label = label .. "  " .. dim(worlds.status)
     					end
     					if worlds.price and not worlds.affordable then
@@ -45435,6 +45455,18 @@ end
     })
     
     Library:AddCommand({
+    	Name = "planner",
+    	Aliases = { "smart", "plan" },
+    	Args = "[on/off]",
+    	Description = "Turns the Smart Planner on or off",
+    	Callback = function(Args)
+    		local State = if Args[1] then Args[1] == "on" else not Toggles.SmartPlan.Value
+    		Toggles.SmartPlan:SetValue(State)
+    		return "Smart Planner " .. (if State then "on" else "off")
+    	end,
+    })
+
+    Library:AddCommand({
     	Name = "farm",
     	Args = "[on/off]",
     	Description = "Starts or stops the auto farm",
@@ -45661,7 +45693,7 @@ end
     end
     
     -- Quick Start: the main loop toggles as two-way mirrors of the originals in their tabs
-    for _, id in ipairs({ "AutoFarm", "AutoTap", "AutoHatch", "EggSmart", "AutoFish", "AutoSpawnUpgrades" }) do
+    for _, id in ipairs({ "AutoFarm", "AutoTap", "AutoHatch", "AutoFish", "AutoSpawnUpgrades" }) do
     	pcall(Library.MirrorToggle, Library, id, UI.AllBox)
     end
     UI.AllBox:AddDivider()
@@ -45682,6 +45714,7 @@ end
 
     if Library.SetQuickBar then
     	Library:SetQuickBar({
+    		{ Toggle = "SmartPlan", Icon = "brain", Label = "Planner" },
     		{ Toggle = "AutoFarm", Icon = "swords", Label = "Farm" },
     		{ Toggle = "AutoHatch", Icon = "egg", Label = "Eggs" },
     		{ Toggle = "AutoUfo", Icon = "rocket", Label = "UFO" },
