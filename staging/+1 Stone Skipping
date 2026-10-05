@@ -34724,24 +34724,20 @@ do
 			local kind = option.Type
 			local default = option.Default
 			if not skip(name) and default ~= nil and kind ~= "KeyPicker" and kind ~= "ColorPicker" then
-				if kind == "Dropdown" or type(default) == "table" then
-					local value = default
-					if option.Multi then
-						value = {}
-						for k, v in pairs(default) do
-							if type(k) == "number" then
-								value[v] = true
-							elseif v then
-								value[k] = true
-							end
+				local value = default
+				if type(default) == "table" and option.Multi then
+					value = {}
+					for k, v in pairs(default) do
+						if type(k) == "number" then
+							value[v] = true
+						elseif v then
+							value[k] = true
 						end
-					elseif type(default) == "table" then
-						value = default[1]
 					end
-					pcall(option.SetValue, option, value)
-				else
-					pcall(option.SetValue, option, default)
+				elseif type(default) == "table" then
+					value = default[1]
 				end
+				pcall(option.SetValue, option, value)
 				changed += 1
 			end
 		end
