@@ -32489,7 +32489,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     Auto.farmNames = {
     	"AutoFarm", "AutoTap", "FarmWorldOn", "AutoUfo", "UfoTravel", "AutoBuyWorlds",
     	"AutoGift", "AutoPartyEgg", "AutoFruitMachine", "AutoGroupChest", "AutoMoonChest", "AutoKeyCraft",
-    	"AutoVipChest", "AutoPartner", "AutoUniverseZone", "AutoQuests", "AutoBen", "AutoCodes",
+    	"AutoVipChest", "AutoPartner", "AutoUniverseZone", "AutoQuests", "AutoBen", "AutoCodes", "AutoFriend",
     	"AutoHatch", "EggAutoTravel", "AutoInvEggs", "IndexHunter", "AutoFruits", "AutoPotions",
     	"AutoLucky", "AutoEquipBest", "AutoGolden", "AutoDiamond", "AutoFish", "FishIndexHunt",
     	"FishIndexGolden", "FishTap", "AutoWorms", "AutoHooks", "AutoSellFish", "AutoMerchantBuy",
@@ -32890,6 +32890,103 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	end,
     })
 
+
+do
+local FPlayers = game:GetService("Players")
+local FTeleport = game:GetService("TeleportService")
+local F = { on = true, asked = {}, friend = {}, sent = 0, lastSend = -1e9, lastLog = "", lastLogAt = -1e9 }
+local function friendBoost()
+local folder = LocalPlayer:FindFirstChild("VariousBoosts", true)
+local v = folder and folder:FindFirstChild("FriendBoostCoins")
+if v and v:IsA("ValueBase") and type(v.Value) == "number" then
+return "+" .. math.floor(math.max(0, (v.Value - 1) * 100) + 0.5) .. "%"
+end
+return "?"
+end
+local function isFriend(p)
+if F.friend[p.UserId] then return true end
+local ok, res = pcall(function() return LocalPlayer:IsFriendsWith(p.UserId) end)
+if ok and res then F.friend[p.UserId] = true end
+return ok and res, ok
+end
+local function friendPump()
+if not F.on then return end
+for _, p in ipairs(FPlayers:GetPlayers()) do
+if p ~= LocalPlayer and not F.asked[p.UserId] and not F.friend[p.UserId] then
+local yes, ok = isFriend(p)
+if ok and not yes then
+if os.clock() - F.lastSend < 10 then return end
+F.asked[p.UserId] = true
+F.lastSend = os.clock()
+if pcall(function() LocalPlayer:RequestFriendship(p) end) then F.sent += 1 end
+return
+end
+end
+end
+end
+local function friendLog()
+local n = 0
+for _, p in ipairs(FPlayers:GetPlayers()) do
+if p ~= LocalPlayer and isFriend(p) then n += 1 end
+end
+local boost = friendBoost()
+local key = F.sent .. "/" .. n .. "/" .. tostring(boost)
+if key ~= F.lastLog and os.clock() - F.lastLogAt >= 60 then
+F.lastLog = key
+F.lastLogAt = os.clock()
+Auto.log("FRIEND sent=" .. F.sent .. " friends=" .. n .. " boost=" .. tostring(boost))
+end
+end
+Library:GiveSignal(FPlayers.PlayerAdded:Connect(function()
+task.delay(2, function() pcall(friendPump) end)
+end))
+task.spawn(function()
+local beat = 0
+while true do
+task.wait(10)
+beat += 1
+pcall(friendPump)
+if beat % 6 == 0 then pcall(friendLog) end
+end
+end)
+local function joinFriend()
+local ok, list = pcall(function() return LocalPlayer:GetFriendsOnline(200) end)
+if not ok or type(list) ~= "table" then
+Auto.log("FRIEND join unsupported")
+notify("Friends", "Joining a friend is not supported by this executor", 4)
+return
+end
+for _, f in ipairs(list) do
+local place, job = f.PlaceId, f.GameId
+if place and job and job ~= game.JobId and (place == game.PlaceId or f.UniverseId == game.GameId) then
+Auto.log("FRIEND join " .. tostring(f.UserName or f.DisplayName or f.VisitorId))
+notify("Friends", "Joining " .. tostring(f.UserName or "a friend"), 4)
+if not pcall(function() FTeleport:TeleportToPlaceInstance(place, job, LocalPlayer) end) then
+Auto.log("FRIEND join unsupported")
+end
+return
+end
+end
+Auto.log("FRIEND join none")
+notify("Friends", "No friend is online in this game's other servers", 4)
+end
+UI.FriendBox = Tabs.Rewards:AddRightGroupbox("Friends", "users")
+UI.FriendBox:AddToggle("AutoFriend", {
+Text = "Auto Friend",
+Description = "Sends friend requests to everyone in the server, once each",
+Tooltip = "Every friend in the server gives a boost. Sends one request per 10 s (and accepts requests sent to you).",
+Default = true,
+Callback = function(v)
+F.on = v == true
+end,
+})
+UI.FriendBox:AddButton({
+Text = "Join friend's server",
+Func = function()
+task.spawn(joinFriend)
+end,
+})
+end
     UI.VipKeysRow = UI.VipChestBox:AddStat({ Icon = "key-round", Text = "VIP keys", Value = "0", Size = 26 })
     UI.VipOpenedRow = UI.VipChestBox:AddStat({ Icon = "crown", Text = "Opened / crafted", Value = "0 / 0", Size = 22, ValueColor = "FontColor" })
     
