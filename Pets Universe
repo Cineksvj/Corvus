@@ -35931,6 +35931,50 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     			if now - AutoCraft.lastTrip < 45 or now < AutoCraft.blockedUntil then return false end
     			return (S.autoGolden and #craftableList("Golden") > 0) or (S.autoDiamond and #craftableList("Diamond") > 0)
     		end
+
+    		-- Fishing Index Hunter: golden fish missing from the index are crafted once enough normal ones are caught.
+    		Auto.FishCraft = { lastTrip = -1e9, blockedUntil = -1e9 }
+    		Auto.fishCraftList = function()
+    			local fish = Auto.Fish
+    			local plan = fish and fish.plan
+    			local list = {}
+    			if not (S.fishIndexHunt and S.fishIndexGolden and plan and type(plan.missing) == "table") then
+    				return list
+    			end
+    			local reqG = craftRequirements()
+    			local multi = petsMulti()
+    			for _, name in ipairs(plan.missing) do
+    				local base = string.match(name, "^Golden (.+)$")
+    				if base then
+    					local info = if type(multi) == "table" then multi[base] else nil
+    					local rarity = if type(info) == "table" then info[3] else nil
+    					local exists = type(multi) ~= "table" or multi["Golden " .. base] ~= nil
+    					if exists and rarity ~= "Exclusive" and rarity ~= "Secret" and petStock("NormalPetsData", base) >= reqG then
+    						table.insert(list, base)
+    					end
+    				end
+    			end
+    			table.sort(list)
+    			return list
+    		end
+    		Auto.fishCraftDue = function(now)
+    			local state = Auto.FishCraft
+    			if not (S.fishIndexHunt and S.fishIndexGolden) or now - state.lastTrip < 45 or now < state.blockedUntil then
+    				return false
+    			end
+    			return #Auto.fishCraftList() > 0
+    		end
+    		Auto.doFishCraft = function()
+    			local state = Auto.FishCraft
+    			state.lastTrip = os.clock()
+    			local list = Auto.fishCraftList()
+    			local done = if #list > 0 then craftBulk("Golden", list) else 0
+    			if done == 0 then
+    				state.blockedUntil = os.clock() + 120
+    			else
+    				queueToast("Fishing Index", string.format("Crafted %d golden fish", done))
+    			end
+    		end
     
     		local function indexedCount()
     			local folder = getDataFolder("IndexData")
@@ -38542,6 +38586,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     							runErrand("Index Hunter", doCraftTrip)
     						elseif wantsAutoCraft(now) then
     							runErrand("Crafting", doAutoCraft)
+    						elseif Auto.fishCraftDue(now) then
+    							runErrand("Fishing Index crafting", Auto.doFishCraft)
     						elseif lateTrips(now, ufoBusy) then
     							return
     						elseif S.indexHunt and Hunter.egg and Hunter.needMove then
@@ -40115,6 +40161,29 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     				end
     			end
     
+    			-- After an errand (Merchant, crafting, ...) the fishing state can be stale: ask the server and cast again if needed.
+    			function Fish.resync()
+    				Fish.wasBusy = false
+    				local remote = fishRemote("GetSession")
+    				if remote then
+    					local ok, data = Auto.invokeTimeout(remote, 6)
+    					if ok and type(data) == "table" then
+    						if data.Ok == true then
+    							beginSession(data, Fish.own)
+    						else
+    							Fish.active = false
+    							Fish.own = false
+    						end
+    					end
+    				end
+    				if Fish.active and not atFishingSpot() then
+    					stopFishing("Moved away")
+    				end
+    				Fish.startTry = -1e9
+    				Fish.startFails = 0
+    			end
+
+
     			local function resultError(ok, result)
     				if ok and type(result) == "table" then
     					return tostring(result.Error or result.Reason or "Refused")
@@ -40365,6 +40434,16 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     					return summary
     				end
     				local pets = getDataFolder("PetsData")
+    				local goldenWanted = {}
+    				if S.fishIndexHunt and S.fishIndexGolden and Fish.plan and type(Fish.plan.missing) == "table" then
+    					for _, missing in ipairs(Fish.plan.missing) do
+    						local wanted = string.match(missing, "^Golden (.+)$")
+    						if wanted then
+    							goldenWanted[wanted] = true
+    						end
+    					end
+    				end
+    				local reqG = craftRequirements()
     				for _, tier in ipairs({ "Normal", "Golden", "Diamond" }) do
     					local folder = if pets and S.sellTiers[tier] then pets:FindFirstChild(tier .. "PetsData") else nil
     					for _, entry in ipairs(folder and folder:GetChildren() or {}) do
@@ -40375,7 +40454,11 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     								local okValue, price = pcall(cfg.GetSellValue, name, PetDisplay)
     								if okValue and type(price) == "number" and price > 0 then
     									local okAvailable, available = pcall(PetDisplay.GetAvailable, LocalPlayer, name)
-    									local amount = math.floor((if okAvailable then tonumber(available) or 0 else 0) - (S.keepFish or 0))
+    									local reserve = S.keepFish or 0
+    									if tier == "Normal" and goldenWanted[base] then
+    										reserve = math.max(reserve, reqG)
+    									end
+    									local amount = math.floor((if okAvailable then tonumber(available) or 0 else 0) - reserve)
     									if amount > 0 then
     										summary.list[name] = amount
     										summary.count += amount
@@ -40922,6 +41005,11 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     							Fish.status = blocked
     							Fish.needTravel = false
     							return
+    						end
+    						if Mover.busy then
+    							Fish.wasBusy = true
+    						elseif Fish.wasBusy then
+    							Fish.resync()
     						end
     						if Fish.active then
     							Fish.status = "Fishing"
