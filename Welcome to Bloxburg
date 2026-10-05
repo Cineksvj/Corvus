@@ -30496,8 +30496,8 @@ do
 		return found
 	end
 	-- Only the job actions a worker sends. Never purchases, trading, admin or anything for other players.
-	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true, TakeOil = true, TakeWheel = true, TakePainter = true, FixBike = true }
-	local AllowedJobInvoke = { CleanSchoolJanitorObject = true }
+	local AllowedJob = { UseWorkstation = true, JobCompleted = true, EndShift = true, TakeFoodCrate = true, RestockShelf = true, TakeIceCreamCup = true, AddIceCreamScoop = true, AddIceCreamTopping = true, TakeNewBag = true, TakeNewBags = true, RestockBags = true, ScanDroppedItem = true, TakeIngredientCrate = true, RestockIngredients = true, TakeOil = true, TakeWheel = true, TakePainter = true, FixBike = true, DeliverPizza = true }
+	local AllowedJobInvoke = { CleanSchoolJanitorObject = true, TakePizzaBox = true }
 	function N.jobFire(packet)
 		local jh = N.jobHandler()
 		if not (jh and AllowedJob[packet.Type]) then
@@ -30521,7 +30521,7 @@ do
 		end
 		local box = { done = false }
 		task.spawn(function()
-			box.ok, box.result = pcall(function()
+			box.ok, box.result, box.result2 = pcall(function()
 				return jh.net:InvokeServer(packet)
 			end)
 			box.done = true
@@ -30531,7 +30531,7 @@ do
 			task.wait(0.03)
 		end
 		log("JOB", packet.Type, if box.done then brief(box.result) else "timed out")
-		return box.done and box.ok, box.result
+		return box.done and box.ok, box.result, box.result2
 	end
 end
 local formatNumber, allows, selected, on, optionNumber, optionText, Status, setStatus, picked
@@ -31731,6 +31731,91 @@ do
 		log("MECHANIC", tostring(kind), if answered then order.Value else "no answer")
 	end
 end
+
+-- Pizza Planet Delivery: boxes ride Interior.Conveyor.MovingBoxes; TakePizzaBox {Box} (InvokeServer) answers with the
+-- delivery spot (second value). The customer is the "PizzaPlanetDeliveryCustomer" tagged NPC within 4 studs of it:
+-- DeliverPizza {Customer}. The hub walks (no moped driving yet), so long trips take a while.
+N.Delivery = { last = "" }
+do
+	local CollectionService = game:GetService("CollectionService")
+	local function pizzaPlanet()
+		local env = workspace:FindFirstChild("Environment")
+		local node = env and env:FindFirstChild("Locations")
+		node = node and node:FindFirstChild("City")
+		return node and node:FindFirstChild("PizzaPlanet")
+	end
+	local function holdingBox()
+		local jh = N.jobHandler()
+		local item = isolated(function()
+			return jh.Shared.EquipmentService:GetEquipped(LocalPlayer)
+		end)
+		return item ~= nil and tostring(item) == "Pizza Box"
+	end
+	local function customerNear(spot)
+		for _, npc in ipairs(CollectionService:GetTagged("PizzaPlanetDeliveryCustomer")) do
+			local root = npc.PrimaryPart or npc:FindFirstChild("HumanoidRootPart")
+			if root and (root.Position - spot).Magnitude <= 4.5 then
+				return npc
+			end
+		end
+		return nil
+	end
+	function N.deliveryStep()
+		if not N.ensureShift("PizzaPlanetDelivery") then
+			return
+		end
+		local place = pizzaPlanet()
+		local interior = place and place:FindFirstChild("Interior")
+		local conveyor = interior and interior:FindFirstChild("Conveyor")
+		local boxes = conveyor and conveyor:FindFirstChild("MovingBoxes")
+		if not boxes then
+			setStatus("Delivery: waiting for Pizza Planet to load")
+			task.wait(1)
+			return
+		end
+		if not (N.Delivery.spot and holdingBox()) then
+			local box = boxes:GetChildren()[1]
+			if not box then
+				setStatus("Delivery: waiting for a pizza box")
+				task.wait(0.5)
+				return
+			end
+			local ok, pivot = pcall(box.GetPivot, box)
+			if ok then
+				N.walkTo(pivot.Position, 5, 15)
+			end
+			task.wait(N.actionDelay())
+			local okTake, _, spot = N.jobInvoke({ Type = "TakePizzaBox", Box = box })
+			if okTake and typeof(spot) == "Vector3" then
+				N.Delivery.spot = spot
+				log("DELIVERY box taken, address", brief(spot))
+			else
+				task.wait(0.5)
+			end
+			return
+		end
+		local spot = N.Delivery.spot
+		setStatus(string.format("Delivery: walking to the customer (%d delivered)", Session.done))
+		N.walkTo(spot, 4, 120)
+		local npc = customerNear(spot)
+		if not npc then
+			-- the NPC streams in when you get close
+			task.wait(1)
+			npc = customerNear(spot)
+		end
+		if not npc then
+			log("DELIVERY no customer at the address")
+			N.Delivery.spot = nil
+			return
+		end
+		task.wait(N.actionDelay())
+		N.jobFire({ Type = "DeliverPizza", Customer = npc })
+		Session.done += 1
+		Session.correct += 1
+		N.Delivery.spot = nil
+		log("DELIVERY delivered")
+	end
+end
 local Window, Tabs, Labels
 do
 	do
@@ -31787,7 +31872,7 @@ do
 	})
 	JobBox:AddDropdown("JobPick", {
 		Text = "Job",
-		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream", "Supermarket Cashier", "Pizza Baker", "Mechanic" },
+		Values = { "Hairdresser", "Janitor", "Stocker", "Ice Cream", "Supermarket Cashier", "Pizza Baker", "Mechanic", "Pizza Delivery" },
 		Default = "Hairdresser",
 		Tooltip = "The Pay box shows what every job really paid you per hour",
 	})
@@ -32492,7 +32577,7 @@ do
 	if not N.jobHandler() then
 		logProblem("The game's JobHandler was not found, job farms cannot start")
 	end
-	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep }
+	local JobSteps = { Hairdresser = N.hairStep, Janitor = N.janitorStep, Stocker = N.stockerStep, ["Ice Cream"] = N.iceStep, ["Supermarket Cashier"] = N.marketCashierStep, ["Pizza Baker"] = N.bakerStep, Mechanic = N.mechanicStep, ["Pizza Delivery"] = N.deliveryStep }
 	local wasWorking = false
 	loop("main loop", function()
 		if N.manualRunning() then
