@@ -30618,7 +30618,7 @@ end
     		end
     		return false
     	end
-    	local function maskPart(part)
+    	local function maskIds(part)
     		part = string.gsub(part, "%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x", "<id>")
     		part = string.gsub(part, "%f[%w]%x+%f[%W]", function(word)
     			if #word >= 12 then
@@ -30626,8 +30626,10 @@ end
     			end
     			return nil
     		end)
-    		part = string.gsub(part, "%d+[%.,]?%d*", "<n>")
     		return part
+    	end
+    	local function maskPart(part)
+    		return (string.gsub(maskIds(part), "%d+[%.,]?%d*", "<n>"))
     	end
     	-- numbers -> <n>, long hex/ids -> <id>, quoted strings are kept
     	local function template(text)
@@ -30664,7 +30666,7 @@ end
     		return text
     	end
     	local function add(text, forced)
-    		text = scrub(text)
+    		text = maskIds(scrub(text))
     		local key = template(text)
     		local item = Pending[key]
     		if not item then
@@ -30783,7 +30785,6 @@ end
     			end
     			return baseWrite(name, content, ...)
     		end
-    		writefile = env.writefile
     	end
     	local baseAppend = env.CorvusRealAppendFile or appendfile
     	if type(baseAppend) == "function" then
@@ -30794,7 +30795,6 @@ end
     			end
     			return baseAppend(name, content, ...)
     		end
-    		appendfile = env.appendfile
     	end
     	task.spawn(function()
     		while not Library.Unloaded do
