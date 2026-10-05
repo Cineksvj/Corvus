@@ -31683,6 +31683,47 @@ end
 pcall(writefile, Log.file, head .. table.concat(Log.lines, "\n"))
 end
 local Plan = { target = nil, surplus = 0, surplusAt = -1e9 }
+-- Smart Planner runs these parts of the money loop itself while it is on (their own toggles stay as they are)
+Plan.driven = {
+AutoSteal = true,
+AutoSell = true,
+AutoPlace = true,
+AutoOpen = true,
+AutoEquipBest = true,
+AutoBuySlot = true,
+AutoUpgradePlot = true,
+AutoUpgradeTreadmill = true,
+AutoTreadmill = true,
+AutoTrails = true,
+AutoEquipTrail = true,
+AutoEquipBat = true,
+AutoOrbs = true,
+AutoThunder = true,
+AutoBlessing = true,
+AutoFuse = true,
+AutoIndex = true,
+AutoOffline = true,
+AutoEventGame = true,
+}
+function Plan.isOn(name)
+local toggle = Toggles[name]
+if toggle ~= nil and toggle.Value == true then
+return true
+end
+if Plan.driven[name] then
+local planner = Toggles.SmartPlanner
+return planner ~= nil and planner.Value == true
+end
+return false
+end
+function Plan.planner()
+local planner = Toggles.SmartPlanner
+return planner ~= nil and planner.Value == true
+end
+-- PLAN / SCHED / ZONES / RARE lines only while a planning switch is on
+function Plan.planning()
+return Plan.isOn("SmartPlanner") or Plan.isOn("SmartSpend") or Plan.isOn("SmartSchedule")
+end
 local Sched = {
 f = 0.5,
 period = 420,
@@ -31701,8 +31742,38 @@ training = nil,
 local Shared = ReplicatedStorage:WaitForChild("Shared", 20)
 local NetFolder = Shared and Shared:WaitForChild("Packages", 10)
 NetFolder = NetFolder and NetFolder:WaitForChild("Network", 10)
+-- With ReplicatedStorage attribute FrameworkCutover = true the game has no rev_ remotes any more: its own
+-- Shared.Packages.Network returns Client.LegacyBridge, which maps the old names (SellResult, PlayMessage,
+-- CRATE_DROP...) onto packets (dump: Network module + LegacyBridge). Without this every listener stayed silent
+-- (SELL "no answer", BUY "no answer").
+local Net = { bridge = nil, sellDialogAt = -1e9, coins = nil }
+function Net.cutover()
+return ReplicatedStorage:GetAttribute("FrameworkCutover") == true
+end
+function Net.gameBridge()
+local waited = 0
+while Net.bridge == "loading" and waited < 10 do
+waited += task.wait(0.1) or 0.1
+end
+if Net.bridge == nil then
+Net.bridge = "loading"
+local ok, mod = pcall(function()
+local client = ReplicatedStorage:FindFirstChild("Client")
+local module = client and client:FindFirstChild("LegacyBridge")
+return module and require(module)
+end)
+Net.bridge = if ok and type(mod) == "table" then mod else false
+end
+return if type(Net.bridge) == "table" then Net.bridge else nil
+end
 local function fire(name, ...)
 local args = table.pack(...)
+if Net.cutover() then
+local bridge = Net.gameBridge()
+if bridge and type(bridge.FireServer) == "function" then
+return pcall(bridge.FireServer, name, table.unpack(args, 1, args.n))
+end
+end
 return pcall(function()
 NetFolder:WaitForChild("rev_" .. name, 5):FireServer(table.unpack(args, 1, args.n))
 end)
@@ -31711,9 +31782,24 @@ end
 -- whole start (the window showed after 76 s)
 local function onNet(name, fn)
 task.spawn(pcall, function()
-local remote = NetFolder and NetFolder:WaitForChild("rev_" .. name, 120)
-if remote and alive() then
+local started = os.clock()
+while alive() and os.clock() - started < 900 do
+if Net.cutover() then
+local bridge = Net.gameBridge()
+if bridge and type(bridge.OnClientEvent) == "function" then
+local signal = bridge.OnClientEvent(name)
+if signal then
+signal:Connect(fn)
+return
+end
+end
+end
+local remote = NetFolder and NetFolder:FindFirstChild("rev_" .. name)
+if remote then
 remote.OnClientEvent:Connect(fn)
+return
+end
+task.wait(1)
 end
 end)
 end
@@ -31773,8 +31859,8 @@ return result
 end
 local AreaData = safeRequire("Shared.Data.AreaData")
 local TrailData = safeRequire("Shared.Data.TrailData")
-local Balance = safeRequire("LBTHClient.Services.ClientBalanceService")
-local ServerLuck = safeRequire("LBTHClient.Services.ServerLuckClient")
+local Balance = safeRequire(if ReplicatedStorage:FindFirstChild("LBTHClient") then "LBTHClient.Services.ClientBalanceService" else "Client.LBTHClient.Services.ClientBalanceService")
+local ServerLuck = safeRequire(if ReplicatedStorage:FindFirstChild("LBTHClient") then "LBTHClient.Services.ServerLuckClient" else "Client.LBTHClient.Services.ServerLuckClient")
 local SpeedData = safeRequire("Shared.Data.SpeedData")
 local SlotPrices = nil
 do
@@ -32003,15 +32089,37 @@ i += 1
 end
 return string.format("%.2f", n):gsub("%.?0+$", "") .. Suffixes[i]
 end
-local function money()
-local ok, value = pcall(function()
-local b = Balance and Balance.Balance
+local function coinsValue(b)
 if type(b) == "table" and b.first then
 return b.first * 10 ^ (b.second or 0)
 end
 return tonumber(b) or 0
+end
+-- own copy of the balance: a required ClientBalanceService that the game never _init-ed stays at 0
+onNet("CoinsChanged", function(value)
+local ok, number = pcall(coinsValue, value)
+if ok and number then
+Net.coins = number
+end
 end)
-return ok and value or 0
+local function money()
+local ok, value = pcall(function()
+return coinsValue(Balance and Balance.Balance)
+end)
+value = ok and value or 0
+if value <= 0 and Net.coins then
+value = Net.coins
+end
+if value <= 0 and Net.cutover() then
+local ok2, cash = pcall(function()
+local data = ReplicatedStorage:FindFirstChild("Data")
+return data and coinsValue(require(data).client.Currency.Cash())
+end)
+if ok2 and type(cash) == "number" and cash > 0 then
+value = cash
+end
+end
+return value
 end
 local function character()
 return LocalPlayer.Character
@@ -33127,7 +33235,7 @@ local hum, root = humanoid(), rootPart()
 if hum and root then
 hum:MoveTo(root.Position)
 end
-return "stopped"
+return "cancelled"
 end
 local hum, root = humanoid(), rootPart()
 if not (hum and root) or hum.Health <= 0 then
@@ -33285,6 +33393,8 @@ end
 local result, stuckAt = follow(points, options, arrive)
 if result == "done" then
 return true
+elseif result == "cancelled" then
+return false, "cancelled"
 elseif result == "stopped" then
 return false
 elseif result == "pulled" then
@@ -33329,8 +33439,8 @@ end
 waited += task.wait(0.2) or 0.2
 end
 end
-local ok = walkTo(target, options)
-if not ok and alive() then
+local ok, why = walkTo(target, options)
+if not ok and why ~= "cancelled" and alive() then
 logEvery("travel", 15, "TRAVEL failed to", string.format("%.0f, %.0f", target.X, target.Z), "status", Status)
 end
 if options.toTreadmill and ok then
@@ -33704,11 +33814,14 @@ if (ZoneBackoff[areaId] or 0) > os.clock() then
 return false
 end
 local area = AreaById[areaId]
-if Toggles.SmartZones and Toggles.SmartZones.Value and area then
+if ((Toggles.SmartZones and Toggles.SmartZones.Value) or Plan.planner()) and area then
 local level = tonumber(LocalPlayer:GetAttribute("SpeedLevel")) or 0
 if (area.RecommendedSpeed or 0) > level then
 return false
 end
+end
+if Plan.planner() then
+return true
 end
 for label, id in pairs(ZoneByLabel) do
 if id == areaId then
@@ -33725,7 +33838,7 @@ if not (folder and root) then
 return nil
 end
 local best, bestScore
-local priority = Options.StealPriority and Options.StealPriority.Value or "Best Value"
+local priority = if Plan.planner() then "Best Value" else (Options.StealPriority and Options.StealPriority.Value or "Best Value")
 local safe = safeSpot()
 for _, crate in ipairs(folder:GetChildren()) do
 local failedUntil = FailedCrates[crate.Name]
@@ -33735,7 +33848,7 @@ failedUntil = nil
 end
 if failedUntil == nil and crate:GetAttribute("IsCrate") ~= false and crate:IsA("Model") then
 local area, rarity = crateInfo(crate)
-if area and rarity and zoneAllowed(area) and selected(Options.StealCrateRarities, rarity) then
+if area and rarity and zoneAllowed(area) and (Plan.planner() or selected(Options.StealCrateRarities, rarity)) then
 local prompt = stealPrompt(crate)
 if prompt then
 local distance = (crate:GetPivot().Position - root.Position).Magnitude
@@ -33903,7 +34016,7 @@ returnToSafety()
 return true
 end
 waitUntilSteady()
-if not (Toggles.AutoSteal and Toggles.AutoSteal.Value) then
+if not Plan.isOn("AutoSteal") then
 return false
 end
 keepSlowModeOff()
@@ -33911,7 +34024,7 @@ local target = pickCrate()
 if not target then
 local wanted = {}
 for label, id in pairs(ZoneByLabel) do
-if selected(Options.StealZones, label) then
+if Plan.planner() or selected(Options.StealZones, label) then
 wanted[id] = true
 end
 end
@@ -33941,7 +34054,7 @@ local function crateStillThere()
 return target.crate:IsDescendantOf(workspace) and target.prompt:IsDescendantOf(workspace) and target.prompt.Enabled
 end
 local function stillWanted()
-return crateStillThere() and Toggles.AutoSteal ~= nil and Toggles.AutoSteal.Value == true
+return crateStillThere() and Plan.isOn("AutoSteal")
 end
 local reach = math.max(4, math.min(tonumber(target.prompt.MaxActivationDistance) or 12, 12) - 2)
 if not travel(spot, { keepGoing = stillWanted, arrive = 2 }) and stillWanted() then
@@ -33952,7 +34065,7 @@ log("STEAL could not reach", target.rarity, target.area, "status", Status)
 return true
 end
 end
-if not (Toggles.AutoSteal and Toggles.AutoSteal.Value) then
+if not Plan.isOn("AutoSteal") then
 return false
 end
 if not crateStillThere() then
@@ -34210,12 +34323,62 @@ local LastSellResult = nil
 onNet("SellResult", function(result)
 LastSellResult = result
 end)
+onNet("SellDialogOpen", function()
+Net.sellDialogAt = os.clock()
+end)
+local function sellerModel()
+local model
+pcall(function()
+model = workspace.Map.Vendors.SellPlaces.Sell1["sellnpc NEW"]
+end)
+return model
+end
+-- The game's flow (dump SellDialog:Handler + Configs.Sell Vendor): the vendor prompt makes the server send
+-- SellDialogOpen, the buttons fire re_SELL_DO("held"/"all"), the dialog closes beyond 18 studs of ProximityPart.
+function Net.sellerReady(walk)
+local model = sellerModel()
+local part = model and model:FindFirstChild("ProximityPart")
+local root = rootPart()
+if not (part and root) then
+return false, "seller not found"
+end
+local distance = (root.Position - part.Position).Magnitude
+if distance > 14 and walk then
+travel(sellerSpot(), { arrive = 5 })
+root = rootPart()
+distance = root and (root.Position - part.Position).Magnitude or math.huge
+end
+if distance > 14 then
+return false, string.format("not at the seller dist=%.0f%s", distance, if walk then "" else " (Walk to Seller is off)")
+end
+if os.clock() - Net.sellDialogAt > 20 then
+local prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
+if prompt and prompt.Enabled then
+local since = os.clock()
+triggerPrompt(prompt, function()
+return Net.sellDialogAt >= since or not prompt.Enabled
+end)
+if Net.sellDialogAt < since then
+logEvery("selldialog", 300, "SELL dialog not confirmed by the server, selling anyway", tostring(PromptIssue or ""))
+end
+end
+end
+return true
+end
 local function sellOnce(kind)
+if kind == "held" then
+local quote = sellQuote()
+if quote and not quote.HeldLabel then
+logEvery("sellheld", 60, "SELL skipped reason=not held (the seller sees nothing in your hand)")
+return false
+end
+end
+local before = money()
 LastSellResult = nil
 Remotes.re_SELL_DO:FireServer(kind)
 waitFor(function()
 return LastSellResult ~= nil
-end, 4)
+end, 6)
 local result = LastSellResult
 if type(result) == "table" and result.Ok then
 log("SELL", kind, "ok $" .. formatNumber(tonumber(result.Total) or 0))
@@ -34224,7 +34387,15 @@ Track.sold(tonumber(result.Total) or 0)
 emit("sold", tonumber(result.Total) or 0, result.Text)
 return true, result
 end
-log("SELL", kind, "failed", type(result) == "table" and tostring(result.Text) or "no answer")
+if result == nil and money() > before then
+local gained = money() - before
+log("SELL", kind, "ok $" .. formatNumber(gained), "(money went up, no SellResult packet)")
+Session.earned += gained
+Track.sold(gained)
+emit("sold", gained, "")
+return true, nil
+end
+log("SELL", kind, "failed", type(result) == "table" and tostring(result.Text) or "no answer", "net", if Net.cutover() then "packets" else "rev")
 return false, result
 end
 local LastSell = 0
@@ -34238,7 +34409,7 @@ placeBest()
 end
 local sellCrates = Toggles.SellCrates
 and Toggles.SellCrates.Value
-and not (Toggles.AutoPlace and Toggles.AutoPlace.Value and os.clock() >= PlotFullUntil)
+and not (Plan.isOn("AutoPlace") and os.clock() >= PlotFullUntil)
 local items, kept, pending = {}, 0, 0
 for _, tool in ipairs(toolsWith("ItemUid")) do
 if isFavorite(tool) then
@@ -34304,10 +34475,13 @@ else "Selling (" .. mode .. ")"
 local root = rootPart()
 local back = root and root.Position
 local teleport = Toggles.SellTeleport and Toggles.SellTeleport.Value
-if teleport then
-travel(sellerSpot(), { arrive = 5 })
-task.wait(0.2)
+local ready, why = Net.sellerReady(teleport)
+if not ready then
+logEvery("sellskip", 60, "SELL skipped reason=" .. tostring(why))
+setStatus("Sell skipped: " .. tostring(why))
+return false
 end
+task.wait(0.2)
 if mode == "All" then
 local ok = sellOnce("all")
 if ok then
@@ -34331,9 +34505,11 @@ break
 end
 if tool.Parent and not isFavorite(tool) and not (tool:GetAttribute("ItemUid") and wantsProtect(tool)) then
 pcall(hum.EquipTool, hum, tool)
-task.wait(0.2)
+task.wait(0.3)
 if sellOnce("held") then
 Session.sold += 1
+else
+break
 end
 end
 end
@@ -34814,6 +34990,57 @@ end
 end
 return bestUid, bestTier
 end
+Bless.seenPrompts = {}
+function Bless.survey(reason)
+pcall(function()
+local halo, total = 0, 0
+local folder = workspace:FindFirstChild("Crates")
+for _, crate in ipairs(folder and folder:GetChildren() or {}) do
+total += 1
+local marked = crate:FindFirstChild("Halo", true) ~= nil
+for name in pairs(crate:GetAttributes()) do
+if string.find(string.lower(name), "halo", 1, true) then
+marked = true
+end
+end
+if marked then
+halo += 1
+end
+end
+local prompts = {}
+for _, d in ipairs(workspace:GetDescendants()) do
+if d:IsA("ProximityPrompt") then
+local text = string.lower(tostring(d.ActionText) .. " " .. tostring(d.ObjectText) .. " " .. d.Name)
+if (string.find(text, "halo", 1, true) or string.find(text, "bless", 1, true) or string.find(text, "feed", 1, true) or string.find(text, "archangel", 1, true)) and not Bless.seenPrompts[d] then
+Bless.seenPrompts[d] = true
+table.insert(prompts, string.format("%s[%s|%s]", d:GetFullName(), tostring(d.ActionText), tostring(d.ObjectText)))
+end
+end
+end
+local attrs = {}
+for name, value in pairs(workspace:GetAttributes()) do
+local low = string.lower(name)
+if string.find(low, "arch", 1, true) or string.find(low, "angel", 1, true) or string.find(low, "halo", 1, true) or string.find(low, "bless", 1, true) then
+table.insert(attrs, name .. "=" .. tostring(value))
+end
+end
+log("ARCHANGEL", reason, "halo crates", halo .. "/" .. total, "| attrs", if #attrs > 0 then table.concat(attrs, ",") else "-", "| prompts", if #prompts > 0 then table.concat(prompts, " ; ") else "-")
+end)
+end
+onNet("ARCHANGEL_SPAWN", function(area, at)
+log("ARCHANGEL spawn", tostring(area), tostring(at))
+task.delay(4, Bless.survey, "after spawn")
+end)
+workspace:GetAttributeChangedSignal("ArchangelActive"):Connect(function()
+local active = workspace:GetAttribute("ArchangelActive") == true
+local ends = tonumber(workspace:GetAttribute("ArchangelEndsAt"))
+log("ARCHANGEL active=" .. tostring(active), "ends in", if ends then tostring(math.floor(ends - os.time())) .. "s" else "?", "points", tostring(Bless.points))
+if active then
+Bless.next = 0
+task.delay(6, Bless.survey, "event on")
+end
+end)
+task.delay(40, Bless.survey, "start")
 local function altarPrompt()
 for _, descendant in ipairs(workspace:GetDescendants()) do
 if descendant:IsA("ProximityPrompt") and descendant.Name == "ArchangelPrompt" then
@@ -34836,6 +35063,10 @@ end)
 return ok and position or nil
 end
 function Bless.ready()
+local active = workspace:GetAttribute("ArchangelActive")
+if active == false then
+return false
+end
 if os.clock() < Bless.next then
 return false
 end
@@ -34877,15 +35108,16 @@ if Bless.points < (Bless.min or (ItemData and type(ItemData.Blessing) == "table"
 Bless.next = now + 600
 return false
 end
-local prompt = altarPrompt()
-local position = prompt and altarPosition(prompt)
+local angel = workspace:FindFirstChild("Archangel")
+local prompt = if angel and angel:IsA("Model") then nil else altarPrompt()
+local position = if angel and angel:IsA("Model") then angel:GetPivot().Position else (prompt and altarPosition(prompt))
 if not position then
 Bless.next = now + 300
 logEvery("blessaltar", 1800, "BLESS no Archangel altar in the world, points", tostring(Bless.points))
 return false
 end
 setStatus("Going to the Archangel altar")
-travel(position + Vector3.new(0, 1, 0), { arrive = 5 })
+travel(position + Vector3.new(0, 1, 0), { arrive = 8 })
 if state then
 local uid, tier = pickCrate(state.crates)
 if not uid then
@@ -35105,11 +35337,10 @@ Plan.V = V
 Plan.list, Plan.best, Plan.time, Plan.ready = {}, nil, nil, false
 Plan.orbSec, Plan.orbPts, Plan.pointValue, Plan.planKey = 0, 0, 0, nil
 function Plan.on(name)
-local toggle = Toggles[name]
-return toggle ~= nil and toggle.Value == true
+return Plan.isOn(name)
 end
 function Plan.smart()
-return Plan.on("SmartSpend")
+return Plan.isOn("SmartPlanner") or Plan.isOn("SmartSpend")
 end
 Plan.touched, Plan.setting = {}, 0
 function Plan.myFilters()
@@ -35469,7 +35700,7 @@ end
 end
 for name, sum in pairs(sums) do
 if count > 0 then
-log("RARE", string.format("tier=%s p=%.5f value=$%s zone=%s", name, sum.p / count, formatNumber(sum.value / count), tostring(id)))
+if Plan.planning() then log("RARE", string.format("tier=%s p=%.5f value=$%s zone=%s", name, sum.p / count, formatNumber(sum.value / count), tostring(id))) end
 end
 end
 end
@@ -35702,7 +35933,7 @@ return math.floor(bestSpend)
 end
 function Plan.orbsFirst()
 local manual = not (Options.OrbPriority and Options.OrbPriority.Value == "Crates first")
-if Plan.manual("OrbPriority") or not (Plan.on("SmartSchedule") and Plan.on("AutoThunder") and Plan.ready and Plan.pointValue > 0) then
+if Plan.manual("OrbPriority") or not ((Plan.on("SmartPlanner") or Plan.on("SmartSchedule")) and Plan.on("AutoThunder") and Plan.ready and Plan.pointValue > 0) then
 return manual
 end
 if Plan.orbSec < 20 then
@@ -36006,7 +36237,9 @@ if #alt > 0 then table.concat(alt, ", ") else "none",
 Sched.info
 )
 local key = (if best then best.kind .. best.name else "none") .. tostring(train)
-if key ~= Plan.planKey then
+if not Plan.planning() then
+Plan.planKey = nil
+elseif key ~= Plan.planKey then
 Plan.planKey = key
 log("PLAN", text)
 else
@@ -36016,7 +36249,7 @@ local zones = {}
 for id, zone in pairs(V.zones) do
 table.insert(zones, string.format("%s $%s/s trip %.0fs n%d loss %.0f%%", id, formatNumber((zone.rate or 0) * (1 - Plan.guardLoss(id))), zone.dist / V.walk(level), zone.n, Plan.guardLoss(id) * 100))
 end
-if #zones > 0 then
+if #zones > 0 and Plan.planning() then
 table.sort(zones)
 logEvery("zones", 300, "ZONES measured:", table.concat(zones, " | "))
 end
@@ -36046,6 +36279,7 @@ end
 return Plan.allow("slot", price)
 end
 Plan.plannerNames = {
+"SmartPlanner",
 "AutoSteal",
 "AutoSell",
 "AutoPlace",
@@ -36101,10 +36335,12 @@ Plan.ready = false
 return
 end
 Plan.refresh()
+if Plan.planning() then
 logEvery("sched", 120, "SCHED", Sched.info)
 end
+end
 function Sched.trainNow()
-if not (Plan.on("SmartSchedule") and Plan.on("AutoTreadmill") and Plan.on("AutoSteal")) then
+if not ((Plan.on("SmartPlanner") or Plan.on("SmartSchedule")) and Plan.on("AutoTreadmill") and Plan.on("AutoSteal")) then
 return false
 end
 local train
@@ -36331,8 +36567,14 @@ end
 local StatusBox, StatusLabel, UpNextLabel, StormLabel, BlessLabel
 do
 local FarmBox = Tabs.Main:AddLeftGroupbox("Quick Start", "rocket")
+Tabs.QuickStart = FarmBox
+FarmBox:AddToggle("SmartPlanner", {
+Text = "Smart Planner",
+Default = false,
+Tooltip = "Runs the whole money loop by profit math: steals the crate with the most money per second of trip in every zone you can escape, trains when a faster zone pays more over 24 h, places, opens, sells what is not protected, buys slots, plot, treadmill and trails by payback. It never switches your other toggles.",
+})
 FarmBox:AddLabel({
-Text = '<font transparency="0.35">Nothing starts on its own. Every automation is its own switch in the tabs, and Corvus only plans while one of them is on.</font>',
+Text = '<font transparency="0.35">Nothing starts on its own. Smart Planner runs the whole loop, or switch single parts on below and in the tabs.</font>',
 DoesWrap = true,
 })
 local StealBox = Tabs.Main:AddLeftGroupbox("Steal", "hand")
@@ -36383,24 +36625,11 @@ end,
 StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 StatusLabel = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 UpNextLabel = StatusBox:AddLabel({ Text = "Up next: planning", DoesWrap = true })
-StatusBox:AddButton({
-Text = "Stop Everything",
-Func = function()
-Plan.stopAll()
-end,
-})
-StatusBox:AddButton({
-Text = "Reset Hub Options",
-Tooltip = "Puts every toggle, dropdown, slider and input back to its default value. Saved configs are not deleted.",
-Func = function()
-Library:AskResetHubOptions(Library.ShareIgnore)
-end,
-})
 -- what changed a toggle is always in the log: the saved config at start (AUTOLOAD) or the player (CLICK)
 Library.OnAutoload = function()
 local names = {}
 for name, toggle in pairs(Toggles) do
-if toggle.Value == true then
+if toggle.Value == true and type(name) == "string" and string.sub(name, 1, 6) ~= "Corvus" then
 table.insert(names, name)
 end
 end
@@ -36435,7 +36664,7 @@ end,
 })
 local SellBox = Tabs.Items:AddLeftGroupbox("Sell", "banknote")
 SellBox:AddToggle("AutoSell", { Text = "Auto Sell", Default = false, Tooltip = "Sells your items every interval" })
-SellBox:AddToggle("SellTeleport", { Text = "Teleport to Seller while Selling", Default = true })
+SellBox:AddToggle("SellTeleport", { Text = "Walk to Seller while Selling", Default = true, Tooltip = "The seller only answers within a few studs, like in the game. Off = sells only while you stand at the seller." })
 SellBox:AddToggle(
 "SellReturn",
 { Text = "Return After Selling", Default = true, Tooltip = "Goes back to where you were after selling" }
@@ -36504,8 +36733,8 @@ end,
 local SpendBox = Tabs.Upgrades:AddLeftGroupbox("Smart Spending", "coins")
 SpendBox:AddToggle("SmartSpend", {
 Text = "Smart Spending",
-Default = true,
-Tooltip = "Puts every buy on one scale: expected extra money in the next 24 hours per dollar spent (slots from your plot and the real crate odds, treadmill tiers and trails from how much sooner they unlock the next zone). Buys the best one, cheaper ones only when they pay back before it.",
+Default = false,
+Tooltip = "For the single buy toggles below when Smart Planner is off (Smart Planner always spends this way). Puts every buy on one scale: expected extra money in the next 24 hours per dollar spent (slots from your plot and the real crate odds, treadmill tiers and trails from how much sooner they unlock the next zone). Buys the best one, cheaper ones only when they pay back before it.",
 })
 SpendBox:AddToggle("AutoBuySlot", { Text = "Auto Buy +1 Equip", Default = false, Tooltip = "Buys extra item slots with cash" })
 SpendBox:AddToggle("AutoUpgradePlot", { Text = "Auto Upgrade Plot", Default = false })
@@ -36528,14 +36757,37 @@ Tooltip = "Trains on your treadmill whenever nothing else needs doing",
 TreadBox:AddToggle("AutoUpgradeTreadmill", { Text = "Auto Upgrade Treadmill", Default = false })
 TreadBox:AddToggle("SmartSchedule", {
 Text = "Balance Steal and Train",
-Default = true,
-Tooltip = "With Auto Steal and Auto Treadmill on, compares the money per second of stealing now with training to a better zone (or stealing first for a speed upgrade) over the next 24 hours and does the one that ends with more money.",
+Default = false,
+Tooltip = "Smart Planner always does this. Without it: with Auto Steal and Auto Treadmill on, compares the money per second of stealing now with training to a better zone (or stealing first for a speed upgrade) over the next 24 hours and does the one that ends with more money.",
 })
 TreadBox:AddToggle("UseAdminTreadmill", {
 Text = "Use Admin Treadmill In Events",
-Default = true,
+Default = false,
 Tooltip = "While an admin event boosts the Admin Treadmill (and nobody is on it) trains there instead",
 })
+do
+local QuickBox = Tabs.QuickStart
+if QuickBox and Library.MirrorToggle then
+for _, name in ipairs({ "AutoTreadmill", "AutoSell", "AutoPlace", "AutoOpen" }) do
+pcall(Library.MirrorToggle, Library, name, QuickBox)
+end
+end
+if QuickBox then
+QuickBox:AddButton({
+Text = "Stop Everything",
+Func = function()
+Plan.stopAll()
+end,
+})
+QuickBox:AddButton({
+Text = "Reset Hub Options",
+Tooltip = "Puts every toggle, dropdown, slider and input back to its default value. Saved configs are not deleted.",
+Func = function()
+Library:AskResetHubOptions(Library.ShareIgnore)
+end,
+})
+end
+end
 local IndexBox = Tabs.Rewards:AddLeftGroupbox("Index", "book-open")
 IndexBox:AddToggle("AutoIndex", { Text = "Auto Claim Index", Default = false, Tooltip = "Claims every finished index reward" })
 local AdminBox = Tabs.Rewards:AddLeftGroupbox("Admin Events", "crown")
@@ -37247,7 +37499,7 @@ pcall(function()
 local TweakBox = (Tabs.Misc or Tabs.Upgrades):AddLeftGroupbox("Game Tweaks", "wrench")
 TweakBox:AddToggle("BlockIdleRejoin", {
 Text = "Block Idle Rejoin",
-Default = true,
+Default = false,
 Tooltip = "The game moves you to another server after 19 minutes without input. This stops it so AFK farming keeps going.",
 Callback = function(value)
 setIdleRejoinBlocked(value)
@@ -37255,7 +37507,7 @@ end,
 })
 TweakBox:AddToggle("AntiKnockback", {
 Text = "Anti Knockback",
-Default = true,
+Default = false,
 Tooltip = "Bat hits and guard flings no longer throw you around",
 Callback = function(value)
 setAntiKnockback(value)
@@ -37304,6 +37556,14 @@ end,
 })
 end
 local AllAutoToggles = {
+"SmartPlanner",
+"SmartSpend",
+"SmartSchedule",
+"AutoEquipTrail",
+"AutoEquipBat",
+"AutoOffline",
+"AutoFreeGift",
+"AutoFriend",
 "AutoSteal",
 "AutoSell",
 "AutoPlace",
@@ -37374,7 +37634,7 @@ Aliases = { "alloff" },
 Description = "Turns every automation off",
 Source = "Steal From The Rich",
 Callback = function()
-setToggles(AllAutoToggles, { "off" })
+Plan.stopAll()
 return "Everything off"
 end,
 })
@@ -37490,7 +37750,7 @@ end
 if Library.SetQuickBar then
 pcall(function()
 Library:SetQuickBar({
-{ Toggle = "SmartSpend", Icon = "rocket", Label = "Smart Spend", Default = false },
+{ Toggle = "SmartPlanner", Icon = "rocket", Label = "Planner" },
 { Toggle = "AutoSteal", Icon = "hand", Label = "Steal" },
 { Toggle = "AutoSell", Icon = "banknote", Label = "Sell" },
 { Toggle = "AutoPlace", Icon = "house", Label = "Place" },
@@ -37876,8 +38136,7 @@ return string.format("%s crates stolen  \u{00B7}  $%s earned", formatNumber(Sess
 end
 end)
 local function on(name)
-local t = Toggles[name]
-return t ~= nil and t.Value == true
+return Plan.isOn(name)
 end
 local Hop, EventGame, AdminChat = { nextTry = 0, busy = false, started = false }, { backoffUntil = 0, stepFails = 0, stage = nil }, { typed = {} }
 do
@@ -38372,6 +38631,10 @@ SpeedData ~= nil,
 SlotPrices ~= nil,
 "| net folder",
 NetFolder ~= nil,
+"| net",
+if Net.cutover() then "packets (FrameworkCutover)" else "rev remotes",
+"| balance module",
+Balance ~= nil,
 "| missing remotes:",
 if #missing > 0 then table.concat(missing, ",") else "none"
 )
@@ -38626,8 +38889,8 @@ local function zoneName(id)
 local area = AreaById[id]
 return area and (area.DisplayName or area.Id) or tostring(id or "?")
 end
-if not (Plan.smart() or Plan.on("SmartSchedule")) then
-return "Turn on Smart Spending or Smart Schedule and the plan shows here."
+if not Plan.planning() then
+return "Turn on Smart Planner and the plan shows here."
 end
 if not (Plan.ready and Plan.time) then
 return "Planning, measuring your income first"
