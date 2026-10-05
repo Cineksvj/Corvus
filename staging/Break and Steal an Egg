@@ -5605,11 +5605,12 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         if Library.ConfirmPrompt and Library.ConfirmPrompt.Parent then
             return
         end
+        local Extra = if Opts.Warning then 64 else 0
         local Root = New("Frame", {
             AnchorPoint = Vector2.new(1, 1),
             BackgroundTransparency = 1,
             Position = UDim2.new(1, 340, 1, -12),
-            Size = UDim2.fromOffset(320, 232),
+            Size = UDim2.fromOffset(320, 232 + Extra),
             ZIndex = 60,
             Parent = Library.ScreenGui,
         })
@@ -5675,13 +5676,29 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             ZIndex = 63,
             Parent = Content,
         })
+        if Opts.Warning then
+        	New("TextLabel", {
+        		BackgroundTransparency = 1,
+        		FontFace = GetBoldFont,
+        		Position = UDim2.fromOffset(14, 166),
+        		Size = UDim2.new(1, -28, 0, 60),
+        		Text = tostring(Opts.Warning),
+        		TextColor3 = Color3.fromRGB(255, 140, 60),
+        		TextSize = 12,
+        		TextWrapped = true,
+        		TextXAlignment = Enum.TextXAlignment.Left,
+        		TextYAlignment = Enum.TextYAlignment.Top,
+        		ZIndex = 63,
+        		Parent = Content,
+        	})
+        end
         local Confirm = New("TextButton", {
             AutoButtonColor = false,
             BackgroundColor3 = "AccentColor",
             FontFace = GetBoldFont,
-            Position = UDim2.fromOffset(12, 182),
+            Position = UDim2.fromOffset(12, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
-            Text = tostring(Opts.ConfirmText or "Confirm"),
+            Text = tostring(Opts.ConfirmText or "Confirm"), TextWrapped = true,
             TextColor3 = "BackgroundColor",
             TextSize = 14,
             ZIndex = 63,
@@ -5692,7 +5709,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             AutoButtonColor = false,
             BackgroundColor3 = "BackgroundColor",
             FontFace = GetBoldFont,
-            Position = UDim2.new(0.5, 4, 0, 182),
+            Position = UDim2.new(0.5, 4, 0, 182 + Extra),
             Size = UDim2.new(0.5, -16, 0, 34),
             Text = tostring(Opts.CancelText or "Cancel"),
             TextColor3 = "FontColor",
@@ -34775,7 +34792,7 @@ do
 				local root = Instance.new("Frame")
 				root.AnchorPoint = Vector2.new(1, 1)
 				root.Position = UDim2.new(1, -12, 1, -12)
-				root.Size = UDim2.fromOffset(300, 196)
+				root.Size = UDim2.fromOffset(300, 260)
 				root.BackgroundColor3 = scheme.MainColor
 				root.ZIndex = 60
 				local corner = Instance.new("UICorner")
@@ -34801,20 +34818,23 @@ do
 						l.Font = Enum.Font.GothamBold
 					end
 					l.Parent = root
+					return l
 				end
 				label("Enable Auto Farm Everything OP?", 12, 20, 15, true)
 				label("Full automatic: the planner spends, upgrades, sells surplus and uses potions for max profit. Can sell your items.", 36, 90, 13, false, 0.2)
+				label("Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.", 128, 64, 12, true).TextColor3 = Color3.fromRGB(255, 140, 60)
 				local function button(text, x, w, fill, textColor, fn)
 					local b = Instance.new("TextButton")
 					b.AutoButtonColor = false
 					b.BackgroundColor3 = fill
-					b.Position = UDim2.fromOffset(x, 144)
+					b.Position = UDim2.fromOffset(x, 208)
 					b.Size = UDim2.fromOffset(w, 36)
 					b.Text = text
 					b.TextColor3 = textColor
 					b.TextSize = 14
 					b.ZIndex = 62
 					b.Font = Enum.Font.GothamBold
+					b.TextWrapped = true
 					local c = Instance.new("UICorner")
 					c.CornerRadius = UDim.new(0, Library.CornerRadius or 6)
 					c.Parent = b
@@ -34829,7 +34849,7 @@ do
 						end
 					end)
 				end
-				button("Enable OP", 12, 130, scheme.AccentColor, scheme.BackgroundColor, onYes)
+				button("I understand, enable OP", 12, 130, scheme.AccentColor, scheme.BackgroundColor, onYes)
 				button("Cancel", 158, 130, scheme.BackgroundColor, scheme.FontColor, onNo)
 				if N.OPCard and N.OPCard.Parent then
 					N.OPCard:Destroy()
@@ -34881,7 +34901,7 @@ do
 		QuickBox:AddToggle("AutoFarmOP", {
 			Text = "Auto Farm Everything OP",
 			Default = false,
-			Tooltip = "Full automatic: the planner spends, upgrades, sells surplus and uses potions for max profit. Can sell your items.",
+			Tooltip = "The planner spends, upgrades, sells surplus and uses potions for max profit and can sell your items. Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
 			Callback = function(value)
 				if N.opRevert then
 					return
