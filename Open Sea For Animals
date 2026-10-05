@@ -29904,9 +29904,32 @@ local BootOk, BootError = xpcall(function()
 			end
 			return best
 		end
+		local function freeSlot()
+			local data = Data()
+			local worstId, worstValue
+			for key, entity in pairs(data and data.PlacedAnimals or {}) do
+				if type(entity) == "table" and entity.brainrotType then
+					local info = describe("Brainrot", entity.brainrotType, entity.mutation, entity.size, entity.level, entity.traits)
+					if not info.special and (not worstValue or info.value < worstValue) then
+						worstId, worstValue = entity.id or key, info.value
+					end
+				end
+			end
+			if not worstId then
+				return false
+			end
+			local before = placedStats()
+			call("AnimalService", "PickupAnimal", worstId)
+			local freed = waitFor(function()
+				return (placedStats()) < before
+			end, 2)
+			log("HATCH freed a plot slot", tostring(freed), "worst $" .. formatNumber(worstValue) .. "/s")
+			return freed
+		end
 		function hatchEggs()
 			local now = serverNow()
 			local hatched = 0
+			local freedAny = false
 			for _, egg in ipairs(placedEggModels()) do
 				local id = egg:GetAttribute("EggId")
 				local start, duration = eggTimes(egg)
@@ -29919,7 +29942,14 @@ local BootOk, BootError = xpcall(function()
 				and (HatchTried[id] or 0) <= os.clock()
 				then
 					HatchTried[id] = os.clock() + 10
+					if (placedStats()) >= maxAnimals() and freeSlot() then
+						freedAny = true
+					end
 					local ok, result = call("EggService", "HatchEgg", id)
+					if not (ok and result) and freeSlot() then
+						freedAny = true
+						ok, result = call("EggService", "HatchEgg", id)
+					end
 					if ok and result then
 						hatched += 1
 						Session.hatched += 1
@@ -29930,6 +29960,10 @@ local BootOk, BootError = xpcall(function()
 						break
 					end
 				end
+			end
+			if freedAny or (hatched > 0 and on("AutoEquipBest")) then
+				task.wait(0.5)
+				equipBest(true)
 			end
 			return hatched
 		end
@@ -31080,6 +31114,29 @@ local BootOk, BootError = xpcall(function()
 					end
 					if Toggles.AutoLock then
 						Toggles.AutoLock:SetValue(false)
+					end
+					local all = {}
+					for _, rarity in ipairs(RarityList) do
+						all[rarity] = true
+					end
+					for _, pair in ipairs({
+						{ "CatchRarities", all }, { "EggRarities", all }, { "CatchKinds", { Animals = true, Eggs = true } },
+						{ "CatchMinValue", "" }, { "EggOrder", "Best Value" }, { "SeaPriority", "Best Value" },
+					}) do
+						local option = Options[pair[1]]
+						if option then
+							pcall(option.SetValue, option, pair[2])
+						end
+					end
+					for _, name in ipairs({ "CatchMutations", "CatchSizes" }) do
+						local option = Options[name]
+						if option and type(option.Values) == "table" then
+							local pick = {}
+							for _, v in ipairs(option.Values) do
+								pick[v] = true
+							end
+							pcall(option.SetValue, option, pick)
+						end
 					end
 					log("FARM ALL on, turned on", #FarmAllTurned, "toggles")
 				else
