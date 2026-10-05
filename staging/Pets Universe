@@ -31848,10 +31848,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	pcall(Auto.flushLog, true)
     end)
     Auto.bootAt = os.clock()
-    -- No exclude list any more: every sell, fuse, convert and spend is its own switch with its own filters.
-    function Auto.excluded()
-    	return false
-    end
     function Auto.petRarity(name)
     	local multi = Auto.lazyRequire("PetsMulti", function()
     		local folder = ReplicatedStorage:FindFirstChild("Pets")
@@ -31865,18 +31861,10 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	local info = multi[base]
     	return if type(info) == "table" then info[3] else nil
     end
-    function Auto.noConvert(name)
-    	if Auto.excluded("convert") then
-    		return true
-    	end
-    	local rarity = Auto.petRarity(name)
-    	return rarity ~= nil and Auto.excluded("rarity:" .. rarity)
-    end
     local S = {
     	autoFarm = false,
-    	farmAll = false,
     	worldSave = 0,
-    	autoTap = true,
+    	autoTap = false,
     	farmWorldOn = false,
     	farmWorld = "Best unlocked",
     	autoBen = false,
@@ -31885,8 +31873,11 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	autoGift = false,
     	autoPartyEgg = false,
     	autoHatch = false,
-    	autoAdminChat = true,
-    	stayPrivate = true,
+    	eggSmart = false,
+    	fishSmart = false,
+    	rebirthSmart = false,
+    	autoAdminChat = false,
+    	stayPrivate = false,
     	hatchEggName = "",
     	hatchMode = "Max",
     	autoFruitMachine = false,
@@ -31915,7 +31906,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	craftRarity = { Basic = true, Rare = true, Epic = true, Legendary = true, Mythical = true },
     	questPick = { Index = true, Daily = true, Group = true, Verify = true },
     	autoUfo = false,
-    	ufoTravel = true,
+    	ufoTravel = false,
     	autoBuyWorlds = false,
     	autoSpawnUp = false,
     	spawnPick = {},
@@ -31924,7 +31915,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	autoMoonIncr = false,
     	moonIncrPick = {},
     	upgradeOrder = "Best value",
-	farmMode = "Normal",
     	autoFriendSend = false,
     	autoFriendAccept = false,
     	webhookOn = false,
@@ -31932,7 +31922,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	webhookRarity = { Mythical = true, Secret = true },
     	webhookPets = {},
     	webhookHideName = false,
-    	eggAutoTravel = true,
+    	eggAutoTravel = false,
     	hatchStopAfter = 0,
     	hatchKeepCoins = 0,
     	fruitRefill = 1,
@@ -31947,7 +31937,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	gemReserve = 0,
     	autoRebirth = false,
     	rebirthStopAt = 0,
-    	autoCodes = true,
+    	autoCodes = false,
     	hookEvents = { UFO = true, World = true, Rebirth = true, Special = true, Codes = true, Goals = true, Fish = true },
     	ufoHop = false,
     	ufoHopWindow = 60,
@@ -31967,7 +31957,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	fishSpot = "Best unlocked",
     	fishIndexHunt = false,
     	fishIndexGolden = false,
-    	fishTap = true,
+    	fishTap = false,
     	fishTapSpeed = "Normal",
     	fishHideTaps = false,
     	fishPriority = "Eggs first",
@@ -33870,84 +33860,37 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	end,
     })
     
+    -- every automatic toggle (Stop Everything switches these off); no master switch and no global planner
     Auto.farmNames = {
-    	"AutoFarm", "AutoTap", "FarmWorldOn", "AutoUfo", "UfoTravel", "AutoBuyWorlds",
+    	"AutoFarm", "AutoTap", "FarmWorldOn", "AutoUfo", "UfoTravel", "UfoHop", "AutoBuyWorlds",
     	"AutoGift", "AutoPartyEgg", "AutoFruitMachine", "AutoGroupChest", "AutoMoonChest", "AutoKeyCraft",
     	"AutoVipChest", "AutoPartner", "AutoUniverseZone", "AutoQuests", "AutoBen", "AutoCodes", "AutoFriend",
-    	"AutoHatch", "EggAutoTravel", "AutoInvEggs", "IndexHunter", "AutoFruits", "AutoPotions",
-    	"AutoLucky", "AutoEquipBest", "AutoGolden", "AutoDiamond", "AutoFish", "FishIndexHunt",
-    	"FishIndexGolden", "FishTap", "AutoWorms", "AutoHooks", "AutoSellFish", "AutoMerchantBuy",
+    	"AutoFriendSend", "AutoFriendAccept", "AutoHatch", "EggSmart", "EggAutoTravel", "AutoInvEggs", "IndexHunter",
+    	"AutoFruits", "AutoPotions", "AutoLucky", "AutoEquipBest", "AutoGolden", "AutoDiamond", "AutoFish", "FishSmart",
+    	"FishIndexHunt", "FishIndexGolden", "FishTap", "AutoWorms", "AutoHooks", "AutoSellFish", "AutoMerchantBuy",
     	"AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoMoonPerm", "AutoMoonIncr",
-    	"MoonGameAuto", "AutoRebirth", "AutoServerLuck", "SkipHatchAnim", "SkipLuckyAnim",
-    	"AutoAdminChat", "AutoItemCraft", "AutoEventCraft",
+    	"MoonGameAuto", "AutoRebirth", "RebirthSmart", "AutoServerLuck", "AutoAdminChat", "AutoItemCraft", "AutoEventCraft",
     }
-    Auto.farmNames = {
-    	"AutoFarm", "AutoTap", "FarmWorldOn", "AutoUfo", "UfoTravel", "AutoBuyWorlds",
-    	"AutoGift", "AutoPartyEgg", "AutoFruitMachine", "AutoGroupChest", "AutoMoonChest", "AutoKeyCraft",
-    	"AutoVipChest", "AutoPartner", "AutoUniverseZone", "AutoQuests", "AutoBen", "AutoCodes", "AutoFriend",
-    	"AutoHatch", "EggAutoTravel", "AutoInvEggs", "IndexHunter", "AutoFruits", "AutoPotions",
-    	"AutoLucky", "AutoEquipBest", "AutoGolden", "AutoDiamond", "AutoFish", "FishIndexHunt",
-    	"FishIndexGolden", "FishTap", "AutoWorms", "AutoHooks", "AutoSellFish", "AutoMerchantBuy",
-    	"AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoMoonPerm", "AutoMoonIncr",
-    	"MoonGameAuto", "AutoRebirth", "AutoServerLuck", "SkipHatchAnim", "SkipLuckyAnim",
-    	"AutoAdminChat", "AutoItemCraft", "AutoEventCraft",
-    }
-    -- No master switch: every automation is its own toggle. The Smart Planner is one of them.
-    function Auto.farmOP()
-    	return S.farmOP == true
-    end
-    -- the budget reserve of a currency; an excluded currency is fully reserved (never spent)
+    -- the budget reserve of a currency (Rubies / Gems reserve inputs)
     function Auto.reserve(currency)
     	if currency == "Rubies" then
-    		return if Auto.excluded("rubies") then 1e18 else (tonumber(S.rubyReserve) or 0)
+    		return tonumber(S.rubyReserve) or 0
     	elseif currency == "Gems" then
-    		return if Auto.excluded("gems") then 1e18 else (tonumber(S.gemReserve) or 0)
+    		return tonumber(S.gemReserve) or 0
     	end
     	return 0
     end
     function Auto.stopEverything()
     	Auto.log("STOP", "everything")
-    	pcall(function() Toggles.SmartPlan:SetValue(false) end)
     	for _, name in ipairs(Auto.farmNames) do
     		local toggle = Toggles[name]
     		if toggle and toggle.Value then
     			pcall(function() toggle:SetValue(false) end)
     		end
     	end
-    	pcall(function() Toggles.UfoHop:SetValue(false) end)
     	notify("Auto Farm", "Everything stopped", 4)
     end
     UI.AllBox = Tabs.Farm:AddLeftGroupbox("Quick Start", "rocket")
-    UI.AllBox:AddToggle("SmartPlan", {
-    	Text = "Smart Planner (best value)",
-    	Tooltip = "Lets the planner pick the egg, world and upgrade by payback over the next 24 hours, with real game odds. It overrides your egg, world and upgrade picks while on. Fusing, converting and selling stay on their own switches.",
-    	Default = false,
-    	Callback = function(v)
-    		S.farmOP = v == true
-    		S.farmAll = S.farmOP
-    		if not S.farmOP then
-    			S.worldSave = 0
-    		end
-    	end,
-    })
-    UI.AllBox:AddLabel({
-    	Text = '<font transparency="0.4">Every automation is its own switch in the tabs. The Smart Planner is the one that plans by payback.</font>',
-    	DoesWrap = true,
-    })
-    UI.AllBox:AddButton({
-    	Text = "Stop Everything",
-    	Tooltip = "Switches off the Smart Planner and every automatic toggle",
-    	Func = function()
-    		Auto.stopEverything()
-    	end,
-    })
-    UI.AllBox:AddButton({
-    	Text = "Reset Hub Options",
-    	Tooltip = "Puts every toggle, dropdown, slider and input back to its default value. Saved configs are not deleted.",
-    	Func = function()
-    		Library:AskResetHubOptions(Library.ShareIgnore)
-    	end,
-    })
     -- what changed a toggle is always in the log: the saved config at start (AUTOLOAD) or the player (CLICK)
     Library.OnAutoload = function()
     	local names = {}
@@ -33998,7 +33941,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	Text = "Auto Tap",
     	Description = "Taps the target so every pet hits it",
     	Tooltip = "On is the fastest: all your pets focus one breakable, rubies and fruits first. Off lets the game's auto mode send each pet to its own breakable.",
-    	Default = true,
+    	Default = false,
     	Callback = function(v)
     		S.autoTap = v
     		if not v then
@@ -34037,7 +33980,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     local AreaRow = StatusBox:AddStat({ Icon = "map-pin", Text = "Area", Value = "unknown", Size = 22, ValueColor = "FontColor" })
     UI.FarmWorldRow = StatusBox:AddStat({ Icon = "globe", Text = "Farm world", Value = "Off", Size = 22, ValueColor = "FontColor" })
     UI.UpNextBox = Tabs.Farm:AddRightGroupbox("Up next", "list-checks")
-    UI.UpNextLabel = UI.UpNextBox:AddLabel({ Text = "Switch on Smart Planner (or Auto Upgrade, Auto Buy Worlds) and the next steps show here.", DoesWrap = true })
+    UI.UpNextLabel = UI.UpNextBox:AddLabel({ Text = "Switch on Smart Egg Pick, Auto Upgrade, Auto Buy Worlds or Smart Fishing and the next steps show here.", DoesWrap = true })
     UI.UfoBox = Tabs.Ufo:AddRightGroupbox("UFO Event", "rocket")
     UI.UfoBox:AddToggle("AutoUfo", {
     	Text = "Auto Break UFO",
@@ -34051,7 +33994,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     UI.UfoBox:AddToggle("UfoTravel", {
     	Text = "Travel to the UFO",
     	Description = "Flies to its world when it lands",
-    	Default = true,
+    	Default = false,
     	Callback = function(v)
     		S.ufoTravel = v
     	end,
@@ -34087,7 +34030,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	Text = "Stay On Private Server",
     	Description = "Never hops away from a private server",
     	Tooltip = "After a hop you cannot come back to a private server, so every automatic hop is skipped while you are on one.",
-    	Default = true,
+    	Default = false,
     	Callback = function(v)
     		S.stayPrivate = v
     	end,
@@ -34274,7 +34217,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	Text = "Auto Type Admin Phrases",
     	Description = "Types the word an admin asks for in chat",
     	Tooltip = "When a global admin message says something like \"type WORD for 100x eggs\", the hub writes that word in chat once.",
-    	Default = true,
+    	Default = false,
     	Callback = function(v)
     		S.autoAdminChat = v
     	end,
@@ -34328,14 +34271,20 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 do
 local FPlayers = game:GetService("Players")
 local FTeleport = game:GetService("TeleportService")
-local F = { on = true, asked = {}, friend = {}, sent = 0, lastSend = -1e9, lastLog = "", lastLogAt = -1e9 }
+local F = { on = false, asked = {}, friend = {}, sent = 0, lastSend = -1e9, lastLog = "", lastLogAt = -1e9 }
 local function friendBoost()
-local folder = LocalPlayer:FindFirstChild("VariousBoosts", true)
+local folder = getDataFolder("VariousBoosts")
 local v = folder and folder:FindFirstChild("FriendBoostCoins")
 if v and v:IsA("ValueBase") and type(v.Value) == "number" then
 return "+" .. math.floor(math.max(0, (v.Value - 1) * 100) + 0.5) .. "%"
 end
-return "?"
+local label
+pcall(function() label = LocalPlayer.PlayerGui.BoostUI.LeftHolder.FriendBoost.Countdown end)
+if label and label:IsA("TextLabel") and string.find(label.Text, "%%") then
+return label.Text
+end
+-- the game adds FriendBoostCoins only once a boost exists
+return if folder then "+0%" else "nofolder"
 end
 local function isFriend(p)
 if F.friend[p.UserId] then return true end
@@ -34409,7 +34358,7 @@ UI.FriendBox:AddToggle("AutoFriend", {
 Text = "Auto Friend",
 Description = "Sends friend requests to everyone in the server, once each",
 Tooltip = "Every friend in the server gives a boost. Sends one request per 10 s (and accepts requests sent to you).",
-Default = true,
+Default = false,
 Callback = function(v)
 F.on = v == true
 end,
@@ -34488,7 +34437,7 @@ end
     	Text = "Auto redeem known codes",
     	Description = "Redeems the known codes, once per account",
     	Tooltip = "Fetches the code list from the Corvus repo at start and every 6 hours, plus the codes the game shows in its update log. Each code is redeemed once with a 2 second pause and remembered, invalid ones are never retried.",
-    	Default = true,
+    	Default = false,
     	Callback = function(v)
     		S.autoCodes = v
     	end,
@@ -34553,10 +34502,19 @@ end
     		end
     	end,
     })
+    EggBox:AddToggle("EggSmart", {
+    	Text = "Smart Egg Pick",
+    	Description = "Picks the egg that pays back best",
+    	Tooltip = "Uses real egg odds, your luck and your team to pick the coin egg that adds the most income per coin within 24 hours. Your egg pick is ignored while this is on. Needs Auto Buy Egg.",
+    	Default = false,
+    	Callback = function(v)
+    		S.eggSmart = v
+    	end,
+    })
     EggBox:AddToggle("EggAutoTravel", {
     	Text = "Go to egg automatically",
     	Description = "Teleports to its world and walks to it",
-    	Default = true,
+    	Default = false,
     	Callback = function(v)
     		S.eggAutoTravel = v
     	end,
@@ -35129,6 +35087,15 @@ end
     		S.autoFish = v
     	end,
     })
+    UI.FishBox:AddToggle("FishSmart", {
+    	Text = "Smart Fishing",
+    	Description = "Pauses fishing while farming pays more",
+    	Tooltip = "Measures what fishing and farming earn per second (fish tokens count as 0) and fishes only while it pays more. Fishing events always fish. Needs Auto Fish.",
+    	Default = false,
+    	Callback = function(v)
+    		S.fishSmart = v
+    	end,
+    })
     UI.FishBox:AddDropdown("FishSpot", {
     	Text = "Fishing spot",
     	Values = UI.FishSpotList,
@@ -35160,7 +35127,7 @@ end
     	Text = "Auto Tap",
     	Description = "Hits every speed-up for faster catches",
     	Tooltip = "Taps each speed-up at a human pace. Every tap shortens the catch and grows the streak, which adds fishing luck.",
-    	Default = true,
+    	Default = false,
     	Callback = function(v)
     		S.fishTap = v
     	end,
@@ -35475,6 +35442,7 @@ end
     UI.WorldBuyBox:AddToggle("AutoBuyWorlds", {
     	Text = "Auto Buy Worlds",
     	Description = "Unlocks the next world once you can afford it",
+    	Tooltip = "Also buys The Moon with rubies. When the next world pays more than any egg, Auto Buy Egg keeps the coins for it.",
     	Default = false,
     	Callback = function(v)
     		S.autoBuyWorlds = v
@@ -35758,6 +35726,15 @@ end
     	Default = false,
     	Callback = function(v)
     		S.rebirthWaitPerm = v
+    	end,
+    })
+    UI.RebirthBox:AddToggle("RebirthSmart", {
+    	Text = "Rebirth By Payback",
+    	Description = "Rebirths when the gem gain beats the rebuild",
+    	Tooltip = "Rebirths only when the extra gems over 24 hours are worth more than the income lost while the Moon Incremental shop is bought again. Replaces Wait For Permanent Max while on.",
+    	Default = false,
+    	Callback = function(v)
+    		S.rebirthSmart = v
     	end,
     })
     UI.RebirthBox:AddInput("RebirthStopAt", {
@@ -36715,7 +36692,7 @@ end
     				stock = stock,
     				price = price,
     				rubies = rubies,
-    				affordable = not (price and rubies and rubies < price) and not Auto.excluded("rubies"),
+    				affordable = not (price and rubies and rubies < price),
     				status = FM.status,
     				last = FM.last,
     			}
@@ -37230,8 +37207,8 @@ end
     
     		local function petPlan(name, reqG, reqD)
     			local wantN = S.huntVariants.Normal == true and not indexed(name)
-    			local wantG = S.huntVariants.Golden == true and not indexed("Golden " .. name) and not Auto.noConvert(name)
-    			local wantD = S.huntVariants.Diamond == true and not indexed("Diamond " .. name) and not Auto.noConvert(name)
+    			local wantG = S.huntVariants.Golden == true and not indexed("Golden " .. name)
+    			local wantD = S.huntVariants.Diamond == true and not indexed("Diamond " .. name)
     			local availN = petStock("NormalPetsData", name)
     			local availG = petStock("GoldenPetsData", "Golden " .. name)
     			local goldNeeded = if wantD then reqD elseif wantG then 1 else 0
@@ -37300,7 +37277,7 @@ end
     								local blockedUntil = Hunter.blocked[egg]
     								if isWorldUnlocked(world) == false then
     									lockedMissing = true
-    								elseif not (blockedUntil and os.clock() < blockedUntil) and not Auto.excluded("egg:" .. egg) then
+    								elseif not (blockedUntil and os.clock() < blockedUntil) then
     									local need = eggNeeds[egg]
     									if not need then
     										need = { egg = egg, world = world, count = 0 }
@@ -37470,7 +37447,7 @@ end
     				local rarity = if type(info) == "table" then info[3] else nil
     				local targetExists = type(multi) ~= "table" or multi[kind .. " " .. base] ~= nil
     				local special = rarity == "Exclusive" or rarity == "Secret"
-    				if targetExists and not special and (rarity == nil or S.craftRarity[rarity]) and not Auto.noConvert(base) and petStock(folderName, name) >= need then
+    				if targetExists and not special and (rarity == nil or S.craftRarity[rarity]) and petStock(folderName, name) >= need then
     					table.insert(list, name)
     				end
     			end
@@ -37603,7 +37580,7 @@ end
     					local info = if type(multi) == "table" then multi[base] else nil
     					local rarity = if type(info) == "table" then info[3] else nil
     					local exists = type(multi) ~= "table" or multi["Golden " .. base] ~= nil
-    					if exists and rarity ~= "Exclusive" and rarity ~= "Secret" and not Auto.noConvert(base) and petStock("NormalPetsData", base) >= reqG then
+    					if exists and rarity ~= "Exclusive" and rarity ~= "Secret" and petStock("NormalPetsData", base) >= reqG then
     						table.insert(list, base)
     					end
     				end
@@ -38164,7 +38141,7 @@ end
     			local balance = getStat(shop.currency) or 0
     			local reserve = Auto.reserve(shop.currency)
     			local plan = Auto.Plan
-    			local planOn = plan ~= nil and plan.ready and (Auto.farmOP() or S.upgradeOrder == "Best value")
+    			local planOn = plan ~= nil and plan.ready and S.upgradeOrder == "Best value"
     			local bestValue = -math.huge
     			for index, name in ipairs(shop.names) do
     				local level = readLevel(shop.folder, name)
@@ -38350,7 +38327,7 @@ end
     				local ok, err = pcall(function()
     					local info = worldInfo()
     					S.worldSave = 0
-    					if Auto.farmOP() and S.autoBuyWorlds and info.next and info.currency == "Coins" and info.price and Auto.Plan and Auto.Plan.ready then
+    					if S.autoBuyWorlds and info.next and info.currency == "Coins" and info.price and Auto.Plan and Auto.Plan.ready then
     						S.worldSave = Auto.Plan.keep.Coins or 0
     					end
     					if not S.autoBuyWorlds then
@@ -38370,7 +38347,7 @@ end
     					else
     						Worlds.status = if Worlds.fails >= 2 then "Going to the portal" else "Buying"
     					end
-    					if info.affordable and not Mover.busy and os.clock() - Worlds.lastBuy > 8 and not (info.currency == "Rubies" and Auto.excluded("rubies")) then
+    					if info.affordable and not Mover.busy and os.clock() - Worlds.lastBuy > 8 then
     						if Worlds.fails < 2 then
     							buyWorld(info, false)
     						elseif os.clock() - Worlds.padTry > 60 then
@@ -38879,7 +38856,7 @@ end
     				local best, bestCost, bestIndex
     				local now = os.clock()
     				local plan = Auto.Plan
-    				local planOn = plan ~= nil and plan.ready and (Auto.farmOP() or S.treeOrder == "Best value")
+    				local planOn = plan ~= nil and plan.ready and S.treeOrder == "Best value"
     				local bestValue = -math.huge
     				for index, group in ipairs(tree.Groups) do
     					if group.parent then
@@ -38979,7 +38956,7 @@ end
     						info.allDone = false
     						if row.locked then
     							info.anyLocked = true
-    						elseif anchor and (Special.blocked[entry.name] or 0) < now and (info.next == nil or entry.price < info.next.price) and not (Auto.Plan and Auto.Plan.on() and not Auto.Plan.allows("special:" .. entry.name, entry.price)) then
+    						elseif anchor and (Special.blocked[entry.name] or 0) < now and (info.next == nil or entry.price < info.next.price) and not (Auto.Plan and Auto.Plan.on() and S.upgradeOrder == "Best value" and not Auto.Plan.allows("special:" .. entry.name, entry.price)) then
     							info.next = row
     						end
     					end
@@ -39454,9 +39431,6 @@ end
     				end
     
     				local function plAdd(list, option)
-    					if (option.cur == "Rubies" and Auto.excluded("rubies")) or (option.cur == "Gems" and Auto.excluded("gems")) then
-    						return
-    					end
     					if option.cost and option.cost > 0 then
     						option.dV = math.max(0, option.dV or 0)
     						option.ratio = option.dV / option.cost
@@ -39483,7 +39457,7 @@ end
     						local price, free = getEggPrice(egg)
     						local event = Auto.eggEvent(egg)
     						local world = Auto.eggWorld(egg)
-    						if price and (Auto.eggCurrency(egg) == "Coins" or free) and not (event and (event.ended or event.locked)) and worldUnlocked(world) and not Auto.excluded("egg:" .. egg) then
+    						if price and (Auto.eggCurrency(egg) == "Coins" or free) and not (event and (event.ended or event.locked)) and worldUnlocked(world) then
     							local gain = plEggGain(egg, P.luck, P.gold) or 0
     							local perEgg = gain / P.team.power * P.V
     							local eff = plWorldEff(world)
@@ -39731,7 +39705,9 @@ end
     					end
     					P.farmEff, P.farmRubyEff = bestEff, bestRuby
     					local options
-    					for _ = 1, 3 do
+    					-- shadow prices start from zero on every compute (two passes: coins first, then the cross terms)
+    					P.w = { Coins = 1, Rubies = 0, Gems = 0 }
+    					for _ = 1, 2 do
     						P.V = Ib.Coins + P.w.Rubies * Ib.Rubies + P.w.Gems * Ib.Gems
     						-- the egg to hatch: best gain per coin (needed first, luck and hatch speed are valued through it)
     						P.hatch = nil
@@ -39747,18 +39723,31 @@ end
     							P.hatch = { egg = bestEgg.name, gain = bestEgg.gain, rate = rate, maxOpen = maxOpen, bound = I.Coins > rate * bestEgg.price }
     							options = plOptions()
     						end
-    						-- shadow price of rubies and gems: best gain over the horizon per unit
+    						-- shadow price of rubies and gems: best gain over the horizon per unit, valued without the currency's own
+    						-- growth (a ruby multiplier bought with rubies fed w_r into itself every pass: V=1e210 in the RATE line)
     						local nextW = { Coins = 1, Rubies = 0, Gems = 0 }
-    						for _, option in ipairs(options) do
-    							if option.cur ~= "Coins" and not option.progress then
-    								local income = math.max(I[option.cur], 1e-9)
-    								local balance = (getStat(option.cur) or 0) - plReserve(option.cur)
-    								local eta = math.max(0, option.cost - balance) / income
-    								nextW[option.cur] = math.max(nextW[option.cur], option.dV * math.max(0, P.H - eta) / option.cost)
+    						for _, cur in ipairs({ "Rubies", "Gems" }) do
+    							local own = P.w[cur]
+    							P.w[cur] = 0
+    							P.V = Ib.Coins + P.w.Rubies * Ib.Rubies + P.w.Gems * Ib.Gems
+    							local curOptions = plOptions()
+    							P.w[cur] = own
+    							for _, option in ipairs(curOptions) do
+    								if option.cur == cur and not option.progress and (option.cost or 0) > 0 then
+    									local income = math.max(I[option.cur], 1e-9)
+    									local balance = (getStat(option.cur) or 0) - plReserve(option.cur)
+    									local eta = math.max(0, option.cost - balance) / income
+    									local value = option.dV * math.max(0, P.H - eta) / option.cost
+    									if value == value and value < math.huge then
+    										nextW[cur] = math.max(nextW[cur], value)
+    									end
+    								end
     							end
     						end
     						P.w = nextW
     					end
+    					P.V = Ib.Coins + P.w.Rubies * Ib.Rubies + P.w.Gems * Ib.Gems
+    					options = plOptions()
     					-- best per currency: largest gain over the 24 h horizon per unit, cheaper buys only when they beat the delay they cause
     					local byId, best = {}, {}
     					for _, option in ipairs(options) do
@@ -39895,9 +39884,9 @@ end
     				end
     				-- plain words for the UI; the raw numbers stay in the log (PLAN lines)
     				function Auto.upNextText()
-    					if not Auto.farmOP() then
-    						return "Switch on Smart Planner (or Auto Upgrade, Auto Buy Worlds) and the next steps show here."
-    					end
+    					if not P.ready and not P.wanted() then
+						return "Switch on Smart Egg Pick, Auto Upgrade, Auto Buy Worlds or Smart Fishing and the next steps show here."
+					end
     					if not P.ready then
     						return "Measuring your income, the plan shows up in a minute."
     					end
@@ -39936,7 +39925,7 @@ end
     				end
     				
     				function P.on()
-    					return P.ready and Auto.farmOP()
+    					return P.ready
     				end
     
     				-- time: value earned per second in each activity (coin-equivalent), half-life 30 min
@@ -39983,7 +39972,7 @@ end
     					P.last = { t = now, value = value, activity = activity }
     					-- fishing vs farming: measure both, keep the better one (tokens from fish are not counted as money)
     					local farm, fishAct = P.act.Farm, P.act.Fish
-    					if not (Auto.farmOP() and S.autoFish) then
+    					if not (S.fishSmart and S.autoFish) then
     						P.fishOff = false
     					elseif P.evt and P.evt.fishBoost then
     						P.fishOff = false
@@ -40017,7 +40006,10 @@ end
     						table.sort(parts)
     						plLog("TIME", table.concat(parts, " "), "fishOff=" .. tostring(P.fishOff))
     						local rb = P.rebirth
-    						if rb then
+    						local rbKey = if rb then tostring(rb.ready) .. "|" .. tostring(P.rebirthNow) .. "|" .. tostring(P.rebirthWhy) .. "|" .. tostring(P.rebirthPath) else ""
+    						if rb and (S.autoRebirth or S.rebirthSmart) and (rbKey ~= P.lastLog.rbKey or now - (P.lastLog.rbAt or -1e9) >= 900) then
+    							P.lastLog.rbKey = rbKey
+    							P.lastLog.rbAt = now
     							plLog("REBIRTH", "ready=" .. tostring(rb.ready), "now=" .. tostring(P.rebirthNow), "why=" .. tostring(P.rebirthWhy), "net=" .. plFmt(rb.net), "gain=" .. plFmt(rb.gain), "loss=" .. plFmt(rb.loss), "rebuildT=" .. plFmt(rb.T), "remain=" .. plFmt(rb.remain), "path=" .. tostring(P.rebirthPath))
     						end
     					end
@@ -40050,10 +40042,7 @@ end
     
     				-- the planner runs only while a switch that uses it is on
     				function P.wanted()
-    					if Auto.farmOP() then
-    						return true
-    					end
-    					for _, name in ipairs({ "AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoBuyWorlds", "AutoHatch", "AutoRebirth", "AutoMoonPerm", "AutoMoonIncr", "AutoGolden", "AutoDiamond", "AutoInvEggs", "IndexHunter" }) do
+    					for _, name in ipairs({ "EggSmart", "FishSmart", "RebirthSmart", "AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoBuyWorlds", "AutoHatch", "AutoRebirth", "AutoMoonPerm", "AutoMoonIncr", "AutoGolden", "AutoDiamond", "AutoInvEggs", "IndexHunter" }) do
     						local toggle = Toggles[name]
     						if toggle and toggle.Value then
     							return true
@@ -40084,7 +40073,7 @@ end
     								plReport(now)
     								-- Moon world: progress, bought with rubies as soon as it is affordable
     								local moonOpt = P.byId.moonworld
-    								if Auto.farmOP() and S.autoBuyWorlds and moonOpt and moonOpt.eta <= 0 and not Mover.busy and now - P.moonTry > 30 then
+    								if S.autoBuyWorlds and moonOpt and moonOpt.eta <= 0 and not Mover.busy and now - P.moonTry > 30 then
     									P.moonTry = now
     									plLog("BUY", "moon world for", moonOpt.cost, "rubies")
     									buyWorld({ next = moonOpt.name, moon = true, from = moonOpt.from, price = moonOpt.cost, currency = "Rubies" }, Worlds.fails >= 2)
@@ -40099,7 +40088,7 @@ end
     
     				-- Normal: the player's egg stays unless it is empty or still the list default
     				function P.eggAuto()
-    					if not (P.ready and Auto.farmOP()) then
+    					if not (P.ready and S.eggSmart) then
     						return false
     					end
     					return true
@@ -40116,7 +40105,7 @@ end
     			Extra.nextErrand = function(now)
     				if S.autoRebirth and now - Rebirth.lastTry > 12 and now >= Rebirth.blockedUntil then
     					local info = rebirthInfo()
-    					local planWait = if Auto.Plan and Auto.Plan.on() then not Auto.Plan.rebirthNow else (S.rebirthWaitPerm and Auto.permMaxed and not Auto.permMaxed())
+    					local planWait = if S.rebirthSmart and Auto.Plan and Auto.Plan.on() then not Auto.Plan.rebirthNow else (S.rebirthWaitPerm and Auto.permMaxed and not Auto.permMaxed())
     					if info.available and info.ready and info.moonUnlocked and info.nextNumber and not info.stopped and not planWait then
     						return "Moon rebirth", function()
     							local travel = Rebirth.needsTravel == true
@@ -40385,7 +40374,7 @@ end
     								Rebirth.status = "Max rebirths"
     							elseif info.stopped then
     								Rebirth.status = "Stopped at " .. tostring(S.rebirthStopAt)
-    							elseif info.ready and Auto.Plan and Auto.Plan.on() and not Auto.Plan.rebirthNow then
+    							elseif info.ready and S.rebirthSmart and Auto.Plan and Auto.Plan.on() and not Auto.Plan.rebirthNow then
     								Rebirth.status = "Waiting: " .. tostring(Auto.Plan.rebirthWhy or "waiting")
     							elseif info.ready and S.rebirthWaitPerm and Auto.permMaxed and not Auto.permMaxed() then
     								local _, owned, cap = Auto.permMaxed()
@@ -41016,7 +41005,7 @@ end
     		local function luckyStep()
     			local now = os.clock()
     			local grow = Auto.knitRemote("LuckyBlockService", "RE", "Grow")
-    			if not S.autoLucky or Auto.excluded("lucky") then
+    			if not S.autoLucky then
     				Lucky.status = if Lucky.active then "Opening" else "Idle"
     				return
     			end
@@ -41128,7 +41117,7 @@ end
     			local useRemote = Auto.knitRemote("ConsumablesService", "RE", "UseItem")
     			for _, name in ipairs(Items.Fruits) do
     				local count = trackCount("FruitsData", name, "fruitsUsed")
-    				if S.autoFruits and useRemote and S.fruitPick[name] and count > 0 and now - (ItemTrack.lastUse[name] or -1e9) >= 2.5 and not Auto.excluded("fruits") then
+    				if S.autoFruits and useRemote and S.fruitPick[name] and count > 0 and now - (ItemTrack.lastUse[name] or -1e9) >= 2.5 then
     					local left = tonumber(readData("FruitsTimeData", name)) or 0
     					local amount = if S.fruitMode == "Use all" then chunkFor(count) elseif left <= 1 then math.min(S.fruitRefill or 1, count) else 0
     					if amount > 0 then
@@ -41139,7 +41128,7 @@ end
     			end
     			for _, name in ipairs(Items.Potions) do
     				local count = trackCount("PotionsData", name, "potionsUsed")
-    				if S.autoPotions and useRemote and S.potionPick[name] and count > 0 and now - (ItemTrack.lastUse[name] or -1e9) >= 2.5 and not Auto.excluded("potions") then
+    				if S.autoPotions and useRemote and S.potionPick[name] and count > 0 and now - (ItemTrack.lastUse[name] or -1e9) >= 2.5 then
     					local amount = 0
     					if S.potionMode == "Use all" then
     						amount = chunkFor(count)
@@ -42121,7 +42110,7 @@ end
     			end
     
     			Auto.nextUpdateErrand = function(now)
-    				if S.autoFruitMachine and now - U.fruitTry > 90 and readData("SPdata", "SP17") == true and not fruitAutoOn() and not Auto.excluded("rubies") then
+    				if S.autoFruitMachine and now - U.fruitTry > 90 and readData("SPdata", "SP17") == true and not fruitAutoOn() then
     					return "Fruit Auto Buy", fruitAutoTrip
     				end
     				if S.autoServerLuck and now - U.luckTry > 10 and now >= U.luckBlocked then
@@ -42142,7 +42131,7 @@ end
     						end
     					end
     				end
-    				if S.autoItemCraft and now - U.craftTry > 30 and now >= U.craftBlocked and not Auto.excluded("potions") then
+    				if S.autoItemCraft and now - U.craftTry > 30 and now >= U.craftBlocked then
     					local list = {}
     					for _, recipe in ipairs(RecipeList) do
     						if S.craftPick[recipe.Id] and craftable(recipe) > 0 then
@@ -43210,7 +43199,7 @@ end
     						local name = entry.Name
     						if not string.find(name, "|", 1, true) then
     							local base = string.gsub(string.gsub(name, "^Golden ", ""), "^Diamond ", "")
-    							if S.sellFishPick[base] and not Auto.excluded("rarity:" .. tostring(Auto.petRarity(base))) then
+    							if S.sellFishPick[base] then
     								local okValue, price = pcall(cfg.GetSellValue, name, PetDisplay)
     								if okValue and type(price) == "number" and price > 0 then
     									local okAvailable, available = pcall(PetDisplay.GetAvailable, LocalPlayer, name)
@@ -43572,7 +43561,7 @@ end
     				local name, count = nil, 0
     				for _, egg in ipairs(invEggNames()) do
     					local owned = math.floor(tonumber(readData("Eggs", egg)) or 0)
-    					if not S.invEggKeep[egg] and owned > 0 and not Auto.excluded("egg:" .. egg) then
+    					if not S.invEggKeep[egg] and owned > 0 then
     						name, count = egg, owned
     						break
     					end
@@ -43621,7 +43610,7 @@ end
     			Auto.moonGameAutoOn = moonAutoOn
     
     			local function moonAutoWanted(now)
-    				return S.moonGameAuto and readData("SPdata", "SP14") == true and not moonAutoOn() and now - MoonAuto.lastTry > 90 and worldUnlocked(moonWorld()) and not Auto.excluded("gems")
+    				return S.moonGameAuto and readData("SPdata", "SP14") == true and not moonAutoOn() and now - MoonAuto.lastTry > 90 and worldUnlocked(moonWorld())
     			end
     
     			local function moonAutoTrip()
@@ -44351,7 +44340,7 @@ end
     -- Luck Combo (EggLuckComboConfig): the combo drops after 150 s without a hatch, one cheap egg keeps it
     local ComboKeep = { last = -1e9, count = 0 }
     local function comboKeep(now)
-    	if not (Auto.farmOP() and S.autoHatch and EggHatch) then
+    	if not (S.autoHatch and EggHatch) then
     		return false
     	end
     	if now - HatchState.lastFire < 110 or now - ComboKeep.last < 20 then
@@ -44373,7 +44362,7 @@ end
     	for egg in pairs(pets or {}) do
     		local price, free = getEggPrice(egg)
     		local cost = if free then 0 else price
-    		if cost and cost < pickPrice and Auto.eggCurrency(egg) == "Coins" and not Auto.excluded("egg:" .. egg) and checkHatch(egg) then
+    		if cost and cost < pickPrice and Auto.eggCurrency(egg) == "Coins" and checkHatch(egg) then
     			pick, pickPrice = egg, cost
     		end
     	end
@@ -44404,11 +44393,6 @@ end
     	local eggName = huntEgg or (if S.autoHatch then (if Auto.effectiveEgg then Auto.effectiveEgg() else S.hatchEggName) else nil)
     	if eggName == "" and not huntEgg and S.autoHatch and Auto.Plan and Auto.Plan.eggAuto and Auto.Plan.eggAuto() then
     		HatchState.status = "Waiting: " .. Auto.Plan.eggWhy
-    		HatchState.waiting = false
-    		return
-    	end
-    	if eggName and eggName ~= "" and Auto.excluded("egg:" .. eggName) then
-    		HatchState.status = "Protected by Exclude"
     		HatchState.waiting = false
     		return
     	end
@@ -45451,18 +45435,6 @@ end
     })
     
     Library:AddCommand({
-    	Name = "planner",
-    	Aliases = { "smart", "plan" },
-    	Args = "[on/off]",
-    	Description = "Turns the Smart Planner on or off",
-    	Callback = function(Args)
-    		local State = if Args[1] then Args[1] == "on" else not Toggles.SmartPlan.Value
-    		Toggles.SmartPlan:SetValue(State)
-    		return "Smart Planner " .. (if State then "on" else "off")
-    	end,
-    })
-    
-    Library:AddCommand({
     	Name = "farm",
     	Args = "[on/off]",
     	Description = "Starts or stops the auto farm",
@@ -45688,9 +45660,28 @@ end
     	end
     end
     
+    -- Quick Start: the main loop toggles as two-way mirrors of the originals in their tabs
+    for _, id in ipairs({ "AutoFarm", "AutoTap", "AutoHatch", "EggSmart", "AutoFish", "AutoSpawnUpgrades" }) do
+    	pcall(Library.MirrorToggle, Library, id, UI.AllBox)
+    end
+    UI.AllBox:AddDivider()
+    UI.AllBox:AddButton({
+    	Text = "Stop Everything",
+    	Tooltip = "Switches off every automatic toggle",
+    	Func = function()
+    		Auto.stopEverything()
+    	end,
+    })
+    UI.AllBox:AddButton({
+    	Text = "Reset Hub Options",
+    	Tooltip = "Puts every toggle, dropdown, slider and input back to its default value. Saved configs are not deleted.",
+    	Func = function()
+    		Library:AskResetHubOptions(Library.ShareIgnore)
+    	end,
+    })
+
     if Library.SetQuickBar then
     	Library:SetQuickBar({
-    		{ Toggle = "SmartPlan", Icon = "rocket", Label = "Planner" },
     		{ Toggle = "AutoFarm", Icon = "swords", Label = "Farm" },
     		{ Toggle = "AutoHatch", Icon = "egg", Label = "Eggs" },
     		{ Toggle = "AutoUfo", Icon = "rocket", Label = "UFO" },
@@ -46162,13 +46153,13 @@ end
     				Description = "Pick everything you want running. Tap again to unpick.",
     				Multi = true,
     				Required = true,
-    				Default = { "farm", "hatch", "rewards", "upgrades", "equip" },
+    				Default = {},
     				Choices = {
     					{ Id = "farm", Title = "Farm coins", Description = "Breaks coins and chests at full speed", Icon = "swords", Color = "#e0a526" },
     					{ Id = "hatch", Title = "Open eggs", Description = "Buys your egg whenever you can afford it", Icon = "egg", Color = "#3ccf91" },
     					{ Id = "index", Title = "Complete the index", Description = "Hunts missing pets, crafts Golden and Diamond", Icon = "book-open", Color = "#5fb8ff" },
     					{ Id = "rewards", Title = "Claim rewards", Description = "Gifts, quests, chests, party egg and codes", Icon = "gift", Color = "#ff5d8f" },
-    					{ Id = "upgrades", Title = "Buy upgrades", Description = "Spawn shop, upgrade tree, special upgrades", Icon = "trending-up", Color = "#c77dff" },
+    					{ Id = "upgrades", Title = "Buy upgrades", Description = "Spends rubies: spawn shop, upgrade tree, special upgrades", Icon = "trending-up", Color = "#c77dff" },
     					{ Id = "worlds", Title = "Unlock worlds", Description = "Buys the next world when you have the coins", Icon = "globe", Color = "#7dffb3" },
     					{ Id = "ufo", Title = "UFO event", Description = "Joins every UFO and helps break it", Icon = "rocket", Color = "#e66767" },
     					{ Id = "equip", Title = "Equip best pets", Description = "Keeps your strongest team on", Icon = "paw-print", Color = "#ffb84d" },
