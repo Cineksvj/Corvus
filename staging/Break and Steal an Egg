@@ -42,6 +42,7 @@ local BootOk, BootError = xpcall(function()
 local HubRepo = "https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/"
 local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/"
     local Library = (function()
+    local CorvusLoadT0, CorvusLoadTimes = os.clock(), {}
     local cloneref = (cloneref or clonereference or function(instance: any)
         return instance
     end)
@@ -2400,14 +2401,51 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         TrashIcon = Library:GetIcon("trash-2")
     end
     
-    local OnlineFetchIcons, OnlineIcons = pcall(function()
-        return (loadstring(
-            game:HttpGet("https://raw.githubusercontent.com/mstudio45/lucide-roblox-direct/refs/heads/main/source.lua")
-        ) :: () -> IconModule)()
-    end)
-    if OnlineFetchIcons and OnlineIcons then
-        Library:SetIconModule(OnlineIcons)
-    end
+    -- Lucide icons: a cached copy loads from disk at once, the download only refreshes the cache in the background
+	-- (a synchronous download here held the whole start on slow executors)
+	do
+		local LucideUrl = "https://raw.githubusercontent.com/mstudio45/lucide-roblox-direct/refs/heads/main/source.lua"
+		local LucideFile = "Corvus/lucide.lua"
+		local IconsT0 = os.clock()
+		local function ApplyIcons(Source)
+			if typeof(Source) ~= "string" or #Source < 1000 then
+				return false
+			end
+			local Ok, Module = pcall(function()
+				return (loadstring(Source) :: any)()
+			end)
+			if Ok and Module then
+				Library:SetIconModule(Module)
+				return true
+			end
+			return false
+		end
+		local Cached = nil
+		pcall(function()
+			if isfile and readfile and isfile(LucideFile) then
+				Cached = readfile(LucideFile)
+			end
+		end)
+		local UsedCache = ApplyIcons(Cached)
+		CorvusLoadTimes.icons = os.clock() - IconsT0
+		task.spawn(function()
+			local Ok, Source = pcall(game.HttpGet, game, LucideUrl)
+			if not Ok or typeof(Source) ~= "string" or #Source < 1000 or Source == Cached then
+				return
+			end
+			pcall(function()
+				if isfolder and makefolder and not isfolder("Corvus") then
+					makefolder("Corvus")
+				end
+				if writefile then
+					writefile(LucideFile, Source)
+				end
+			end)
+			if not UsedCache and not Library.Unloaded then
+				ApplyIcons(Source)
+			end
+		end)
+	end
     
     Library.Cursor = {}
     
@@ -4987,6 +5025,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             local Toggle = Library.Toggles[Entry.Target]
             if Toggle and not Toggle.Disabled then
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Entry.Target) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Entry.Target, Toggle.Value)
+                end
                 Library:Notify({ Title = tostring(Toggle.Text), Description = if Toggle.Value then "ON" else "OFF", Time = 1.5 })
             end
         elseif Entry.Kind == "Button" then
@@ -5697,6 +5738,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
 				Close(false, "outside")
 			end)
 		end
+		local ModalOpenedAt = os.clock()
 		pcall(function()
 			KeyConnection = UserInputService.InputBegan:Connect(function(Input, Processed)
 				if Input.UserInputType ~= Enum.UserInputType.Keyboard then
@@ -5704,7 +5746,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
 				end
 				if Input.KeyCode == Enum.KeyCode.Escape then
 					Close(false, "close")
-				elseif not Processed and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
+				elseif not Processed and not Opts.Warning and os.clock() - ModalOpenedAt > 0.8 and (Input.KeyCode == Enum.KeyCode.Return or Input.KeyCode == Enum.KeyCode.KeypadEnter) then
 					Close(true, "key")
 				end
 			end)
@@ -10752,6 +10794,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 end
     
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Idx) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+                end
             end))
     
             if typeof(Toggle.Tooltip) == "string" or typeof(Toggle.DisabledTooltip) == "string" then
@@ -11067,6 +11112,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 end
     
                 Toggle:SetValue(not Toggle.Value)
+                if typeof(Idx) == "string" and Library.OnUserToggle then
+                	pcall(Library.OnUserToggle, Idx, Toggle.Value)
+                end
             end))
     
             table.insert(Toggle.Connections, Button.MouseButton1Down:Connect(function()
@@ -17635,6 +17683,28 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             return nil, false
         end
     
+        function Library:ResetHubOptions(Ignore: any): (boolean, any)
+        	local Ok, Json = pcall(HttpService.JSONEncode, HttpService, { v = 1, g = game.GameId, d = {} })
+        	if not Ok then
+        		return false, "Could not reset"
+        	end
+        	return Library:ImportShareCode("CORVUS-" .. Library.Base64Encode(Json), Ignore)
+        end
+
+        function Library:AskResetHubOptions(Ignore: any)
+        	return Library:ShowModal({
+        		Icon = "rotate-ccw",
+        		Title = "Reset all options to defaults?",
+        		Text = "Every toggle, dropdown, slider and input of this hub goes back to its default value. Saved configs are not deleted.",
+        		ConfirmText = "Reset",
+        		CancelText = "Cancel",
+        		OnConfirm = function()
+        			local Ok, Result = Library:ResetHubOptions(Ignore)
+        			Library:Notify({ Title = "Reset Hub Options", Description = if Ok then string.format("%d options reset", Result) else tostring(Result), Time = 4 })
+        		end,
+        	})
+        end
+
         function Library:ExportShareCode(Ignore: any): (string?, any)
             local Changed = {}
             local Count = 0
@@ -17763,7 +17833,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             end
             CommunityState.Fetching = true
             task.spawn(function()
-                local Data = HttpRequestJSON(string.format("https://discord.com/api/v10/invites/%s?with_counts=true", Code))
+                local CommunityT0 = os.clock()
+local Data = HttpRequestJSON(string.format("https://discord.com/api/v10/invites/%s?with_counts=true", Code))
+CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - CommunityT0)
                 CommunityState.Fetching = false
                 if typeof(Data) ~= "table" or Library.Unloaded then
                     return
@@ -27400,7 +27472,6 @@ end
                     "CorvusConfigList",
                     "CorvusShareCode",
                     "CorvusAutoSave",
-                    "FarmAll",
                 })
                 SaveManager:SetFolder(Folder)
                 if Info.SubFolder then
@@ -27605,6 +27676,7 @@ end
                 if Info.AutoLoad ~= false then
                     task.defer(function()
                         pcall(SaveManager.LoadAutoloadConfig, SaveManager)
+                        if Library.OnAutoload then pcall(Library.OnAutoload) end
                     end)
                 end
             end
@@ -29975,6 +30047,9 @@ end
                         local Toggle = Library.Toggles[Item.Toggle]
                         if Toggle and not Toggle.Disabled then
                             Toggle:SetValue(not Toggle.Value)
+                            if typeof(Item.Toggle) == "string" and Library.OnUserToggle then
+                            	pcall(Library.OnUserToggle, Item.Toggle, Toggle.Value)
+                            end
                         end
                     end)
                     table.insert(DockButtons, Entry)
@@ -31254,7 +31329,101 @@ end
     end
     -- CORVUS-DIAG-END
     getgenv().Library = Library
-    getgenv().CorvusLibrary = Library
+    -- CORVUS-LOAD: start timing. Every phase gets a time; the hub logs the line through Library.LoadLogger and the
+	-- owner loader waits for getgenv().CorvusLoaded (set once the window exists).
+	Library.LoadTimes = CorvusLoadTimes
+	CorvusLoadTimes.lib = os.clock() - CorvusLoadT0
+	CorvusLoadTimes.libDone = os.clock()
+	-- Obsidian addons: the cached copy is used at once and refreshed in the background (Network = true forces a download)
+	function Library.FetchAddon(BaseUrl: string, Name: string, Network: boolean?): string
+		local T0 = os.clock()
+		local File = "Corvus/addons/" .. Name
+		local Source = nil
+		if not Network then
+			pcall(function()
+				if isfile and readfile and isfile(File) then
+					Source = readfile(File)
+				end
+			end)
+		end
+		if typeof(Source) == "string" and #Source > 500 then
+			task.spawn(function()
+				local Ok, Fresh = pcall(game.HttpGet, game, BaseUrl .. Name)
+				if Ok and typeof(Fresh) == "string" and #Fresh > 500 and Fresh ~= Source and writefile then
+					pcall(writefile, File, Fresh)
+				end
+			end)
+		else
+			Source = game:HttpGet(BaseUrl .. Name)
+			if typeof(Source) == "string" and #Source > 500 then
+				pcall(function()
+					if isfolder and makefolder then
+						if not isfolder("Corvus") then
+							makefolder("Corvus")
+						end
+						if not isfolder("Corvus/addons") then
+							makefolder("Corvus/addons")
+						end
+					end
+					if writefile then
+						writefile(File, Source)
+					end
+				end)
+			end
+		end
+		CorvusLoadTimes.addons = (CorvusLoadTimes.addons or 0) + (os.clock() - T0)
+		return Source
+	end
+	function Library:LoadReport(): string
+		local T = CorvusLoadTimes
+		local Loader = getgenv().CorvusLoaderTimes
+		Loader = if typeof(Loader) == "table" then Loader else {}
+		local function F(Value)
+			return if typeof(Value) == "number" then string.format("%.1f", Value) else "-"
+		end
+		local GameTime = if T.shown and T.libDone then math.max(0, T.shown - T.libDone - (T.ui or 0) - (T.addons or 0)) else nil
+		local BootTime = if typeof(Loader.run) == "number" then math.max(0, CorvusLoadT0 - Loader.run) else nil
+		local Total = if T.shown and typeof(Loader.begin) == "number" then T.shown - Loader.begin elseif T.shown then T.shown - CorvusLoadT0 else nil
+		return string.format(
+			"LOAD fetch=%s compile=%s boot=%s lib=%s icons=%s ui=%s addons=%s community=%s discord=%s game=%s total=%s",
+			F(Loader.fetch), F(Loader.compile), F(BootTime), F(T.lib), F(T.icons), F(T.ui), F(T.addons), F(T.community), F(T.discord), F(GameTime), F(Total)
+		)
+	end
+	do
+		local BaseCreateWindow = Library.CreateWindow
+		function Library:CreateWindow(...)
+			local T0 = os.clock()
+			local Window = BaseCreateWindow(self, ...)
+			if CorvusLoadTimes.shown == nil then
+				CorvusLoadTimes.ui = os.clock() - T0
+				CorvusLoadTimes.shown = os.clock()
+				getgenv().CorvusLoaded = os.clock()
+				-- reported a bit later so the background phases (community, discord) have their times too
+				task.delay(12, function()
+					local Ok, Line = pcall(Library.LoadReport, Library)
+					if not Ok then
+						return
+					end
+					getgenv().CorvusLoadLine = Line
+					print("[Corvus] " .. Line)
+					if typeof(Library.LoadLogger) == "function" then
+						pcall(Library.LoadLogger, Line)
+					end
+				end)
+			end
+			return Window
+		end
+		local BaseOpenDiscordInvite = Library.OpenDiscordInvite
+		function Library:OpenDiscordInvite(...)
+			local T0 = os.clock()
+			local Result = BaseOpenDiscordInvite(self, ...)
+			if CorvusLoadTimes.discord == nil then
+				CorvusLoadTimes.discord = os.clock() - T0
+			end
+			return Result
+		end
+	end
+	getgenv().CorvusLibrary = Library
     return Library
     end)()
 local N = {}
@@ -31265,7 +31434,7 @@ do
 		local lastError
 		for attempt = 1, 3 do
 			local ok, addon = pcall(function()
-				return loadstring(game:HttpGet(AddonsUrl .. name))()
+				return loadstring(Library.FetchAddon(AddonsUrl, name, attempt > 1))()
 			end)
 			if ok and type(addon) == "table" then
 				return addon
@@ -31398,6 +31567,9 @@ do
 			end
 		end
 		Log.dirty = true
+	end
+	Library.LoadLogger = function(line)
+		pcall(log, line)
 	end
 	function logProblem(text)
 		text = string.sub(tostring(text or ""), 1, 300)
@@ -32797,53 +32969,28 @@ do
 	N.onRemote("AnimalBankedRemote", function(...)
 		log("BANKED event", ...)
 	end)
-	-- Farm Everything uses Fast (0.36-0.4 s, just above the server's HitCooldown) unless the player picked Blatant
+	-- No master switch any more: every automation is its own toggle. These stay as plain answers for the loops.
 	function N.bestValueOn()
-		return on("AutoFarmBest") and optionText("FarmMode", "Best value") ~= "My filters"
-	end
-	-- My filters: only the loops picked in Run, with the player's own filters. No planner, never sells, never spends.
-	function N.filtersOn()
-		return on("AutoFarmBest") and optionText("FarmMode", "Best value") == "My filters"
-	end
-	function N.farmMode()
-		return if N.bestValueOn() then "Auto" elseif N.filtersOn() then "Filters" else "Manual"
-	end
-	-- Exclude (Main tab): things Auto Farm Everything never sells, places over, spends on or speeds up. Only checked while it runs.
-	N.OPExcludeAt = {}
-	function N.opExcluded(label)
-		if not N.bestValueOn() then
-			return false
-		end
-		local value = Options.OPExclude and Options.OPExclude.Value
-		if type(value) == "table" and value[label] == true then
-			if os.clock() - (N.OPExcludeAt[label] or -1e9) > 120 then
-				N.OPExcludeAt[label] = os.clock()
-				log("OP exclude", label)
-			end
-			return true
-		end
 		return false
 	end
-	function N.opProtects(entry)
-		if N.opExcluded("Animals: " .. tostring(entry.rarity)) then
-			return true
-		end
-		return entry.mutation ~= nil and entry.mutation ~= "" and N.opExcluded("Mutated animals")
+	function N.filtersOn()
+		return false
+	end
+	function N.farmMode()
+		return "Toggles"
+	end
+	function N.opExcluded()
+		return false
+	end
+	function N.opProtects()
+		return false
 	end
 	function N.spendable()
-		local cash = N.cash()
-		if N.opExcluded("Cash reserve (keep 25%)") then
-			return math.floor(cash * 0.75)
-		end
-		return cash
+		return N.cash()
 	end
+	-- Hit Speed: Fast is 0.36-0.4 s, just above the server's HitCooldown. The player picks it, Recommended Settings sets Fast.
 	function N.hitSpeedPick()
-		local pick = optionText("HitSpeed", "Normal")
-		-- Auto Farm Everything overrides Hit Speed (Fast unless Blatant), unless Hit Speed Fast is excluded.
-		if N.bestValueOn() and pick ~= "Blatant (HIGH RISK OF BAN)" and not N.opExcluded("Hit Speed Fast") then
-			return "Fast"
-		end
-		return pick
+		return optionText("HitSpeed", "Normal")
 	end
 	function N.hitRange()
 		local base = N.swingGap()
@@ -33354,30 +33501,6 @@ do
 		if not force and os.clock() - F.lastEquipBest < 8 then
 			return false
 		end
-		-- Auto Farm Everything never places over an animal the player excluded (Equip Best would swap it out)
-		if not force and N.bestValueOn() then
-			for _, placed in ipairs(N.placedAnimals()) do
-				if N.opProtects(placed) then
-					return false
-				end
-			end
-		end
-		-- Auto Farm Everything never places over an animal the player excluded (Equip Best would swap it out)
-		if not force and N.bestValueOn() then
-			for _, placed in ipairs(N.placedAnimals()) do
-				if N.opProtects(placed) then
-					return false
-				end
-			end
-		end
-		-- Auto Farm Everything never places over an animal the player excluded (Equip Best would swap it out)
-		if not force and N.bestValueOn() then
-			for _, placed in ipairs(N.placedAnimals()) do
-				if N.opProtects(placed) then
-					return false
-				end
-			end
-		end
 		-- Equip Best only changes something when a backpack animal beats the weakest placed one (any animal, while
 		-- the plot has room). Otherwise the call and its 1 s wait are skipped, the worse ones wait for Auto Sell.
 		local tools = 0
@@ -33458,10 +33581,6 @@ do
 		return list
 	end
 	function N.sellStep(force)
-		-- My filters never sells on its own
-		if not force and N.filtersOn() then
-			return false
-		end
 		if not (force or on("AutoSell") or on("AutoSellSurplus")) then
 			return false
 		end
@@ -34533,9 +34652,6 @@ do
 		return true
 	end
 	function N.shopStep()
-		if N.filtersOn() then
-			return false
-		end
 		pcall(N.Plan.update, false)
 		if N.tutorial() or N.carrying() then
 			return false
@@ -34862,7 +34978,7 @@ do
 			})
 		end)
 	end
-	Tabs.Main = N.addTab("Main", "house", "Auto Farm Everything and what Corvus is doing")
+	Tabs.Main = N.addTab("Main", "house", "Quick start and what Corvus is doing")
 	Tabs.Farm = N.addTab("Farm", "egg", "Eggs, animals, guards, placing and the treadmill")
 	Tabs.Plot = Tabs.Farm
 	Tabs.Base = Tabs.Farm
@@ -34898,161 +35014,10 @@ do
 	N.HitSpeeds = { "Slow", "Normal", "Fast", "Blatant (HIGH RISK OF BAN)" }
 	do
 		-- One switch for people who do not want to set anything: the safe, best settings for a full farm.
-		local QuickBox = Tabs.Main:AddLeftGroupbox("Auto Farm", "sparkles")
-		-- Auto Farm Everything turns on and drives all of these (the planner spends, upgrades, sells surplus and uses potions)
+		local QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "sparkles")
+		-- No master switch: every automation is its own toggle. Recommended Settings turns on this profit set.
 		N.FarmBestOn = { "AutoFarm", "GrabOwnHatch", "StealPickups", "OnlyBetter", "TitanicFirst", "AvoidGuards", "AutoPlace", "AutoTrain", "AutoMergeEggs", "AutoSellSurplus", "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill", "AutoSatchel", "AutoDemonShop", "AutoIndex", "AutoOffline", "AutoFriend", "AutoGroup" }
-		N.FarmBestOff = N.FarmBestOn
-		-- Confirmation card for OP: the library modal (Library:ShowModal). onYes runs only after the player taps Enable.
-		function N.showOPCard(onYes, onNo)
-			local shown = Library.ShowModal and Library:ShowModal({
-				Icon = "sparkles",
-				Title = "Enable Auto Farm Everything?",
-				Text = "Full automatic: the planner spends, upgrades, sells surplus and uses potions for max profit. Can sell your items.",
-				Warning = "Full automatic. Uses the game's remotes faster than a normal player: the game's anticheat MAY BAN this account. Use at your own risk, preferably on an alt.",
-				ConfirmText = "I understand, enable it",
-				CancelText = "Cancel",
-				OnConfirm = onYes,
-				OnCancel = onNo,
-			})
-			if not shown then
-				log("OP card failed, OP stays off")
-				notify("Auto Farm Everything", "Could not show the confirmation, it stays off", 5)
-			end
-		end
-		-- My filters: the loops the player picks in Run. Only things that never sell and never spend.
-		N.FarmRunMap = {
-			["Auto Farm (eggs)"] = { "AutoFarm" },
-			["Auto Steal"] = { "StealPickups" },
-			["Auto Place"] = { "AutoPlace" },
-			["Auto Train"] = { "AutoTrain" },
-			["Index rewards"] = { "AutoIndex" },
-			["Offline cash"] = { "AutoOffline" },
-			["Group rewards"] = { "AutoGroup" },
-			["Auto Friend"] = { "AutoFriend" },
-		}
-		N.FarmRunValues = { "Auto Farm (eggs)", "Auto Steal", "Auto Place", "Auto Train", "Index rewards", "Offline cash", "Group rewards", "Auto Friend" }
-		N.farmApplied = nil
-		function N.applyFilters()
-			local picked = Options.FarmRun and Options.FarmRun.Value
-			picked = if type(picked) == "table" then picked else {}
-			N.farmApplied = "filters"
-			local names = {}
-			for _, label in ipairs(N.FarmRunValues) do
-				if picked[label] == true then
-					table.insert(names, label)
-				end
-				for _, name in ipairs(N.FarmRunMap[label]) do
-					local toggle = Toggles[name]
-					local want = picked[label] == true
-					if toggle and toggle.Value ~= want then
-						toggle:SetValue(want)
-					end
-				end
-			end
-			log("FILTERS run", table.concat(names, ", "))
-		end
-		QuickBox:AddToggle("AutoFarmBest", {
-			Text = "Auto Farm Everything",
-			Default = false,
-			Tooltip = "Best value: full automatic, the planner farms, steals, trains, places, sells surplus, buys the best upgrades and uses potions. My filters: only the loops you pick in Run, with your own filters, never sells or spends. Never saved, always off after a restart. Best value uses the game's remotes faster than a normal player, use at your own risk, preferably on an alt.",
-			Callback = function(value)
-				if N.opRevert then
-					return
-				end
-				-- A saved config or a share code never turns it on at start: only the player does
-				if value and not N.opOK and os.clock() - N.uiStart < 10 then
-					N.opRevert = true
-					Toggles.AutoFarmBest:SetValue(false)
-					N.opRevert = false
-					log("Auto Farm Everything not restored from config")
-					return
-				end
-				if value and optionText("FarmMode", "Best value") == "My filters" then
-					task.defer(N.applyFilters)
-					return
-				end
-				if value and not N.opOK then
-					-- stays off until the player confirms the card
-					N.opRevert = true
-					Toggles.AutoFarmBest:SetValue(false)
-					N.opRevert = false
-					N.showOPCard(function()
-						N.opOK = true
-						Toggles.AutoFarmBest:SetValue(true)
-						N.opOK = false
-						log("OP confirmed")
-					end, function()
-						log("OP cancelled")
-					end)
-					return
-				end
-				task.defer(function()
-					if value then
-						N.farmApplied = "best"
-					end
-					local names = N.FarmBestOn
-					if not value and N.farmApplied == "filters" then
-						names = {}
-						for _, list in pairs(N.FarmRunMap) do
-							for _, name in ipairs(list) do
-								table.insert(names, name)
-							end
-						end
-					end
-					for _, name in ipairs(names) do
-						local toggle = Toggles[name]
-						if toggle and toggle.Value ~= value then
-							toggle:SetValue(value)
-						end
-					end
-					if not value then
-						N.farmApplied = nil
-					end
-					if value then
-						N.applyRecommended()
-					end
-				end)
-			end,
-		})
-		QuickBox:AddDropdown("FarmMode", {
-			Text = "Mode",
-			Values = { "Best value", "My filters" },
-			Default = "Best value",
-			Tooltip = "Best value: the planner decides everything for the most profit (farms, upgrades, potions, sells surplus). My filters: no planner, no selling, no spending, only the loops you pick in Run and your own filters",
-			Callback = function(value)
-				pcall(function()
-					local run = Options.FarmRun
-					if run and run.SetVisible then
-						run:SetVisible(value == "My filters")
-					end
-				end)
-				-- changing the mode while it runs turns it off, so Best value always asks first
-				if Toggles.AutoFarmBest and Toggles.AutoFarmBest.Value then
-					Toggles.AutoFarmBest:SetValue(false)
-					notify("Auto Farm Everything", "Mode changed, it is off. Turn it on again.", 4)
-				end
-			end,
-		})
-		QuickBox:AddDropdown("FarmRun", {
-			Text = "Run",
-			Values = N.FarmRunValues,
-			Default = { "Auto Farm (eggs)", "Auto Steal", "Auto Place", "Auto Train", "Index rewards", "Offline cash", "Group rewards" },
-			Multi = true,
-			AllowNull = true,
-			Visible = false,
-			Tooltip = "The loops My filters runs. Auto Farm uses your zone and egg filters. Hit Speed stays as you set it. Never sells, never spends",
-			Callback = function()
-				if N.filtersOn() then
-					N.applyFilters()
-				end
-			end,
-		})
-		pcall(function()
-			if Options.FarmRun and Options.FarmRun.SetVisible then
-				Options.FarmRun:SetVisible(optionText("FarmMode", "Best value") == "My filters")
-			end
-		end)
-		-- Recommended settings: the planner picks the egg, the zone and farm vs train, walking is the safe movement.
+		-- Recommended settings: the planner picks the egg, the zone and farm vs train, Fast hits stay above the server cooldown.
 		function N.applyRecommended()
 			if Options.ZoneMode then
 				Options.ZoneMode:SetValue("Best zone")
@@ -35066,43 +35031,31 @@ do
 			if Options.MoveMode and N.moveMode() ~= "Walk" then
 				Options.MoveMode:SetValue("Walk")
 			end
+			if Options.HitSpeed and Options.HitSpeed.Value ~= "Blatant (HIGH RISK OF BAN)" then
+				Options.HitSpeed:SetValue("Fast")
+			end
+		end
+		function N.recommendedAll()
+			N.applyRecommended()
+			for _, name in ipairs(N.FarmBestOn) do
+				local toggle = Toggles[name]
+				if toggle and not toggle.Value then
+					toggle:SetValue(true)
+				end
+			end
 		end
 		QuickBox:AddLabel({
-			Text = '<font color="rgb(255,140,60)">Full automatic. Uses the game\'s remotes faster than a normal player: the game\'s anticheat MAY BAN this account. Use at your own risk, preferably on an alt.</font>',
+			Text = '<font transparency="0.35">Every automation is its own switch in the tabs. Recommended Settings sets the best options and turns on the profit set.</font>',
 			DoesWrap = true,
 		})
 		QuickBox:AddButton({
 			Text = "Recommended Settings",
-			Tooltip = "Best zone, best value per second egg, profit plan training, safe walking",
+			Tooltip = "Best zone, best value per second egg, profit plan training, Fast hits, then turns on farming, stealing, placing, training, upgrades and rewards",
 			Func = function()
-				N.applyRecommended()
+				N.recommendedAll()
 				notify("Recommended Settings", "Applied", 3)
 			end,
 		})
-		do
-			local ExcludeBox = Tabs.Main:AddLeftGroupbox("Exclude", "shield")
-			N.OPExcludeValues = {}
-			for _, rarity in ipairs(N.RarityOrder) do
-				table.insert(N.OPExcludeValues, "Animals: " .. rarity)
-			end
-			table.insert(N.OPExcludeValues, "Mutated animals")
-			table.insert(N.OPExcludeValues, "Potions (Fallen Tokens)")
-			table.insert(N.OPExcludeValues, "Hit Speed Fast")
-			table.insert(N.OPExcludeValues, "Cash reserve (keep 25%)")
-			ExcludeBox:AddDropdown("OPExclude", {
-				Text = "Never sell or spend",
-				Values = N.OPExcludeValues,
-				Default = {},
-				Multi = true,
-				AllowNull = true,
-				Searchable = true,
-				Tooltip = "Auto Farm Everything never sells or places over the animals of the rarities you pick (or any mutated one), never buys potions, keeps Hit Speed as you set it, or keeps 25% of your cash unspent",
-			})
-			ExcludeBox:AddLabel({
-				Text = '<font transparency="0.35">Only used while Auto Farm Everything runs. Excluded animals are never sold or swapped out by Equip Best; Cash reserve keeps a quarter of your cash out of every purchase.</font>',
-				DoesWrap = true,
-			})
-		end
 		StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
@@ -35731,7 +35684,6 @@ do
 	Log.header = Debug.header
 end
 N.AllAutoToggles = {
-	"AutoFarmBest",
 	"AutoFarm",
 	"StealPickups",
 	"AutoTrain",
@@ -35763,10 +35715,12 @@ do
 		end
 	end
 	function N.stopAll()
-		for _, name in ipairs(N.AllAutoToggles) do
-			local toggle = Toggles[name]
-			if toggle and toggle.Value then
-				toggle:SetValue(false)
+		for _, list in ipairs({ N.AllAutoToggles, N.FarmBestOn or {} }) do
+			for _, name in ipairs(list) do
+				local toggle = Toggles[name]
+				if toggle and toggle.Value then
+					toggle:SetValue(false)
+				end
 			end
 		end
 		N.holdAt(nil)
@@ -36153,7 +36107,7 @@ do
 	end
 	if Library.AddCommand then
 		pcall(function()
-			toggleCommand("farmall", { "farmbest", "all", "everything", "bestfarm" }, { "AutoFarmBest" }, "Auto Farm Everything")
+			toggleCommand("farm", { "farmbest", "all", "everything", "bestfarm" }, N.FarmBestOn, "the whole profit set")
 			toggleCommand("farm", { "eggs", "autofarm" }, { "AutoFarm" }, "Break Eggs In Best Zone")
 			toggleCommand("steal", { "grab", "animals" }, { "StealPickups" }, "Steal Animals")
 			toggleCommand("train", { "treadmill" }, { "AutoTrain" }, "Auto Train")
@@ -36267,7 +36221,6 @@ do
 	if Library.SetQuickBar then
 		pcall(function()
 			Library:SetQuickBar({
-				{ Toggle = "AutoFarmBest", Icon = "sparkles", Label = "Farm All" },
 				{ Toggle = "AutoFarm", Icon = "egg", Label = "Eggs" },
 				{ Toggle = "StealPickups", Icon = "hand", Label = "Steal" },
 				{ Toggle = "AutoTrain", Icon = "footprints", Label = "Train" },
@@ -36307,9 +36260,8 @@ do
 					Description = "Pick everything you want running. Tap again to unpick.",
 					Multi = true,
 					Required = true,
-					Default = { "farm" },
+					Default = { "eggs", "wild", "train", "place", "upgrades", "rewards" },
 					Choices = {
-						{ Id = "farm", Title = "Auto Farm Everything", Description = "Full automatic: spends, upgrades, sells surplus and uses potions for max profit. Asks you to confirm, the anticheat MAY BAN this account", Icon = "sparkles", Color = "#ff5d8f" },
 						{ Id = "eggs", Title = "Break eggs", Description = "Breaks eggs in the best zone you can escape and brings the animals home", Icon = "egg", Color = "#fab428" },
 						{ Id = "wild", Title = "Steal animals", Description = "Steals animals lying in the zones that make more money than your weakest pet", Icon = "hand", Color = "#3ccf91" },
 						{ Id = "train", Title = "Train speed", Description = "Uses your treadmill between egg runs, speed opens new zones", Icon = "footprints", Color = "#5fb8ff" },
@@ -36334,10 +36286,7 @@ do
 			},
 			Finish = function(values)
 				local chosen = type(values.tasks) == "table" and values.tasks or {}
-				if chosen.farm then
-					-- shows the confirmation card, the toggle stays off until the player confirms
-					setToggles({ "AutoFarmBest" }, { "on" })
-				end
+
 				local groups = {
 					eggs = { "AutoFarm" },
 					wild = { "StealPickups" },
@@ -36346,7 +36295,7 @@ do
 					upgrades = { "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill" },
 					rewards = { "AutoIndex", "AutoOffline" },
 				}
-				for id, names in pairs(if chosen.farm or chosen.op then {} else groups) do
+				for id, names in pairs(groups) do
 					setToggles(names, { if chosen[id] then "on" else "off" })
 				end
 				if type(values.move) == "string" then
@@ -36362,10 +36311,7 @@ do
 		})
 	end
 end
--- The master toggle is never saved or restored: a config or a restart always starts it off
-pcall(function()
-	SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoFarmBest" })
-end)
+
 if Window.AddSettingsTab then
 	local ok, tab = pcall(Window.AddSettingsTab, Window, {
 		ThemeManager = ThemeManager,
@@ -36384,7 +36330,7 @@ else
 		ThemeManager:SetLibrary(Library)
 		SaveManager:SetLibrary(Library)
 		SaveManager:IgnoreThemeSettings()
-		SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoFarmBest" })
+		SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
 		ThemeManager:SetFolder("Corvus")
 		SaveManager:SetFolder("Corvus/BreakAndStealAnEgg")
 		SaveManager:BuildConfigSection(Tabs.Settings)
@@ -36408,13 +36354,7 @@ pcall(function()
 		end
 	end
 end)
-pcall(function()
-	if Library.GetSetting and not Library:GetSetting("BSE_FarmSplitToast", false) then
-		Library:SetSetting("BSE_FarmSplitToast", true)
-		notify("Auto Farm Everything", "Auto Farm Everything is now on Main. Pick Best value (full automatic) or My filters (only your loops).", 8)
-	end
-end)
-log("MODE", N.farmMode())
+log("MODE", "single toggles, no master switch")
 if Window.AddInfoTab then
 	local DonateMethods = {
 		{
@@ -36550,10 +36490,10 @@ do
 				if choreDue("place", 2) then
 					N.placeStep(false)
 				end
-				if not N.filtersOn() and (on("AutoSell") or on("AutoSellSurplus")) and choreDue("sell", 10) and N.sellStep(false) then
+				if (on("AutoSell") or on("AutoSellSurplus")) and choreDue("sell", 10) and N.sellStep(false) then
 					return
 				end
-				if not N.filtersOn() and choreDue("shop", 4) and N.shopStep() then
+				if choreDue("shop", 4) and N.shopStep() then
 					return
 				end
 				if choreDue("merge", 3) and N.mergeStep() then
@@ -36646,7 +36586,7 @@ do
 	-- Up next in plain words (the raw planner line only goes to the log)
 	local P = N.Plan
 	local lines = {}
-	if N.bestValueOn() then
+	if on("AutoFarm") or on("AutoTrain") then
 		table.insert(lines, if P.activity == "train" then string.format("Now: training speed to %s", formatNumber(P.trainTarget or 0)) else "Now: farming eggs")
 	end
 	for i = 1, math.min(#(P.valid or {}), 4) do
