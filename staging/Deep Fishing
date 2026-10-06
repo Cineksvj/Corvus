@@ -32120,7 +32120,7 @@ do
 	end
 	-- Movement: Teleport (default, the game checks no player movement) or Walk.
 	function N.safeMove()
-		return optionText("MoveMode", "Teleport (Fast)") ~= "Teleport (Fast)"
+		return optionText("MoveMode", "Teleport") ~= "Teleport"
 	end
 	-- Chore timer: true at most once per `seconds` for a key.
 	local DueAt = {}
@@ -32400,9 +32400,11 @@ do
 			return true
 		end
 		if not N.safeMove() then
-			for _ = 1, 2 do
+			-- Right after a spawn or a world change the game still moves the character (cutscene, streaming), so the first
+			-- pivots can be undone: retry for about 3 s before calling it a problem.
+			for try = 1, 6 do
 				N.tp(pos + Vector3.new(0, 3, 0))
-				task.wait(0.2)
+				task.wait(0.3 + 0.1 * try)
 				if flat() <= near then
 					return true
 				end
@@ -32437,7 +32439,7 @@ do
 			end
 			task.wait(0.1)
 		end
-		logProblem(string.format("Walk did not reach the spot (%.0f studs left). Movement Teleport (Fast) skips walking", flat()))
+		logProblem(string.format("Walk did not reach the spot (%.0f studs left). Movement Teleport skips walking", flat()))
 		return false
 	end
 	-- The current world's folder (workspace.World.<world>) and a named spot in it (NPC_Sell, Throw, BigMouthFish, ...).
@@ -32538,22 +32540,18 @@ N.Fish = {
 }
 do
 	local F = N.Fish
-	-- Auto Fish mode (default "Auto (best measured)"): a ladder measures Safe for 5 min, then Blatant for 5 min (coins per
-	-- minute from the planner's worth line) and keeps the faster one; it re-measures every hour. Any danger signal while
-	-- Blatant (refused casts, casts without an answer or catch window, a client error/kick message) = Safe for 30 minutes,
-	-- and 3 such fallbacks in a day switch Blatant off for the day. "Safe" / "Blatant" in the dropdown pin the mode.
+	-- Auto Fish mode (default "Fast (default)"): always the fastest way that works. Any danger signal while fast (refused
+	-- casts, casts without an answer or catch window, a client error/kick message) = the game's own auto fishing for 30
+	-- minutes, and 3 such fallbacks in a day switch the fast way off for the day. "Legit" pins the game's auto fishing.
 	F.ladder = { phase = "measureSafe", mode = "safe", t0 = nil, w0 = 0, safe = nil, blat = nil, keep = "safe", falls = {}, dayOffUntil = 0, ratio = nil }
 	local L = F.ladder
 	local function modeChoice()
-		return string.sub(optionText("FishMode", "Auto (best measured)"), 1, 4)
+		return string.sub(optionText("FishMode", "Fast (default)"), 1, 4)
 	end
 	function N.fishMode()
 		local c = modeChoice()
-		if c == "Safe" or os.clock() < F.fallbackUntil or os.clock() < L.dayOffUntil then
+		if c == "Legi" or os.clock() < F.fallbackUntil or os.clock() < L.dayOffUntil then
 			return "safe"
-		end
-		if c == "Blat" then
-			return "blatant"
 		end
 		return "blatant"
 	end
@@ -32561,17 +32559,16 @@ do
 	function N.ladderTick() end
 	function N.modeText()
 		local c = modeChoice()
-		local m = if N.fishMode() == "blatant" then "Blatant" else "Safe"
 		if os.clock() < F.fallbackUntil then
-			return "Mode Safe: Blatant paused 30 min (" .. F.fallbackReason .. ")"
+			return "Fishing with the game's auto fishing (fast way paused 30 min: " .. F.fallbackReason .. ")"
 		end
 		if os.clock() < L.dayOffUntil then
-			return "Mode Safe: Blatant off for the day (3 fallbacks)"
+			return "Fishing with the game's auto fishing (fast way off for the day)"
 		end
-		if c ~= "Auto" then
-			return "Mode " .. m .. " (picked by you)"
+		if c == "Legi" then
+			return "Fishing with the game's auto fishing (your choice)"
 		end
-		return "Mode Blatant (fastest)"
+		return "Fishing at full speed"
 	end
 	function N.fallback(reason)
 		if os.clock() < F.fallbackUntil then
@@ -32590,7 +32587,7 @@ do
 			L.dayOffUntil = now + 86400
 			log("MODE blatant off for the day", "falls=" .. #L.falls)
 		end
-		notify("Auto Fish", "Blatant paused for 30 minutes (" .. tostring(reason) .. "), fishing Safe meanwhile", 6)
+		notify("Auto Fish", "Fast fishing paused for 30 minutes (" .. tostring(reason) .. "), using the game's auto fishing meanwhile", 6)
 	end
 	pcall(function()
 		game:GetService("GuiService").ErrorMessageChanged:Connect(function(msg)
@@ -33299,7 +33296,7 @@ do
 					local ok, err = pcall(AF.SetOn, AF, true)
 					log("FISH safe", "game auto fishing on", if ok then "" else tostring(err))
 				end
-				setStatus("Fishing (Safe: the game's auto fishing, aimed at the best fish)")
+				setStatus("Fishing: the game's auto fishing, aimed at the best fish")
 				if N.due("safeStats", 300) then
 					local caught = tonumber(N.tab("Stats").FishCaught) or 0
 					F.caughtBase = F.caughtBase or caught
@@ -33309,7 +33306,7 @@ do
 				return
 			end
 			F.engine = "remote-legit"
-			setStatus("Fishing (Safe, legit pace)")
+			setStatus("Fishing at the game's own pace")
 			N.castOnce(false)
 			task.wait(1.5 + math.random())
 			return
@@ -33320,7 +33317,7 @@ do
 			F.paused = false
 		end
 		F.engine = "remote-blatant"
-		setStatus("Fishing (Blatant: best fish of the school, instant reel)")
+		setStatus("Fishing: best fish of every school, instant reel")
 		N.castOnce(true)
 		task.wait(0.3 + math.random() * 0.3)
 	end
@@ -34866,9 +34863,9 @@ do
 		})
 		FishBox:AddDropdown("FishMode", {
 			Text = "Mode",
-			Values = { "Auto (best measured)", "Safe", "Blatant" },
-			Default = "Auto (best measured)",
-			Tooltip = "Auto (default): measures Safe for 5 minutes, then Blatant for 5 minutes, keeps the one that earns more coins per minute and re-measures every hour. Any danger signal in Blatant (refused casts, no answer, an error message) = Safe for 30 minutes; 3 of those in a day = Blatant off for the day. Safe: the game's own auto fishing, aimed at the most valuable fish. Blatant: casts through the game's remotes, hooks the best fish of the whole school, reels right away (about 2x faster)",
+			Values = { "Fast (default)", "Legit (game's auto fishing)" },
+			Default = "Fast (default)",
+			Tooltip = "Fast (default): casts through the game's remotes, hooks the best fish of the whole school and reels right away (about 2x faster). If the server refuses casts or shows an error message, the hub uses the game's auto fishing for 30 minutes; after 3 such pauses in a day it stays on it for the day. Legit: always the game's own auto fishing, aimed at the most valuable fish",
 		})
 		FishBox:AddSlider("PerfectRate", {
 			Text = "Perfect Rate",
@@ -34967,7 +34964,7 @@ do
 		Labels.Rods = RodBox:AddLabel({ Text = "-", DoesWrap = true })
 		local WorldBox = Tabs.Upgrades:AddRightGroupbox("Worlds", "globe")
 		WorldBox:AddToggle("AutoWorlds", { Text = "Auto Worlds", Default = false, Tooltip = "Unlocks the next world once your level and cash allow (World 2: level 15, 30M; World 3: 40, 7.5B; World 4: 65, 400B) and fishes in the best one" })
-		WorldBox:AddDropdown("MoveMode", { Text = "Movement", Values = { "Walk (Safe)", "Teleport (Fast)" }, Default = "Teleport (Fast)", Tooltip = "Teleport (default): straight to the pier, merchant and shops. Walk: walks there" })
+		WorldBox:AddDropdown("MoveMode", { Text = "Movement", Values = { "Walk", "Teleport" }, Default = "Teleport", Tooltip = "Teleport (default): straight to the pier, merchant and shops. Walk: walks there" })
 		Labels.World = WorldBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
@@ -35164,7 +35161,7 @@ do
 	function Debug.perfText()
 		local last = Perf.last
 		if not last then
-			return "still measuring"
+			return "first reading in 30 s"
 		end
 		return string.format(
 			"fps %d, worst frame %dms, hitches %d, freezes %d, Corvus used %dms in %ds (%.2f%%), ping %sms, memory %sMB",
@@ -35774,7 +35771,7 @@ do
 					Required = false,
 					Default = {},
 					Choices = {
-						{ Id = "fish", Title = "Fish", Description = "Auto Fish (Safe) on the best fish of every cast", Icon = "fish", Color = "#5fb8ff" },
+						{ Id = "fish", Title = "Fish", Description = "Auto Fish on the best fish of every cast", Icon = "fish", Color = "#5fb8ff" },
 						{ Id = "sell", Title = "Sell", Description = "Smart Sell when the backpack fills, keeps Secret and Exotic fish", Icon = "coins", Color = "#fab428" },
 						{ Id = "planner", Title = "Smart Planner", Description = "Autopilot: fishes, sells, buys by payback, pond, rewards, the whole game", Icon = "brain", Color = "#3ccf91" },
 						{ Id = "pond", Title = "Pond", Description = "Unlock, fill, feed and collect the pond", Icon = "droplets", Color = "#4fd1c5" },
@@ -36098,7 +36095,7 @@ do
 		local out = {}
 		local who = if N.planner() then "Smart Planner: " else ""
 		if N.planner() then
-			table.insert(out, if N.Plan.say ~= "" then "Smart Planner: " .. N.Plan.say else "Smart Planner: fishing and measuring the income (first minute)")
+			table.insert(out, if N.Plan.say ~= "" then "Smart Planner: " .. N.Plan.say else "Smart Planner: fishing, the first purchases come after about a minute of income data")
 		end
 		if N.wants("AutoFish") and not N.planner() then
 			table.insert(out, N.modeText() .. string.format(", %d%% Perfect", math.floor(optionNumber("PerfectRate", 60))))
@@ -36167,7 +36164,7 @@ do
 					else string.format("Level %s, pending %s\n%s\nTrips %d", tostring(pond.Level or 1), formatNumber(pond.PendingIncome or 0), N.Pond.last, Session.pondTrips)
 				I.probes = if N.Probe.last ~= "-" then "Last probe: " .. N.Probe.last else "Off. Each probe runs once per game version and logs PROBE <name> result="
 				I.planner = if N.planner()
-					then string.format("<b>On</b>  \u{00B7}  income %s/h\n%s\nLast buy: %s", formatNumber(N.Econ.rate * 3600), if N.Plan.say ~= "" then N.Plan.say else "Fishing and measuring the income (1 minute)", N.Shop.last)
+					then string.format("<b>On</b>  \u{00B7}  income %s/h\n%s\nLast buy: %s", formatNumber(N.Econ.rate * 3600), if N.Plan.say ~= "" then N.Plan.say else "Fishing; the first purchases come after about a minute of income data", N.Shop.last)
 					else "Off. Turn it on and Corvus plays the whole game: fishing, selling, buying by payback, pond, rewards. Your other toggles stay as they are"
 				local up = N.tab("Upgrades")
 				I.upgrades = string.format("Capacity %s  \u{00B7}  Strength %s  \u{00B7}  Weight %s  \u{00B7}  Bounce %s\nHooks per cast %d\nBought %d this session", tostring(up.Capacity or 0), tostring(up.Strength or 0), tostring(up.Weight or 0), tostring(up.Bounce or 0), N.hookCap(), Session.upgrades)
@@ -36255,7 +36252,7 @@ do
 						Labels.Items:SetText(I.items or "-")
 					end)
 				end
-				if shown(Tabs.Stats) then
+				if shown(Tabs.Stats) or frame % 30 == 0 then
 					group(N.drawStats)
 				end
 				if Labels.Perf and shown(Tabs.Misc) then
