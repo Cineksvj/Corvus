@@ -32179,6 +32179,10 @@ do
 			local ok, data = pcall(function()
 				return model:Load(LocalPlayer)
 			end)
+			if not (ok and type(data) == "table") and os.clock() - (N.Bp.errAt or -1e9) > 60 then
+				N.Bp.errAt = os.clock()
+				log("BACKPACK load failed", tostring(ok), typeof(data), tostring(data))
+			end
 			N.Bp.data = if ok and type(data) == "table" then data else N.Bp.data
 		end
 		return N.Bp.data
@@ -32443,6 +32447,7 @@ local Session = {
 	pulls = 0,
 	eggs = 0,
 	dungeons = 0,
+	timeCoins = 0,
 	clicks = 0,
 	goldStart = nil,
 	bestAnt = "-",
@@ -32751,12 +32756,52 @@ end
 -- 4. Auto Roll: RollAnt every 3 s (the server's roll timer, no distance check). Every result is valued: Star items are
 -- free, ants are bought by payback (Smart) or when they beat the weakest ant of the team.
 N.Roll = { at = -1e9, pending = {}, last = "-", lastBuy = "-", seen = 0 }
+-- Vine activity (blatant.md pass 2 #6): a vine roll gives ONE ant, always Leaf-mutated, at luck x0.2-0.8 (best case 0.8),
+-- from the vine's Queen platform (14 studs). A normal roll gives "ants per roll" results at full luck. The planner rolls
+-- at the vine only when its expected value (0.8 x one Leaf ant) beats the normal roll (results x 1.0).
+function N.vineWorth()
+	local perRoll = math.max(math.floor(N.attrLevel("单抽数量")), 1)
+	local vineValue = 0.8 * (tonumber(N.tagMul(1)) or 1)
+	return vineValue > perRoll, vineValue, perRoll
+end
+function N.vineQueen()
+	for _, d in ipairs(workspace:GetChildren()) do
+		if d.Name == "Vine" and d:GetAttribute("VineActivityReady") == true then
+			local q = d:FindFirstChild("Queen", true)
+			if q and q:IsA("BasePart") then
+				return q
+			end
+		end
+	end
+	return nil
+end
 function N.rollStep()
 	local R = N.Roll
 	if os.clock() - R.at < 3.05 then
 		return false
 	end
 	R.at = os.clock()
+	if N.activity() == "Vine" and N.planner() then
+		local worth, vineValue, perRoll = N.vineWorth()
+		local queen = if worth then N.vineQueen() else nil
+		if queen then
+			local root = N.root()
+			if root and (root.Position - queen.Position).Magnitude > 12 then
+				N.saveHome()
+				N.goTo(queen.Position + Vector3.new(0, 3, 0), 10)
+			end
+			cmd("RollAnt", { Source = "Vine" })
+			Session.rolls += 1
+			if os.clock() - (R.vineLogAt or -1e9) >= 30 then
+				R.vineLogAt = os.clock()
+				log("ROLL src=Vine", "value", string.format("%.2f", vineValue), "vs", perRoll)
+			end
+			return true
+		elseif os.clock() - (R.vineSkipAt or -1e9) >= 300 then
+			R.vineSkipAt = os.clock()
+			log("ROLL vine skipped", "value", string.format("%.2f", vineValue), "vs normal", perRoll, if worth then "(no vine ready)" else "(normal roll is better)")
+		end
+	end
 	cmd("RollAnt", { Source = "ProximityPrompt" })
 	Session.rolls += 1
 	return true
@@ -33030,7 +33075,7 @@ function N.eventStep()
 end
 -- 6. Auto Dungeon: enters through the entrance prompt, starts the boss (the game's own Start command) and keeps the
 -- click boost at 4x attack speed (the server has no click rate limit, blatant.md #4).
-N.Dungeon = { state = nil, stateAt = -1e9, startedFor = nil, enterAt = -1e9, burstAt = -1e9, logAt = -1e9, last = "-", entered = 0 }
+N.Dungeon = { state = nil, stateAt = -1e9, startedFor = nil, enterAt = -1e9, burstAt = -1e9, logAt = -1e9, last = "-", entered = 0, coins = {}, cfg = nil }
 N.onEvent("DungeonState", function(d)
 	if type(d) == "table" then
 		N.Dungeon.state = d
@@ -33048,6 +33093,89 @@ function N.dungeonPrompt()
 		end
 	end
 	return nil
+end
+-- Time coins (blatant.md pass 2 #1): the server only checks that the landing spot is on the ring (35-50 studs from the boss,
+-- Y = LandingHeight), the client normally picks it at random. Corvus places the coin on the ring point nearest to the
+-- player, then teleports there once it has landed and sends PickupTimeCoin: +15 s of boss time per coin, no running.
+function N.coinCfg(st)
+	local D = N.Dungeon
+	if not D.cfg then
+		D.cfg = { y = -370, min = 35, max = 50, bonus = 15, starY = 0 }
+		local mod = N.safeRequire("Battle.Game.Config.DungeonConfig")
+		local tc = type(mod) == "table" and mod.TimeCoin
+		if type(tc) == "table" then
+			D.cfg.y = tonumber(tc.LandingHeight) or D.cfg.y
+			D.cfg.min = tonumber(tc.MinRadius) or D.cfg.min
+			D.cfg.max = tonumber(tc.MaxRadius) or D.cfg.max
+			D.cfg.bonus = tonumber(tc.BonusSeconds) or D.cfg.bonus
+			local star = type(mod.StarEvent) == "table" and mod.StarEvent.PositionOffset
+			D.cfg.starY = if typeof(star) == "Vector3" then star.Y else 0
+		end
+	end
+	return D.cfg, D.cfg.y + (if st.dungeonType == "StarEvent" then D.cfg.starY else 0)
+end
+function N.timeCoinStep(st)
+	local D = N.Dungeon
+	local coins = st.timeCoins
+	if type(coins) ~= "table" then
+		return false
+	end
+	local root = N.root()
+	if not root then
+		return false
+	end
+	local cfg, landY = N.coinCfg(st)
+	local now = N.serverTime()
+	local present, acted = {}, false
+	for _, c in ipairs(coins) do
+		local id = c.id
+		present[id] = true
+		local rec = D.coins[id]
+		if not rec then
+			rec = { at = os.clock(), picks = 0 }
+			D.coins[id] = rec
+		end
+		if not rec.placed and not c.position and typeof(c.from) == "Vector3" then
+			local dx, dz = root.Position.X - c.from.X, root.Position.Z - c.from.Z
+			local d = math.sqrt(dx * dx + dz * dz)
+			if d < 1e-3 then
+				dx, dz, d = 1, 0, 1
+			end
+			local radius = math.clamp(d, cfg.min + 1, cfg.max - 1)
+			rec.placed = true
+			rec.mine = Vector3.new(c.from.X + dx / d * radius, landY, c.from.Z + dz / d * radius)
+			cmd("DungeonCommand", { Action = "PlaceTimeCoin", SessionId = st.sessionId, CoinId = id, Position = rec.mine })
+			log("DUNGEON timecoin place", "id", id, "radius", string.format("%.0f", radius))
+		end
+		local pos = c.position
+		if pos and not acted and rec.picks < 3 and now >= (tonumber(c.landsAt) or 0) + 0.3 then
+			if not rec.tpAt or (rec.pickAt and os.clock() - rec.pickAt > 2.5) then
+				N.tp(pos + Vector3.new(0, 3, 0))
+				rec.tpAt = os.clock()
+				rec.pickAt = nil
+				acted = true
+			elseif not rec.pickAt and os.clock() - rec.tpAt >= 0.4 then
+				rec.pickAt = os.clock()
+				rec.picks += 1
+				cmd("DungeonCommand", { Action = "PickupTimeCoin", SessionId = st.sessionId, CoinId = id })
+				acted = true
+			end
+		elseif rec.picks >= 3 and not rec.failLogged then
+			rec.failLogged = true
+			log("DUNGEON timecoin failed", "id", id)
+		end
+	end
+	for id, rec in pairs(D.coins) do
+		if not present[id] then
+			D.coins[id] = nil
+			if rec.pickAt then
+				Session.timeCoins += 1
+				log("DUNGEON timecoin +" .. tostring(cfg.bonus) .. "s", "id", id, "total", Session.timeCoins, "limit", tostring(st.timeLimit))
+				D.last = "time coin picked up (+" .. tostring(cfg.bonus) .. " s)"
+			end
+		end
+	end
+	return acted
 end
 function N.dungeonStep()
 	local D = N.Dungeon
@@ -33076,6 +33204,9 @@ function N.dungeonStep()
 				D.last = string.format("fighting, attack speed x%s", tostring(mult))
 			end
 		end
+		if st.status ~= "ended" and st.status ~= "ready" and on("DungeonTimeCoins") then
+			N.timeCoinStep(st)
+		end
 		setStatus("Dungeon: " .. tostring(st.status))
 		return true
 	end
@@ -33097,7 +33228,7 @@ function N.dungeonStep()
 end
 -- 7. Auto Compost: junk ants (picked rarities, never favorites, mutated or anything that could join the team) go into
 -- the compost machine (CompostAddAnts with the backpack values), the lever is pulled when the bar is full.
-N.Compost = { at = -1e9, model = nil, tried = false, last = "-" }
+N.Compost = { at = -1e9, model = nil, tried = false, last = "-", pullAt = -1e9 }
 function N.compostState()
 	local C = N.Compost
 	if not C.model and not C.tried then
@@ -33123,9 +33254,32 @@ function N.compostJunk()
 	end
 	local items = {}
 	for _, s in ipairs(N.stacks()) do
-		if selected(Options.CompostRarities, s.Rarity) and not s.Favorite and s.TagId == 0 and s.food < weakest and s.V then
-			table.insert(items, { V = s.V, Count = s.Count })
+		if selected(Options.CompostRarities, s.Rarity) and not selected(Options.CompostProtect, s.Rarity) and not s.Favorite and s.TagId == 0 and s.food < weakest and s.V then
+			table.insert(items, { V = s.V, Count = s.Count, food = s.food, rarity = tostring(s.Rarity) })
 		end
+	end
+	-- Protect list: the best N ants of every rarity stay in the backpack (Compost Keep Best).
+	local keep = math.floor(optionNumber("CompostKeepBest", 1))
+	if keep > 0 then
+		table.sort(items, function(a, b)
+			return a.food > b.food
+		end)
+		local kept, out = {}, {}
+		for _, it in ipairs(items) do
+			local have = kept[it.rarity] or 0
+			if have >= keep then
+				table.insert(out, it)
+			elseif have + it.Count > keep then
+				kept[it.rarity] = keep
+				table.insert(out, { V = it.V, Count = have + it.Count - keep, food = it.food, rarity = it.rarity })
+			else
+				kept[it.rarity] = have + it.Count
+			end
+		end
+		items = out
+	end
+	for _, it in ipairs(items) do
+		it.food, it.rarity = nil, nil
 	end
 	return items
 end
@@ -33152,10 +33306,12 @@ function N.compostStep()
 		C.last = "locked (unlock " .. formatNumber(price) .. " gold, bought when that is under 10 min of income)"
 		return false
 	end
-	if state.CanPull then
+	-- The server lets the lever be pulled once per 300 s (os.time, TryPullCompostReward): never sent earlier.
+	if state.CanPull and os.time() - C.pullAt >= 300 then
+		C.pullAt = os.time()
 		cmd("CompostPullLever", {})
 		Session.pulls += 1
-		log("COMPOST pull", "level", tostring(state.CompostLevel), "coins", tostring(state.CompostCoin))
+		log("COMPOST pull", "level", tostring(state.CompostLevel), "coin=" .. formatNumber(state.CompostCoin or 0) .. "/" .. formatNumber(state.NeedValue or 0), "pull=ok")
 		C.last = "pulled the lever"
 		return true
 	end
@@ -33167,7 +33323,7 @@ function N.compostStep()
 		end
 		cmd("CompostAddAnts", { Items = items })
 		Session.compost += n
-		log("COMPOST add", n, "ants")
+		log("COMPOST add", n, "ants", "coin=" .. formatNumber(state.CompostCoin or 0) .. "/" .. formatNumber(state.NeedValue or 0), "pull=" .. (if state.CanPull then "waiting" else "cooldown"))
 		C.last = "composted " .. n .. " junk ants"
 		N.backpack(true)
 		return true
@@ -33928,6 +34084,8 @@ function N.planCandidates()
 					table.insert(list, {
 						kind = "Mutation Potions",
 						key = "shop" .. id,
+						item = id,
+						slot = target.SlotIndex,
 						name = tostring(cfg.DisplayName or id),
 						cost = price,
 						dG = target.food * math.max(N.tagMul(tag) - 1, 0) * k,
@@ -33995,6 +34153,12 @@ function N.planStep()
 		text = "nothing pays back inside " .. optionNumber("PaybackHours", 24) .. " h"
 	end
 	P.spendText = text
+	-- Mutation crystals multiply every claim (TagMul), speed jellies only speed the walk Fast Harvest skips: never bought.
+	local mutKey = if P.best and P.best.kind == "Mutation Potions" then P.best.key .. ":" .. tostring(P.best.slot) else nil
+	if mutKey and mutKey ~= P.mutLogged then
+		P.mutLogged = mutKey
+		log("PLAN mutation", "item=" .. tostring(P.best.item), "ant=" .. tostring(P.best.slot), "payback=" .. string.format("%.0f", P.best.payback) .. "s")
+	end
 	P.say = string.format("Income %s gold/s from %d ants", formatNumber(G), #N.equipped())
 	if (N.planner() or on("AutoUpgrades")) and (text ~= P.text or os.clock() - P.logAt >= 60) then
 		P.text = text
@@ -34268,6 +34432,7 @@ do
 			Default = false,
 			Tooltip = "Enters the pet dungeon when it appears, starts the boss and keeps the click boost at 4x attack speed. Pet eggs and pet tokens",
 		})
+		DungeonBox:AddToggle("DungeonTimeCoins", { Text = "Collect Time Coins", Default = true, Tooltip = "While Auto Dungeon runs: puts every time coin on the ring spot next to you and picks it up (+15 s boss time each, more kills, more pet eggs). Same remotes as the game, no running" })
 		Labels.Dungeon = DungeonBox:AddLabel({ Text = "-", DoesWrap = true })
 		N.QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "zap")
 		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
@@ -34409,6 +34574,8 @@ do
 			Tooltip = "Puts junk ants into the compost machine and pulls the lever when full (mutation potions, jellies). Never favorites, mutated ants or ants that could join your team. Unlocks the machine when it costs under 10 min of income",
 		})
 		CompostBox:AddDropdown("CompostRarities", { Text = "Compost Rarities", Values = N.Rarities, Default = { "Common", "Uncommon" }, Multi = true, AllowNull = true })
+		CompostBox:AddDropdown("CompostProtect", { Text = "Compost Protect List", Values = N.Rarities, Default = {}, Multi = true, AllowNull = true, Tooltip = "Rarities that are never composted, even when they are ticked above" })
+		CompostBox:AddSlider("CompostKeepBest", { Text = "Keep Best Per Rarity", Default = 1, Min = 0, Max = 10, Rounding = 0, Tooltip = "The strongest N ants of every rarity stay in the backpack. The lever is pulled once per 300 s (the server cooldown)" })
 		Labels.Compost = CompostBox:AddLabel({ Text = "-", DoesWrap = true })
 		local MutateBox = Tabs.Items:AddLeftGroupbox("Mutation Potions", "flask-conical")
 		MutateBox:AddToggle("AutoMutate", { Text = "Auto Mutate", Default = false, Tooltip = "Uses your best mutation potion on your strongest unmutated ant (Leaf x1.35 up to Starlight x5)" })
@@ -34527,10 +34694,37 @@ do
 	N.StatRows.Sells = statRow(FarmStats, "coins", "Sells / avg price / Black Market", 22)
 	N.StatRows.Rolls = statRow(FarmStats, "dices", "Rolls / ants bought", 22)
 	N.StatRows.Upgrades = statRow(FarmStats, "trending-up", "Upgrades / gold spent", 22)
+	N.StatRows.Friends = statRow(FarmStats, "users", "Friends online / sell bonus", 22)
 	local OtherStats = Tabs.Stats:AddLeftGroupbox("Events & Items", "sparkles")
 	N.StatRows.Events = statRow(OtherStats, "sparkles", "Coins / snail / dungeons", 22)
 	N.StatRows.Items = statRow(OtherStats, "flask-conical", "Mutations / composted / eggs", 22)
 	N.StatRows.Rewards = statRow(OtherStats, "gift", "Rewards / codes", 22)
+	-- Every friend in the same server gives +10% sell price (GetPlayerFoodSellPriceState, uncapped). Only counted, no alt automation.
+	local friendsLogged = -1
+	local friendCache, friendAt = {}, -1e9
+	function N.friendsOnline()
+		if os.clock() - friendAt < 20 then
+			return friendCache.n or 0
+		end
+		friendAt = os.clock()
+		local n = 0
+		for _, p in ipairs(game:GetService("Players"):GetPlayers()) do
+			if p ~= LocalPlayer then
+				local ok, yes = pcall(function()
+					return LocalPlayer:IsFriendsWith(p.UserId)
+				end)
+				if ok and yes then
+					n += 1
+				end
+			end
+		end
+		friendCache.n = n
+		if n ~= friendsLogged then
+			friendsLogged = n
+			log("FRIENDS", "n=" .. n, "bonus=" .. n * 10 .. "%")
+		end
+		return n
+	end
 	function N.drawStats()
 		local elapsed = math.max(os.clock() - Session.started, 1)
 		local gold = N.gold()
@@ -34545,6 +34739,8 @@ do
 		N.StatRows.Food.set(formatNumber(Session.collectFood))
 		N.StatRows.Sells.set(string.format("%d / %.2f / %d", Session.sells, if Session.sells > 0 then Session.priceSum / Session.sells else 0, Session.bmSells))
 		N.StatRows.Rolls.set(formatNumber(Session.rolls) .. " / " .. Session.bought)
+		local friends = N.friendsOnline()
+		N.StatRows.Friends.set(friends .. " -> +" .. friends * 10 .. "% sell price")
 		N.StatRows.Upgrades.set(Session.upgrades .. " / " .. formatNumber(Session.upgradeGold + Session.boughtGold))
 		N.StatRows.Events.set(Session.coins .. " / " .. Session.snail .. " / " .. Session.dungeons)
 		N.StatRows.Items.set(Session.mutations .. " / " .. Session.compost .. " / " .. Session.eggs)
@@ -34615,7 +34811,7 @@ do
 				#N.equipped(),
 				#N.unlockedSlots(),
 				N.nestLayer(),
-				N.attrLevel("蚂蚁攻击力"),
+				N.attrLevel("èš‚èšæ”»å‡»åŠ›"),
 				N.treeId(),
 				tostring(N.Price.base),
 				tostring(N.activity()),
