@@ -33631,6 +33631,11 @@ do
 	end
 	N.rarityOf = catalogRarity
 	local SpeedBonus = { Epic = 0.35, Legendary = 0.85 }
+	local DashCut = { Epic = 0.1, Legendary = 0.35 }
+	-- Coins have no priced sink yet (gear abilities are an open item), so a coin is worth a fraction of an XP point.
+	function N.coinWeight()
+		return 0.25
+	end
 	function N.ownsRarity(rarity)
 		for _, skin in ipairs(N.knifeList()) do
 			if catalogRarity(skin) == rarity then
@@ -33658,13 +33663,18 @@ do
 		local bonus = rarity and SpeedBonus[rarity]
 		if bonus then
 			-- Speed: survival scales about twice as fast as the speed gain (escapes and catches both need the edge).
-			return N.xpPerMatch() * 2 * bonus / N.runnerSpeed() * (1 + N.coinPerXp()), rarity .. " +" .. bonus .. " speed"
+			-- The perk also cuts the dash cooldown (KnifePerks 57692: Epic -0.1 s, Legendary -0.35 s of 1.1 s): more
+			-- dashes per crossing = more perfect dodges, worth most with Auto Perfect Dodge on.
+			local dash = DashCut[rarity] or 0
+			local dashShare = if N.wants("AutoDodge") then 0.5 else 0.15
+			local value = N.xpPerMatch() * (2 * bonus / N.runnerSpeed() + dashShare * dash / 1.1)
+			return value * (1 + N.coinPerXp() * N.coinWeight()), rarity .. " +" .. bonus .. " speed, -" .. dash .. " s dash cd"
 		elseif skin == "BananaBlade" then
-			return 10 * (1 + N.coinPerXp()), "+10 XP per match"
+			return 10 * (1 + N.coinPerXp() * N.coinWeight()), "+10 XP per match"
 		elseif skin == "PizzaPunisher" then
 			return 2 * N.gemValue(), "+2 gems per match"
 		elseif skin == "CluckBasher" then
-			return 5, "+5 coins per match"
+			return 5 * N.coinWeight(), "+5 coins per match"
 		end
 		return 0, "no bonus"
 	end
@@ -33697,6 +33707,19 @@ do
 		end
 		return if total > 0 then p / total else 0
 	end
+	-- Duplicates refund gems (10/20/40/75 by rarity, CrateCatalog 41343), so a crate's real cost is the price minus
+	-- the expected refund of its drops.
+	function N.crateRefund(crate)
+		local def = N.G.Crates.Crates and N.G.Crates.Crates[crate]
+		local sum, total = 0, 0
+		for _, e in ipairs(def and def.Entries or {}) do
+			total += e.Weight or 0
+			if N.owned(e.Skin) then
+				sum += (e.Weight or 0) * (e.DuplicateGems or 0)
+			end
+		end
+		return if total > 0 then sum / total else 0
+	end
 	function N.crateDecision()
 		local crates = (N.G.Crates.Order and #N.G.Crates.Order > 0) and N.G.Crates.Order or { "Ember", "Celestial" }
 		if on("StopAfterLegendary") and N.ownsRarity("Legendary") then
@@ -33725,7 +33748,7 @@ do
 		end
 		local legendary = N.knifeValue("SolarPhoenix")
 		local current = N.knifeValue(N.bestKnife() or "BaseDagger")
-		return pick, string.format("P(better knife) %d%%, up to +%.1f XP pts/match if it hits, gems have no other income use", math.floor(pickP * 100 + 0.5), math.max(legendary - current, 0))
+		return pick, string.format("P(better knife) %d%%, up to +%.1f XP pts/match if it hits, net cost %.0f gems after duplicate refunds, gems have no other income use", math.floor(pickP * 100 + 0.5), math.max(legendary - current, 0), price - N.crateRefund(pick))
 	end
 	-- Chicken or Hero: Hero crosses alone (pressure XP with every catcher on him), Chicken keeps the group crossing.
 	function N.crossXp(c, r)
