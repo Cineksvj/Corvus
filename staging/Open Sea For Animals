@@ -31877,6 +31877,15 @@ end
 						if service == "NotificationService" and name == "NotifySignal" and tostring(args[1]) == "Error" then
 							-- server refusals the hub already backs off from: log once per text per session as INFO (not a problem)
 							local key = string.gsub(tostring(args[2]), "%d+", "<n>")
+							if Game.auto then
+								local low = string.lower(tostring(args[2]))
+								for _, word in ipairs({ "too fast", "slow down", "cooldown", "too far", "too many", "too quickly", "wait", "spam" }) do
+									if string.find(low, word, 1, true) then
+										Game.auto.signal("notice: " .. string.sub(tostring(args[2]), 1, 60))
+										break
+									end
+								end
+							end
 							if not NoticeSeen[key] then
 								NoticeSeen[key] = true
 								log("INFO", "game notice (seen once per session): " .. tostring(args[2]))
@@ -32916,6 +32925,9 @@ end
 			end
 			Metrics.cum.Items += 1
 			SaveDirty = true
+			if Game.auto then
+				Game.auto.note(info.value)
+			end
 			local rank = info.rank or 0
 			local big = rank >= (RarityRank.Divine or 7)
 			feedPush({
@@ -33076,8 +33088,229 @@ end
 			Moves.last = { pos = position, at = os.clock() }
 			return true
 		end
+		-- Movement "Auto (best measured)": measures each allowed mode, keeps the most profitable one without danger signals
+		do
+			local AutoName = "Auto (best measured)"
+			local Steps = { "Blatant", "Teleport", "Glide", "Walk" }
+			local Auto = {
+				mode = "Blatant", falls = {}, off = {}, rate = {}, phase = "wait", why = "waiting for Auto Open Sea",
+				sigs = {}, active = 0, holdUntil = 0, queue = {}, results = {},
+				file = "Corvus/OSFA_Auto.json", day = os.date("%Y-%m-%d"),
+			}
+			Game.auto = Auto
+			pcall(function()
+				if type(isfile) == "function" and type(readfile) == "function" and isfile(Auto.file) then
+					local data = HttpService:JSONDecode(readfile(Auto.file))
+					if type(data) == "table" then
+						if type(data.rate) == "table" then
+							Auto.rate = data.rate
+						end
+						if data.day == Auto.day then
+							Auto.falls = type(data.falls) == "table" and data.falls or {}
+							Auto.off = type(data.off) == "table" and data.off or {}
+						end
+					end
+				end
+			end)
+			function Auto.save()
+				pcall(function()
+					if type(writefile) ~= "function" then
+						return
+					end
+					if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder("Corvus") then
+						makefolder("Corvus")
+					end
+					writefile(Auto.file, HttpService:JSONEncode({ day = Auto.day, falls = Auto.falls, off = Auto.off, rate = Auto.rate }))
+				end)
+			end
+			function Auto.isOn()
+				return (Options.SeaMove and Options.SeaMove.Value) == AutoName
+			end
+			function Game.effMove()
+				local v = Options.SeaMove and Options.SeaMove.Value
+				if v == AutoName then
+					return Auto.mode
+				end
+				return v
+			end
+			function Auto.note(value)
+				if Auto.sample and Auto.isOn() then
+					Auto.sample.value += tonumber(value) or 0
+				end
+			end
+			-- a danger signal; soft ones need 3 within 60 s, hard ones (refused instant catch, kick) act at once
+			function Auto.signal(reason, hard)
+				if not Auto.isOn() or Auto.pending then
+					return
+				end
+				local now = os.clock()
+				table.insert(Auto.sigs, { at = now, why = reason })
+				local recent = {}
+				for _, sig in ipairs(Auto.sigs) do
+					if now - sig.at <= 60 then
+						table.insert(recent, sig)
+					end
+				end
+				Auto.sigs = recent
+				if hard or #recent >= 3 then
+					Auto.sigs = {}
+					Auto.pending = reason
+				end
+			end
+			function Auto.lower(from)
+				local at = table.find(Steps, from) or 1
+				for i = at + 1, #Steps do
+					if not Auto.off[Steps[i]] then
+						return Steps[i]
+					end
+				end
+				return "Walk"
+			end
+			function Auto.fallback(reason, weight)
+				local from = Auto.mode
+				Auto.falls[from] = (Auto.falls[from] or 0) + (weight or 1)
+				if Auto.falls[from] >= 3 and from ~= "Walk" and not Auto.off[from] then
+					Auto.off[from] = true
+					log("MODE off for today", from, "falls", Auto.falls[from])
+				end
+				local to = Auto.lower(from)
+				if to ~= from then
+					Auto.mode = to
+				end
+				Auto.why = "fell back from " .. from .. ": " .. tostring(reason)
+				log("MODE fallback " .. from .. " -> " .. Auto.mode .. " reason=" .. tostring(reason))
+				Auto.save()
+			end
+			function Auto.kick(message)
+				if Auto.isOn() and message and message ~= "" then
+					Auto.fallback("kick or disconnect: " .. string.sub(tostring(message), 1, 80), 3)
+				end
+			end
+			function Auto.beginSample()
+				while #Auto.queue > 0 do
+					local mode = table.remove(Auto.queue, 1)
+					if not Auto.off[mode] then
+						Auto.mode = mode
+						Auto.sample = { mode = mode, t = 0, value = 0 }
+						Auto.phase = "measure"
+						return
+					end
+				end
+				Auto.sample = nil
+				Auto.finish()
+			end
+			function Auto.finish()
+				local best, bestRate = nil, 0
+				for _, mode in ipairs(Steps) do
+					local r = Auto.results[mode]
+					if r and r > bestRate then
+						best, bestRate = mode, r
+					end
+				end
+				if best then
+					-- the safer mode wins when it is within 5 percent of the best
+					for i = #Steps, 1, -1 do
+						local r = Auto.results[Steps[i]]
+						if r and r >= bestRate * 0.95 then
+							best = Steps[i]
+							break
+						end
+					end
+				else
+					best = if Auto.off.Teleport then "Walk" else "Teleport"
+				end
+				local parts = {}
+				for _, mode in ipairs(Steps) do
+					if Auto.results[mode] then
+						table.insert(parts, mode .. "=" .. formatNumber(Auto.results[mode]) .. "/min")
+					end
+				end
+				Auto.mode = best
+				Auto.phase = "hold"
+				Auto.holdUntil = Auto.active + 3600
+				Auto.why = string.format("best measured: %s (%s)", best, table.concat(parts, ", "))
+				log("MODE measure " .. table.concat(parts, " ") .. " keep=" .. best)
+				Auto.save()
+			end
+			function Auto.startMeasure()
+				Auto.results, Auto.queue = {}, {}
+				local top = 0
+				for _, mode in ipairs(Steps) do
+					top = math.max(top, tonumber(Auto.rate[mode]) or 0)
+				end
+				for _, mode in ipairs(Steps) do
+					local prior = tonumber(Auto.rate[mode])
+					if not Auto.off[mode] and (prior == nil or prior >= top * 0.5) then
+						table.insert(Auto.queue, mode)
+					end
+				end
+				Auto.beginSample()
+			end
+			function Auto.tick()
+				if not Auto.isOn() then
+					Auto.phase, Auto.sample = "wait", nil
+					return
+				end
+				if not on("AutoSea") then
+					Auto.why = "waiting for Auto Open Sea"
+					return
+				end
+				Auto.active += 1
+				if Auto.pending then
+					local reason = Auto.pending
+					Auto.pending = nil
+					if Auto.phase == "measure" and Auto.sample then
+						Auto.fallback(reason)
+						Auto.results[Auto.sample.mode] = nil
+						Auto.rate[Auto.sample.mode] = 0
+						Auto.beginSample()
+					else
+						Auto.fallback(reason)
+						Auto.holdUntil = Auto.active + 3600
+					end
+					return
+				end
+				if Auto.phase == "wait" then
+					Auto.startMeasure()
+				elseif Auto.phase == "measure" and Auto.sample then
+					local sample = Auto.sample
+					sample.t += 1
+					if sample.t >= 180 and (sample.value > 0 or sample.t >= 300) then
+						local rate = sample.value / sample.t * 60
+						Auto.results[sample.mode] = rate
+						Auto.rate[sample.mode] = rate
+						Auto.beginSample()
+					end
+				elseif Auto.phase == "hold" and Auto.active >= Auto.holdUntil then
+					Auto.phase = "wait"
+				end
+			end
+			function Auto.text()
+				if not Auto.isOn() then
+					return nil
+				end
+				if Auto.phase == "measure" and Auto.sample then
+					return string.format("Movement: measuring %s, %ds left", Auto.sample.mode, math.max(180 - Auto.sample.t, 0))
+				end
+				return "Movement: " .. Auto.mode .. " (" .. Auto.why .. ")"
+			end
+			task.spawn(function()
+				while alive() do
+					task.wait(1)
+					local ok, err = pcall(Auto.tick)
+					if not ok then
+						log("ERROR", "auto movement", tostring(err))
+					end
+				end
+			end)
+			pcall(function()
+				game:GetService("GuiService").ErrorMessageChanged:Connect(function()
+					Auto.kick(game:GetService("GuiService"):GetErrorMessage())
+				end)
+			end)
+		end
 		local function moveMode()
-			local v = Options.SeaMove and Options.SeaMove.Value
+			local v = Game.effMove()
 			return if v == "Glide" or v == "Walk" then v else "Teleport"
 		end
 		local function moveSpeed(mode)
@@ -33930,7 +34163,7 @@ end
 		end
 		Sea.instant = { gap = 0.25, fails = 0, ok = 0, refused = 0, off = false }
 		function isBlatant()
-			return (Options.SeaMove and Options.SeaMove.Value) == "Blatant" and not Sea.instant.off
+			return Game.effMove() == "Blatant" and not Sea.instant.off
 		end
 		-- Wave probes (blatant.md 1, 2, 3, 7): the same remotes the instant catch already uses, each tried on one Blatant
 		-- wave. The server's real inventory change decides: an accepted mine is used every wave (and dropped again after 3
@@ -34278,6 +34511,9 @@ end
 				I.gap = math.min(I.gap * 1.5 + 0.1, 4)
 				setStatus(string.format("Blatant: the sea did not open, next try in %.1fs", I.gap))
 				if I.fails % 10 == 0 then
+					if Game.auto then
+						Game.auto.signal("the sea refused to open " .. I.fails .. " times", true)
+					end
 					logProblem("Blatant: the sea refused to open " .. I.fails .. " times, gap now " .. string.format("%.2fs", I.gap))
 				end
 				if isWaveActive() then
@@ -34496,6 +34732,9 @@ end
 			if not got and inventoryCount() <= before then
 				I.refused += 1
 				log("INSTANT refused", #ids, "item(s), inventory", before, "->", inventoryCount(), "refused", I.refused)
+				if Game.auto then
+					Game.auto.signal("instant catch refused", I.refused >= 3)
+				end
 				if I.refused >= 3 and I.ok == 0 then
 					I.off = true
 					Game.callGap = nil
@@ -34587,7 +34826,7 @@ end
 				local now = os.clock()
 				if now - (Stars.logAt or 0) >= 60 then
 					Stars.logAt = now
-					log("STARS mode=" .. tostring(Options.SeaMove and Options.SeaMove.Value) .. " queued=" .. #Stars.queue)
+					log("STARS mode=" .. tostring(Game.effMove()) .. " queued=" .. #Stars.queue)
 				end
 				while #Stars.claims > 0 and Stars.claims[1] < now - 20 do
 					table.remove(Stars.claims, 1)
@@ -35876,7 +36115,7 @@ end
 		function upgradeTick()
 			for _, label in ipairs(UpgradeOrder) do
 				local id = UpgradeIds[label]
-				local move = Options.SeaMove and Options.SeaMove.Value
+				local move = Game.effMove()
 				local useless = id == "MovementSpeed" and (move == "Blatant" or move == "Teleport")
 				if not useless and allows(Options.UpgradeFilter, label) and (UpgradeBackoff[id] or 0) <= os.clock() then
 					local amount = maxBuyable(id, if Game.plannerOn() then Game.budget(id) elseif id == "Carry" then cash() else spendable())
@@ -37248,7 +37487,7 @@ end
 			local q = 1 + 0.1 * sumValues(modifier("CompletedEggs"))
 			local slotGain = if placedAmount >= maxAnimals() then worst * multi else 0
 			add("PlotUpgrade", nextUpgradePrice("PlotUpgrade"), slotGain + base * 0.05 * q, "Upgrade Base")
-			if not isBlatant() and (Options.SeaMove and Options.SeaMove.Value) ~= "Teleport" then
+			if not isBlatant() and Game.effMove() ~= "Teleport" then
 				add("MovementSpeed", nextUpgradePrice("MovementSpeed"), catchBase * 0.5 / (16 + upgradeLevel("MovementSpeed")), "Speed")
 			end
 			local nextR, curR = Rebirths[rebirths() + 1], Rebirths[rebirths()]
@@ -37696,9 +37935,9 @@ end
 			})
 			MoveBox:AddDropdown("SeaMove", {
 				Text = "Movement",
-				Values = { "Blatant", "Teleport", "Glide", "Walk" },
-				Default = "Blatant",
-				Tooltip = "Blatant opens the sea and takes the best items instantly, many waves a second. Teleport flies to each item. Glide flies at the speed below. Walk uses your own speed.",
+				Values = { "Auto (best measured)", "Blatant", "Teleport", "Glide", "Walk" },
+				Default = "Auto (best measured)",
+				Tooltip = "Auto measures every mode for a few minutes, keeps the most profitable one without server refusals, re-checks every hour and steps back on any warning sign. Blatant opens the sea and takes the best items instantly, many waves a second. Teleport flies to each item. Glide flies at the speed below. Walk uses your own speed.",
 			})
 			MoveBox:AddSlider(
 				"GlideSpeed",
@@ -39948,6 +40187,16 @@ end
 			if Library.OnAutoload then pcall(Library.OnAutoload) end
 		end)
 	end
+	-- one time: configs still on the old fixed Blatant default move to Auto (best measured)
+	pcall(function()
+		if not Library:GetSetting("OSFA_AutoMoveDefault") then
+			Library:SetSetting("OSFA_AutoMoveDefault", true)
+			if Options.SeaMove and Options.SeaMove.Value == "Blatant" then
+				Options.SeaMove:SetValue("Auto (best measured)")
+				log("MIGRATE movement Blatant -> Auto (best measured)")
+			end
+		end
+	end)
 	-- one time: configs saved before Blatant existed still say Teleport, the instant catch is much faster
 	pcall(function()
 		if not Library:GetSetting("OSFA_BlatantDefault") then
@@ -40336,12 +40585,16 @@ end
 					Labels.Status:SetText(Status)
 				end)
 				group(function()
+					local autoLine = Game.auto and Game.auto.text()
 					if not Game.plannerOn() then
-						Labels.UpNext:SetText("Switch on Smart Planner to see the plan")
+						Labels.UpNext:SetText((if autoLine then autoLine .. "\n" else "") .. "Switch on Smart Planner to see the plan")
 						return
 					end
 					local plan = Game.lastPlan
 					local lines = {}
+					if autoLine then
+						table.insert(lines, autoLine)
+					end
 					local parts = Game.drives()
 					if #parts > 0 then
 						table.insert(lines, "Planner runs " .. table.concat(parts, ", ") .. " for you")
