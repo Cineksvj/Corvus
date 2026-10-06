@@ -34097,7 +34097,20 @@ end
 			if type(isfile) == "function" and type(readfile) == "function" and isfile(Probe.file) then
 				local data = HttpService:JSONDecode(readfile(Probe.file))
 				if type(data) == "table" and tostring(data.pv) == Probe.pv and type(data.state) == "table" then
-					Probe.state = data.state
+					-- accepted mines are remembered per PlaceVersion; refused ones are tried once more every session (a few waves)
+					-- so the log always shows a PROBE line and a wrongly refused mine cannot stay off for good
+					local kept, again = {}, {}
+					for name, s in pairs(data.state) do
+						if type(s) == "table" and s.ok == true then
+							Probe.state[name] = s
+							table.insert(kept, name .. "=accepted")
+						else
+							table.insert(again, name)
+						end
+					end
+					table.sort(kept)
+					table.sort(again)
+					Probe.memory = "pv=" .. Probe.pv .. " kept[" .. table.concat(kept, ",") .. "] retest[" .. table.concat(again, ",") .. "]"
 				end
 			end
 		end)
@@ -34521,7 +34534,9 @@ end
 			local P, probe, level = Game.probe, nil, nil
 			local k = math.max(math.floor(maxPickup()), 1)
 			if P.active() and evCount == 0 then
-				if P.ready("finished2") and #list > k and free >= 2 * k then
+				if P.ready("dup") and #list >= 1 and free >= math.max(k, 2) then
+					probe = "dup"
+				elseif P.ready("finished2") and #list > k and free >= 2 * k then
 					probe = "finished2"
 				elseif P.use("finished2") and P.ready("finished2same") and #list >= 1 and free >= 2 * k then
 					probe = "finished2same"
@@ -34531,8 +34546,26 @@ end
 					probe = "overcap2k"
 				elseif P.use("overcap2k") and P.ready("overcapall") and #list > 2 * k and free >= #list then
 					probe = "overcapall"
-				elseif P.ready("dup") and k >= 2 and #list >= 1 and free >= k then
-					probe = "dup"
+				end
+			end
+			if P.active() then
+				if P.memory then
+					log("PROBE memory " .. P.memory)
+					P.memory = nil
+				end
+				P.waves = (P.waves or 0) + 1
+				if probe then
+					log(string.format("PROBE start %s carry=%d list=%d free=%d", probe, k, #list, free))
+				elseif P.waves % 25 == 1 then
+					local waiting = {}
+					for _, name in ipairs({ "dup", "finished2", "overcap" }) do
+						if P.ready(name) then
+							table.insert(waiting, name)
+						end
+					end
+					if #waiting > 0 then
+						log(string.format("PROBE waiting for %s carry=%d list=%d free=%d events=%d", table.concat(waiting, "/"), k, #list, free, evCount))
+					end
 				end
 			end
 			local take = k
@@ -34604,7 +34637,7 @@ end
 				if probe == "dup" then
 					table.insert(ids, 1, best.id)
 					table.insert(infos, 1, best.info)
-					if #ids > capacity then
+					if #ids > capacity and k >= 2 then
 						table.remove(ids)
 						table.remove(infos)
 					end
@@ -35277,6 +35310,8 @@ end
 					setStatus("Placing " .. infoTitle(entry.info))
 					local cf = eggCFrame(surface, tool, spot)
 					local ok, result, reason = call("EggService", "PlaceEgg", tool:GetAttribute("EntityId"), cf)
+					-- the game itself moves the character right after a placement (same spot every time): not a snapback
+					Moves.last = nil
 					if waitFor(function()
 						return placedEggCount() > before
 						end, 2.5) or (ok and result) then
@@ -40289,6 +40324,29 @@ end
 						task.delay(0.3, function()
 							if source then
 								log("AUTO " .. name .. "=true by " .. source)
+							elseif string.find(tostring(trace), "Load", 1, true) and os.clock() - (Game.clickAt[name] or -1e9) > 0.6 then
+								-- the saved config landed after the first AUTOLOAD line: say so, with the full list
+								Game.lateLoad = Game.lateLoad or {}
+								Game.lateLoad[name] = true
+								if not Game.lateLoadAt then
+									Game.lateLoadAt = true
+									task.delay(1.5, function()
+										local late, all = {}, {}
+										for n in pairs(Game.lateLoad) do
+											table.insert(late, n)
+										end
+										for n, tg in pairs(Toggles) do
+											if typeof(n) == "string" and string.sub(n, 1, 6) ~= "Corvus" and type(tg) == "table" and tg.Value == true then
+												table.insert(all, n)
+											end
+										end
+										table.sort(late)
+										table.sort(all)
+										log("AUTOLOAD late (saved config) added=" .. table.concat(late, ",") .. " toggles=" .. table.concat(all, ","))
+										Game.lateLoadAt = nil
+										Game.lateLoad = nil
+									end)
+								end
 							elseif os.clock() - (Game.clickAt[name] or -1e9) > 0.6 then
 								local lines = {}
 								for line in string.gmatch(tostring(trace), "[^\n]+") do
