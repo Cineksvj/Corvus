@@ -33834,7 +33834,7 @@ do
 				wanted = true
 			end
 		end
-		if not wanted then
+		if not wanted or (N.fuseWorth and not N.fuseWorth(i)) then
 			return false
 		end
 		for _, m in ipairs(N.miniCars()) do
@@ -33926,6 +33926,9 @@ do
 				end
 				held[ing] -= 1
 			end
+		end
+		if N.planner() and N.fuseWorth and not (tier and (tonumber(tier.EndsAt) or 0) > 0) and not N.fuseWorth(i) then
+			return false
 		end
 		return true
 	end
@@ -34589,28 +34592,49 @@ do
 		return pick, curMult
 	end
 	-- What to buy now, by payback: plot level first when it pays back in an hour, then a trail.
+	-- Both buys are priced in the same unit (cash gained per cash spent) and the better ratio goes first.
+	function N.trailValue(t)
+		local cur = N.bestOwnedTrail()
+		local curMult = cur and cur.speed or 1
+		local eta = N.etaNextZone()
+		if eta == math.huge or eta <= 0 or t.speed <= curMult then
+			return 0
+		end
+		return eta * (1 - curMult / t.speed) * math.max(N.incomeAfterNext() - N.income(), N.income())
+	end
 	function N.nextBuy()
 		local planner = N.planner()
+		local plotPick
 		if (planner or N.wants("AutoUpgradePlot")) and N.plotLevel() < N.maxPlotLevel() then
 			local payback, cost = N.plotPayback()
 			local cash = N.cash()
 			if cost and cash >= cost then
 				if not planner then
-					return { kind = "plot", cost = cost, why = "affordable" }
-				end
-				local worth, value = N.plotWorth()
-				if worth and N.parked()[1] ~= nil then
-					return { kind = "plot", cost = cost, why = "the new slots earn $" .. formatNumber(value) .. " in 24 h, payback " .. N.longTime(payback) }
+					plotPick = { kind = "plot", cost = cost, why = "affordable" }
+				else
+					local worth, value = N.plotWorth()
+					if worth and N.parked()[1] ~= nil then
+						plotPick = { kind = "plot", cost = cost, value = value, why = "the new slots earn $" .. formatNumber(value) .. " in 24 h, payback " .. N.longTime(payback) }
+					end
 				end
 			end
 		end
+		local trailPick
 		if planner or N.wants("AutoBuyTrails") then
 			local t = N.nextTrail(not planner)
 			if t then
-				return { kind = "trail", trail = t, cost = t.price, why = if planner then "shortens the next zone" else "affordable" }
+				trailPick = { kind = "trail", trail = t, cost = t.price, value = N.trailValue(t), why = if planner then "shortens the next zone" else "affordable" }
 			end
 		end
-		return nil
+		if plotPick and trailPick and planner then
+			local plotRatio = (plotPick.value or 0) / math.max(plotPick.cost, 1)
+			local trailRatio = (trailPick.value or 0) / math.max(trailPick.cost, 1)
+			if trailRatio > plotRatio then
+				trailPick.why ..= " (better return than the plot level)"
+				return trailPick
+			end
+		end
+		return plotPick or trailPick
 	end
 	function N.spendStep()
 		local pick = N.nextBuy()
@@ -34665,6 +34689,20 @@ do
 			return car, string.format("+%s/s for %s vs %ds off the treadmill", formatNumber(gain or 0), N.longTime(horizon), math.floor(T))
 		end
 		return nil, "training pays more than " .. tostring(car.id)
+	end
+	-- Fuse priced like every other choice: the fused car (after its duration) against the ingredients, which leave the
+	-- plot for the whole fuse, plus the slots they free (refilled by the zone's average car, half weight).
+	function N.fuseWorth(i)
+		local recipe = N.fuseRecipes()[i]
+		if not recipe then
+			return false, "no recipe"
+		end
+		local newCps, sum = N.fuseValue(i)
+		local H = 24 * 3600
+		local D = tonumber(recipe.Duration) or 0
+		local freed = math.max(#(recipe.Ingredients or {}) - 1, 0)
+		local gain = newCps * math.max(H - D, 0) + freed * N.zoneAvgCps(N.bestZone()) * H * 0.5
+		return gain >= sum * H, string.format("%s gives $%s/s vs ingredients $%s/s over %s", tostring(recipe.Name or recipe.CarId), formatNumber(newCps), formatNumber(sum), N.longTime(D))
 	end
 	-- G4: zones 12 (Palace) and 13 (Underworld) are EventOnly: their content is a timed slot spawn, not a car tier. With
 	-- every normal zone open, the planner trains only while such a car is visible and still above our power.
