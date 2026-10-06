@@ -32125,6 +32125,7 @@ end
 local Session = {
 	startedAt = os.clock(),
 	started = 0,
+	plannerRuns = 0,
 	runs = 0,
 	fullRuns = 0,
 	partialRuns = 0,
@@ -32421,7 +32422,11 @@ do
 		local run = { id = Session.started, start = os.clock(), gold0 = N.gold(), offset0 = N.Run.offset, mode = mode.id, level = level, flown = 0, credited = 0, ended = false, first = 0, misses = 0, quest = N.Quest and N.Quest.active }
 		N.Run.current = run
 		M.flying = true
-		log("RUN start", "#" .. run.id, "mode", mode.id, "gold", N.gold(), "x" .. N.multiplier(), if N.planner() and not on("AutoFarm") then "(planner)" else "")
+		local byPlanner = N.planner() and not on("AutoFarm")
+		if byPlanner then
+			Session.plannerRuns += 1
+		end
+		log("RUN start", "#" .. run.id, "mode", mode.id, "gold", N.gold(), "x" .. N.multiplier(), if byPlanner then "(planner)" else "")
 		noclip(char)
 		local pos = N.myPos()
 		local okRoute = N.flyTo(Vector3.new(pos.X, N.CruiseY, pos.Z), mode.speed)
@@ -33204,23 +33209,37 @@ do
 		end
 		local now = os.clock()
 		if N.Plan.remeasureAt and now >= N.Plan.remeasureAt then
+			-- Hourly: the faster modes are measured again (2 runs each); a slower mode only when the current one stopped
+			-- completing every run or lost more than 10 % of its best gold per hour (a slower flight with the same credit
+			-- gate cannot beat a faster one that completes every run).
 			N.Plan.remeasureAt = nil
+			N.Plan.remeasures = (N.Plan.remeasures or 0) + 1
+			local cur = N.Plan.level
+			local curId = cur and N.Modes[cur].id
+			local s = cur and N.modeStats(curId)
+			local degraded = cur ~= nil and (N.modeFull(curId) < #s.window or N.modeRate(curId) < (s.best or 0) * 0.9)
 			local cleared = {}
 			for i, m in ipairs(N.Modes) do
-				if i ~= N.Plan.level and candidate(i) and N.modeMeasured(m.id) > 0 then
+				if i ~= cur and candidate(i) and N.modeMeasured(m.id) > 0 and (cur == nil or i < cur or degraded) then
 					table.clear(N.modeStats(m.id).window)
 					table.insert(cleared, m.id)
 				end
 			end
 			if #cleared > 0 then
 				log("PLAN re-measure", table.concat(cleared, ", "), "(an hour passed, 2 runs each)")
+			elseif curId then
+				log("PLAN re-measure skipped", curId, "still completes every run at", formatNumber(N.modeRate(curId)) .. "/h; a slower mode cannot beat it, faster ones are not allowed")
 			end
 		end
 		local parts = {}
 		for _, m in ipairs(N.Modes) do
 			local runs = N.modeMeasured(m.id)
 			if runs > 0 then
-				table.insert(parts, string.format("%s %s/h (%d runs, %d full)", m.id, formatNumber(N.modeRate(m.id)), runs, N.modeFull(m.id)))
+				local s, rate = N.modeStats(m.id), N.modeRate(m.id)
+				if runs >= 2 and rate > (s.best or 0) then
+					s.best = rate
+				end
+				table.insert(parts, string.format("%s %s/h (%d runs, %d full)", m.id, formatNumber(rate), runs, N.modeFull(m.id)))
 			end
 		end
 		N.Plan.routeText = if #parts > 0 then table.concat(parts, ", ") else "no run measured yet"
@@ -33295,6 +33314,11 @@ do
 	local function idleReason()
 		if N.Manual.running then
 			return "a manual action is running"
+		end
+		if N.Discover and os.clock() - N.Discover.hopAt < 90 then
+			-- a server hop: the hub is being torn down and starts again in the new server
+			N.Plan.idleSince = nil
+			return nil
 		end
 		if not N.alive() and not N.Move.flying then
 			N.Plan.idleSince = N.Plan.idleSince or os.clock()
