@@ -33293,9 +33293,6 @@ function N.chooseUpgrade(list, round)
 	return best, bestStars, if #parts > 0 then "learned " .. table.concat(parts, ", ") else ""
 end
 local function pickDelay()
-	if optionText("PickSpeed", "Instant") == "Human" then
-		return 1 + math.random() * 2
-	end
 	return 0.4
 end
 function N.wantDuel()
@@ -33524,7 +33521,7 @@ function N.aimStep()
 	if D.aimWaitKey ~= key then
 		D.aimWaitKey = key
 		D.aimSeen = os.clock()
-		D.aimDelay = if optionText("PickSpeed", "Instant") == "Human" then 0.6 + math.random() * 0.9 else 0.15
+		D.aimDelay = 0.15
 		-- SEED check: once per match, at the first aim, before our launch lock.
 		if D.match and not D.match.seedLogged then
 			D.match.seedLogged = true
@@ -34105,6 +34102,7 @@ do
 			-- as a different button. If the stack grew, a new reward card just arrived (not a miss): re-click, no flip.
 			if n < P.n then
 				RC.count += 1
+				RC.streak = 0
 				Session.receives += 1
 				RC.logged += 1
 				if RC.logged <= 5 or RC.logged % 20 == 0 then
@@ -34113,7 +34111,11 @@ do
 			elseif n == P.n and top and top.name == P.name then
 				-- same stack, same top card: the click missed, so try the other inset offset next time
 				RC.misses += 1
+				RC.streak = (RC.streak or 0) + 1
 				RC.offset = if P.offset == 0 then guiInset() else 0
+				if RC.streak >= 8 then
+					RC.at = os.clock() + 4
+				end
 				if RC.misses <= 3 or RC.misses % 20 == 0 then
 					log("RECEIVE miss", P.name, "offset " .. P.offset .. "->" .. RC.offset, "misses=" .. RC.misses)
 				end
@@ -34123,7 +34125,25 @@ do
 			return false
 		end
 		RC.at = os.clock()
-		local ok = clickAt(top.button, RC.offset)
+		local ok = false
+		if (RC.streak or 0) >= 2 then
+			-- the mouse click keeps missing: fire the button's own Activated/MouseButton1Click handlers instead
+			for _, signal in ipairs({ top.button.Activated, top.button.MouseButton1Click }) do
+				if typeof(getconnections) == "function" then
+					pcall(function()
+						for _, c in ipairs(getconnections(signal)) do
+							c:Fire()
+						end
+						ok = true
+					end)
+				elseif typeof(firesignal) == "function" then
+					ok = pcall(firesignal, signal) or ok
+				end
+			end
+		end
+		if not ok then
+			ok = clickAt(top.button, RC.offset)
+		end
 		if ok then
 			RC.clicks += 1
 			RC.pending = { button = top.button, n = n, name = top.name, offset = RC.offset }
@@ -34647,7 +34667,7 @@ function N.nextBuy()
 	if N.planner() then
 		-- the planner buys when the new ball lifts the expected best offer (collection value), from a 20% new chance
 		local gain = N.collectionGain()
-		gainText = string.format(", +%.1f pp best offer", gain * 100 * math.max(yield, 0))
+		gainText = if gain * yield > 0.0005 then string.format(", lifts the best offer by %.1f points", gain * 100 * yield) else ""
 		if gain * yield > 0.002 then
 			minChance = math.min(minChance, 0.2)
 		end
@@ -35009,12 +35029,6 @@ do
 			Text = "Keep playing for quests",
 			Default = true,
 			Tooltip = "After the daily coin cap, keeps dueling only until the Win and 3 HP daily quests are done (they pay coins), then stops. Off = stop at the cap",
-		})
-		DuelBox:AddDropdown("PickSpeed", {
-			Text = "Pick speed",
-			Values = { "Instant", "Human" },
-			Default = "Instant",
-			Tooltip = "Instant (default): picks and aims right away, the server only checks the choice. Human: 1-3 s per pick and 0.6-1.5 s per aim",
 		})
 		Labels.Duel = DuelBox:AddLabel({ Text = "-", DoesWrap = true })
 		local PickBox = Tabs.Duel:AddRightGroupbox("Ball & Upgrade Picks", "target")
