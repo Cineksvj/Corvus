@@ -33763,6 +33763,18 @@ do
 				F.failedEggs[egg] = os.clock() + 30
 				break
 			end
+			-- A tough egg (25K HP = about 13 minutes of hits) must not hold the whole loop: when the plan has a purchase it can
+			-- afford now, step out so shopStep runs (live 2026-10-07: 'next buy Plot level 2 for $10K now' waited 8 min with
+			-- 170B in the bank). The egg stays where it is; the hub comes back to it after the purchase.
+			if os.clock() - (F.shopPeekAt or 0) > 6 and os.clock() - started > 8 then
+				F.shopPeekAt = os.clock()
+				pcall(N.Plan.update, false)
+				local pick = N.Plan.pick
+				if pick and (N.Shop.lastAt[pick.key] or 0) < os.clock() and (tonumber(pick.cost) or math.huge) <= N.cash() and N.buyingOn() then
+					log("EGG paused for a purchase", pick.label)
+					break
+				end
+			end
 			if os.clock() - (F.pickupCheckAt or 0) > 0.5 then
 				F.pickupCheckAt = os.clock()
 				local wanted = N.bestHatched() or (on("StealPickups") and N.bestPickup(nil, nil))
