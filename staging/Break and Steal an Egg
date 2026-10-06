@@ -32202,7 +32202,8 @@ do
 		return if type(tiers) == "table" and tiers[1] then tiers[1].Capacity or 1 else 1
 	end
 	function N.tutorial()
-		return LocalPlayer:GetAttribute("TutorialActive") == true or LocalPlayer:GetAttribute("TutorialStage") ~= nil
+		local stage = LocalPlayer:GetAttribute("TutorialStage")
+		return LocalPlayer:GetAttribute("TutorialActive") == true or (stage ~= nil and stage ~= "Done")
 	end
 	-- TutorialConfig.StageAttribute (dump 149180): EquipPickaxe, BreakEgg ... UseTreadmill, BuyPickaxe, ... BuyTrail.
 	function N.tutorialStage()
@@ -34106,6 +34107,9 @@ do
 		if not force and os.clock() - F.lastPlaceAt < 3 then
 			return false
 		end
+		if not force and os.clock() < (F.sellBlockedUntil or 0) then
+			return false
+		end
 		local tools = N.sellPlan(not (force or on("AutoSell")), force)
 		if #tools == 0 then
 			if force then
@@ -34129,7 +34133,17 @@ do
 		local gained = math.max(N.cash() - cashBefore, 0)
 		Session.sold += gone
 		Session.soldCash += gained
-		log("SOLD", gone, "animals for", gained, "ok", tostring(ok))
+		if gone == 0 then
+			-- The server took nothing (the tutorial blocks selling, or the animals are not sellable): back off instead of
+			-- repeating the same call every 10 s.
+			F.sellFails = (F.sellFails or 0) + 1
+			F.sellBlockedUntil = os.clock() + math.min(30 * F.sellFails, 300)
+			log("SELL refused, nothing left the backpack", #tools, "animals, retry in", math.min(30 * F.sellFails, 300), "s tutorial", tostring(N.tutorialStage()))
+			gained = 0
+		else
+			F.sellFails = 0
+			log("SOLD", gone, "animals for", gained, "ok", tostring(ok))
+		end
 		if gone > 0 then
 			N.planSay("sell", string.format("sold %d animals that never beat your weakest placed one (protected: %s)", gone, table.concat(N.protectText(), ", ")))
 		end
@@ -35132,9 +35146,9 @@ do
 			N.Shop.stepByStep = true
 			log("SHOP pickaxe skip refused, buying tier by tier")
 		else
-			N.Shop.lastAt.pickaxe = os.clock() + 60
+			N.Shop.lastAt.pickaxe = os.clock() + (if N.tutorial() then 180 else 60)
 		end
-		return true
+		return ok
 	end
 	function N.buyTrail(trail)
 		if N.cash() < (tonumber(trail.Price) or math.huge) then
@@ -35151,9 +35165,9 @@ do
 			N.Shop.trailStepByStep = true
 			log("SHOP trail skip refused, buying one by one")
 		else
-			N.Shop.lastAt.trail = os.clock() + 60
+			N.Shop.lastAt.trail = os.clock() + (if N.tutorial() then 180 else 60)
 		end
-		return true
+		return ok
 	end
 	function N.buyPlot()
 		local level = tonumber(N.plotAttr("PlotLevel", 1)) or 1
@@ -35168,10 +35182,10 @@ do
 		end, 2.5) then
 			Session.bought += 1
 			shopNote("Plot upgraded to level " .. (level + 1))
-		else
-			N.Shop.lastAt.plot = os.clock() + 60
+			return true
 		end
-		return true
+		N.Shop.lastAt.plot = os.clock() + (if N.tutorial() then 180 else 60)
+		return false
 	end
 	function N.unlockTreadmill()
 		local cost = tonumber(N.G.TreadmillUnlock.Cost) or 100
@@ -35181,10 +35195,10 @@ do
 		fire("UnlockTreadmillRequest")
 		if waitFor(N.treadmillUnlocked, 2.5) then
 			shopNote("Treadmill unlocked")
-		else
-			N.Shop.lastAt.treadmill = os.clock() + 60
+			return true
 		end
-		return true
+		N.Shop.lastAt.treadmill = os.clock() + 60
+		return false
 	end
 	function N.upgradeTreadmill()
 		local level = tonumber(N.plotAttr("TreadmillLevel", 1)) or 1
@@ -35327,13 +35341,44 @@ do
 			return false
 		end
 		pcall(N.Plan.update, false)
-		-- The tutorial is played through, not waited out: its own stages need the pickaxe/trail/plot purchases (the game
-		-- shows the Pickaxes shop during it), so the buys run and the server refuses whatever the stage does not allow.
 		if N.carrying() then
 			return false
 		end
 		if N.equipOwnedStep() then
 			return true
+		end
+		-- The tutorial BLOCKS every cash purchase except the one its current stage asks for (TutorialService, dump
+		-- 114692), so only that purchase is made until the stage is Done; the planner buys nothing meanwhile.
+		if N.tutorial() then
+			local stage = N.tutorialStage()
+			if stage ~= N.Shop.tutStage then
+				N.Shop.tutStage = stage
+				log("TUTORIAL stage", tostring(stage), "cash", formatNumber(N.cash()))
+			end
+			if (N.Shop.lastAt.tutorial or 0) > os.clock() then
+				return false
+			end
+			local did = false
+			if stage == "UpgradePen" then
+				did = N.buyPlot()
+			elseif stage == "UseTreadmill" or stage == "EarnPickaxeCash" then
+				did = (not N.treadmillUnlocked()) and N.unlockTreadmill() or false
+			elseif stage == "BuyPickaxe" then
+				did = N.pickaxeTier() < 2 and N.buyPickaxe(2) or false
+			elseif stage == "BuyTrail" then
+				local owned, cheapest = N.ownedList("OwnedTrails"), nil
+				for _, trail in ipairs(type(N.G.Trails.Trails) == "table" and N.G.Trails.Trails or {}) do
+					local price = tonumber(trail.Price) or math.huge
+					if not owned[trail.Id] and price > 0 and price <= N.cash() and (not cheapest or price < (tonumber(cheapest.Price) or math.huge)) then
+						cheapest = trail
+					end
+				end
+				did = cheapest ~= nil and N.buyTrail(cheapest) or false
+			end
+			if not did then
+				N.Shop.lastAt.tutorial = os.clock() + 8
+			end
+			return did
 		end
 		local pick = N.Plan.pick
 		if pick and (N.Shop.lastAt[pick.key] or 0) < os.clock() then
