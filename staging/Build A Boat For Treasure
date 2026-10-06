@@ -32028,6 +32028,11 @@ do
 		ended = e ~= nil and type(e.Value) == "string" and e.Value ~= ""
 		return n, ended, first, paying
 	end
+	function N.stageHas(key)
+		local other = LocalPlayer:FindFirstChild("OtherData")
+		local v = other and other:FindFirstChild(key)
+		return v ~= nil and type(v.Value) == "string" and v.Value ~= ""
+	end
 	function N.stagesEmpty()
 		local n, ended = N.credited()
 		return n == 0 and not ended
@@ -32184,7 +32189,7 @@ N.CruiseY = 60
 N.StageWait = 5 -- seconds inside a stage for the server's credit (8 when the server turned out slower)
 N.EndWait = 13 -- seconds at the chest for OtherData.End (the server writes it about 11 s after the touch)
 N.GoldWait = 15 -- seconds the gold stat is polled after a claim (the credit lands late)
-N.Move = { level = nil, fails = 0, failMode = nil, refusedUntil = {}, stats = {}, probes = {}, probesLoaded = false, flying = false }
+N.Move = { speed = nil, speedCeil = nil, speedTimes = {}, speedGood = 0, level = nil, fails = 0, failMode = nil, refusedUntil = {}, stats = {}, probes = {}, probesLoaded = false, flying = false }
 N.Run = { current = nil, pending = nil, respawnAt = nil, last = "-", history = {}, offset = 0, bestStages = 0, stageMiss = {}, stageSkip = {}, endSeconds = nil, creditSeconds = nil }
 N.Claim = { charClaimed = nil, last = "-" }
 do
@@ -32250,6 +32255,44 @@ do
 		end
 		M.level = level
 		return N.Modes[level], level
+	end
+	-- Flight speed of a mode. Blatant climbs by itself while the server keeps crediting every stage without a miss and the
+	-- flight gets shorter (SPEED up), and steps back at the first miss (SPEED down, the failed speed is the ceiling).
+	function N.runSpeed(mode)
+		if mode.id == "Blatant" then
+			return M.speed or mode.speed
+		end
+		return mode.speed
+	end
+	function N.speedLearn(run, full)
+		if run.mode ~= "Blatant" or not run.speed or not run.chestAt then
+			return
+		end
+		local flight = run.chestAt - run.start
+		local base = N.Modes[1].speed
+		if not full or run.misses > 0 then
+			if run.speed > base then
+				M.speedCeil = run.speed
+				M.speed = math.max(base, math.floor(run.speed / 1.2))
+				M.speedGood = 0
+				log("SPEED down", run.speed, "->", M.speed, string.format("(misses=%d full=%s, ceiling %d)", run.misses, tostring(full), M.speedCeil))
+			end
+			return
+		end
+		local prev = M.speedTimes[run.speed]
+		M.speedTimes[run.speed] = if prev then prev * 0.5 + flight * 0.5 else flight
+		M.speedGood += 1
+		local nextSpeed = math.min(math.floor(run.speed * 1.2), 1500)
+		if M.speedGood >= 2 and nextSpeed > run.speed and (M.speedCeil == nil or nextSpeed < M.speedCeil) then
+			local lower = M.speedTimes[math.floor(run.speed / 1.2)]
+			if lower and lower - M.speedTimes[run.speed] < 0.5 then
+				M.speedCeil = run.speed
+				log("SPEED hold", run.speed, string.format("(flight %.1fs, no gain over the slower speed)", M.speedTimes[run.speed]))
+				return
+			end
+			M.speed, M.speedGood = nextSpeed, 0
+			log("SPEED up", run.speed, "->", nextSpeed, string.format("(flight %.1fs, 2 clean runs)", flight))
+		end
 	end
 	function N.modeStats(id)
 		local s = M.stats[id]
@@ -32408,7 +32451,8 @@ do
 			end
 		end
 		Session.started += 1
-		local run = { id = Session.started, start = os.clock(), gold0 = N.gold(), offset0 = N.Run.offset, mode = mode.id, level = level, flown = 0, credited = 0, ended = false, first = 0, misses = 0, quest = N.Quest and N.Quest.active }
+		local speed = N.runSpeed(mode)
+		local run = { speed = speed, id = Session.started, start = os.clock(), gold0 = N.gold(), offset0 = N.Run.offset, mode = mode.id, level = level, flown = 0, credited = 0, ended = false, first = 0, misses = 0, quest = N.Quest and N.Quest.active }
 		N.Run.current = run
 		M.flying = true
 		local byPlanner = N.planner() and not on("AutoFarm")
@@ -32418,24 +32462,38 @@ do
 		log("RUN start", "#" .. run.id, "mode", mode.id, "gold", N.gold(), "x" .. N.multiplier(), if byPlanner then "(planner)" else "")
 		noclip(char)
 		local pos = N.myPos()
-		local okRoute = N.flyTo(Vector3.new(pos.X, N.CruiseY, pos.Z), mode.speed)
+		local okRoute = N.flyTo(Vector3.new(pos.X, N.CruiseY, pos.Z), speed)
 		for i, stage in ipairs(R.stages) do
 			if not okRoute then
 				break
 			end
 			local target = Vector3.new(stage.X, N.CruiseY, stage.Z)
 			setStatus(string.format("Flying: stage %d/%d (%s)", i, #R.stages, mode.id))
-			okRoute = N.flyTo(target, mode.speed)
+			okRoute = N.flyTo(target, speed)
 			if okRoute then
 				local before = N.credited()
+				local key = N.StageKeys[i]
 				if N.Run.stageSkip[i] and run.id % 20 ~= 0 then
 					okRoute = N.hold(target, mode.hold)
 				else
 					setStatus(string.format("Flying: stage %d/%d (%s), waiting for the server's credit", i, #R.stages, mode.id))
 					local t0 = os.clock()
+					-- The gate is THIS stage's own value: a late credit of the previous stage must not count (owner's log
+					-- 2026-10-06: 9/10 with misses=0). If the keys do not match the caves (3 stages credited by count only
+					-- in a run), the hub falls back to the count gate.
 					local got = N.touchHold(target, N.StageWait, function()
-						return N.credited() > before
+						if N.Run.countGate or not key then
+							return N.credited() > before
+						end
+						return N.stageHas(key)
 					end, Vector3.new(0, 0, -16))
+					if not got and not N.Run.countGate and key and N.credited() > before then
+						run.keyMismatch = (run.keyMismatch or 0) + 1
+						if run.keyMismatch >= 3 then
+							N.Run.countGate = true
+							log("STAGE gate", "count gate from now on (the stage values do not follow the cave order)")
+						end
+					end
 					okRoute = keepGoing()
 					if got then
 						N.Run.stageMiss[i] = 0
@@ -32468,7 +32526,7 @@ do
 		local chest = R.chest
 		if okRoute then
 			setStatus("Flying: down to the treasure chest (" .. mode.id .. ")")
-			okRoute = N.flyTo(Vector3.new(chest.X, N.CruiseY, chest.Z), mode.speed) and N.flyTo(chest, mode.speed)
+			okRoute = N.flyTo(Vector3.new(chest.X, N.CruiseY, chest.Z), speed) and N.flyTo(chest, speed)
 		end
 		if okRoute then
 			setStatus("At the chest: touching the treasure trigger")
@@ -32507,7 +32565,15 @@ do
 							N.settleStep()
 						end
 					end
-					N.resetChar("after the End (no wait for the game's respawn)")
+					-- The game kills the character 10.9 s after the End (owner's log: every run, a character reset earlier
+					-- respawns after 4.8 s and is killed anyway 6 s into its flight). So no early reset and no doomed run:
+					-- wait for the game's respawn (0.5 s), reset only when it does not come.
+					setStatus("At the chest: waiting for the game's respawn")
+					if not waitFor(function()
+						return N.char() ~= char or not N.alive() or not keepGoing()
+					end, 14) and keepGoing() then
+						N.resetChar("the game did not respawn 14 s after the End")
+					end
 				elseif keepGoing() then
 					log("RUN end not credited", string.format("in %.0fs at the chest", os.clock() - run.chestAt))
 					N.resetChar("no End")
@@ -32540,6 +32606,7 @@ do
 		end
 		local full = paid and ended and n >= math.max(9, N.Run.bestStages)
 		local refused = n < 5
+		N.speedLearn(run, full)
 		Session.runs += 1
 		Session.stages += n
 		Session.runGold += gold
