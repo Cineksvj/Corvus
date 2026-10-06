@@ -20186,8 +20186,8 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         Library.MinSize = Vector2.new(math.min(WindowInfo.MinContainerWidth, MaxX), Library.OriginalMinSize.Y)
     
         WindowInfo.Size = UDim2.fromOffset(
-            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, MaxX),
-            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, MaxY)
+            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, math.max(Library.MinSize.X, MaxX)),
+            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, math.max(Library.MinSize.Y, MaxY))
         )
         Library.MobileWindowSize = Vector2.new(WindowInfo.Size.X.Offset, WindowInfo.Size.Y.Offset)
         if typeof(WindowInfo.Font) == "EnumItem" then
@@ -33011,6 +33011,7 @@ function N.sellCrates()
 		end
 		local guid = tool:GetAttribute("InventoryKey")
 		local value = tonumber(tool:GetAttribute("Cash")) or 0
+		local before = N.cash()
 		local ok, tried = N.act("sellCrate", npc, 8, function()
 			N.equip(tool)
 			return guid and send("SellCrate", guid)
@@ -33020,6 +33021,11 @@ function N.sellCrates()
 		if ok then
 			sold += 1
 			Session.sold += 1
+			-- the crate tool carries no Cash attribute in the live game (sold cash stayed 0 for 94 crates): count the real cash delta
+			if value <= 0 then
+				task.wait(0.2)
+				value = math.max(N.cash() - before, 0)
+			end
 			Session.soldCash += value
 		elseif not tried then
 			break
