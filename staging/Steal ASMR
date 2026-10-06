@@ -33090,7 +33090,8 @@ do
 			if N.canSteal(nest) then
 				local T = N.runTime(nest.pos)
 				-- 5 % margin: an item only just above the weakest would never take its spot (same rule as placing).
-				local gain = nest.rate - floor * 1.05
+				-- Income starts after the egg has grown: value over one hour, grow time included.
+				local gain = nest.rate * (1 - math.min(N.growSeconds(nest.id), 3599) / 3600) - floor * 1.05
 				if floor > 0 and weakest and not N.replaceWorth(nest, weakest) then
 					gain = 0
 				end
@@ -34175,27 +34176,31 @@ do
 	end
 	-- What one more pad earns: the best item the plot would add (held spare, best open nest or the zone average).
 	function N.padItemRate()
-		local best = 0
+		local best, grow = 0, 0
 		for _, kind in ipairs({ "Item", "Egg" }) do
 			local e = N.inventory(kind)[1]
-			if e then
-				best = math.max(best, e.rate)
+			if e and e.rate > best then
+				best = e.rate
+				grow = if kind == "Egg" then N.growSeconds(e.id) else 0
 			end
 		end
-		local zone = N.bestZone()
-		best = math.max(best, N.zoneAvgRate(zone))
-		return best
+		local avg = N.zoneAvgRate(N.bestZone())
+		if avg > best then
+			-- A stolen drop is an egg: its income starts after the unbox time.
+			best, grow = avg, 240
+		end
+		return best, grow
 	end
 	function N.padPayback()
 		local pick = N.nextPad()
 		if not pick then
 			return nil
 		end
-		local rate = N.padItemRate()
+		local rate, grow = N.padItemRate()
 		if rate <= 0 then
 			return nil, pick
 		end
-		return pick.price / rate, pick
+		return pick.price / rate + grow, pick
 	end
 	-- The next purchase. Without the planner a toggle buys as soon as it is affordable; with it every buy must pay back:
 	-- pads within 24 h of their item's income, treadmill and trails within the training time they save.
