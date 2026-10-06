@@ -33829,6 +33829,48 @@ do
 		end
 		return total
 	end
+	-- Income gained per second of run in a zone with `cap` eggs in the bag.
+	local function zoneScore(zone, cap, power, live)
+		local values = {}
+		if live[zone] and #live[zone] > 0 then
+			for i = 1, math.min(cap, #live[zone]) do
+				table.insert(values, live[zone][i])
+			end
+		else
+			local avg = N.zoneEggValue(zone)
+			for _ = 1, cap do
+				table.insert(values, avg)
+			end
+		end
+		return improvement(values) / (N.drillTimeTo(zone, power) + travelSeconds(zone) + 2 * cap + 6)
+	end
+	-- Extra income/s per second of run that one more carry slot adds in the current best zone (carry payback basis).
+	function N.carryGain()
+		local zone = N.Plan.zone
+		if not zone then
+			return 0
+		end
+		local live = {}
+		for _, egg in ipairs(N.zoneEggs()) do
+			live[egg.zone] = live[egg.zone] or {}
+			table.insert(live[egg.zone], egg.value)
+		end
+		local power, cap = N.power(), N.carryCap()
+		return math.max(0, zoneScore(zone, cap + 1, power, live) - zoneScore(zone, cap, power, live))
+	end
+	-- Income per second a drill adds by unlocking farm slots (the next farm level needs drill number N).
+	local function drillSlotGain(id)
+		local level = tonumber(N.d().BaseLevel) or 0
+		if level >= 14 then
+			return 0
+		end
+		local need = N.expandNeed(level + 1)
+		local number = N.drillNumber(id) or tonumber(string.match(tostring(id), "%d+"))
+		if N.drillCap() >= need or not number or number < need then
+			return 0
+		end
+		return 2 * math.max(N.zoneEggValue(N.Plan.zone or "Common"), 0)
+	end
 	-- Best zone by income gained per second of run (drill + travel + steal).
 	function N.planZone()
 		local power = N.power()
@@ -33879,13 +33921,24 @@ do
 		-- animal upgrade pays back within an hour.
 		if def and def.Price and cash >= def.Price then
 			local ratio = (def.Strength or 0) / math.max(select(2, N.bestOwnedDrill()), 1)
-			if def.Price <= income * 7200 or not bestUp or bestUp.payback > 3600 then
+			-- The slots a drill unlocks (farm level) are income too: payback = price / slot income.
+			local slotGain = drillSlotGain(id)
+			local slotPays = slotGain > 0 and def.Price / slotGain <= horizon()
+			if slotPays or def.Price <= income * 7200 or not bestUp or bestUp.payback > 3600 then
 				return { kind = "drill", id = id, def = def, price = def.Price, say = string.format("%s for $%s (x%.1f Power)", def.Name, formatNumber(def.Price), ratio) }
 			end
 		end
 		-- Carry: one more egg every run; first when it costs at most 30 min of farm income.
 		local carryFirst = N.carryPrice()
-		if carryFirst and cash >= carryFirst and carryFirst <= income * 1800 then
+		-- Carry payback = price / average extra income/s over the horizon (each run adds permanent income: gain/s per
+		-- run-second x run share x horizon / 2); pays back inside a quarter of the horizon -> buy.
+		local runShare = Session.runSeconds / math.max(Session.runSeconds + Session.trainSeconds, 1)
+		if runShare <= 0 then
+			runShare = 0.5
+		end
+		local carryExtra = N.carryGain() * runShare * horizon() / 2
+		local carryPays = carryFirst and carryExtra > 0 and carryFirst / carryExtra <= horizon() / 4
+		if carryFirst and cash >= carryFirst and (carryPays or carryFirst <= income * 1800) then
 			return { kind = "carry", price = carryFirst, say = string.format("carry +1 egg for $%s (%s of income)", formatNumber(carryFirst), N.longTime(carryFirst / income)) }
 		end
 		if bestUp and bestUp.payback <= horizon() and cash >= bestUp.price then
@@ -33922,10 +33975,13 @@ do
 		local regrow = if rate > 0 then N.power() / rate else 0
 		local nextCfg = N.rebirthCfg(N.rebirths() + 1)
 		local gain = (nextCfg.CashMulti or 1) / math.max(N.cashMulti(), 1) - 1
-		if regrow <= 1800 or rate <= 0 then
+		-- Worth it when the regrow time stays small against what x money forever earns over the horizon (the animals keep
+		-- earning meanwhile, only the run depth drops): 30 min, or a quarter of the horizon scaled by the gain share.
+		local limit = math.max(1800, horizon() * 0.25 * gain / (1 + gain))
+		if regrow <= limit or rate <= 0 then
 			return true, string.format("Rebirth now: x%s money (+%d%%), Power regrows in %s", formatNumber(nextCfg.CashMulti), math.floor(gain * 100), N.longTime(regrow))
 		end
-		return false, string.format("Rebirth waits: Power regrow %s > 30m", N.longTime(regrow))
+		return false, string.format("Rebirth waits: Power regrow %s > %s", N.longTime(regrow), N.longTime(limit))
 	end
 	-- Run or train: a run when the best zone adds income, training otherwise.
 	function N.planMode()
