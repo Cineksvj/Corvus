@@ -32508,6 +32508,71 @@ do
 			setRoot(target)
 		end
 	end
+	-- Action speed ladder (SPEED_PLAN): Act(action, rungs) runs the fastest rung that works. rungs = { {name, fn}, ... };
+	-- fn returns true when the server's result was seen. Two rejects in 60 s degrade one rung for 10 minutes.
+	N.ActMem = {}
+	function N.Act(action, rungs)
+		local mem = N.ActMem[action]
+		if not mem then
+			mem = { idx = 1, rejects = {}, retryAt = 0 }
+			N.ActMem[action] = mem
+		end
+		if mem.idx > 1 and mem.retryAt > 0 and os.clock() >= mem.retryAt then
+			mem.idx, mem.retryAt = 1, 0
+			log("ACT retry", action, "via=" .. rungs[1][1])
+		end
+		local rung = rungs[math.min(mem.idx, #rungs)]
+		local ok, res = pcall(rung[2])
+		ok = (ok and res) and true or false
+		log("ACT", action, "via=" .. rung[1], ok and "ok" or "rejected")
+		if ok then
+			table.clear(mem.rejects)
+			return true
+		end
+		local now = os.clock()
+		table.insert(mem.rejects, now)
+		while #mem.rejects > 0 and now - mem.rejects[1] > 60 do
+			table.remove(mem.rejects, 1)
+		end
+		if #mem.rejects >= 2 and mem.idx < #rungs then
+			mem.idx += 1
+			mem.retryAt = now + 600
+			table.clear(mem.rejects)
+			log("ACT fallback", action, rung[1] .. " -> " .. rungs[mem.idx][1])
+			return N.Act(action, rungs)
+		end
+		return false
+	end
+	-- Rung 3: teleport hops of at most 30 studs. A snapback = back near the origin 0.35 s after a hop.
+	function N.hopTo(target, near)
+		near = near or 5
+		local pos = N.myPos()
+		if not pos then
+			return false
+		end
+		N.streamAround(target)
+		local guard = 0
+		while (pos - target).Magnitude > near and guard < 40 do
+			guard += 1
+			local origin = pos
+			local delta = target - pos
+			local step = math.min(delta.Magnitude, 30)
+			if not setRoot(pos + delta.Unit * step) then
+				return false
+			end
+			task.wait(0.35)
+			pos = N.myPos()
+			if not pos then
+				return false
+			end
+			if (pos - origin).Magnitude < 10 and step >= 15 then
+				snapback()
+				log("MOVE snapback hop", string.format("%.0f studs", step))
+				return false
+			end
+		end
+		return (pos - target).Magnitude <= near + 2
+	end
 end
 local Session = {
 	started = os.clock(),
@@ -32900,7 +32965,19 @@ do
 				tried[target.model] = true
 				N.Run.phase = "egg " .. target.name
 				setStatus("Taking " .. target.name .. " (" .. target.zone .. ", ~$" .. formatNumber(target.value) .. "/s)")
-				if N.moveTo(target.part.Position + Vector3.new(0, 2, 0), 5) then
+				local landing = target.part.Position + Vector3.new(0, 2, 0)
+				if N.Act("steal_move", {
+					{ "hop30", function()
+						local ok = N.hopTo(landing, 5)
+						if N.probeGet("hop_30") == nil then
+							N.probeSet("hop_30", if ok then "accepted" else "rejected", if ok then "egg trips by 30-stud hops" else "-")
+						end
+						return ok
+					end },
+					{ "tween", function()
+						return N.moveTo(landing, 5)
+					end },
+				}) then
 					local before = N.carrying()
 					pcall(function()
 						if fireproximityprompt then
@@ -33213,48 +33290,63 @@ do
 		if #list == 0 then
 			return false
 		end
-		local result = N.probeGet("collect_remote")
-		if result ~= "rejected" then
+		-- Ladder: (1) the pad remote from anywhere (probe collect_far), (2) firetouchinterest on the pad from here,
+		-- (3) tween to the pad and touch it.
+		local plot = N.plot()
+		local pads = plot and plot:FindFirstChild("CollectPads")
+		local function touchPads(move)
 			local cash = N.cash()
 			for _, item in ipairs(list) do
-				send("Collect Earnings", item.key)
+				local pad = pads and pads:FindFirstChild(item.key)
+				local top = pad and pad:FindFirstChild("Top")
+				if top then
+					if move then
+						setStatus("Collecting pad " .. item.key)
+						N.moveTo(top.Position + Vector3.new(0, 3, 0), 2)
+					end
+					pcall(function()
+						if firetouchinterest and N.root() then
+							firetouchinterest(N.root(), top, 0)
+							firetouchinterest(N.root(), top, 1)
+						end
+					end)
+					task.wait(if move then 0.7 else 0.15)
+				end
 			end
-			Session.collects += 1
-			if result == nil then
+			return waitFor(function()
+				return N.cash() > cash
+			end, 2.5)
+		end
+		local rungs = {}
+		if N.probeGet("collect_far") ~= "rejected" then
+			table.insert(rungs, { "remote", function()
+				local cash = N.cash()
+				for _, item in ipairs(list) do
+					send("Collect Earnings", item.key)
+				end
 				local ok = waitFor(function()
 					return N.cash() > cash
 				end, 3)
-				N.probeSet("collect_remote", if ok then "accepted" else "rejected", if ok then "no walking to the pads" else "-")
-				if not ok then
-					return false
+				if N.probeGet("collect_far") == nil then
+					N.probeSet("collect_far", if ok then "accepted" else "rejected", if ok then "no walking to the pads" else "-")
 				end
-			end
-			Session.collected += total
-			N.Collect.last = "Collected $" .. formatNumber(total)
-			return true
+				return ok
+			end })
 		end
-		if not atBase then
+		table.insert(rungs, { "touch", function()
+			return touchPads(false)
+		end })
+		if atBase or N.probeGet("collect_far") ~= "rejected" then
+			table.insert(rungs, { "tween", function()
+				return touchPads(true)
+			end })
+		end
+		if not N.Act("collect", rungs) then
 			return false
 		end
-		local plot = N.plot()
-		local pads = plot and plot:FindFirstChild("CollectPads")
-		for _, item in ipairs(list) do
-			local pad = pads and pads:FindFirstChild(item.key)
-			local top = pad and pad:FindFirstChild("Top")
-			if top then
-				setStatus("Collecting pad " .. item.key)
-				N.moveTo(top.Position + Vector3.new(0, 3, 0), 2)
-				pcall(function()
-					if firetouchinterest and N.root() then
-						firetouchinterest(N.root(), top, 0)
-						firetouchinterest(N.root(), top, 1)
-					end
-				end)
-				task.wait(0.7)
-			end
-		end
+		Session.collects += 1
 		Session.collected += total
-		N.Collect.last = "Collected $" .. formatNumber(total) .. " (pads)"
+		N.Collect.last = "Collected $" .. formatNumber(total)
 		return true
 	end
 	-- Equip Best: the game's own button puts the best inventory animals on the farm.
@@ -35196,7 +35288,7 @@ do
 		if (on("AutoExpand") or N.planner()) and choreDue("expand", 30) and N.expandStep() then
 			return true
 		end
-		if N.job("AutoCollect") and N.probeGet("collect_remote") == "rejected" and choreDue("collectPads", 60) and N.collectStep(true) then
+		if N.job("AutoCollect") and N.probeGet("collect_far") == "rejected" and choreDue("collectPads", 60) and N.collectStep(true) then
 			return true
 		end
 		return false
@@ -35276,7 +35368,7 @@ do
 		if N.job("AutoHatch") and choreDue("hatch", 3) then
 			N.hatchStep()
 		end
-		if N.job("AutoCollect") and N.probeGet("collect_remote") ~= "rejected" and choreDue("collect", 20) then
+		if N.job("AutoCollect") and N.probeGet("collect_far") ~= "rejected" and choreDue("collect", 20) then
 			N.collectStep(false)
 		end
 		if N.job("AutoEquipBest") and choreDue("equipBest", 30) then
