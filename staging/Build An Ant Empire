@@ -34416,25 +34416,32 @@ function N.planCandidates()
 	-- Trees: food x (1 + addition), next tree in the ladder.
 	if N.kindOn("Trees") then
 		local cur = N.treeId()
-		local nextId = cur + 1
-		local row = N.G.Trees["AppelTree" .. nextId]
-		if row and row.ConditionType == "Gold" then
-			local owned = math.floor(N.qnum("/属性/已解锁苹果树皮肤?属性数量", 0))
+		local owned = math.floor(N.qnum("/属性/已解锁苹果树皮肤?属性数量", 0))
+		local addNow = N.treeAdd(cur)
+		-- Scan the ladder above the equipped tree: a Robux/event tree must not block the Gold trees behind it, and an
+		-- owned tree is free to equip. Every reachable tree is a candidate (the plan sorts by payback).
+		for nextId = cur + 1, cur + 12 do
+			local row = N.G.Trees["AppelTree" .. nextId]
+			if not row then
+				break
+			end
 			local has = math.floor(owned / 2 ^ (nextId - 1)) % 2 == 1
-			local addNow, addNext = N.treeAdd(cur), tonumber(row.Addition) or 0
-			table.insert(list, {
-				kind = "Trees",
-				key = "tree",
-				name = tostring(row.Disname or ("Tree " .. nextId)),
-				cost = if has then 0 else math.max(tonumber(row.Num) or 0, 0),
-				dG = G * math.max(addNext - addNow, 0) / (1 + addNow),
-				exec = function()
-					if not has and not N.wk("/功能商人/解锁苹果树?购买", "__null__", "__null__", { nextId }) then
-						return false
-					end
-					return N.wk("/功能商人/装备苹果树?购买", "__null__", "__null__", { nextId })
-				end,
-			})
+			local addNext = tonumber(row.Addition) or 0
+			if (has or row.ConditionType == "Gold") and addNext > addNow then
+				table.insert(list, {
+					kind = "Trees",
+					key = "tree",
+					name = tostring(row.Disname or ("Tree " .. nextId)),
+					cost = if has then 0 else math.max(tonumber(row.Num) or 0, 0),
+					dG = G * (addNext - addNow) / (1 + addNow),
+					exec = function()
+						if not has and not N.wk("/功能商人/解锁苹果树?购买", "__null__", "__null__", { nextId }) then
+							return false
+						end
+						return N.wk("/功能商人/装备苹果树?购买", "__null__", "__null__", { nextId })
+					end,
+				})
+			end
 		end
 	end
 	-- Roll upgrades: luck (queen gated), queen, results per roll. Budget rule.
