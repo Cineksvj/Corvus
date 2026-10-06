@@ -31880,8 +31880,15 @@ end
 							local key = string.gsub(tostring(args[2]), "%d+", "<n>")
 							if Game.auto then
 								local low = string.lower(tostring(args[2]))
-								for _, word in ipairs({ "too fast", "slow down", "cooldown", "too far", "too many", "too quickly", "wait", "spam" }) do
-									if string.find(low, word, 1, true) then
+								local benign = string.find(low, "equip", 1, true) or string.find(low, "please wait", 1, true) or string.find(low, "cooldown", 1, true) or string.find(low, "boss", 1, true) or string.find(low, "locked", 1, true)
+									if benign then
+										if not NoticeSeen["ign:" .. key] then
+											NoticeSeen["ign:" .. key] = true
+											log("NOTICE ignored (not a danger signal): " .. tostring(args[2]))
+										end
+									end
+									for _, word in ipairs({ "too fast", "slow down", "too far", "too many", "too quickly", "spam" }) do
+									if not benign and string.find(low, word, 1, true) then
 										Game.auto.signal("notice: " .. string.sub(tostring(args[2]), 1, 60))
 										break
 									end
@@ -33161,7 +33168,7 @@ end
 				if to ~= from then
 					Auto.mode = to
 				end
-				Auto.why = "fell back from " .. from .. ": " .. tostring(reason)
+				Auto.why = (if string.find(tostring(reason), "kick", 1, true) then "after a disconnect" elseif string.find(tostring(reason), "instant catch", 1, true) or string.find(tostring(reason), "sea refused", 1, true) then "after refused catches" else "after a snapback or server warning")
 				log("MODE fallback " .. from .. " -> " .. Auto.mode .. " reason=" .. tostring(reason))
 				Auto.save()
 			end
@@ -33195,7 +33202,7 @@ end
 				if Auto.mode == "Blatant" then
 					return nil
 				end
-				return "Movement stepped down to " .. Auto.mode .. " (" .. Auto.why .. "), Blatant is retried in a few minutes"
+				return "Movement: " .. Auto.mode .. " for 10 min " .. tostring(Auto.why) .. ", then Blatant again"
 			end
 			task.spawn(function()
 				while alive() do
