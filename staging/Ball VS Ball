@@ -34620,11 +34620,11 @@ function N.collectionGain(newRate)
 	table.insert(rates, newRate)
 	return expectedBestOf3(rates) - now, now
 end
--- Coins kept back from spending: the slider, but the planner keeps at most 300 (nothing else in the game needs coins
+-- Coins kept back from spending: the slider, but the planner keeps none (nothing else in the game needs coins
 -- and a balance only risks the audit bound).
 function N.reserve()
 	local reserve = optionNumber("CoinReserve", 1000)
-	return if N.planner() then math.min(reserve, 300) else reserve
+	return if N.planner() then 0 else reserve
 end
 -- What Smart Buy would do now: {kind="shop"|"crate", ...} or nil and why not.
 function N.nextBuy()
@@ -34844,7 +34844,7 @@ function N.planTick()
 		if g then string.format(" | copies: upgrade 6 %s %s", N.ballName(g.itemId), g.kind) else ""
 	)
 	local key = string.gsub(line, "%d+", "#")
-	if key ~= P.lastLine or os.clock() - P.lineAt > 60 then
+	if P.lineAt == nil or (key ~= P.lastLine and os.clock() - P.lineAt > 15) or os.clock() - P.lineAt > 60 then
 		P.lastLine = key
 		P.lineAt = os.clock()
 		log("PLAN", line)
