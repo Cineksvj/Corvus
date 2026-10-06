@@ -31663,6 +31663,13 @@ do
 	function alive()
 		return not INSTANCE.stop and Env.BlueLockFarmInstance == INSTANCE and not Library.Unloaded
 	end
+	local setIdentity = setthreadidentity or set_thread_identity or setidentity or (syn and syn.set_thread_identity)
+	function N.fixIdentity()
+		if setIdentity then
+			pcall(setIdentity, 8)
+		end
+	end
+	N.fixIdentity()
 	UIQueue = { list = {} }
 	function UIQueue.push(fn)
 		if #UIQueue.list < 200 then
@@ -35682,11 +35689,38 @@ do
 		end
 		return Library.ActiveTab == nil or Library.ActiveTab == tab
 	end
+	local UiLater, uiMoved = {}, false
+	pcall(function()
+		Library:GiveSignal(RunService.Heartbeat:Connect(function()
+			if #UiLater == 0 then
+				return
+			end
+			local queue = UiLater
+			UiLater = {}
+			for _, fn in ipairs(queue) do
+				pcall(fn)
+			end
+		end))
+	end)
 	task.spawn(function()
 		local uiErrorAt = -1e9
 		local function group(fn)
+			N.fixIdentity()
 			local ok, err = xpcall(fn, debug.traceback)
-			if not ok and os.clock() - uiErrorAt > 30 then
+			if ok then
+				return
+			end
+			if string.find(tostring(err), "lacking capability", 1, true) then
+				if #UiLater < 20 then
+					table.insert(UiLater, fn)
+				end
+				if not uiMoved then
+					uiMoved = true
+					log("UI thread lost its rights, UI updates now run on the frame thread")
+				end
+				return
+			end
+			if os.clock() - uiErrorAt > 30 then
 				uiErrorAt = os.clock()
 				log("ERROR", "ui", string.sub(tostring(err), 1, 300))
 			end
