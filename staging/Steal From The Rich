@@ -31651,7 +31651,7 @@ pcall(function()
 Library:Notify({ Title = Title, Description = Text, Time = Time or 3 })
 end)
 end
-local Log = { lines = {}, start = os.clock(), flushedAt = os.clock() - 25, once = {}, file = "Corvus_SFTR_" .. LocalPlayer.Name .. "_log.txt" }
+local Log = { lines = {}, start = os.clock(), flushedAt = os.clock() - 25, once = {}, problems = {}, problemCount = 0, file = "Corvus_SFTR_" .. LocalPlayer.Name .. "_log.txt" }
 local function log(...)
 local parts = table.pack(...)
 for i = 1, parts.n do
@@ -31662,6 +31662,13 @@ pcall(function()
 stamp = os.date("%H:%M:%S")
 end)
 local line = string.format("[%s +%7.1fs] %s", stamp, os.clock() - Log.start, table.concat(parts, " ", 1, parts.n))
+if parts[1] == "PROBLEM" or parts[1] == "ERROR" then
+Log.problemCount += 1
+local short = string.sub(table.concat(parts, " ", 1, parts.n), 1, 120)
+if #Log.problems < 12 and not table.find(Log.problems, short) then
+table.insert(Log.problems, short)
+end
+end
 if #line > 420 then
 line = string.sub(line, 1, 420) .. "..."
 end
@@ -34245,7 +34252,7 @@ local rate, n, total, count = Night.measure(60)
 if rate then
 Night.rate = rate
 end
-log("NIGHT start", string.format("value_rate=%s", if rate then string.format("%.1f", rate) else "?"), "mult=" .. Night.mult, "crates=" .. tostring(count), "matched=" .. n, "remaining=" .. math.floor(total) .. "s", "cycle=" .. (if Night.cycle then math.floor(Night.cycle) .. "s" else "?"))
+log("NIGHT start", string.format("value_rate=%s", if rate then string.format("%.1f", rate) else "n/a (no crate timers to measure)"), "mult=" .. Night.mult, "crates=" .. tostring(count), "matched=" .. n, "remaining=" .. math.floor(total) .. "s", "cycle=" .. (if Night.cycle then math.floor(Night.cycle) .. "s" else "n/a (first night seen)"))
 end)
 else
 if Night.startedAt then
@@ -34263,7 +34270,7 @@ local rate, n = Night.measure(60)
 if rate then
 Night.dayRate = rate
 end
-log("NIGHT end", string.format("value_rate=%s day", if rate then string.format("%.2f", rate) else "?"), "night_rate=" .. (if Night.rate then string.format("%.1f", Night.rate) else "?"), "len=" .. (if Night.len then math.floor(Night.len) .. "s" else "?"), "share=" .. (if Night.share then string.format("%.3f", Night.share) else "?"), "matched=" .. n, "confirmed=" .. tostring(Night.confirmed()))
+log("NIGHT end", string.format("value_rate=%s day", if rate then string.format("%.2f", rate) else "n/a") .. "", "night_rate=" .. (if Night.rate then string.format("%.1f", Night.rate) else "n/a"), "len=" .. (if Night.len then math.floor(Night.len) .. "s" else "n/a"), "share=" .. (if Night.share then string.format("%.3f", Night.share) else "n/a"), "matched=" .. n, "confirmed=" .. tostring(Night.confirmed()))
 end)
 end
 end
@@ -38905,32 +38912,13 @@ local stamp = ""
 pcall(function()
 stamp = os.date("%Y-%m-%d %H:%M:%S")
 end)
-add("Corvus Steal From The Rich log | " .. LocalPlayer.Name .. " | executor " .. executor)
-add(string.format("written %s | hub running %dh %02dm | place %s", stamp, elapsed // 3600, (elapsed % 3600) // 60, tostring(game.PlaceId)))
-add("status: " .. tostring(Status))
-local enabled = {}
-for _, name in ipairs(AllAutoToggles) do
-if on(name) then
-table.insert(enabled, name)
-end
-end
-add("running toggles: " .. (if #enabled > 0 then table.concat(enabled, ", ") else "none"))
+add("Corvus debug log  |  Steal From The Rich")
+add(string.format("Player %s (@%s)  |  executor %s  |  place %s  |  %s", LocalPlayer.DisplayName, LocalPlayer.Name, executor, tostring(game.PlaceId), stamp))
 add(
 string.format(
-"money $%s | income $%s/s | speed level %s | treadmill level %s | best trail x%s | added slots %s | carrying %s | on treadmill %s",
-formatNumber(money()),
-formatNumber(LocalPlayer:GetAttribute("IncomePerSecond") or 0),
-formatNumber(LocalPlayer:GetAttribute("SpeedLevel") or 0),
-tostring(LocalPlayer:GetAttribute("TreadmillLevel")),
-tostring(Plan.mult()),
-tostring(LocalPlayer:GetAttribute("AddedSlots")),
-tostring(carrying()),
-tostring(onTreadmill())
-)
-)
-add(
-string.format(
-"session: stolen %d | placed %d | opened %d | sold %d for $%s | bought %d | orbs %d | made $%s",
+"Session %dh %02dm  |  stolen %d, placed %d, opened %d  |  sold %d, earned $%s  |  bought %d, orbs %d, made $%s",
+elapsed // 3600,
+(elapsed % 3600) // 60,
 Session.stolen,
 Session.placed,
 Session.opened,
@@ -38939,6 +38927,27 @@ formatNumber(Session.earned),
 Session.bought,
 Session.orbs,
 formatNumber(Session.made or 0)
+)
+)
+add("Status: " .. tostring(Status))
+local enabled = {}
+for _, name in ipairs(AllAutoToggles) do
+if on(name) then
+table.insert(enabled, name)
+end
+end
+add("Running: " .. (if #enabled > 0 then table.concat(enabled, ", ") else "none"))
+add(
+string.format(
+"Game: money $%s | income $%s/s | speed level %s | treadmill level %s | best trail x%s | added slots %s | carrying %s | on treadmill %s",
+formatNumber(money()),
+formatNumber(LocalPlayer:GetAttribute("IncomePerSecond") or 0),
+formatNumber(LocalPlayer:GetAttribute("SpeedLevel") or 0),
+tostring(LocalPlayer:GetAttribute("TreadmillLevel")),
+tostring(Plan.mult()),
+tostring(LocalPlayer:GetAttribute("AddedSlots")),
+tostring(carrying()),
+tostring(onTreadmill())
 )
 )
 add(
@@ -38963,6 +38972,7 @@ add("best buy: " .. (if Plan.target then string.format("%s %s for $%s (gain/$ %.
 add("schedule: " .. Sched.info .. " | now " .. (if Sched.training then "training" else "stealing"))
 add("storm: " .. (if stormActive() then "ON" else "off") .. " | storm points " .. formatNumber(tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0))
 add("admin: " .. (if Admin.describe() ~= "" then Admin.describe() else "none") .. " | event game " .. tostring(on("AutoEventGame")) .. " | hop " .. tostring(on("EventHop")) .. " | phrases " .. tostring(on("AutoAdminPhrases")))
+add("Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"))
 add(string.rep("-", 70))
 return table.concat(out, "\n")
 end
@@ -39190,10 +39200,12 @@ last.best = now
 task.spawn(placeBest)
 end
 if floor and now > last.upgrade then
-if on("AutoBuySlot") and now > last.slot and Remotes.re_PLOT_UPGRADE and Plan.slotOk() then
+if on("AutoBuySlot") and now > last.slot and Plan.slotOk() then
 tryUpgrade("slot", function()
 return tostring(LocalPlayer:GetAttribute("AddedSlots")) .. "/" .. tostring(LocalPlayer:GetAttribute("UnlockedPlotSlots"))
-end, Remotes.re_PLOT_UPGRADE, floor, true)
+end, { FireServer = function()
+fire("bs_upgrade")
+end })
 elseif
 on("AutoUpgradePlot")
 and now > last.plot
