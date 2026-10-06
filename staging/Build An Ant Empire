@@ -32677,7 +32677,7 @@ end
 N.Harvest = { at = -1e9, interval = 3.1, gained = 0, expected = 0, windowAt = os.clock(), lowWindows = 0, lastPile = nil, say = "", fallbacks = 0 }
 function N.claimPace()
 	if on("FastHarvest") or N.planner() then
-		return if optionText("HarvestSpeed", "Blatant (3 s)") == "Fast (5 s)" then 5 else N.Harvest.interval
+		return N.Harvest.interval
 	end
 	return 12
 end
@@ -32762,17 +32762,6 @@ function N.harvestMeasure(total)
 	H.say = string.format("%s food/min (%d%% of the claims)", formatNumber(H.gained / span * 60), math.floor(ratio * 100))
 	if on("FastHarvest") or N.planner() then
 		log("HARVEST", "ants", #N.equipped(), "every", string.format("%.1fs", N.claimPace()), "food/min", formatNumber(H.gained / span * 60), "expected/min", formatNumber(H.expected / span * 60), string.format("ratio %.2f", ratio))
-		if (on("AutoCollect") or N.planner()) and H.expected > 0 and ratio < 0.5 and optionText("HarvestSpeed", "Blatant (3 s)") ~= "Fast (5 s)" then
-			H.lowWindows += 1
-			if H.lowWindows >= 2 and H.interval < 6 then
-				H.interval = math.min(H.interval + 0.4, 6)
-				H.lowWindows = 0
-				H.fallbacks += 1
-				log("HARVEST fallback", string.format("every %.1fs", H.interval))
-			end
-		else
-			H.lowWindows = 0
-		end
 	end
 	H.gained, H.expected, H.windowAt = 0, 0, os.clock()
 end
@@ -34726,7 +34715,7 @@ function N.upNext()
 		table.insert(lines, "Roll: " .. N.Roll.last)
 	end
 	if auto or on("AutoUpgrades") then
-		table.insert(lines, "Planner: " .. (if N.Plan.spendText ~= "" then N.Plan.spendText else "measuring"))
+		table.insert(lines, "Planner: " .. (if N.Plan.spendText ~= "" then N.Plan.spendText else "choosing the next buy"))
 	end
 	if on("AutoEvents") or auto then
 		table.insert(lines, "Events: " .. (N.activity() or "none now") .. (if N.Event.last ~= "-" then ", " .. N.Event.last else ""))
@@ -34870,13 +34859,7 @@ do
 		HarvestBox:AddToggle("FastHarvest", {
 			Text = "Fast Harvest",
 			Default = false,
-			Tooltip = "Claims the food of every ant every 3 s (the server's own cooldown) instead of waiting for each ant's walk to the tree. About 4x food. Measures itself and slows down only if the server stops paying",
-		})
-		HarvestBox:AddDropdown("HarvestSpeed", {
-			Text = "Harvest Speed",
-			Values = { "Blatant (3 s)", "Fast (5 s)" },
-			Default = "Blatant (3 s)",
-			Tooltip = "Blatant: every 3 s, the server's per-ant cooldown (default). Fast: every 5 s",
+			Tooltip = "Claims the food of every ant every 3 s (the server's own cooldown) instead of waiting for each ant's walk to the tree. About 4x food.",
 		})
 		HarvestBox:AddToggle("AutoCollect", {
 			Text = "Auto Collect Food",
@@ -34893,7 +34876,7 @@ do
 		SellBox:AddSlider("SellPrice", { Text = "Sell At Price", Default = 1.8, Min = 0.5, Max = 2, Rounding = 2, Tooltip = "1.8 = about 1 price window in 8 (every 2.5 min), +52% gold per food against selling at a random time. 0.5 sells at every price" })
 		SellBox:AddToggle("SellBlackMarket", { Text = "Sell At The Black Market", Default = true, Tooltip = "While the Black Market event is open: goes to its seller, sells everything at 2.5 per food and comes back" })
 		SellBox:AddToggle("HoldForMarket", { Text = "Hold Food For The Black Market", Default = true, Tooltip = "When the next event is the Black Market, keeps the food for it (at most 15 min)" })
-		SellBox:AddDropdown("MoveMode", { Text = "Movement", Values = { "Teleport (Fast)", "Walk (Safe)" }, Default = "Teleport (Fast)", Tooltip = "How Corvus reaches the Black Market, event coins and the dungeon entrance. The game has no movement check, Teleport is the default" })
+		SellBox:AddDropdown("MoveMode", { Text = "Movement", Values = { "Teleport (Fast)", "Walk" }, Default = "Teleport (Fast)", Tooltip = "How Corvus reaches the Black Market, event coins and the dungeon entrance. The game has no movement check, Teleport is the default" })
 		Labels.Sell = SellBox:AddLabel({ Text = "-", DoesWrap = true })
 		local RollBox = Tabs.Farm:AddLeftGroupbox("Roll Ants", "dices")
 		RollBox:AddToggle("AutoRoll", { Text = "Auto Roll", Default = false, Tooltip = "Rolls every 3 s (the server's roll timer, from anywhere) and buys the results worth it, then equips the best ants" })
@@ -35253,7 +35236,7 @@ do
 	function Debug.perfText()
 		local last = Perf.last
 		if not last then
-			return "still measuring"
+			return "collecting data"
 		end
 		return string.format(
 			"fps %d, worst frame %dms, hitches %d, freezes %d, Corvus used %dms in %ds (%.2f%%), ping %sms, memory %sMB",
@@ -36178,7 +36161,7 @@ do
 				)
 				local upNext = N.upNext()
 				I.plan = if #upNext > 0 then "<b>Up next</b>\n" .. '<font transparency="0.2">\u{2022} ' .. table.concat(upNext, "\n\u{2022} ") .. "</font>" else "Up next: nothing running"
-				I.harvest = string.format("%d ants, %s food per round\nClaims every <b>%.1f s</b>%s\n%s", #eq, formatNumber(foodSum), N.claimPace(), if N.Harvest.fallbacks > 0 then " (slowed down " .. N.Harvest.fallbacks .. "x)" else "", if N.Harvest.say ~= "" then N.Harvest.say else "measuring")
+				I.harvest = string.format("%d ants, %s food per round\nClaims every <b>%.1f s</b>%s\n%s", #eq, formatNumber(foodSum), N.claimPace(), "", if N.Harvest.say ~= "" then N.Harvest.say else "starting")
 				I.sell = string.format(
 					"Price now <b>%s</b> (x%s bonus)%s\nLast: %s\nSold %d times, avg %.2f, Black Market %d",
 					if N.Price.base then string.format("%.2f", N.Price.base) else "?",
