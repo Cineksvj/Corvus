@@ -33729,7 +33729,7 @@ if type(name) ~= "string" or typeof(position) ~= "Vector3" then
 return nil
 end
 local private = cfg:GetAttribute("PrivateTo")
-if private and private ~= LocalPlayer.UserId then
+if private and tostring(private) ~= tostring(LocalPlayer.UserId) then
 return nil
 end
 local weight = tonumber(cfg:GetAttribute("Weight")) or 1
@@ -33771,11 +33771,13 @@ function N.worldEggs()
 local folder = activeEggsFolder()
 local list = {}
 for _, cfg in ipairs(folder and folder:GetChildren() or {}) do
-local info = eggInfo(cfg)
-if info and not eggClaimed(cfg, info.name) then
+local info = if cfg:GetAttribute("TutorialEgg") == true then nil else eggInfo(cfg)
+if cfg:GetAttribute("TutorialEgg") == true then
+-- handled by N.tutorialRun, never by the farm
+elseif info and not eggClaimed(cfg, info.name) then
 table.insert(list, info)
-elseif not EggDiag[cfg] and N.anyAuto and N.anyAuto() then
-EggDiag[cfg] = true
+elseif os.clock() - (EggDiag[cfg.Name] or -1e9) > (if info then 600 else 60) and N.anyAuto and N.anyAuto() then
+EggDiag[cfg.Name] = os.clock()
 if info then
 log("EGG skipped as already claimed this cycle", info.name, "cycle", tostring(cfg:GetAttribute("Cycle")), "claimed", tostring(claimedCycles()[info.name]))
 else
@@ -39325,6 +39327,484 @@ return true
 end
 return false
 end
+-- Tutorial autopilot (2026-10-06): the game's own Onboarding script (PlayerGui.Onboarding, ReplicatedStorage.Remotes.Tutorial.Step)
+-- fires every Tutorial/Step itself once the world state matches, so Corvus only recreates the state a human would:
+-- ride the snail, stand at Rick, open his shop, buy the Advanced Radar, use it, carry the private tutorial egg home,
+-- place it, place the snail, collect cash, buy one luck upgrade, hatch the final egg. State-driven, so it resumes anywhere.
+do
+local T = { stage = 0, cur = nil, since = 0, warned = 0, lastAct = -1e9, safe = false, done = {}, logged = {}, picked = {}, skip = {}, reply = nil, petTry = 0, walkCollect = false, started = false }
+N.Tut = T
+N.onEvent("Game/EggPickup", function(kind, a)
+T.reply = { kind = kind, a = a }
+end, true)
+local function findTool(pred)
+for _, tool in ipairs(N.allTools()) do
+if pred(tool) then
+return tool
+end
+end
+return nil
+end
+local function snailTool()
+return findTool(function(t)
+return t:GetAttribute("PetKey") == "TUTORIAL_Snail"
+end) or findTool(function(t)
+return N.hasTag(t, "Pet") and t:GetAttribute("PetKey") ~= nil
+end)
+end
+local function radarTool()
+return findTool(function(t)
+return t.Name == "Advanced Radar"
+end)
+end
+local function eggTool()
+return findTool(function(t)
+return t:GetAttribute("EggInventoryId") ~= nil or N.hasTag(t, "Egg")
+end)
+end
+local function radarRunning()
+return string.find(tostring(N.playerAttr("RunningRadars") or ""), "Advanced Radar", 1, true) ~= nil or #N.radarTargets() > 0
+end
+local function placedEgg()
+local name = N.playerAttr("TutorialRareEggName")
+for _, model in ipairs(N.plotEggModels()) do
+if name == nil or model.Name == name then
+return model
+end
+end
+return nil
+end
+local function stageNow()
+local s = 0
+if N.isRiding() then
+s = 1
+end
+if radarTool() then
+s = math.max(s, 4)
+end
+if radarRunning() then
+s = math.max(s, 5)
+end
+if N.playerAttr("TutorialRareEggFound") == true or #N.basketItems() > 0 then
+s = math.max(s, 6)
+end
+if eggTool() then
+s = math.max(s, 7)
+end
+if placedEgg() then
+s = math.max(s, 8)
+end
+if #N.plotPets() > 0 then
+s = math.max(s, 10)
+end
+if N.playerAttr("TutorialFinalEggKey") ~= nil or N.playerAttr("TutorialFinalEggResolved") == true then
+s = math.max(s, 12)
+end
+if N.playerAttr("TutorialFinalEggHatched") == true then
+s = 13
+end
+return s
+end
+local function rickTorso()
+local stalls = workspace:FindFirstChild("Stalls")
+local gears = stalls and stalls:FindFirstChild("Gears")
+local rick = gears and gears:FindFirstChild("Rick")
+return rick and (rick:FindFirstChild("Torso") or rick:FindFirstChild("HumanoidRootPart"))
+end
+local function shopOpen()
+local gui = LocalPlayer:FindFirstChild("PlayerGui")
+local main = gui and gui:FindFirstChild("Main")
+local shop = main and main:FindFirstChild("Shop")
+local holders = shop and shop:FindFirstChild("Holders")
+local gears = holders and holders:FindFirstChild("Gears")
+return shop ~= nil and shop.Visible == true and gears ~= nil and gears.Visible == true
+end
+local function nearRick(limit)
+local torso, root = rickTorso(), rootPart()
+return torso ~= nil and root ~= nil and flat(torso.Position, root.Position) <= limit
+end
+local function tutorialEggs()
+local list = {}
+local serverData = ReplicatedStorage:FindFirstChild("ServerData")
+local folder = (serverData and serverData:FindFirstChild("ActiveEggs")) or ReplicatedStorage:FindFirstChild("ActiveEggs")
+for _, cfg in ipairs(folder and folder:GetChildren() or {}) do
+if cfg:GetAttribute("TutorialEgg") == true then
+local private = cfg:GetAttribute("PrivateTo")
+local pos = cfg:GetAttribute("Position")
+if (private == nil or tostring(private) == tostring(LocalPlayer.UserId)) and typeof(pos) == "Vector3" and not T.picked[cfg.Name] and os.clock() >= (T.skip[cfg.Name] or 0) then
+table.insert(list, { id = cfg.Name, pos = pos, name = tostring(cfg:GetAttribute("Egg")), dropEndsAt = tonumber(cfg:GetAttribute("DropEndsAt")) or 0 })
+end
+end
+end
+return list
+end
+local function go(target)
+return N.travelTo(target, { mode = if T.safe then "Safe" else nil })
+end
+local Phases = {}
+local function phase(id, step, name, text, done, act, gap)
+table.insert(Phases, { id = id, step = step, name = name, text = text, done = done, act = act, gap = gap or 2 })
+end
+phase("A", 5, "ride the snail", "Getting on your snail", function()
+return T.stage >= 1
+end, function()
+local tool = snailTool()
+if not tool then
+setStatus("Tutorial: waiting for the game to hand you the snail")
+return
+end
+if not T.logged.snail then
+T.logged.snail = true
+log("TUTORIAL step 1 snail received done")
+end
+if not N.equipTool(tool) then
+return
+end
+fire("Game/Mounting")
+waitFor(N.isRiding, 3)
+end, 3)
+phase("B", 6, "walk to the gear shop", "Walking to Rick's gear shop", function()
+return T.stage >= 4 or T.done.B == true
+end, function()
+if nearRick(20) then
+T.done.B = true
+return
+end
+local torso = rickTorso()
+if not torso then
+setStatus("Tutorial: looking for the gear shop")
+return
+end
+go((torso.CFrame * CFrame.new(0, 0, -7)).Position)
+end, 2)
+phase("C", 7, "open Rick's shop", "Opening Rick's shop", function()
+return T.stage >= 4 or T.done.C == true or shopOpen()
+end, function()
+if shopOpen() then
+T.done.C = true
+return
+end
+local torso = rickTorso()
+if torso and not nearRick(18) then
+go((torso.CFrame * CFrame.new(0, 0, -7)).Position)
+end
+local prompt = torso and torso:FindFirstChildWhichIsA("ProximityPrompt")
+if prompt and type(fireproximityprompt) == "function" then
+pcall(fireproximityprompt, prompt)
+elseif not T.logged.noprompt then
+T.logged.noprompt = true
+log("TUTORIAL no way to press Rick's prompt (fireproximityprompt missing or prompt not found)")
+end
+task.wait(1)
+if not shopOpen() and os.clock() - T.since > 20 then
+local gui = LocalPlayer:FindFirstChild("PlayerGui")
+local main = gui and gui:FindFirstChild("Main")
+local shop = main and main:FindFirstChild("Shop")
+local ui = ReplicatedStorage:FindFirstChild("UIController")
+if shop and ui then
+pcall(function()
+require(ui).open(shop)
+end)
+end
+end
+end, 3)
+phase("D", 8, "buy the Advanced Radar", "Buying the Advanced Radar", function()
+return T.stage >= 4
+end, function()
+fire("Game/BuyWithCash", "Gears", "Advanced Radar")
+waitFor(function()
+return radarTool() ~= nil
+end, 2)
+end, 3)
+phase("E", 9, "use the radar", "Using the radar", function()
+return T.stage >= 5
+end, function()
+local tool = radarTool()
+if not tool then
+return
+end
+if N.isRiding() then
+N.dismount()
+end
+if not N.equipTool(tool) then
+return
+end
+fire("Game/ActivateRadar")
+task.wait(0.6)
+fire("Game/RadarState")
+waitFor(radarRunning, 2)
+N.unequipTools()
+end, 3)
+phase("F", 10, "pick up the tutorial egg", "Picking up the tutorial egg", function()
+return T.stage >= 6
+end, function()
+local list = tutorialEggs()
+local egg = list[1]
+if not egg then
+setStatus("Tutorial: waiting for the tutorial egg to appear")
+return
+end
+if serverNow() < egg.dropEndsAt then
+return
+end
+local root = rootPart()
+if not root then
+return
+end
+N.watchBasket()
+if (root.Position - egg.pos).Magnitude > 12 then
+go(egg.pos + Vector3.new(0, 3, 0))
+end
+local before = #N.basketItems()
+T.reply = nil
+fire("Game/EggPickup", egg.id)
+waitFor(function()
+return #N.basketItems() > before or T.reply ~= nil
+end, 3)
+if #N.basketItems() > before or (T.reply and T.reply.kind == "PickedUp") then
+T.picked[egg.id] = true
+log("TUTORIAL picked", egg.name, egg.id)
+elseif T.reply then
+T.skip[egg.id] = os.clock() + 6
+log("TUTORIAL egg pickup answered", tostring(T.reply.kind), tostring(T.reply.a))
+end
+end, 2)
+phase("G", 11, "bring the egg to the plot", "Bringing the egg home", function()
+return T.stage >= 7
+end, function()
+if #N.basketItems() == 0 then
+return
+end
+N.dismount()
+N.deliverBasket()
+end, 1)
+phase("H", 12, "place the egg", "Placing the egg", function()
+return T.stage >= 8
+end, function()
+local tool = eggTool()
+if not tool then
+setStatus("Tutorial: waiting for the egg in your backpack")
+return
+end
+local plot = N.myPlot()
+if not plot or plot:GetAttribute("NestsOwnerLoaded") ~= LocalPlayer.UserId then
+return
+end
+N.dismount()
+if N.playerAttr("NoNest") == true then
+local spot = N.plotSpot(0, 0)
+if not spot then
+return
+end
+go(spot)
+if N.equipTool(tool) then
+fire("Game/EggPlaced", { PlantPosition = spot - Vector3.new(0, N.hrpOffset() + 0.3, 0) + Vector3.new(3, 0, 0) })
+waitFor(function()
+return N.toolGone(tool) or placedEgg() ~= nil
+end, 3)
+end
+else
+local pick
+for _, entry in ipairs(N.nestList()) do
+if entry.unlocked and not entry.occupied then
+pick = entry
+break
+end
+end
+if not pick then
+setStatus("Tutorial: no free nest yet")
+return
+end
+local ok, pivot = pcall(function()
+return pick.nest:GetPivot().Position
+end)
+local base = N.baseplate()
+if not ok or not base then
+return
+end
+local center = base.Position
+local away = Vector3.new(center.X - pivot.X, 0, center.Z - pivot.Z)
+local offset = if away.Magnitude > 0.5 then away.Unit * 4 else Vector3.new(4, 0, 0)
+go(Vector3.new(pivot.X, base.Position.Y + base.Size.Y / 2, pivot.Z) + offset + Vector3.new(0, N.hrpOffset() + 0.3, 0))
+if N.equipTool(tool) then
+fire("Game/EggPlaced", { NestId = pick.nest.Name })
+waitFor(function()
+local occupied = pick.nest:GetAttribute("Occupied")
+return (occupied ~= nil and occupied ~= false) or N.toolGone(tool)
+end, 3)
+end
+end
+N.unequipTools()
+end, 2)
+phase("J", 14, "place the snail on the plot", "Placing your snail on the plot", function()
+return T.stage >= 10
+end, function()
+local tool = snailTool()
+if not tool or not N.baseplate() then
+return
+end
+N.dismount()
+T.petTry += 1
+local offsets = { { 0, 0 }, { 14, 0 }, { -14, 0 }, { 0, 12 }, { 0, -12 }, { 14, 12 }, { -14, -12 } }
+local o = offsets[(T.petTry - 1) % #offsets + 1]
+local spot = N.plotSpot(o[1], o[2])
+if not spot then
+return
+end
+go(spot)
+if not N.equipTool(tool) then
+return
+end
+local root = rootPart()
+local drop = root and (root.CFrame * CFrame.new(0, 0, -5)).Position or spot
+local before = #N.plotPets()
+fire("Game/PlacePet", tool:GetAttribute("PetKey"), drop)
+waitFor(function()
+return tool.Parent == nil or #N.plotPets() > before
+end, 3)
+N.unequipTools()
+end, 3)
+phase("K", 15, "collect cash from the pet", "Collecting cash from your pet", function()
+return T.stage >= 12 or T.done.K == true
+end, function()
+if T.cash0 == nil then
+T.cash0 = N.cash()
+end
+if N.cash() > T.cash0 then
+T.done.K = true
+return
+end
+local pets = N.plotPets()
+if #pets == 0 then
+return
+end
+if not T.walkCollect and not N.RC.dead then
+N.remoteCollect(pets)
+if N.RC.dead then
+N.RC.dead = false
+N.RC.fails = 0
+T.walkCollect = true
+end
+else
+local base = N.baseplate()
+for _, pet in ipairs(pets) do
+local ok, pos = pcall(function()
+return pet.item:GetPivot().Position
+end)
+if ok and pos then
+local ground = if base then base.Position.Y + base.Size.Y / 2 else pos.Y
+go(Vector3.new(pos.X, ground + N.hrpOffset() + 0.3, pos.Z))
+N.holdStill(0.35)
+end
+end
+end
+if N.cash() > T.cash0 then
+T.done.K = true
+end
+end, 3)
+phase("L", 16, "buy one luck upgrade", "Buying a luck upgrade", function()
+return T.stage >= 12 or T.done.L == true
+end, function()
+if T.up0 == nil then
+T.up0 = N.luckUpgrades()
+end
+if N.luckUpgrades() > T.up0 then
+T.done.L = true
+return
+end
+if (tonumber(N.savedValue("FreeHatchUpgrades")) or 0) > 0 then
+fire("Plot/Upgrades", "MaxFree")
+else
+fire("Plot/Upgrades")
+end
+if waitFor(function()
+return N.luckUpgrades() > T.up0
+end, 2) then
+T.done.L = true
+end
+end, 3)
+phase("M", 17, "hatch the final egg", "Hatching the final egg", function()
+return T.stage >= 13
+end, function()
+local key = N.playerAttr("TutorialFinalEggKey")
+if key == nil or N.playerAttr("TutorialFinalEggResolved") ~= true then
+setStatus("Tutorial: waiting for the final egg")
+return
+end
+local model
+for _, m in ipairs(N.plotEggModels()) do
+if m:GetAttribute("EggKey") == key then
+model = m
+break
+end
+end
+if not model then
+return
+end
+if N.playerAttr("TutorialHatchLocked") == true then
+local locked = N.playerAttr("TutorialLockedEggKey")
+if locked == nil or locked == key then
+setStatus("Tutorial: the final egg is still locked")
+return
+end
+end
+local left = N.eggGrowth(model)
+if left ~= nil and left > 0.5 then
+setStatus(string.format("Tutorial: the final egg hatches in %ds", math.ceil(left)))
+return
+end
+fire("Game/Hatch", { EggKey = key })
+waitFor(function()
+return N.playerAttr("TutorialFinalEggHatched") == true
+end, 3)
+end, 3)
+-- one pass per call: finds the first phase that is not done and runs its action; the main loop calls this again
+function N.tutorialRun()
+if not T.started then
+T.started = true
+log("TUTORIAL start, the game's own tutorial is played by Corvus", "stage", stageNow())
+end
+T.stage = math.max(T.stage, stageNow())
+for index, ph in ipairs(Phases) do
+if ph.done() then
+if not T.logged[ph.id] then
+T.logged[ph.id] = true
+T.count = (T.count or 0) + 1
+log("TUTORIAL step " .. ph.step .. " " .. ph.name .. " done")
+end
+else
+if T.cur ~= ph then
+T.cur = ph
+T.since = os.clock()
+T.warned = 0
+T.lastAct = -1e9
+end
+setStatus(string.format("Tutorial %d/%d: %s", index, #Phases, ph.text))
+if os.clock() - T.since >= 60 * (T.warned + 1) then
+T.warned += 1
+T.safe = true
+N.unequipTools()
+log(string.format("TUTORIAL stuck step=%s %s for %ds, retrying with safe moves", tostring(ph.step), ph.name, T.warned * 60))
+end
+if os.clock() - T.lastAct >= ph.gap then
+T.lastAct = os.clock()
+local ok, err = xpcall(ph.act, debug.traceback)
+if not ok then
+log("ERROR", "tutorial " .. ph.name, tostring(err))
+end
+end
+task.wait(0.25)
+return
+end
+end
+if not T.logged.final then
+T.logged.final = true
+log("TUTORIAL complete, waiting for the game to mark it finished")
+end
+setStatus("Tutorial finished, starting the Smart Planner")
+task.wait(1)
+end
+end
 task.spawn(function()
 while alive() do
 local ok, err = xpcall(function()
@@ -39336,7 +39816,11 @@ setStatus("Waiting for your character")
 return
 end
 if N.tutorialActive() then
-setStatus("Finish the game's tutorial first, Corvus starts right after")
+if N.anyAuto() then
+N.tutorialRun()
+else
+setStatus("Tutorial not done yet: switch on the Smart Planner and Corvus plays it for you")
+end
 return
 end
 if not N.myPlot() then
