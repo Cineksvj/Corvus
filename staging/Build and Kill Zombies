@@ -32744,7 +32744,12 @@ function N.gainPerSec(a, b)
 	if oldIndex > 0 then
 		distGain = newIndex / oldIndex - 1
 	elseif newIndex > 0 then
-		distGain = 1
+		-- the part that makes a broken car run: worth the income of the car it completes (own model from the new
+		-- build's distance, never above the measured rate of an earlier, better car): no overpay for a cheap rebuild
+		local g = N.aggregates(b)
+		local _, d = N.carScore(g)
+		local own = d * 0.4 * 1.3 / (g.FuelTime + 12)
+		return math.min(math.max(rate, 1), math.max(own, 0.5))
 	else
 		-- bootstrap: a car that cannot run yet. Each missing piece (seat, engine, fuel, wheels) that this change
 		-- supplies is worth a quarter of the first working car.
@@ -35967,7 +35972,7 @@ do
 		if N.wants("AutoBuild") and choreDue("build", 1.5) then
 			N.buildStep()
 		end
-		if (on("AutoSkills") or on("AutoEventShop") or N.planner()) and choreDue("spend", 3) then
+		if (on("AutoSkills") or on("AutoEventShop") or N.planner()) and choreDue("spend", 2) then
 			N.spendStep()
 		end
 		N.rewardStep()
