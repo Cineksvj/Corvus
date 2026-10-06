@@ -32640,6 +32640,16 @@ do
 		local ok, req = pcall(CF.Required, def)
 		return if ok and type(req) == "number" and req > 0 then req else nil
 	end
+	-- Seconds one hook keeps the cast open: the spacing between hooks plus, for fish with a fight, the sequential fight
+	-- (required clicks at 10 per second in Blatant, 7 at the legit pace; castOnce waits exactly this). Cast time is money:
+	-- the planner's income per second prices every one of these seconds.
+	function N.hookSeconds(name, boss)
+		local req = N.fightRequired(name, boss)
+		if N.fishMode() == "blatant" then
+			return 0.11 + (if req then req / 10 + 0.15 else 0)
+		end
+		return 0.6 + (if req then req / 7 + 0.4 else 0)
+	end
 	-- The pier (the world's Interactable.Throw area). The server takes a cast only inside it or on a stopped boat.
 	function N.throwArea()
 		local folder = N.worldFolder()
@@ -32795,11 +32805,21 @@ do
 			if on("IndexHunt") and type(index) == "table" and not index[name] then
 				value = value * 1.5 + 1
 			end
-			table.insert(fish, { index = i, name = name, value = value, fight = N.fightRequired(name, boss) })
+			table.insert(fish, { index = i, name = name, value = value, fight = N.fightRequired(name, boss), boss = boss })
+		end
+		-- Value per second (planner): a hook is worth its sell value minus what its seconds cost at the current income rate
+		-- (spacing + fight). Fish are ranked by that net, the ones below zero stay in the water (the cast simply ends sooner),
+		-- bosses and the index hunt are never skipped. Without the planner: plain best value first, like the game's client.
+		local rate = if N.planner() then N.incomeRate() else 0
+		if rate > 1 then
+			for _, f in ipairs(fish) do
+				f.net = f.value - rate * N.hookSeconds(f.name, f.boss)
+			end
 		end
 		table.sort(fish, function(x, y)
-			if x.value ~= y.value then
-				return x.value > y.value
+			local a, b = x.net or x.value, y.net or y.value
+			if a ~= b then
+				return a > b
 			end
 			return x.index < y.index
 		end)
@@ -32808,7 +32828,11 @@ do
 			table.insert(picks, { index = #school + k, special = true, name = if type(special) == "table" then tostring(special.Name or special.name or "special") else tostring(special) })
 		end
 		for i = 1, math.min(cap, #fish) do
-			table.insert(picks, fish[i])
+			local f = fish[i]
+			if f.net and f.net <= 0 and not f.boss and #picks > 0 then
+				break
+			end
+			table.insert(picks, f)
 		end
 		return picks, fish
 	end
@@ -33667,6 +33691,30 @@ do
 		if sellable == 0 then
 			return false
 		end
+		-- Priced like every purchase (cast model): the cheapest fish fed (about `Goal`, 10 when unknown) against the +5% luck
+		-- (the smaller of its two steps) it buys over the planner's horizon; a backpack of only expensive fish is not fed.
+		if N.planner() and N.castModel and N.due("bigMouthPrice", 120) then
+			local base = N.castModel()
+			local up = N.castModel({ extraLuck = 0.05 })
+			if base and up then
+				local values = {}
+				for _, item in pairs(N.inv()) do
+					if type(item) == "table" and item.Type == "Fish" and not N.isLocked(item) and not N.relicOf(item) then
+						table.insert(values, N.value(item))
+					end
+				end
+				table.sort(values)
+				local cost = 0
+				for i = 1, math.min(#values, math.max(tonumber(bm.Goal) or 0, 10)) do
+					cost += values[i]
+				end
+				local worth = (up / base - 1) * N.incomeRate() * 3600 * math.max(N.Plan.horizon or 12, 1)
+				if cost > worth then
+					log("BIGMOUTH skipped", "cost=" .. formatNumber(cost), "luck gain over the horizon=" .. formatNumber(worth))
+					return false
+				end
+			end
+		end
 		N.pauseFishing("Big Mouth")
 		local back = N.worldKey()
 		if back ~= "World 1" and not N.travel("World 1") then
@@ -33853,20 +33901,59 @@ do
 			worth = prev.w
 		end
 		local now = os.clock()
-		table.insert(E.samples, { t = now, w = worth })
+		table.insert(E.samples, { t = now, w = worth, c = Session.casts, v = Session.castValue })
 		while #E.samples > 2 and now - E.samples[1].t > 900 do
 			table.remove(E.samples, 1)
 		end
 		local first, last = E.samples[1], E.samples[#E.samples]
 		if last.t - first.t >= 60 then
 			E.rate = math.max((last.w - first.w) / (last.t - first.t), 0)
+			E.cps = math.max((last.c - first.c) / (last.t - first.t), 0)
+			if E.cps > 0 and N.castModel then
+				local _, info = N.castModel()
+				if info then
+					local seen = math.clamp(1 / E.cps - info.cycle, 0.3, 30)
+					E.overhead = if E.overhead then E.overhead * 0.7 + seen * 0.3 else seen
+				end
+			end
+		end
+		-- Realised cast value / what the cast model says the current setup is worth (size, mutation and event luck of the
+		-- real catches): an exponential average over the last casts, so a purchase changes the model side at once.
+		local prevS = E.samples[#E.samples - 1]
+		if prevS and N.castScale then
+			local dc, dv = last.c - prevS.c, last.v - prevS.v
+			local scale, model = N.castScale()
+			if dc > 0 and model and model > 0 and scale > 0 then
+				E.rhoNum = (E.rhoNum or 0) * 0.9 + dv
+				E.rhoDen = (E.rhoDen or 0) * 0.9 + scale * model * dc
+			end
 		end
 	end
 	function N.spent(amount)
 		E.spent += tonumber(amount) or 0
 	end
+	-- Expected income per second = realised/modelled value ratio x modelled cast value x measured casts per second. The
+	-- measured worth slope still rules before the model or the cast pace exist, and it stays a cross-check: a one-off x10
+	-- relic sale or a lull never again decides a payback (a measured 15K/s from one relic sale kept the planner from buying
+	-- for 20 minutes, then fell to 2.6K/s). Without a cast pace the live cast value / cycle stands in.
+	function N.expectedRate()
+		if os.clock() - (E.expAt or -1e9) < 3 then
+			return E.exp
+		end
+		E.expAt, E.exp = os.clock(), nil
+		local scale, model = N.castScale()
+		if model and model > 0 and (E.cps or 0) > 0 and (E.rhoDen or 0) > 0 then
+			local rho = math.clamp(E.rhoNum / E.rhoDen, 0.3, 5)
+			E.exp = rho * scale * model * E.cps
+		end
+		return E.exp
+	end
 	function N.incomeRate()
-		return math.max(E.rate, 1)
+		local r = N.expectedRate() or E.rate
+		if r <= 0 and N.Fish.cycle > 0 and N.Fish.evCast > 0 then
+			r = N.Fish.evCast / N.Fish.cycle
+		end
+		return math.max(r, 1)
 	end
 	-- Rod stats on the current world (older world rods keep RodStep^(worlds behind), WorldsConfig.RodFactor).
 	local function rodPower(name)
@@ -33908,12 +33995,317 @@ do
 		end
 		return if level <= 0 then 0.05 else 0.02
 	end
-	-- Every purchase Corvus could make now: {kind, name, price, frac, payback (h)}.
+	-- CAST MODEL (valuation core, 2026-10-06): one function that replays the server's own throw maths (dump 188350-188730)
+	-- for a hypothetical state and returns the expected value of one cast in base-price units:
+	--   luck   = ((1 + rodLuck x rodFactor + bait + level + referral + big mouth + enchant) x skin x gamepass + potion) x ServerLuck
+	--   dist   = quality x 25 x StrengthMult x (1 + rod strength) x (1 + enchant), capped 11700, plus the Bounce skip
+	--            (chance x gain, capped at 11700)
+	--   depth  = log2(dist x WeightMult x (1 + bait weight) / 60 + 1) x 30 + 26 + enchant
+	--   school = clamp(floor(max(hooks x 1.5, (depth - 26) / 5.5) + 0.5), 3, 56), hooks = Capacity + HookSlots + potion
+	--   fish odds = Fish:SpawnWeights(luck, world, depth, depthScale) (the game's own rarity x depth x luck weights);
+	--   the hub keeps the best `hooks` of the school, so a cast = min(hooks, school) x mean of the top hooks/school share.
+	-- Every purchase is valued by its effect on this number: Capacity (hooks), Strength/Weight/Bounce (depth, so rarity),
+	-- rods and bait (luck, distance, depth), the next world (its fish table with the upgrades it would start with). The
+	-- model is a RATIO tool (cast after / cast before); N.castScale turns it into coins. Missing pieces fall back to 0/1 and
+	-- a missing Fish module returns nil (the planner then uses the older flat shares).
+	local function try(f, default, ...)
+		local ok, v = pcall(f, ...)
+		if ok and v ~= nil then
+			return v
+		end
+		return default
+	end
+	-- Species by sell price, best first (rebuilt per call: a few dozen species, cheaper than a stale cache).
+	local function fishOrder(Fish)
+		local list = {}
+		for name, def in pairs(Fish.Items) do
+			if type(def) == "table" and tonumber(def.SellPrice) and def.SellPrice > 0 then
+				table.insert(list, { name = name, price = def.SellPrice })
+			end
+		end
+		table.sort(list, function(a, b)
+			return a.price > b.price
+		end)
+		return list
+	end
+	local function baseBait()
+		local baits = N.sh("Content.Item.Bait")
+		local defs = baits and baits.Items
+		local best
+		if type(defs) == "table" then
+			for name, n in pairs(N.tab("ActiveBaits")) do
+				local def = defs[name]
+				if (tonumber(n) or 0) > 0 and def and (not best or (tonumber(def.Luck) or 0) > (tonumber(best.Luck) or 0)) then
+					best = def
+				end
+			end
+		end
+		return best or false
+	end
+	-- Landing flight of a cast (the server's mapping of the logical distance, dump 188431-188440) and the time its arc takes
+	-- (Arc module, dump 190624-190677). A cast lasts about arc + dive + return + the hub's own overhead, so a deeper or
+	-- farther setup is worth its richer fish divided by the longer cycle.
+	local function flightOf(dist)
+		local d = math.max(dist, 0)
+		return math.min(if d < 110 then d ^ 2 * 0.03540353338991906 else d ^ 0.975 * 4.38, 40546.68244059479)
+	end
+	local function arcTime(mag)
+		local function timeFor(apex)
+			local v = math.max(apex, 0) * 2 / (36.4 * (1 + math.max(apex, 0) / 1000))
+			return math.max(math.sqrt(v) * 2, 0.45)
+		end
+		local function solved(m)
+			local apex = 0.045 * math.max(m, 0)
+			return timeFor(math.max(apex / (1 + (apex / 420) ^ 3) ^ (1 / 3), 8))
+		end
+		if mag > 6000 then
+			return math.min(solved(6000) * (mag / 6000) ^ 0.11, 8)
+		end
+		return solved(mag)
+	end
+	-- over = { world = key, rod = name, bait = def | false, levels = { Stat = level }, extraLuck = n, quality = n }
+	function N.castModel(over)
+		over = over or {}
+		local d = N.data()
+		local U, Wc = cfg("UpgradesConfig"), cfg("WorldsConfig")
+		local Fish, Rods = N.sh("Content.Item.Fish"), N.sh("Content.Item.Rod")
+		if not (U and Wc and type(Fish) == "table" and type(Fish.Items) == "table" and type(Fish.SpawnWeights) == "function") then
+			return nil
+		end
+		local key = over.world or (N.bestFishingWorld())
+		local wdef = type(Wc.Worlds) == "table" and Wc.Worlds[key]
+		if not wdef then
+			return nil
+		end
+		local effect = tonumber(wdef.UpgradeEffect) or 1
+		local levels = try(U.LevelsFor, {}, d, key)
+		local function lv(stat)
+			if over.levels and over.levels[stat] then
+				return over.levels[stat]
+			end
+			return tonumber(levels[stat]) or 0
+		end
+		local rodName = over.rod or d.RodEquipped or "Wooden Rod"
+		local rdef = type(Rods) == "table" and type(Rods.Items) == "table" and Rods.Items[rodName] or {}
+		local home = math.max(N.worldNumber(rdef.RequiredWorld or "World 1"), if rdef.FullPowerThrough then N.worldNumber(rdef.FullPowerThrough) else 0)
+		local factor = try(Wc.RodFactor, 1, home, tonumber(wdef.WorldNumber) or 1)
+		local bait = over.bait
+		if bait == nil then
+			bait = baseBait()
+		end
+		local baitLuck = if bait then tonumber(bait.Luck) or 0 else 0
+		local baitWeight = if bait then tonumber(bait.Weight) or 0 else 0
+		local Enchant = N.sh("Modules.Enchant")
+		local function ench(effect2)
+			return tonumber(try(function()
+				return Enchant.Add(d, effect2)
+			end, 0)) or 0
+		end
+		local luckSum = (tonumber(rdef.Luck) or 0) * factor / 100 + baitLuck / 100
+			+ try(function()
+				return cfg("LevelConfig").LuckForLevel(N.level()) / 100
+			end, 0)
+			+ try(function()
+				return cfg("ReferralConfig").LuckFor(d)
+			end, 0)
+			+ try(function()
+				return cfg("BigMouthConfig").LuckFor(d)
+			end, 0)
+			+ ench("Luck") + (over.extraLuck or 0)
+		local skin = try(function()
+			return cfg("SkinBoostConfig").WornMultiplier(d, "Luck")
+		end, 1)
+		local gamepass = try(function()
+			return cfg("LuckConfig").MultiplierFor(type(d.Gamepasses) == "table" and d.Gamepasses or {})
+		end, 1)
+		local potion = try(function()
+			return cfg("PotionConfig").LuckBonus(d)
+		end, 0)
+		local luck = ((1 + luckSum) * skin * gamepass + potion) * (tonumber(workspace:GetAttribute("ServerLuck")) or 1)
+		local quality = over.quality or (if N.fishMode() == "blatant" then 2 else 1.8)
+		local dist = math.min(quality * 25 * U.StrengthMultiplier(lv("Strength"), effect) * (1 + (tonumber(rdef.Strength) or 0) * factor / 100) * (1 + ench("Distance")), 11700)
+		local bounceLevel = lv("Bounce")
+		local pBounce = try(function()
+			return U.BounceChance(bounceLevel, effect)
+		end, 0) * (if quality >= 2 then 1 elseif quality >= 1.5 then 0.5 else 0)
+		local gBounce = try(function()
+			return U.BounceGain(bounceLevel, effect)
+		end, 0)
+		dist += pBounce * math.min(dist * gBounce, math.max(11700 - dist, 0))
+		local depth = math.log(dist * U.WeightMultiplier(lv("Weight"), effect) * (baitWeight / 100 + 1) / 60 + 1, 2) * 30 + 26 + ench("Depth")
+		local hooks = U.CapacityValue(lv("Capacity"), effect, key) + ench("HookSlots") + math.floor(try(function()
+			return cfg("PotionConfig").Bonus(d, "Capacity")
+		end, 0))
+		local school = math.clamp(math.floor(math.max(hooks * 1.5, (depth - 26) / 5.5) + 0.5), 3, 56)
+		local ok, weights, total = pcall(Fish.SpawnWeights, Fish, luck, tonumber(wdef.WorldNumber) or 1, depth, tonumber(wdef.DepthScale) or 1)
+		if not (ok and type(weights) == "table" and tonumber(total) and total > 0) then
+			return nil
+		end
+		-- Exact expected value of the best k fish of `school` independent draws (the hub keeps the best `hooks`): with the
+		-- species sorted by price, species j fills min(N<=j, k) - min(N<j, k) of the k slots, N ~ Binomial(school, F_j), and
+		-- E[min(N, k)] = sum over m = 1..k of P(N >= m). A plain "mean of the top share" would ignore the luck of the draw.
+		local n, k = school, math.min(hooks, school)
+		local function slots(F)
+			if F <= 0 then
+				return 0
+			elseif F >= 1 then
+				return k
+			end
+			local q = 1 - F
+			local pmf, ratio = q ^ n, F / q
+			local cdf, acc = 0, 0
+			for m = 1, k do
+				cdf += pmf
+				acc += 1 - cdf
+				pmf = pmf * (n - (m - 1)) / m * ratio
+			end
+			return acc
+		end
+		local sum, cumulative, before, hookTime = 0, 0, 0, 0
+		for _, e in ipairs(fishOrder(Fish)) do
+			local w = weights[e.name]
+			if w and w > 0 then
+				cumulative += w / total
+				local now = slots(cumulative)
+				sum += e.price * (now - before)
+				hookTime += (now - before) * N.hookSeconds(e.name, false)
+				before = now
+			end
+		end
+		if sum <= 0 then
+			return nil
+		end
+		local mag = flightOf(dist)
+		local cycle = arcTime(mag) + math.clamp(depth / 70, 0.15, 1) + math.clamp(mag / 3810, 1, 3) + hookTime
+		return sum, { luck = luck, dist = dist, depth = depth, hooks = hooks, school = school, cycle = cycle }
+	end
+	-- Coins per model unit: the game's own sell multiplier (gamepass, index, enchant) on the cheapest fish, without a
+	-- server CashBoost; plus the base model value.
+	function N.castScale()
+		local base = N.castModel()
+		local scale = 1
+		pcall(function()
+			local Fish = N.sh("Content.Item.Fish")
+			local list = fishOrder(Fish)
+			local e = list[#list]
+			local v = N.value({ Type = "Fish", Name = e.name, Data = { Size = 1 } })
+			local boost = math.max(tonumber(workspace:GetAttribute("ServerCash")) or 1, 1)
+			if v > 0 and e.price > 0 then
+				scale = v / boost / e.price
+			end
+		end)
+		return scale, base
+	end
+	-- Upgrade levels a world would start with after its cheap first steps (the unlock then buys 10% of its price in
+	-- upgrades at once: W2 Strength 500K/1M, Weight 1M ...): greedy cheapest next step within the budget.
+	local function catchUp(key, budget)
+		local U = cfg("UpgradesConfig")
+		local cur = try(U.LevelsFor, {}, N.data(), key)
+		local lvls = {}
+		for _, stat in ipairs(U.Order) do
+			lvls[stat] = tonumber(cur[stat]) or 0
+		end
+		local spent = 0
+		while true do
+			local pickStat, pickPrice
+			for _, stat in ipairs(U.Order) do
+				local ok, price = pcall(function()
+					if lvls[stat] < U.MaxLevelFor(stat, key) then
+						return U.GetPrice(stat, lvls[stat], key)
+					end
+					return nil
+				end)
+				if ok and price and price > 0 and spent + price <= budget and (not pickPrice or price < pickPrice) then
+					pickStat, pickPrice = stat, price
+				end
+			end
+			if not pickStat then
+				break
+			end
+			lvls[pickStat] += U.StepFor(pickStat, key)
+			spent += pickPrice
+		end
+		return lvls, spent
+	end
+	-- Planning horizon in hours: what is left of the current 24 h window (with a 10% margin), never under 6 h (the account
+	-- keeps playing after the mark, the window just rolls over).
+	function N.horizon()
+		return math.max((24 - ((os.clock() - Session.started) / 3600) % 24) * 0.9, 6)
+	end
+	-- Every purchase Corvus could make now: {kind, name, price, g, frac, payback (h), paybackNow (h)}.
+	--   g       = share of income it adds right now: the cast model's rate ratio after / before, rate = cast value / cycle
+	--             (arc + dive + return + hook and fight seconds + the hub's measured overhead);
+	--   frac    = its share averaged over the planning horizon H. The upgrades are PER WORLD (the next world starts from its own
+	--             levels), so while a world move is planned (unlocked in tW hours) an upgrade only works for min(tW, H);
+	--             a rod keeps working in the new world at that world's rod factor and the new world pays m = 1 + fracWorld
+	--             times the income, so its gain after the move counts m times: frac = (g x min(tW,H) + gPost x m x (H - tW)) / H;
+	--   payback = price / (rate x frac), the number the "best payback" ordering and the horizon test use; it is the real
+	--             payback only when nothing is planned (frac = g); paybackNow = price / (rate x g) is the plain payback today.
 	function N.candidates()
 		local d = N.data()
 		local out = {}
 		local rate = N.incomeRate()
 		local U = cfg("UpgradesConfig")
+		local base, baseInfo = N.castModel()
+		local _, bestNumber = N.bestFishingWorld()
+		local overhead = E.overhead or 1.5
+		local H = N.horizon()
+		-- Income ratio after / before: cast value per cycle (arc + dive + return + hook/fight seconds + the hub's overhead).
+		local function perCycle(c, info)
+			return c / (info.cycle + overhead)
+		end
+		local function gain(over)
+			if not (base and base > 0) then
+				return nil
+			end
+			local c, info = N.castModel(over)
+			return if c then math.max(perCycle(c, info) / perCycle(base, baseInfo) - 1, 0) else nil
+		end
+		local worldCand, worldRate, worldLvls
+		if N.planner() or on("AutoWorlds") then
+			local W = cfg("WorldsConfig")
+			for key, w in pairs(W and type(W.Worlds) == "table" and W.Worlds or {}) do
+				if not w.NoFishing and tonumber(w.WorldNumber) == bestNumber + 1 and not N.unlocked(key) and N.level() >= (tonumber(w.RequiredLevel) or 1) then
+					local price = tonumber(w.UnlockPrice) or 0
+					local frac, extra = 5, 0
+					if base then
+						-- The new world's fish table with the upgrades it starts with and the best owned rod there.
+						local lvls, spent = catchUp(key, price * 0.1)
+						local bestRate
+						for name in pairs(N.tab("Rods")) do
+							local c, info = N.castModel({ world = key, rod = name, levels = lvls })
+							if c and (not bestRate or perCycle(c, info) > bestRate) then
+								bestRate = perCycle(c, info)
+							end
+						end
+						if not bestRate then
+							local c, info = N.castModel({ world = key, levels = lvls })
+							bestRate = if c then perCycle(c, info) else nil
+						end
+						if bestRate then
+							frac, extra = math.clamp(bestRate / perCycle(base, baseInfo) - 1, 0.2, 1000), spent
+							worldRate, worldLvls = bestRate, lvls
+						end
+					end
+					worldCand = { kind = "world", name = key, price = price, cost = price + extra, g = frac, frac = frac, persist = true, key = key }
+					table.insert(out, worldCand)
+				end
+			end
+		end
+		-- Hours until the planned world is paid for (cash plus the backpack it can sell at once).
+		local tW, mW
+		if worldCand then
+			local funds = N.cash() + N.backpackValue() * 0.95
+			tW = math.max(worldCand.price - funds, 0) / rate / 3600 + 0.02
+			mW = 1 + worldCand.g
+			worldCand.eta = tW
+		end
+		local function averaged(g, gPost)
+			if not tW then
+				return g
+			end
+			return (g * math.min(tW, H) + gPost * mW * math.max(H - tW, 0)) / H
+		end
 		if U and type(U.Order) == "table" and (N.planner() or on("AutoUpgrades")) then
 			local key = "World 1"
 			pcall(function()
@@ -33926,8 +34318,12 @@ do
 						return lv, U.MaxLevelFor(stat, key), U.GetPrice(stat, lv, key)
 					end)
 					if ok and level < max and price and price > 0 then
-						local frac = statGain(U, stat, level, key)
-						table.insert(out, { kind = "upgrade", name = stat, price = price, frac = frac })
+						local step = 1
+						pcall(function()
+							step = U.StepFor(stat, key)
+						end)
+						local g = gain({ world = key, levels = { [stat] = level + step } }) or statGain(U, stat, level, key)
+						table.insert(out, { kind = "upgrade", name = stat, price = price, g = g, frac = averaged(g, 0), persist = false })
 					end
 				end
 			end
@@ -33935,40 +34331,55 @@ do
 		local rods = N.sh("Content.Item.Rod")
 		if rods and type(rods.Items) == "table" and (N.planner() or on("AutoRods")) then
 			local curL, curS = rodPower(d.RodEquipped or "Wooden Rod")
-			local _, bestNumber = N.bestFishingWorld()
 			local owned = N.tab("Rods")
 			for name, def in pairs(rods.Items) do
 				local price = tonumber(def.Price) or 0
 				local need = N.worldNumber(def.RequiredWorld or "World 1")
 				if not owned[name] and price > 0 and not def.MazeOnly and not def.CaveOnly and need <= bestNumber then
-					local l, s = rodPower(name)
-					local frac = (l - curL) / (100 + curL) * 0.8 + (s - curS) / (100 + curS) * 0.4
-					if frac > 0.005 then
-						table.insert(out, { kind = "rod", name = name, price = price, frac = frac })
+					local g = gain({ rod = name })
+					if not g then
+						local l, s = rodPower(name)
+						g = (l - curL) / (100 + curL) * 0.8 + (s - curS) / (100 + curS) * 0.4
+					end
+					if g > 0.005 then
+						-- After the move: the rod's rate in the new world against the best rod already owned there.
+						local gPost = 0
+						if worldRate then
+							local c, info = N.castModel({ world = worldCand.key, rod = name, levels = worldLvls })
+							if c then
+								gPost = math.max(perCycle(c, info) / worldRate - 1, 0)
+							end
+						end
+						table.insert(out, { kind = "rod", name = name, price = price, g = g, frac = averaged(g, gPost), persist = gPost > 0.01 })
 					end
 				end
 			end
 		end
-		if N.planner() or on("AutoWorlds") then
-			local _, bestNumber = N.bestFishingWorld()
-			local W = cfg("WorldsConfig")
-			for key, w in pairs(W and type(W.Worlds) == "table" and W.Worlds or {}) do
-				if not w.NoFishing and tonumber(w.WorldNumber) == bestNumber + 1 and not N.unlocked(key) and N.level() >= (tonumber(w.RequiredLevel) or 1) then
-					-- Fish base prices jump x100-x1000 per world: the unlock is worth several times today's income.
-					table.insert(out, { kind = "world", name = key, price = tonumber(w.UnlockPrice) or 0, frac = 5 })
-				end
-			end
-		end
 		if N.wants("AutoPond") and not N.unlocked("Pond") and N.level() >= 5 then
-			table.insert(out, { kind = "world", name = "Pond", price = 25000, frac = 0.15 })
+			table.insert(out, { kind = "world", name = "Pond", price = 25000, g = 0.15, frac = 0.15, persist = true })
 		end
 		for _, c in ipairs(out) do
-			c.payback = c.price / math.max(rate * c.frac, 1e-6) / 3600
+			c.payback = (c.cost or c.price) / math.max(rate * c.frac, 1e-6) / 3600
+			c.paybackNow = (c.cost or c.price) / math.max(rate * c.g, 1e-6) / 3600
 		end
 		table.sort(out, function(a, b)
 			return a.payback < b.payback
 		end)
 		return out
+	end
+	-- While the planner saves for the next world (cost C, in tW hours): another purchase X goes first only when it gets the
+	-- world bought SOONER. Time to buy world after X now: (need + pX) / (r (1 + gX)); without X: need / r, plus, for a rod that
+	-- keeps working after the move, the time to buy it after the world: pX / (r m). Both then run at the same rate, so the
+	-- earlier finish wins. For a per-world upgrade this is exactly "pays back before the world arrives"; for a rod it also
+	-- credits the gain it keeps in the new world.
+	function N.beatsWorld(c, world, funds, rate)
+		local need = math.max(world.price - funds, 0)
+		local without = need / rate
+		if c.persist then
+			without += c.price / (rate * (1 + world.g))
+		end
+		local with = (need + c.price) / (rate * (1 + c.g))
+		return with < without
 	end
 	-- Offline net (OfflineNet "Buy": cash is the only server check, no NPC needed, 186038): one World 1 fish every
 	-- SecondsPerFish (quality 1.5), up to MaxFish, claimed by Auto Rewards (Offline) every 2 minutes. Whether the net also
@@ -34157,7 +34568,7 @@ do
 		P.list = list
 		-- A purchase must pay back before the current 24 h window ends (with a 10% margin), so late buys never cost
 		-- more than they return.
-		local horizon = math.max((24 - ((os.clock() - Session.started) / 3600) % 24) * 0.9, 0.5)
+		local horizon = N.horizon()
 		P.horizon = horizon
 		if N.planner() then
 			-- Spare-cash perk: an offline net level that costs at most 0.2% of the cash on hand (never the reserve).
@@ -34185,9 +34596,18 @@ do
 				else
 					P.need = best
 					P.eta = math.max(best.price - funds, 0) / N.incomeRate() / 3600
+					-- Saving for a world: another purchase goes first only when it gets the world bought sooner (beatsWorld).
+					-- Saving for anything else: only when it pays back before the best could be afforded.
 					local limit = math.min(P.eta, horizon)
+					local rate = N.incomeRate()
 					for _, c in ipairs(list) do
-						if c ~= best and c.payback <= limit then
+						local goesFirst
+						if best.kind == "world" and best.cost then
+							goesFirst = c.price < best.price and N.beatsWorld(c, best, funds, rate)
+						else
+							goesFirst = c.paybackNow <= limit
+						end
+						if c ~= best and goesFirst then
 							if cash >= c.price then
 								pick = c
 								break
@@ -34208,8 +34628,8 @@ do
 			if key ~= P.lastKey or os.clock() - P.lastAt > 60 then
 				P.lastKey, P.lastAt = key, os.clock()
 				local parts = {}
-				for i = 1, math.min(3, #list) do
-					table.insert(parts, string.format("%s %s %s payback %.1fh", list[i].kind, list[i].name, formatNumber(list[i].price), list[i].payback))
+				for i = 1, math.min(5, #list) do
+					table.insert(parts, string.format("%s %s %s payback %.1fh (today %.1fh, +%d%%)", list[i].kind, list[i].name, formatNumber(list[i].price), list[i].payback, list[i].paybackNow or list[i].payback, math.floor((list[i].g or 0) * 100)))
 				end
 				log("PLAN", "rate=" .. formatNumber(N.incomeRate()) .. "/s", "horizon=" .. string.format("%.1fh", horizon), "best: " .. (if #parts > 0 then table.concat(parts, " | ") else "-"), "buy=" .. action)
 			end
@@ -34416,17 +34836,35 @@ do
 			log("BAIT use", "luck=" .. tostring(bestLuck), "x" .. n, "=" .. (n * 5) .. " casts")
 			return true
 		end
-		if not on("BuyBait") then
+		if not N.wants("BuyBait") then
 			return false
 		end
 		local perCast = math.max(N.Fish.evCast, N.incomeRate() * math.max(N.Fish.cycle, 15))
 		local budget = perCast * optionNumber("BaitBudget", 10) / 100
 		local free = N.cash() - N.reserve()
 		local pick, pickLuck
-		for name, def in pairs(defs) do
-			local price = tonumber(def.Price) or math.huge
-			if price / 5 <= budget and price * 2 <= free and (N.Shop.stockOut[name] or 0) < os.clock() and (not pick or (tonumber(def.Luck) or 0) > pickLuck) then
-				pick, pickLuck = name, tonumber(def.Luck) or 0
+		-- Marginal value (cast model): extra coins per cast of this bait (luck and depth) minus its cost per cast
+		-- (price / 5); the best net gain wins. Without the model: the strongest bait inside the budget share.
+		local K, base = N.castScale()
+		local none = if base then N.castModel({ bait = false }) else nil
+		if base and none then
+			local pickNet
+			for name, def in pairs(defs) do
+				local price = tonumber(def.Price) or math.huge
+				if price * 2 <= free and (N.Shop.stockOut[name] or 0) < os.clock() then
+					local c = N.castModel({ bait = def })
+					local net = if c then (c - none) * K - price / 5 else -1
+					if net > 0 and (not pickNet or net > pickNet) then
+						pick, pickNet, pickLuck = name, net, tonumber(def.Luck) or 0
+					end
+				end
+			end
+		else
+			for name, def in pairs(defs) do
+				local price = tonumber(def.Price) or math.huge
+				if price / 5 <= budget and price * 2 <= free and (N.Shop.stockOut[name] or 0) < os.clock() and (not pick or (tonumber(def.Luck) or 0) > pickLuck) then
+					pick, pickLuck = name, tonumber(def.Luck) or 0
+				end
 			end
 		end
 		if not pick then
@@ -34443,7 +34881,6 @@ do
 			log("BAIT buy failed", pick, "(out of stock or too far), retry in 5m")
 			return false
 		end
-		N.spent(price * count)
 		log("BAIT buy", pick, "x" .. count, "cost/cast=" .. formatNumber(price / 5), "cast value=" .. formatNumber(perCast))
 		return true
 	end
@@ -34510,8 +34947,7 @@ do
 					send("Pond", "AddFood", entry.guid)
 					task.wait(0.3)
 				end
-				N.spent(tonumber(foods.Items[pick].Price) or 0)
-				log("POND food", pick)
+					log("POND food", pick)
 			end
 		end
 		if N.due("pondAutoFeed", 3600) then
