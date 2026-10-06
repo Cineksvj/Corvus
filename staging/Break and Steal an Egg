@@ -20179,8 +20179,8 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         Library.MinSize = Vector2.new(math.min(WindowInfo.MinContainerWidth, MaxX), Library.OriginalMinSize.Y)
     
         WindowInfo.Size = UDim2.fromOffset(
-            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, MaxX),
-            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, MaxY)
+            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, math.max(Library.MinSize.X, MaxX)),
+            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, math.max(Library.MinSize.Y, MaxY))
         )
         Library.MobileWindowSize = Vector2.new(WindowInfo.Size.X.Offset, WindowInfo.Size.Y.Offset)
         if typeof(WindowInfo.Font) == "EnumItem" then
@@ -35176,10 +35176,29 @@ do
 		if not cost or N.cash() < cost then
 			return false
 		end
-		fire("UpgradePlotRequest")
-		if waitFor(function()
+		local function upgraded()
 			return (tonumber(N.plotAttr("PlotLevel", 1)) or 1) > level
-		end, 2.5) then
+		end
+		fire("UpgradePlotRequest")
+		local ok = waitFor(upgraded, 2.5)
+		if not ok then
+			-- Fired from afar the server takes nothing (live 2026-10-06: 4 requests, plot level stayed 1, tutorial stuck at
+			-- UpgradePen). The real client presses the upgrade board at the plot (TutorialConfig.UpgradeBoardMarker "TUTHere",
+			-- dump 149182/74171), so the next rung is: stand at the board, ask again.
+			local plot = N.plot()
+			local marker = plot and plot:FindFirstChild("TUTHere")
+			local spot = if marker and marker:IsA("Attachment") then marker.WorldPosition elseif marker and marker:IsA("BasePart") then marker.Position else nil
+			local hitbox = N.plotHitbox()
+			spot = spot or (hitbox and hitbox.Position)
+			log("ACT plotUpgrade via=remote rejected", if spot then "going to the upgrade board" else "no board marker")
+			if spot and N.travelNear(spot, 5) then
+				task.wait(0.3)
+				fire("UpgradePlotRequest")
+				ok = waitFor(upgraded, 2.5)
+				log("ACT plotUpgrade via=travel", if ok then "ok" else "rejected")
+			end
+		end
+		if ok then
 			Session.bought += 1
 			shopNote("Plot upgraded to level " .. (level + 1))
 			return true
