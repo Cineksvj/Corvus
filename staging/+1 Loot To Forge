@@ -31849,6 +31849,7 @@ do
 	-- ATKOnceBE is one click of the attack button.
 	local AllowedBindable = {
 		["Stage/ExitFightBE"] = true,
+		["Dungeon/DungeonGiveUpBE"] = true,
 		["Attack/ATKOnceBE"] = true,
 		["Attack/AttackEnemyBE"] = true,
 		["Attack/EnemyHitBE"] = true,
@@ -37791,9 +37792,18 @@ do
 		end
 		if N.dead() then
 			setStatus("Dead, waiting for the respawn")
+			-- Stage and boss deaths respawn by themselves after 3 s; a tower death waits for the Give up button
+			-- (DungeonGiveUpBE). Live 2026-10-06: dead 280 s after the tower, hp -7, nothing ran. Press it.
+			N.deadSince = N.deadSince or os.clock()
+			if os.clock() - N.deadSince > 4 and os.clock() - (N.deadPress or 0) > 5 then
+				N.deadPress = os.clock()
+				log("RESPAWN", "dead for " .. math.floor(os.clock() - N.deadSince) .. " s, pressing Give up")
+				N.bindable("Dungeon/DungeonGiveUpBE")
+			end
 			task.wait(0.5)
 			return
 		end
+		N.deadSince = nil
 		local mode = N.fightMode()
 		if mode == "Stage" then
 			if N.want("AutoStages") then
