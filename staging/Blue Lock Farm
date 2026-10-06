@@ -32093,7 +32093,19 @@ do
 	end
 	-- Movement: one mode, teleport (the audit found no position check). Walking only as the auto-degrade after snapbacks.
 	function N.safeMove()
-		return N.Move ~= nil and os.clock() < (N.Move.walkUntil or 0)
+		return N.Move ~= nil and os.clock() < math.max(N.Move.walkUntil or 0, N.Move.walkFar or 0)
+	end
+	-- Region of a target: "far" = away from the player's plot (map tokens, obby, merchant), "near" = the plot itself.
+	-- Snapbacks are counted per region, so a far-region snap never takes the plot loop (rolls, levels, crates) off teleport.
+	function N.moveRegion(pos)
+		local plot = N.plot()
+		local ok, c = pcall(function()
+			return plot and plot:GetPivot().Position
+		end)
+		if ok and c and (Vector3.new(pos.X, 0, pos.Z) - Vector3.new(c.X, 0, c.Z)).Magnitude > 150 then
+			return "far"
+		end
+		return "near"
 	end
 	Status = "Idle"
 	local StatusSeen, StatusSeenCount = {}, 0
@@ -32229,7 +32241,7 @@ do
 	end
 	-- Goes next to a part. Teleport (default) pivots there; a position that snaps back twice within a minute switches to
 	-- walking for 10 minutes (MOVE fallback) and the hub keeps working. Walk uses Humanoid:MoveTo.
-	N.Move = { snaps = {}, walkUntil = 0, teleports = 0 }
+	N.Move = { snaps = { near = {}, far = {} }, walkUntil = 0, walkFar = 0, teleports = 0 }
 	function N.goTo(target, near, timeout)
 		local pos = if typeof(target) == "Vector3" then target else N.partPos(target)
 		if not pos then
@@ -32248,21 +32260,29 @@ do
 			return true
 		end
 		local up = pos + Vector3.new(0, 3, 0)
-		if not N.safeMove() then
+		local region = N.moveRegion(pos)
+		local walkUntil = if region == "far" then N.Move.walkFar else N.Move.walkUntil
+		if os.clock() >= walkUntil then
 			N.tp(up)
 			N.Move.teleports += 1
-			task.wait(0.2)
+			task.wait(0.35)
 			if dist() <= near + 3 then
 				return true
 			end
-			table.insert(N.Move.snaps, os.clock())
-			while #N.Move.snaps > 0 and os.clock() - N.Move.snaps[1] > 60 do
-				table.remove(N.Move.snaps, 1)
+			local snaps = N.Move.snaps[region]
+			table.insert(snaps, os.clock())
+			while #snaps > 0 and os.clock() - snaps[1] > 60 do
+				table.remove(snaps, 1)
 			end
-			if #N.Move.snaps >= 2 then
-				N.Move.snaps = {}
-				N.Move.walkUntil = os.clock() + 600
-				log("MOVE fallback", "teleport snapped back twice in 60 s, walking for 10 min")
+			if #snaps >= 2 then
+				table.clear(snaps)
+				-- Walking for 3 minutes in this region only, then teleport is tried again.
+				if region == "far" then
+					N.Move.walkFar = os.clock() + 180
+				else
+					N.Move.walkUntil = os.clock() + 180
+				end
+				log("MOVE fallback", "teleport snapped back twice in 60 s in the " .. region .. " region, walking there for 3 min")
 			end
 			return false
 		end
