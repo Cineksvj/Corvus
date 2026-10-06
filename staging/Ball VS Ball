@@ -20192,8 +20192,8 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         Library.MinSize = Vector2.new(math.min(WindowInfo.MinContainerWidth, MaxX), Library.OriginalMinSize.Y)
     
         WindowInfo.Size = UDim2.fromOffset(
-            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, MaxX),
-            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, MaxY)
+            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, math.max(Library.MinSize.X, MaxX)),
+            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, math.max(Library.MinSize.Y, MaxY))
         )
         Library.MobileWindowSize = Vector2.new(WindowInfo.Size.X.Offset, WindowInfo.Size.Y.Offset)
         if typeof(WindowInfo.Font) == "EnumItem" then
@@ -32355,6 +32355,10 @@ N.Duel = {
 	modeCache = nil,
 	modeWhy = nil,
 	modeTryAt = {},
+	modeCool = {},
+	mmWait = {},
+	qSince = nil,
+	qMode = nil,
 	selfInfo = nil,
 	weeklyFree = nil,
 	oppBallByUser = {},
@@ -33658,18 +33662,53 @@ function N.modeText()
 	end
 	return table.concat(parts, " ")
 end
+-- Queue time-box: a mode whose queue never starts a match (no human opponents) is left and put on a cooldown that grows 2x.
+function N.modeCooling(mode)
+	local c = D.modeCool[mode]
+	return c ~= nil and os.clock() < c.untilAt
+end
+function N.queueLimit(mode)
+	local w = D.mmWait[mode]
+	if w then
+		return math.max(45, math.min(180, w * 2))
+	end
+	return 60
+end
+function N.queueTimeout(mode, waited)
+	local c = D.modeCool[mode] or { dur = 150 }
+	c.dur = math.min(3600, c.dur * 2)
+	c.untilAt = os.clock() + c.dur
+	D.modeCool[mode] = c
+	D.qSince, D.qMode = nil, nil
+	log("MODE queue timeout mode=" .. mode, "waited=" .. math.floor(waited), "cooldown=" .. c.dur)
+	D.modeCache, D.modeAt = nil, -1e9
+	local was = mode
+	local nextMode = N.plannedMode()
+	if nextMode ~= was then
+		log("MODE switch " .. was .. " -> " .. nextMode, "reason=no match in " .. math.floor(waited) .. " s")
+	end
+	D.queueAt = -1e9
+end
 function N.plannedMode()
-	if D.modeCache and os.clock() - D.modeAt < 5 then
+	if D.modeCache and os.clock() - D.modeAt < 5 and not N.modeCooling(D.modeCache) then
 		return D.modeCache
 	end
 	D.modeAt = os.clock()
 	local current = D.modeCache
 	local avail = { Duel = true, RPS = current == "RPS" or N.freeRpsSeat() ~= nil, ["2v2"] = modeUnlocked("2v2") }
+	for _, mode in ipairs(N.Modes) do
+		if N.modeCooling(mode) then
+			avail[mode] = false
+		end
+	end
 	local rates, counts, best = {}, {}, "Duel"
 	for _, mode in ipairs(N.Modes) do
 		local rate, _, n = N.modeRate(mode)
 		rates[mode], counts[mode] = rate, n
-		if avail[mode] and rate > rates[best] then
+	end
+	for _, mode in ipairs(N.Modes) do
+		local rate = rates[mode]
+		if avail[mode] and (rate > rates[best] or not avail[best]) then
 			best = mode
 		end
 	end
@@ -33765,6 +33804,12 @@ function N.queueStep()
 	local prefix = N.statusPrefix
 	local e = D.mine
 	if e then
+		if D.qSince and D.qMode then
+			local waited = os.clock() - D.qSince
+			D.mmWait[D.qMode] = if D.mmWait[D.qMode] then D.mmWait[D.qMode] * 0.5 + waited * 0.5 else waited
+			D.modeCool[D.qMode] = nil
+			D.qSince, D.qMode = nil, nil
+		end
 		if e.state == "Waiting" and D.seatedAt and os.clock() - D.seatedAt > 90 then
 			local others = 0
 			for _, seat in pairs(type(e.seats) == "table" and e.seats or {}) do
@@ -33777,6 +33822,9 @@ function N.queueStep()
 				Session.leaves += 1
 				D.seatedAt = os.clock()
 				log("DUEL leave", "no opponent for 90 s")
+				if N.planner() then
+					N.queueTimeout(N.tableMode(e), 90)
+				end
 			end
 		end
 		D.idleKey = nil
@@ -33810,8 +33858,12 @@ function N.queueStep()
 	end
 	D.idleKey = nil
 	local mode = N.duelMode()
+	if N.planner() and D.qSince and D.qMode == mode and os.clock() - D.qSince > N.queueLimit(mode) then
+		N.queueTimeout(mode, os.clock() - D.qSince)
+		mode = N.duelMode()
+	end
 	if os.clock() - D.queueAt < 10 then
-		return prefix(if N.planner() then string.format("queueing %s (coins/min %s), looking for an opponent", mode, N.modeText()) else "Duel: looking for an opponent")
+		return prefix(if N.planner() then string.format("queueing %s (waits %d of %d s, then tries another mode), coins/min %s", mode, math.floor(D.qSince and os.clock() - D.qSince or 0), N.queueLimit(mode), N.modeText()) else "Duel: looking for an opponent")
 	end
 	D.queueAt = os.clock()
 	if mode == "2v2" then
@@ -33831,6 +33883,9 @@ function N.queueStep()
 		fire("DuelQuickPlayRequest")
 	end
 	Session.queues += 1
+	if D.qMode ~= mode or not D.qSince then
+		D.qSince, D.qMode = os.clock(), mode
+	end
 	task.delay(8, function()
 		if alive() and not D.mine then
 			fire("DuelTableStateRequest")
