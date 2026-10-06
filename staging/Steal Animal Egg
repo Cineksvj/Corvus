@@ -31783,8 +31783,9 @@ do
 	-- Remotes: ReplicatedStorage.<Folder>.<Name> (notes.md "Remotes"). Only the player's own actions, with the same
 	-- arguments the game's client sends. Never the admin tools (AdminRemotes, AdminInspectRemotes, LiveEventRemotes.Admin,
 	-- EggRemotes.GrowAllDebug), never Robux (InstantGrow, SpeedBoost, ServerLuck, skips, trail Robux), never PvP (bat
-	-- swings, ragdoll push), never Block Blast scores, never the unused IndexRemotes.ClaimAll (no client calls it) and never
-	-- CutsceneTagRemote (only the game's own cinemas send it).
+	-- swings, ragdoll push), never Block Blast scores. The unused IndexRemotes.ClaimAll, CutsceneTagRemote, AfkRemotes.Sit
+	-- while carrying and a teleport-home remote only through their opt-in alt probes (p03_probes: toggle on and not
+	-- rejected on this game version).
 	function N.remote(path)
 		local node = ReplicatedStorage
 		for part in string.gmatch(path, "[^%.]+") do
@@ -31795,10 +31796,25 @@ do
 	local function isStr(v)
 		return type(v) == "string" and v ~= ""
 	end
+	local function probe(name)
+		return N.probeAllowed ~= nil and N.probeAllowed(name)
+	end
 	-- RemoteEvents: path -> argument check (true = no arguments).
 	local FireAllowed = {
+		-- The AFK seat; while carrying an egg only through the sit home probe.
 		["AfkRemotes.Sit"] = function(...)
-			return select("#", ...) == 0
+			return select("#", ...) == 0 and (not N.carrying() or probe("sit_home"))
+		end,
+		-- The cinema tag: "on" with a server time at most 130 s ahead through the guard tag probe; "off" ends our own tag.
+		["CutsceneTagRemote"] = function(mode, untilAt, ...)
+			if select("#", ...) > 0 then
+				return false
+			end
+			if mode == "off" then
+				return untilAt == nil and N.Probes ~= nil and N.Probes.tagOn == true
+			end
+			local now = N.serverTime()
+			return mode == "on" and probe("cutscene_guard") and type(untilAt) == "number" and untilAt > now and untilAt <= now + 130
 		end,
 		["FoodRemotes.OrderBatch"] = function(list)
 			if type(list) ~= "table" or #list == 0 or #list > 12 then
@@ -31850,6 +31866,9 @@ do
 			return type(list) == "table" and #list == 3 and N.MergeToken == list and unique(list)
 		end,
 		["IndexRemotes.ClaimIndex"] = isStr,
+		["IndexRemotes.ClaimAll"] = function(...)
+			return select("#", ...) == 0 and probe("index_claimall")
+		end,
 		-- 0 = every ready gift (Claim All); i = one gift (the planner times the potions).
 		["PlaytimeRewardRemotes.Claim"] = function(i)
 			return type(i) == "number" and i % 1 == 0 and i >= 0 and i <= 30
@@ -31860,6 +31879,13 @@ do
 		["TrailSystem.ToggleTrailEquip"] = isStr,
 		["TrailSystem.GetTrailShopState"] = true,
 	}
+	-- A teleport-home remote found at run time (none in this version): no arguments, only through the home probe.
+	function N.allowHomeRemote(path, isFunction)
+		local list = if isFunction then InvokeAllowed else FireAllowed
+		list[path] = function(...)
+			return select("#", ...) == 0 and probe("teleport_home")
+		end
+	end
 	local Quiet = { ["FoodRemotes.Eat"] = true, ["SellRemotes.ListSellable"] = true, ["TrailSystem.GetTrailShopState"] = true, ["EggRemotes.HatchEgg"] = true }
 	N.Sent = { count = 0, byName = {} }
 	local function allowed(list, name, ...)
@@ -32471,7 +32497,7 @@ do
 	end
 	-- ===== Legit movement (notes.md "Anticheat": the server owns WalkSpeed, guards chase you) =====
 	-- Humanoid:MoveTo along a PathfindingService route (or straight legs of at most 300 studs with a jump when stuck), at the
-	-- walk speed the server gave. Never WalkSpeed, never CFrame.
+	-- walk speed the humanoid has (the server's, or x2 only through the opt-in walk speed probe). Never CFrame.
 	N.Walk = { fails = 0, path = "", meters = 0 }
 	-- The zone lane runs along X 236 from TheLine (Z 1505) south; legs cross the line through the lane.
 	N.LineZ = 1505
@@ -32501,7 +32527,7 @@ do
 		return points
 	end
 	N.route = route
-	local function followPath(hum, target, near, deadline)
+	local function followPath(hum, target, near, deadline, stop)
 		local ok, waypoints = pcall(function()
 			local path = game:GetService("PathfindingService"):CreatePath({ AgentRadius = 2.5, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 8 })
 			path:ComputeAsync(N.root().Position, target)
@@ -32529,6 +32555,9 @@ do
 			end)
 			local started = os.clock()
 			while os.clock() - started < 4 and os.clock() <= deadline do
+				if stop and stop() then
+					return false
+				end
 				local p = N.myPos()
 				if not p or N.flatDist(p, wp.Position) <= 3 then
 					break
@@ -32543,7 +32572,7 @@ do
 		return p ~= nil and N.flatDist(p, target) <= near
 	end
 	local function walkLeg(hum, target, near, deadline, stop)
-		if followPath(hum, target, near, deadline) then
+		if followPath(hum, target, near, deadline, stop) then
 			return true
 		end
 		local lastDist, lastAt, sentAt = math.huge, os.clock(), -1e9
@@ -32901,12 +32930,20 @@ do
 		end
 		return out
 	end
-	-- Seconds for one run: walk out, hold the prompt, walk back past TheLine to the yard.
+	-- Seconds for one run: walk out, hold the prompt, walk back past TheLine to the yard. Working alt probes count: x2 walk
+	-- speed, and a teleport home (the game's teleport or the AFK seat) makes the way back ~3 s.
 	function N.runTime(pos)
 		local real = math.max(N.realSpeed(), 16)
+		if N.probeWorks("walkspeed") then
+			real = math.min(real * 2, 400)
+		end
 		local home = N.homePos() or Vector3.new(N.LaneX, pos.Y, N.lineZ() + 20)
 		local here = N.myPos() or home
-		return (N.flatDist(here, pos) + N.flatDist(pos, home)) / real + 4
+		local back = N.flatDist(pos, home) / real
+		if N.probeWorks("teleport_home") or (N.probeWorks("sit_home") and N.tableLevel() >= 1) then
+			back = math.min(back, 3)
+		end
+		return N.flatDist(here, pos) / real + back + 4
 	end
 	function N.pinnedZone()
 		return tonumber(string.match(optionText("StealZone", "Best (by value)"), "^Zone (%d+)$"))
@@ -33008,7 +33045,8 @@ do
 	end
 
 	-- ===== Steal run (Auto Steal): walk to the bed, hold EggPrompt, walk home past TheLine =====
-	-- Movement is legit only: no teleports, no WalkSpeed changes, no guard tricks (CLAUDE.md: never bypass detection).
+	-- Legit walking by default. Teleport home, the AFK seat, the guard tag and x2 walk speed only through their opt-in alt
+	-- probes (p03_probes), each measured and dropped for the game version on the first rejection.
 	function N.stealStep(target, info)
 		local egg = target
 		if not egg then
@@ -33017,7 +33055,17 @@ do
 		if not egg then
 			return false
 		end
-		info = info or {}
+		N.wsBegin()
+		N.Steal.outcome = nil
+		local ok, result = pcall(N.stealRun, egg, info or {})
+		N.wsEnd(N.Steal.outcome)
+		N.tagEnd(N.Steal.outcome or "failed")
+		if not ok then
+			error(result, 0)
+		end
+		return result
+	end
+	function N.stealRun(egg, info)
 		local runStart = os.clock()
 		if N.seated() then
 			N.standUp()
@@ -33027,7 +33075,7 @@ do
 		N.streamAround(egg.pos)
 		local range = tonumber(egg.prompt.MaxActivationDistance) or 10
 		local near = math.max(range - 3, 3)
-		if not N.goTo(egg.pos, near, "egg " .. tostring(egg.label)) then
+		if not N.goTo(egg.pos, near, "egg " .. tostring(egg.label), N.probeTick) then
 			N.Steal.skip[egg.model] = os.clock() + 30
 			Session.stealFails += 1
 			return false
@@ -33050,6 +33098,7 @@ do
 		end, 2 + hold)
 		N.promptReacted(took)
 		if not N.carrying() and instant() then
+			N.Steal.outcome = "claimed"
 			Session.steals += 1
 			N.Steal.last = string.format("%s (%s), claimed at once", tostring(egg.label), egg.loose and "loose egg" or "home side")
 			log("STEAL claimed", egg.label, "zone", egg.zone.n, "at once")
@@ -33068,27 +33117,20 @@ do
 		N.Steal.claimedAt = nil
 		local bagBefore = N.eggBagCount()
 		setStatus("Carrying " .. tostring(egg.label) .. " home")
-		local claimed = false
-		do
-			local home = N.homePos() or Vector3.new(N.LaneX, egg.pos.Y, N.lineZ() + 20)
-			N.goTo(home, 8, "home", function()
-				return N.Steal.claimedAt ~= nil and not N.carrying()
-			end)
-			claimed = waitFor(function()
-				return N.Steal.claimedAt ~= nil or not N.carrying()
-			end, 4) and (N.Steal.claimedAt ~= nil or N.eggBagCount() > bagBefore)
-		end
+		local claimed, via = N.bringHome(bagBefore, egg)
 		local took2 = os.clock() - runStart
 		Session.stealSeconds += took2
 		if claimed then
+			N.Steal.outcome = "claimed"
 			Session.steals += 1
-			N.Steal.last = string.format("%s from zone %d (%s), %ds", tostring(egg.label), egg.zone.n, why, math.floor(took2))
-			log("STEAL claimed", egg.label, "zone", egg.zone.n, "in", math.floor(took2) .. "s")
+			N.Steal.last = string.format("%s from zone %d (%s), %ds%s", tostring(egg.label), egg.zone.n, why, math.floor(took2), if via ~= "walk" then ", " .. via else "")
+			log("STEAL claimed", egg.label, "zone", egg.zone.n, "in", math.floor(took2) .. "s", if via ~= "walk" then "via " .. via else "")
 			if N.Events.stolen then
 				pcall(N.Events.stolen, egg)
 			end
 			return true
 		end
+		N.Steal.outcome = if N.carrying() then "failed" else "caught"
 		Session.caught += 1
 		log("STEAL caught", egg.label, "zone", egg.zone.n, "carrying", tostring(N.carrying()))
 		return false
@@ -33810,6 +33852,456 @@ do
 	end
 end
 do
+	-- ===== Alt-test probes (blatant.md "Second pass 2026-10-06 (deep)", owner approved 2026-10-06) =====
+	-- Each probe is opt-in (its toggle, default off), measures itself on real runs and is remembered per game version in
+	-- Corvus/SAEGG_probes_<PlaceVersion>.txt (accepted / rejected / absent). A rejection falls back to legit play for that
+	-- version; a working probe is used by every run and counted by the Smart Planner while its toggle is on. A game update
+	-- (new PlaceVersion) measures everything again.
+	N.ProbeToggle = {
+		teleport_home = "ProbeHome",
+		sit_home = "ProbeHome",
+		cutscene_guard = "ProbeCutscene",
+		walkspeed = "ProbeWalkSpeed",
+		index_claimall = "ProbeIndexAll",
+	}
+	N.ProbeOrder = { "teleport_home", "sit_home", "cutscene_guard", "walkspeed", "index_claimall" }
+	N.ProbeUse = {
+		teleport_home = "every delivery: the game's teleport home instead of the walk",
+		sit_home = "every delivery: the AFK seat at the base table instead of the walk home",
+		cutscene_guard = "guard tag on during every run home",
+		walkspeed = "x2 walk speed on every steal run",
+		index_claimall = "one Claim All instead of one claim per animal",
+	}
+	local Label = { teleport_home = "Teleport home", sit_home = "Sit home", cutscene_guard = "Guard tag", walkspeed = "Walk speed x2", index_claimall = "Index Claim All" }
+	-- Successes before the verdict is written to the file (each later run keeps measuring).
+	local NeedWins = { teleport_home = 3, sit_home = 3, cutscene_guard = 2, walkspeed = 3, index_claimall = 1 }
+	N.Probes = { state = nil, wins = {}, runs = {}, home = nil, tagOn = false, ws = nil }
+	local P = N.Probes
+	function N.placeVersion()
+		return tostring(game.PlaceVersion or 0)
+	end
+	function N.probeFile()
+		return "Corvus/SAEGG_probes_" .. N.placeVersion() .. ".txt"
+	end
+	local function load()
+		if P.state then
+			return
+		end
+		P.state = {}
+		local ok, text = pcall(function()
+			return if isfile(N.probeFile()) then readfile(N.probeFile()) else nil
+		end)
+		if ok and type(text) == "string" then
+			for key, value in string.gmatch(text, "([%w_]+)=(%a+)") do
+				if N.ProbeToggle[key] and (value == "accepted" or value == "rejected" or value == "absent") then
+					P.state[key] = value
+				end
+			end
+		end
+	end
+	local function save()
+		local lines = {}
+		for _, name in ipairs(N.ProbeOrder) do
+			if P.state[name] then
+				table.insert(lines, name .. "=" .. P.state[name])
+			end
+		end
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Corvus") then
+				makefolder("Corvus")
+			end
+			writefile(N.probeFile(), table.concat(lines, "\n"))
+		end)
+	end
+	function N.probeState(name)
+		load()
+		return P.state[name] or "untested"
+	end
+	-- May the hub use this probe now: its toggle is on and this game version did not refuse it.
+	function N.probeAllowed(name)
+		local state = N.probeState(name)
+		return on(N.ProbeToggle[name]) and state ~= "rejected" and state ~= "absent"
+	end
+	-- Known to work (accepted on this version, or a success this session): the planner's run times count it.
+	function N.probeWorks(name)
+		return N.probeAllowed(name) and (N.probeState(name) == "accepted" or (P.wins[name] or 0) > 0)
+	end
+	-- result: accepted / partial (one more success), rejected (legit again on this version), absent, else no verdict.
+	function N.probeResult(name, result, detail)
+		load()
+		P.runs[name] = (P.runs[name] or 0) + 1
+		local known = P.state[name] == "accepted"
+		local text = "PROBE " .. name .. " result=" .. result .. (if detail and detail ~= "" then " " .. detail else "")
+		if result == "accepted" or result == "partial" then
+			P.wins[name] = (P.wins[name] or 0) + 1
+			-- Once accepted, every 20th success is logged (the rest only count).
+			if not known or P.wins[name] % 20 == 0 then
+				log(text)
+			end
+			if not known and P.wins[name] >= NeedWins[name] then
+				P.state[name] = "accepted"
+				save()
+				log("PROBE " .. name .. " accepted on place version " .. N.placeVersion() .. " after " .. P.wins[name] .. " successes")
+			end
+			return
+		end
+		log(text)
+		if result == "rejected" then
+			P.wins[name] = 0
+			P.state[name] = "rejected"
+			save()
+			if name ~= "index_claimall" then
+				log("MOVE fallback legit (" .. name .. " rejected on place version " .. N.placeVersion() .. ")")
+			end
+		elseif result == "absent" then
+			P.state[name] = "absent"
+			save()
+		end
+	end
+	function N.probeSummary()
+		load()
+		local parts = {}
+		for _, name in ipairs(N.ProbeOrder) do
+			table.insert(parts, name .. "=" .. N.probeState(name) .. (if on(N.ProbeToggle[name]) then "(on)" else ""))
+		end
+		return table.concat(parts, " ")
+	end
+	function N.anyProbeOn()
+		for _, toggle in pairs(N.ProbeToggle) do
+			if on(toggle) then
+				return true
+			end
+		end
+		return false
+	end
+	function N.probeText()
+		local lines = {}
+		for _, name in ipairs(N.ProbeOrder) do
+			local state = N.probeState(name)
+			local shown = state
+			if state == "absent" then
+				shown = "not in this game version"
+			elseif state == "untested" and (P.wins[name] or 0) > 0 then
+				shown = "working (" .. P.wins[name] .. " ok)"
+			elseif state == "accepted" then
+				shown = "<b>works</b>"
+			end
+			table.insert(lines, Label[name] .. ": " .. shown .. (if on(N.ProbeToggle[name]) then "" else " (off)"))
+		end
+		return table.concat(lines, "\n") .. "\nGame version " .. N.placeVersion()
+	end
+
+	-- (5) A RequestTeleportHome-style remote (another game's teleport home). This version has none (dump remote list);
+	-- the check runs again on every new game version. Folders only, no rigs.
+	local HomeNames = { RequestTeleportHome = true, TeleportHome = true, ReturnHome = true, GoHome = true, TeleportToBase = true, HomeTeleport = true }
+	function N.findHomeRemote()
+		if P.home == nil then
+			P.home = false
+			local function scan(node, path, depth)
+				for _, child in ipairs(node:GetChildren()) do
+					local here = if path == "" then child.Name else path .. "." .. child.Name
+					if HomeNames[child.Name] and (child:IsA("RemoteEvent") or child:IsA("RemoteFunction")) then
+						P.home = { remote = child, path = here, fn = child:IsA("RemoteFunction") }
+						return true
+					end
+					if depth < 3 and not child:IsA("Model") and scan(child, here, depth + 1) then
+						return true
+					end
+				end
+				return false
+			end
+			pcall(scan, ReplicatedStorage, "", 1)
+			if P.home then
+				N.allowHomeRemote(P.home.path, P.home.fn)
+				log("PROBE teleport_home remote found", P.home.path)
+			else
+				N.probeResult("teleport_home", "absent", "no teleport-home remote on place version " .. N.placeVersion())
+			end
+		end
+		if P.home then
+			return P.home.remote, P.home.path, P.home.fn
+		end
+		return nil
+	end
+	function N.teleportHome(claimed)
+		if not (N.probeAllowed("teleport_home") and N.carrying()) then
+			return nil
+		end
+		local remote, path, isFunction = N.findHomeRemote()
+		if not remote then
+			return nil
+		end
+		local before = N.myPos()
+		local t0 = os.clock()
+		setStatus("Teleport home probe")
+		if isFunction then
+			invoke(path)
+		else
+			fire(path)
+		end
+		local moved = waitFor(function()
+			local p = N.myPos()
+			return claimed() or (p ~= nil and before ~= nil and p.Z > N.lineZ() and N.flatDist(p, before) > 30)
+		end, 3)
+		local got = moved and waitFor(claimed, 4)
+		local detail = string.format("moved=%s claimed=%s dt=%.1fs", tostring(moved), tostring(got), os.clock() - t0)
+		if got then
+			N.probeResult("teleport_home", "accepted", detail)
+			return "claimed"
+		end
+		if moved and N.carrying() then
+			log("PROBE teleport_home home with the egg, walking the rest", detail)
+			return "teleported"
+		end
+		N.probeResult("teleport_home", "rejected", detail .. (if N.carrying() then "" else " egg lost"))
+		return "refused"
+	end
+
+	-- (1) AfkRemotes.Sit() while carrying. AfkAutoClient fires it from wherever the player idles (39843-39856) and the
+	-- server seats the player at the base MukbangTable; seated within 2 s and EggRemotes.Claimed within 5 s = the run
+	-- home took ~2 s. Seated with the egg still in hand = stand up and walk the rest from the base. Once per egg, never
+	-- more than one every 5 s.
+	function N.sitHome(claimed)
+		if not (N.probeAllowed("sit_home") and N.carrying() and N.tableLevel() >= 1) then
+			return nil
+		end
+		if os.clock() - (P.sitAt or -1e9) < 5 then
+			return nil
+		end
+		P.sitAt = os.clock()
+		local here, home = N.myPos(), N.homePos()
+		local walk = if here and home then N.flatDist(here, home) / math.max(N.realSpeed(), 16) else 0
+		local t0 = os.clock()
+		N.Eat.sitRefused = nil
+		setStatus("Sit home probe: AFK seat with the egg")
+		if not fire("AfkRemotes.Sit") then
+			return nil
+		end
+		local seated = waitFor(function()
+			return N.seated() or claimed() or N.Eat.sitRefused ~= nil
+		end, 2) and (N.seated() or claimed())
+		local got = seated and waitFor(claimed, 5)
+		local dt = os.clock() - t0
+		local detail = string.format("seated=%s claimed=%s dt=%.1fs saved=%ds", tostring(seated), tostring(got), dt, math.max(math.floor(walk - dt), 0))
+		if got then
+			N.probeResult("sit_home", "accepted", detail)
+			return "claimed"
+		end
+		if seated and N.carrying() then
+			log("PROBE sit_home seated with the egg, walking the rest", detail)
+			N.standUp()
+			return "seated"
+		end
+		N.probeResult("sit_home", "rejected", detail .. (if N.Eat.sitRefused then " refused" elseif not N.carrying() then " egg lost" else ""))
+		if N.seated() then
+			N.standUp()
+		end
+		return "refused"
+	end
+
+	-- (2) CutsceneTagRemote("on", untilServerTime) while carrying (the hatch cinema and table reveal tag, 140085). If the
+	-- server skips guard catches for tagged players, a guard within reach does not catch: accepted. Caught while tagged:
+	-- rejected. "off" again at the end of every run.
+	function N.guardDistance()
+		local folder = workspace:FindFirstChild("ActiveGuardians")
+		local here = N.myPos()
+		if not (folder and here) then
+			return nil
+		end
+		local best
+		for _, guard in ipairs(folder:GetChildren()) do
+			local ok, cf = pcall(function()
+				return guard:GetPivot()
+			end)
+			if ok and cf then
+				local d = N.flatDist(cf.Position, here)
+				if not best or d < best then
+					best = d
+				end
+			end
+		end
+		return best
+	end
+	function N.tagStart(seconds)
+		if P.tagOn or not (N.probeAllowed("cutscene_guard") and N.carrying()) then
+			return false
+		end
+		local untilAt = N.serverTime() + math.clamp(math.floor(seconds or 30), 10, 120)
+		P.tagNear, P.tagNearDist = false, nil
+		P.tagOn = true
+		if not fire("CutsceneTagRemote", "on", untilAt) then
+			P.tagOn = false
+			return false
+		end
+		return true
+	end
+	function N.tagEnd(outcome)
+		if not P.tagOn then
+			return
+		end
+		fire("CutsceneTagRemote", "off")
+		P.tagOn = false
+		local detail = string.format("near=%s caught=%s%s", tostring(P.tagNear), tostring(outcome == "caught"), if P.tagNearDist then " guard=" .. math.floor(P.tagNearDist) .. "studs" else "")
+		if outcome == "caught" then
+			N.probeResult("cutscene_guard", "rejected", detail)
+		elseif P.tagNear and outcome == "claimed" then
+			N.probeResult("cutscene_guard", "accepted", detail)
+		elseif os.clock() - (P.tagQuietAt or -1e9) > 300 then
+			P.tagQuietAt = os.clock()
+			log("PROBE cutscene_guard result=untested " .. detail .. " (no guard came within reach)")
+		end
+	end
+
+	-- (3) WalkSpeed x2 (at most 400) for one steal run. The server writes WalkSpeed only when it applies a speed change
+	-- (RunSpeedService 323596-323616). A reset without a speed change, a pull back (snapback) or a catch: rejected. The
+	-- server's own value comes back at the end of the run.
+	function N.wsBegin()
+		if P.ws or not N.probeAllowed("walkspeed") then
+			return nil
+		end
+		local hum = N.humanoid()
+		local base = hum and tonumber(hum.WalkSpeed)
+		if not base or base < 8 then
+			return nil
+		end
+		local boosted = math.min(base * 2, 400)
+		if boosted < base * 1.2 then
+			return nil
+		end
+		if not pcall(function()
+			hum.WalkSpeed = boosted
+		end) then
+			return nil
+		end
+		P.ws = { hum = hum, base = base, boosted = boosted, stat = N.speed(), dist = 0, time = 0, snap = false, reverted = false }
+		return P.ws
+	end
+	local function wsRestore(ws)
+		if math.abs((tonumber(ws.hum.WalkSpeed) or 0) - ws.boosted) < 0.5 then
+			pcall(function()
+				ws.hum.WalkSpeed = ws.base
+			end)
+		end
+	end
+	-- Called about every 0.1 s by the walk (its stop check): walk speed samples and the guard distance while tagged.
+	-- Never stops the walk.
+	function N.probeTick()
+		local ws = P.ws
+		if ws and not ws.stopped then
+			local p, now = N.myPos(), os.clock()
+			if p and ws.last then
+				local dt = now - ws.lastAt
+				local d = N.flatDist(p, ws.last)
+				if dt > 0 and dt <= 0.5 then
+					if d > ws.boosted * dt * 1.5 + 6 then
+						ws.snap = true
+						ws.stopped = "snapback"
+						wsRestore(ws)
+						log("MOVE fallback walk speed (pulled back " .. math.floor(d) .. " studs)")
+					else
+						ws.dist += d
+						ws.time += dt
+					end
+				end
+			end
+			ws.last, ws.lastAt = p, now
+			local current = tonumber(ws.hum.WalkSpeed) or 0
+			if not ws.stopped and math.abs(current - ws.boosted) > 0.5 then
+				if N.speed() ~= ws.stat and current > 0 then
+					-- The server applied a new speed stat (eating, index): boost the new value.
+					ws.stat, ws.base = N.speed(), current
+					ws.boosted = math.min(current * 2, 400)
+					pcall(function()
+						ws.hum.WalkSpeed = ws.boosted
+					end)
+				else
+					ws.reverted = true
+					ws.stopped = "reverted"
+				end
+			end
+		end
+		if P.tagOn and not P.tagNear then
+			local d = N.guardDistance()
+			if d and d <= 6 then
+				P.tagNear, P.tagNearDist = true, d
+			end
+		end
+		return false
+	end
+	function N.wsEnd(outcome)
+		local ws = P.ws
+		if not ws then
+			return
+		end
+		P.ws = nil
+		wsRestore(ws)
+		local speed = if ws.time > 0 then ws.dist / ws.time else 0
+		local detail = string.format("reverted=%s snapback=%s caught=%s speed=%d/%d walked=%ds", tostring(ws.reverted), tostring(ws.snap), tostring(outcome == "caught"), math.floor(speed), math.floor(ws.base), math.floor(ws.time))
+		if ws.reverted or ws.snap or outcome == "caught" then
+			N.probeResult("walkspeed", "rejected", detail)
+		elseif ws.time >= 2 and speed >= ws.base * 1.3 then
+			N.probeResult("walkspeed", "accepted", detail)
+		elseif ws.time >= 2 then
+			N.probeResult("walkspeed", "rejected", detail .. " no gain")
+		elseif os.clock() - (P.wsQuietAt or -1e9) > 300 then
+			P.wsQuietAt = os.clock()
+			log("PROBE walkspeed result=untested " .. detail .. " (run too short to measure)")
+		end
+	end
+
+	-- The way home with a carried egg: a teleport probe first (the game's teleport home, else the AFK seat), then the walk
+	-- (guard tag and walk speed probes measure themselves on the way). Returns claimed, how.
+	function N.bringHome(bagBefore, egg)
+		local function claimed()
+			return N.Steal.claimedAt ~= nil or N.eggBagCount() > bagBefore
+		end
+		local name, via = "teleport_home", N.teleportHome(claimed)
+		if via == nil then
+			name, via = "sit_home", N.sitHome(claimed)
+		end
+		local how = if name == "sit_home" then "sit home" else "teleport home"
+		if via == "claimed" then
+			return true, how
+		end
+		-- Home with the egg still in hand: the rest of the way decides that probe's verdict.
+		local partial = via == "seated" or via == "teleported"
+		local function verdict(ok)
+			if partial then
+				N.probeResult(name, if ok then "partial" else "rejected", "home with the egg, claimed after the walk=" .. tostring(ok))
+			end
+		end
+		if claimed() then
+			verdict(true)
+			return true, if partial then how else "walk"
+		end
+		if not N.carrying() then
+			verdict(false)
+			return false, "lost"
+		end
+		local here = N.myPos()
+		local home = N.homePos() or Vector3.new(N.LaneX, (egg and egg.pos.Y) or (here and here.Y) or 28, N.lineZ() + 20)
+		N.tagStart((if here then N.flatDist(here, home) / math.max(N.realSpeed(), 16) else 30) + 15)
+		-- Ends the walk once the egg is out of our hands (claimed, or caught and flown back to its bed).
+		local function stop()
+			N.probeTick()
+			return not N.carrying()
+		end
+		N.goTo(home, 8, "home", stop)
+		-- A teleport that left the egg in hand on the home side: if the yard did not count it, cross TheLine once.
+		if partial and N.carrying() and not claimed() then
+			local y = (N.myPos() or home).Y
+			N.goTo(Vector3.new(N.LaneX, y, N.lineZ() - 10), 4, "line", stop)
+			N.goTo(Vector3.new(N.LaneX, y, N.lineZ() + 20), 6, "line home", stop)
+		end
+		local ok = waitFor(function()
+			return N.Steal.claimedAt ~= nil or not N.carrying()
+		end, 4) and claimed()
+		verdict(ok)
+		N.tagEnd(if ok then "claimed" elseif not N.carrying() then "caught" else "failed")
+		return ok, if partial then how .. " + walk" else "walk"
+	end
+end
+do
 	-- ===== Rewards: index, daily, playtime, free egg, exit gift (all remote-only, the game's own buttons) =====
 	N.Reward = { log = {}, indexAt = -1e9, dailyAt = -1e9, playAt = -1e9, freeAt = -1e9, exitAt = -1e9 }
 	local function note(text)
@@ -33842,12 +34334,50 @@ do
 		table.sort(out)
 		return out
 	end
+	-- Index Claim All probe (opt-in alt test, blatant.md 2nd pass gem 7): IndexRemotes.ClaimAll exists but no client calls
+	-- it. Accepted when the claimed set grows (then one call replaces the per-animal claims); refused = one by one again.
+	function N.indexClaimAll(list)
+		if not N.probeAllowed("index_claimall") then
+			return nil
+		end
+		local sp0, money0 = N.speed(), N.money()
+		local ok, info = invoke("IndexRemotes.ClaimAll")
+		local function got()
+			local claimed, n = N.claimedSet(), 0
+			for _, model in ipairs(list) do
+				if claimed[model] then
+					n += 1
+				end
+			end
+			return n
+		end
+		waitFor(function()
+			return got() > 0
+		end, 2)
+		local n = got()
+		local sp = math.max(N.speed() - sp0, 0)
+		local detail = string.format("claimed=%d/%d speed=+%s money=+%s ret=%s %s", n, #list, formatNumber(sp), formatNumber(math.max(N.money() - money0, 0)), brief(ok), brief(info))
+		if n > 0 then
+			N.probeResult("index_claimall", "accepted", detail)
+			Session.indexClaims += n
+			Session.indexSpeed += sp
+			note(string.format("Index Claim All: %d animals, +%s speed", n, formatNumber(sp)))
+			log("INDEX claim all", n, "speed", formatNumber(sp), "runspeed", formatNumber(N.speed()))
+			return n
+		end
+		N.probeResult("index_claimall", "rejected", detail)
+		log("INDEX fallback one by one (Claim All rejected on place version " .. N.placeVersion() .. ")")
+		return nil
+	end
 	function N.indexStep()
 		local list = N.indexClaimable()
 		if #list == 0 then
 			return 0
 		end
-		local n = 0
+		local n = N.indexClaimAll(list) or 0
+		if n > 0 then
+			list = N.indexClaimable()
+		end
 		for _, model in ipairs(list) do
 			local before = N.speed()
 			local ok, info = invoke("IndexRemotes.ClaimIndex", model)
@@ -34383,6 +34913,13 @@ do
 			if z then "zone " .. z.n .. " needs +" .. formatNumber(missing) else "none",
 			if z and eta < math.huge then " in " .. N.longTime(eta) .. " of eating" else ""
 		)
+		-- Working alt probes (their toggle on, measured or accepted on this version) are part of the plan: run times and
+		-- egg scores already count them (N.runTime).
+		for _, name in ipairs(N.ProbeOrder) do
+			if N.probeWorks(name) then
+				planLog("probe " .. name, "use " .. name .. " (" .. N.ProbeUse[name] .. ")", 3600, 0)
+			end
+		end
 		-- Saving never means idling: the line names what is saved for, the mode line below names what runs meanwhile.
 		local payback, cost = N.penPayback()
 		if N.planner() and cost and cost > N.money() and payback and payback <= Day then
@@ -34446,6 +34983,15 @@ do
 			if left then
 				table.insert(out, string.format("Next guaranteed %s in %s", tostring(g and g.title or "big egg"), N.longTime(left)))
 			end
+		end
+		local probes = {}
+		for _, name in ipairs(N.ProbeOrder) do
+			if N.probeWorks(name) then
+				table.insert(probes, N.ProbeUse[name])
+			end
+		end
+		if #probes > 0 then
+			table.insert(out, "Alt probes in use: " .. table.concat(probes, "; "))
 		end
 		return out
 	end
@@ -34521,6 +35067,10 @@ do
 		{ "AutoIndex", "Claim index" },
 		{ "AutoRewards", "Claim rewards" },
 		{ "AutoCodes", "Redeem codes" },
+		{ "ProbeHome", "Teleport home probe" },
+		{ "ProbeCutscene", "Guard tag probe" },
+		{ "ProbeWalkSpeed", "Walk speed probe" },
+		{ "ProbeIndexAll", "Index Claim All probe" },
 	}
 	function N.resetOptions()
 		local ignore = (SaveManager and SaveManager.Ignore) or {}
@@ -34611,6 +35161,34 @@ do
 			Tooltip = "Autopilot: plays the whole game by itself, even with every other toggle off. Steals (new index animals and big eggs first), places, hatches, equips, claims the index and rewards, eats between egg cycles, sells and merges spares, buys pen slots, the table and trails by 24 h payback, times the playtime potions",
 		})
 		Labels.Planner = PlanBox:AddLabel({ Text = "-", DoesWrap = true })
+		-- Alt probes (blatant.md 2nd pass, p03_probes): all off by default, each measures itself and is remembered per
+		-- game version; a refused one goes back to normal play for that version.
+		local ProbeBox = Tabs.Farm:AddRightGroupbox("Alt Probes", "flask-conical")
+		ProbeBox:AddLabel({
+			Text = '<font transparency="0.35">Test these on an alt account first. Each one checks itself on real runs; if the game refuses it once, Corvus goes back to normal play for this game version.</font>',
+			DoesWrap = true,
+		})
+		ProbeBox:AddToggle("ProbeHome", {
+			Text = "Teleport Home Probe",
+			Default = false,
+			Tooltip = "Right after grabbing an egg Corvus asks the server to bring you home: the game's teleport-home call when a version has one (this one has none), else the AFK seat at your base table. If the egg counts, every delivery takes about 2 s instead of the walk home",
+		})
+		ProbeBox:AddToggle("ProbeCutscene", {
+			Text = "Guard Tag Probe",
+			Default = false,
+			Tooltip = "While carrying an egg home Corvus sends the cutscene tag the game's hatch cinema uses. If a guard reaches you and does not catch you, the tag stays on for every run home; one catch and it is never sent again on this game version",
+		})
+		ProbeBox:AddToggle("ProbeWalkSpeed", {
+			Text = "Walk Speed Probe",
+			Default = false,
+			Tooltip = "Steal runs at 2x the walk speed the game gives you (at most 400). If the server resets it or pulls you back, Corvus walks at the normal speed again",
+		})
+		ProbeBox:AddToggle("ProbeIndexAll", {
+			Text = "Index Claim All Probe",
+			Default = false,
+			Tooltip = "Claims every new index animal with the game's unused Claim All call instead of one by one. If nothing gets claimed Corvus goes back to one by one",
+		})
+		Labels.Probes = ProbeBox:AddLabel({ Text = "-", DoesWrap = true })
 		-- Main: Quick Start (filled at the end of this part) + Status.
 		N.QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "zap")
 		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
@@ -34945,6 +35523,7 @@ do
 				tostring(N.trailEquipped()),
 				tostring(N.attr("TutorialStep"))
 			),
+			"Probes (place version " .. N.placeVersion() .. "): " .. N.probeSummary(),
 			"Perf: " .. Debug.perfText(),
 			"Plan: " .. (if N.Plan.say ~= "" then N.Plan.say else "-") .. " | " .. (if N.Plan.why ~= "" then N.Plan.why else "-") .. " | " .. (if N.Plan.spendText ~= "" then N.Plan.spendText else "-"),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
@@ -35757,6 +36336,12 @@ do
 		)
 		task.spawn(N.fetchTrails)
 		N.calibrate()
+		local okFile, hasFile = pcall(function()
+			return isfile(N.probeFile())
+		end)
+		if okFile and hasFile then
+			log("PROBE states version=" .. N.placeVersion() .. " " .. N.probeSummary())
+		end
 	end
 	-- The movement loop owns the character: steal runs, placing eggs, the merge machine, the sell stand and the table
 	-- never overlap.
@@ -35863,6 +36448,10 @@ do
 		if N.does("AutoRewards") then
 			N.rewardStep()
 		end
+		-- Teleport home probe: does this game version have a teleport-home remote (logged once, else the AFK seat is used).
+		if on("ProbeHome") and N.probeState("teleport_home") == "untested" then
+			N.findHomeRemote()
+		end
 		N.codeStep()
 		N.sampleEating()
 		-- AfkRejoinClient asks the server for a new server after 1080 s without input. A mouse move through
@@ -35914,13 +36503,15 @@ do
 				I.plan = if #upNext > 0 then "<b>Up next</b>\n" .. '<font transparency="0.2">\u{2022} ' .. table.concat(upNext, "\n\u{2022} ") .. "</font>" else "Up next: nothing running"
 				local left, g = N.nextMark()
 				I.lines = string.format(
-					"Next zone %s  \u{00B7}  eggs in bag %d, growing %d\nNext guaranteed big egg %s in %s\n<font transparency=\"0.35\">The game's admins can review saves (Inspect panel). Corvus walks and buys like a player, at the game's own pace.</font>",
+					"Next zone %s  \u{00B7}  eggs in bag %d, growing %d\nNext guaranteed big egg %s in %s\n<font transparency=\"0.35\">%s</font>",
 					if z then tostring(z.n) .. " (+" .. formatNumber(missing) .. " speed)" else "all open",
 					N.eggBagCount(),
 					#N.placedEggs(),
 					tostring(g and g.title or "-"),
-					N.longTime(left or 0)
+					N.longTime(left or 0),
+					if N.anyProbeOn() then "Alt probes are on (Farm > Alt Probes): use them on an alt account first." else "The game's admins can review saves (Inspect panel). Corvus walks and buys like a player, at the game's own pace."
 				)
+				I.probes = N.probeText()
 				I.steal = string.format(
 					"Best open zone <b>%d</b>  \u{00B7}  walk speed %d\nLast: %s\nSteals <b>%d</b>, caught %d, failed %d, big %d%s",
 					N.bestZone(),
@@ -36009,6 +36600,7 @@ do
 						Labels.Steal:SetText(I.steal or "-")
 						Labels.Eat:SetText(I.eat or "-")
 						Labels.Planner:SetText(I.planner or "-")
+						Labels.Probes:SetText(I.probes or "-")
 					end)
 				end
 				if frame % 6 == 0 and N.syncMirrors then
