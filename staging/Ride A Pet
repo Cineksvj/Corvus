@@ -33963,7 +33963,8 @@ end
 if N.plannerOn() and N.Plan and N.Plan.eggValue then
 -- Smart Planner: expected $ of the hatch (sell worth + income over your weakest placed pet) per second of the trip
 local v = N.Plan.eggValue(info)
-return v / ((info.toEgg or 0) + (info.back or 0) + (info.waitDrop or 0) + 2)
+-- the scarce resource is the slower of the trip and the nests (every egg holds a nest for its growth time)
+return v / math.max((info.toEgg or 0) + (info.back or 0) + (info.waitDrop or 0) + 2, N.Plan.nestSeconds(info))
 end
 if pick == "Rarest" then
 return info.rank * 1e18 + value
@@ -35837,6 +35838,17 @@ end
 function P.spent()
 P.dirty = true
 end
+-- Nest-seconds one egg costs when nests are the bottleneck (eggs waiting >= nests): growth time / nests, else 0
+function P.nestSeconds(info)
+local nests = P.nests or 0
+if nests <= 0 then
+return 0
+end
+if #N.eggTools() + #N.plotEggModels() < nests then
+return 0
+end
+return N.growthSeconds(info.name, tonumber(info.weight) or 1) / nests
+end
 -- money made by a rate that rises rho $/s every second and stops rising after gap $/s, over T seconds
 local function accrue(rho, gap, T)
 if rho <= 0 or gap <= 0 or T <= 0 then
@@ -35967,7 +35979,7 @@ local r = if #t >= 3 then #t / math.max(os.clock() - t[1], 60) elseif grow > 0 t
 local L0 = N.luckMultiplier()
 local g0, s0, p0, fAvg, rar0 = dropStats(L0, w)
 local gap0 = if p0 > 0 then math.max(K * s0 / p0 - raw, 0) else 0
-P.w, P.m, P.K = w, m, K
+P.w, P.m, P.K, P.nests = w, m, K, nests
 local opts = {}
 local function add(o)
 o.ratio = if o.C > 0 then o.dI / o.C else math.huge
@@ -35988,14 +36000,17 @@ if #placed >= K then
 for _, pet in ipairs(N.petTools()) do
 spare = math.max(spare, pet.income)
 end
+-- the extra slot is filled by the hatch stream even without a spare pet: at least as good as the weakest placed
+spare = math.max(spare, w)
 end
+local per = tonumber(N.RebirthData.MultiplierPerRebirth) or 1
 local o = add({
 kind = "rebirth",
 key = "",
 label = "Rebirth " .. (n + 1),
 cash = cost,
 C = cost + luckRepl(N.paidLuckUpgrades()),
-dI = income / (n + 1) + spare * m * (n + 2) / (n + 1),
+dI = income * per / (1 + n * per) + spare * m * (1 + (n + 1) * per) / (1 + n * per),
 exempt = true,
 })
 rebirthAt = math.min(H, o.eta)
