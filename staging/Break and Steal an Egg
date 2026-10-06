@@ -32469,6 +32469,10 @@ function N.zoneAllowed(index)
 	if not index or not N.Cat.zones[index] then
 		return false
 	end
+	-- Tutorial stage "Break a Stronger Egg" completes only with a zone 1 egg (Rock/Swamp, dump 123514): zone 1 is the zone.
+	if N.tutorial() and N.tutorialStage() == "BreakStrongerEgg" then
+		return index == 1
+	end
 	if optionText("ZoneMode", "Best zone") == "Picked zones" then
 		return selected(Options.ZonePick, N.Cat.zones[index].label)
 	end
@@ -33460,6 +33464,9 @@ do
 	end
 	-- The game only streams in eggs near you, so a far zone looks empty until you go there.
 	function N.farmZoneTarget()
+		if N.tutorial() and N.tutorialStage() == "BreakStrongerEgg" then
+			return 1
+		end
 		local mode = optionText("ZoneMode", "Best zone")
 		if mode == "Picked zones" then
 			local top
