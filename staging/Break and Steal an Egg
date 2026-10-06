@@ -32202,7 +32202,12 @@ do
 		return if type(tiers) == "table" and tiers[1] then tiers[1].Capacity or 1 else 1
 	end
 	function N.tutorial()
-		return LocalPlayer:GetAttribute("TutorialActive") == true
+		return LocalPlayer:GetAttribute("TutorialActive") == true or LocalPlayer:GetAttribute("TutorialStage") ~= nil
+	end
+	-- TutorialConfig.StageAttribute (dump 149180): EquipPickaxe, BreakEgg ... UseTreadmill, BuyPickaxe, ... BuyTrail.
+	function N.tutorialStage()
+		local stage = LocalPlayer:GetAttribute("TutorialStage")
+		return if type(stage) == "string" then stage else nil
 	end
 	function N.ragdolled()
 		local c = character()
@@ -32977,10 +32982,7 @@ do
 	local ModeRank = { Walk = 1, Fast = 2, Teleport = 3 }
 	N.ModeOrder = ModeOrder
 	function N.chosenMoveMode()
-		local v = optionText("MoveMode", N.Auto.Label)
-		if string.sub(v, 1, 4) == "Auto" then
-			return N.Auto.move.cur
-		end
+		local v = optionText("MoveMode", "Fast")
 		return if v == "Walk" or v == "Teleport" then v else "Fast"
 	end
 	function N.moveMode()
@@ -33020,7 +33022,6 @@ do
 	end
 	local function noteSnap(distance)
 		N.Moves.snaps += 1
-		N.Auto.signal("move", "snapback")
 		N.Moves.slowUntil = os.clock() + 45
 		N.Moves.slowFactor = math.max((N.Moves.slowFactor or 1) * 0.8, 0.4)
 		log("MOVE snapback", math.floor(distance) .. " studs, slowing down to", math.floor(N.Moves.slowFactor * 100) .. "%")
@@ -33263,26 +33264,10 @@ N.Manual = { running = false }
 N.Farm = { failedEggs = setmetatable({}, { __mode = "k" }), failedPickups = setmetatable({}, { __mode = "k" }), rejects = 0, hatches = {}, target = nil, placeAt = -1e9, placeWanted = false, lastEquipBest = -1e9 }
 do
 	local F = N.Farm
-	-- Hit ladder: Blatant goes under the server floor, the server only drops those hits (EggHitRejected, no kick code
-	-- exists for hits). 3 rejections within 60 s step Blatant down to Fast; Blatant is tried again after 10 min.
-	N.HitLadder = { rejects = {}, fallbackUntil = 0 }
-	N.BlatantHit = "Blatant (rejected hits)"
 	N.onRemote("EggHitRejected", function(part)
 		F.rejects += 1
 		Session.rejects += 1
 		F.backoffUntil = os.clock() + 0.4
-		N.Auto.signal("hit", "rejected hits")
-		local H, now = N.HitLadder, os.clock()
-		if N.hitSpeedPick() == N.BlatantHit then
-			table.insert(H.rejects, now)
-			while H.rejects[1] and now - H.rejects[1] > 60 do
-				table.remove(H.rejects, 1)
-			end
-			if #H.rejects >= 3 then
-				H.rejects, H.fallbackUntil, H.fellBack = {}, now + 600, true
-				log("HIT fallback Blatant -> Fast (3 rejected hits in 60 s, retry in 10 min)")
-			end
-		end
 		if typeof(part) == "Instance" and F.target and F.target.part == part then
 			F.targetRejects = (F.targetRejects or 0) + 1
 			if (F.targetHits or 0) <= 1 then
@@ -33312,7 +33297,6 @@ do
 		end
 		Session.caught += 1
 		if N.moveMode() == "Teleport" then
-			N.Auto.signal("move", "caught by a guard")
 		end
 		F.caughtAt = os.clock()
 		if F.carryZone and not on("IgnoreGuards") then
@@ -33338,36 +33322,14 @@ do
 	end
 	-- Hit Speed: the server takes one hit per 0.92 x the swing gap (EggConfig.HitCooldownFactor, PickaxeConfig
 	-- SwingCooldown 0.5 = 0.46 s at base, burst 2). Fast sits just above that floor (0.94-0.98 x gap = 0.47-0.49 s), so
-	-- no hit is rejected; Normal is the game's own swing. The player picks it (default Fast).
-	function N.chosenHitSpeed()
-		local v = optionText("HitSpeed", N.Auto.Label)
-		if string.sub(v, 1, 4) == "Auto" then
-			v = N.Auto.hit.cur
-		end
-		return if string.sub(v, 1, 7) == "Blatant" then N.BlatantHit else v
-	end
+	-- no hit is rejected (anything faster is dropped by the server, so it is not offered); Normal is the game's own swing.
 	function N.hitSpeedPick()
-		local v = N.chosenHitSpeed()
-		local H = N.HitLadder
-		if v ~= N.BlatantHit then
-			H.rejects, H.fallbackUntil, H.fellBack = {}, 0, false
-			return v
-		end
-		if os.clock() < H.fallbackUntil then
-			return "Fast"
-		end
-		if H.fellBack then
-			H.fellBack = false
-			log("HIT retry Fast -> Blatant")
-		end
-		return v
+		return if optionText("HitSpeed", "Fast") == "Normal" then "Normal" else "Fast"
 	end
 	function N.hitRange()
 		local base = N.swingGap()
 		local range = ({
-			Slow = { base + 0.15, base + 0.3 },
 			Fast = { base * 0.94, base * 0.98 },
-			[N.BlatantHit] = { 0.1, 0.14 },
 		})[N.hitSpeedPick()] or { base, base + 0.06 }
 		return range[1], range[2]
 	end
@@ -33777,7 +33739,7 @@ do
 			if hpNow < lastHp then
 				lastHp, progressAt = hpNow, os.clock()
 			end
-			-- Only leave an egg when hits stop landing at all. Rejected hits (Blatant speed) just slow down for a moment.
+			-- Only leave an egg when hits stop landing at all. A rejected hit just slows down for a moment.
 			if os.clock() - progressAt > 10 or os.clock() - started > budget then
 				log("EGG gave up", info.kind, "after", hits, "hits, rejected", F.targetRejects or 0)
 				F.failedEggs[egg] = os.clock() + 30
@@ -34228,259 +34190,6 @@ do
 		end
 		return false
 	end
-end
--- Auto mode ladder (CLAUDE.md "MODES ARE CHOSEN BY MEASURED PROFIT"). Movement Type and Hit Speed default to
--- "Auto (best measured)": while Break Eggs runs (own toggle or the Smart Planner) every allowed mode is measured for
--- MeasureSecs of farming time (animals banked per minute), the danger signals of notes.md Anticheat are watched
--- (snapback / pull-back = move, EggHitRejected = hit), the most profitable mode that raised none is kept, everything is
--- measured again every hour. A signal steps one mode down (MODE fallback), 3 fallbacks from the same mode switch it off
--- for the day. Fixed dropdown picks keep the old behaviour (plus the old snapback ladder).
-N.Auto = {
-	Label = "Auto (best measured)",
-	MeasureSecs = 240,
-	WarmSecs = 30,
-	RecheckSecs = 3600,
-	DisableSecs = 86400,
-	Ladders = {
-		move = { "Walk", "Fast", "Teleport" },
-		hit = { "Normal", "Fast", "Blatant (rejected hits)" },
-	},
-	Options = { move = "MoveMode", hit = "HitSpeed" },
-	Needs = { move = 1, hit = 3 },
-	queue = {},
-	nextAt = 0,
-	cycle = 0,
-}
-do
-	local A = N.Auto
-	for axis, list in pairs(A.Ladders) do
-		A[axis] = { cur = "Fast", best = nil, bestRate = nil, disabled = {}, falls = {}, sig = {}, why = "", rates = {} }
-		A[axis].list = list
-	end
-	local function short(mode)
-		return if string.sub(mode, 1, 7) == "Blatant" then "Blatant" else mode
-	end
-	A.short = short
-	function A.isAuto(axis)
-		local option = Options[A.Options[axis]]
-		local value = option and option.Value
-		return value == nil or (type(value) == "string" and string.sub(value, 1, 4) == "Auto")
-	end
-	function A.anyAuto()
-		return A.isAuto("move") or A.isAuto("hit")
-	end
-	function A.current(axis)
-		return A[axis].cur
-	end
-	local function rank(axis, mode)
-		for i, name in ipairs(A.Ladders[axis]) do
-			if name == mode then
-				return i
-			end
-		end
-		return 1
-	end
-	local function allowed(axis, mode)
-		return (A[axis].disabled[mode] or 0) <= os.clock()
-	end
-	-- One step down from `mode` that is still allowed (rank 1 is the floor).
-	local function lower(axis, mode)
-		local list = A.Ladders[axis]
-		for i = rank(axis, mode) - 1, 1, -1 do
-			if allowed(axis, list[i]) or i == 1 then
-				return list[i]
-			end
-		end
-		return list[1]
-	end
-	function A.buildQueue()
-		A.cycle += 1
-		A.queue, A.results = {}, {}
-		for _, axis in ipairs({ "move", "hit" }) do
-			if A.isAuto(axis) then
-				A[axis].best, A[axis].bestRate, A[axis].rates = nil, nil, {}
-				for _, mode in ipairs(A.Ladders[axis]) do
-					if allowed(axis, mode) then
-						table.insert(A.queue, { axis = axis, mode = mode })
-					else
-						A[axis].rates[mode] = "off today"
-					end
-				end
-			end
-		end
-		A.total = #A.queue
-	end
-	local function setWhy(axis)
-		local ax = A[axis]
-		local parts = {}
-		for _, mode in ipairs(A.Ladders[axis]) do
-			local rate = ax.rates[mode]
-			if rate ~= nil then
-				table.insert(parts, short(mode) .. " " .. (if type(rate) == "number" then string.format("%.1f/min", rate) else tostring(rate)))
-			end
-		end
-		ax.why = table.concat(parts, ", ")
-	end
-	function A.startPhase(item)
-		A.phase = { axis = item.axis, mode = item.mode, warm = A.WarmSecs, secs = 0, b0 = Session.banked, raised = false, index = A.total - #A.queue }
-		A[item.axis].cur = item.mode
-	end
-	function A.finishPhase(why)
-		local phase = A.phase
-		A.phase = nil
-		local ax = A[phase.axis]
-		local rate = if phase.secs > 0 then (Session.banked - phase.b0) / phase.secs * 60 else 0
-		local keep
-		if phase.raised then
-			ax.rates[phase.mode] = "raised a danger signal"
-			keep = "no (danger signal)"
-		else
-			ax.rates[phase.mode] = rate
-			if ax.best == nil or rate > (ax.bestRate or 0) * 1.03 then
-				ax.best, ax.bestRate = phase.mode, rate
-				keep = "yes"
-			else
-				keep = string.format("no (%s earns %.1f/min)", short(ax.best), ax.bestRate or 0)
-			end
-		end
-		log(string.format(
-			"MODE measure move=%s hit=%s rate=%.1f/min keep=%s",
-			if phase.axis == "move" then phase.mode else A.move.cur,
-			if phase.axis == "hit" then phase.mode else A.hit.cur,
-			rate,
-			keep
-		))
-		ax.cur = ax.best or A.Ladders[phase.axis][1]
-		setWhy(phase.axis)
-		if #A.queue == 0 then
-			A.nextAt = os.clock() + A.RecheckSecs
-			log(string.format("MODE best move=%s hit=%s, measured again in %d min", A.move.cur, A.hit.cur, math.floor(A.RecheckSecs / 60)))
-		end
-	end
-	-- A danger signal from the server: axis "move" (snapback / pull-back) or "hit" (EggHitRejected). Moves step down on
-	-- the first one, hits on 3 within 60 s (a lone rejected hit is lag, the server only drops it).
-	function A.signal(axis, what)
-		if not A.isAuto(axis) then
-			return false
-		end
-		local ax = A[axis]
-		local now = os.clock()
-		table.insert(ax.sig, now)
-		while ax.sig[1] and now - ax.sig[1] > 60 do
-			table.remove(ax.sig, 1)
-		end
-		if #ax.sig < A.Needs[axis] then
-			return false
-		end
-		ax.sig = {}
-		local from = ax.cur
-		if rank(axis, from) <= 1 then
-			return false
-		end
-		local to = lower(axis, from)
-		ax.falls[from] = (ax.falls[from] or 0) + 1
-		log(string.format("MODE fallback %s -> %s reason=%s", from, to, what or axis))
-		if ax.falls[from] >= 3 then
-			ax.disabled[from] = now + A.DisableSecs
-			ax.rates[from] = "off today"
-			log(string.format("MODE disabled %s %s for the day (3 fallbacks)", axis, short(from)))
-		end
-		ax.cur = to
-		if ax.best == from then
-			ax.best = to
-		end
-		if A.phase and A.phase.axis == axis and A.phase.mode == from then
-			A.phase.raised = true
-		end
-		setWhy(axis)
-		return true
-	end
-	-- Called once a second. Measuring time only runs while Break Eggs farms (not on the treadmill).
-	function A.tick()
-		local now = os.clock()
-		local dt = math.min(now - (A.lastTick or now), 5)
-		A.lastTick = now
-		if not A.anyAuto() then
-			if A.phase then
-				A.phase = nil
-				A.queue = {}
-			end
-			A.nextAt = 0
-			return
-		end
-		if not on("AutoFarm") then
-			return
-		end
-		if not A.phase then
-			if #A.queue == 0 then
-				if now < A.nextAt then
-					return
-				end
-				A.buildQueue()
-				log(string.format("MODE measuring %d modes, %d s each, danger signals watched", A.total, A.MeasureSecs))
-			end
-			if #A.queue == 0 then
-				A.nextAt = now + A.RecheckSecs
-				return
-			end
-			A.startPhase(table.remove(A.queue, 1))
-			return
-		end
-		local phase = A.phase
-		if not A.isAuto(phase.axis) then
-			A.phase = nil
-			return
-		end
-		if phase.raised then
-			A.finishPhase()
-			return
-		end
-		if N.Train.startedAt then
-			return
-		end
-		if phase.warm > 0 then
-			phase.warm -= dt
-			phase.b0 = Session.banked
-			return
-		end
-		phase.secs += dt
-		if phase.raised or phase.secs >= A.MeasureSecs then
-			A.finishPhase()
-		end
-	end
-	-- Plain words for Up next.
-	function A.text()
-		if not A.anyAuto() then
-			return nil
-		end
-		local function part(axis, noun)
-			if not A.isAuto(axis) then
-				return nil
-			end
-			local ax = A[axis]
-			local why = ax.why ~= "" and (" (" .. ax.why .. ")") or ""
-			return string.format("%s %s%s", noun, short(ax.cur), if A.phase and A.phase.axis == axis then " [measuring]" else why)
-		end
-		local lines = {}
-		for _, bit in ipairs({ part("move", "movement"), part("hit", "hits") }) do
-			table.insert(lines, bit)
-		end
-		local state
-		if A.phase then
-			state = string.format("measuring %s %s, step %d of %d", A.phase.axis, short(A.phase.mode), A.phase.index, A.total)
-		elseif A.nextAt > os.clock() then
-			state = string.format("best kept, measured again in %d min", math.ceil((A.nextAt - os.clock()) / 60))
-		else
-			state = "waiting for Break Eggs to measure"
-		end
-		return "<b>Auto modes</b>: " .. table.concat(lines, ", ") .. "; " .. state
-	end
-	task.spawn(function()
-		while alive() do
-			pcall(A.tick)
-			task.wait(1)
-		end
-	end)
 end
 -- Profit engine v2 (CLAUDE.md.txt 8.00). One planner ranks every way to spend cash and time on one scale.
 -- Value of a state = extra cash the egg farm adds by the end of the 24 h horizon, from the best schedule
@@ -35270,7 +34979,7 @@ do
 		end
 		if not N.treadmillUnlocked() then
 			local cost = tonumber(N.G.TreadmillUnlock.Cost) or 100
-			if on("AutoTreadmill") and N.cash() >= cost and not N.tutorial() and os.clock() - T.unlockAskedAt > 10 then
+			if on("AutoTreadmill") and N.cash() >= cost and os.clock() - T.unlockAskedAt > 10 then
 				T.unlockAskedAt = os.clock()
 				fire("UnlockTreadmillRequest")
 				task.wait(1)
@@ -35303,6 +35012,11 @@ do
 	-- train only while the best 24 h schedule starts with training. The other two modes are the player's own schedule.
 	function N.wantTrain(farmHadWork)
 		local farmOn = on("AutoFarm") or on("StealPickups")
+		-- Tutorial stages that ask for treadmill time (TutorialConfig TreadmillMinSeconds 8): do them while anything runs.
+		local stage = N.tutorialStage()
+		if (stage == "UseTreadmill" or stage == "EarnPickaxeCash") and N.treadmillUnlocked() and N.anyAutoOn and N.anyAutoOn() then
+			return true
+		end
 		if not on("AutoTrain") then
 			return false
 		end
@@ -35613,7 +35327,9 @@ do
 			return false
 		end
 		pcall(N.Plan.update, false)
-		if N.tutorial() or N.carrying() then
+		-- The tutorial is played through, not waited out: its own stages need the pickaxe/trail/plot purchases (the game
+		-- shows the Pickaxes shop during it), so the buys run and the server refuses whatever the stage does not allow.
+		if N.carrying() then
 			return false
 		end
 		if N.equipOwnedStep() then
@@ -35978,10 +35694,9 @@ do
 			table.insert(N.EggNames, egg.name)
 		end
 	end
-	N.HitSpeeds = { "Auto (best measured)", "Slow", "Normal", "Fast", "Blatant (rejected hits)" }
+	N.HitSpeeds = { "Normal", "Fast" }
 	do
-		-- One switch for people who do not want to set anything: the safe, best settings for a full farm.
-		-- Quick Start (CLAUDE.md "Main = Quick Start"): Smart Planner plus the main loop toggles mirrored from their tabs
+				-- Quick Start (CLAUDE.md "Main = Quick Start"): Smart Planner plus the main loop toggles mirrored from their tabs
 		-- (MirrorToggle keeps both switches in sync, one config key), then Stop Everything and Reset Hub Options.
 		local QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "sparkles")
 		N.QuickBox = QuickBox
@@ -36053,8 +35768,8 @@ do
 		EggBox:AddDropdown("HitSpeed", {
 			Text = "Hit Speed",
 			Values = N.HitSpeeds,
-			Default = "Auto (best measured)",
-			Tooltip = "Auto (default) measures Normal, Fast and Blatant for a few minutes each while Break Eggs runs, keeps the one that banks the most animals without rejected hits and measures again every hour. Fast hits right at the server limit. Normal is the game's own swing. Blatant goes past the limit, the server drops those hits and Corvus switches to Fast after 3 rejections",
+			Default = "Fast",
+			Tooltip = "Fast hits right at the server limit (one hit per 0.92 swing gaps), the fastest the server takes. Normal is the game\'s own swing. Faster hits are dropped by the server, so they are not offered",
 		})
 		EggBox:AddToggle("AvoidPlayers", {
 			Text = "Skip Eggs Other Players Hit",
@@ -36166,7 +35881,7 @@ do
 		BuyBox:AddToggle("AutoPickaxe", { Text = "Best Pickaxe", Default = false, Tooltip = "Buys and equips the best pickaxe you can afford" })
 		BuyBox:AddToggle("AutoTrail", { Text = "Best Trail", Default = false, Tooltip = "Trails multiply the speed you get on the treadmill. Bought when the profit plan says the faster training pays back" })
 		BuyBox:AddToggle("AutoPlotUpgrade", { Text = "Plot Upgrades", Default = false, Tooltip = "Every plot level holds one more animal. Bought when the profit plan ranks it best per dollar" })
-		BuyBox:AddToggle("AutoTreadmill", { Text = "Treadmill Unlock And Upgrades", Default = false })
+		BuyBox:AddToggle("AutoTreadmill", { Text = "Treadmill Unlock And Upgrades", Default = false, Tooltip = "Unlocks your treadmill and buys its levels when the profit plan says faster training pays back" })
 		BuyBox:AddToggle("AutoSatchel", {
 			Text = "Satchel Upgrades",
 			Default = false,
@@ -36359,9 +36074,9 @@ do
 		local MoveBox = Tabs.Player:AddLeftGroupbox("Movement", "route")
 		MoveBox:AddDropdown("MoveMode", {
 			Text = "Movement Type",
-			Values = { "Auto (best measured)", "Walk", "Fast", "Teleport" },
-			Default = "Auto (best measured)",
-			Tooltip = "Auto (default) measures Walk, Fast and Teleport for a few minutes each while Break Eggs runs, keeps the one that banks the most animals without a snapback and measures again every hour. Fast glides a bit above your own speed. Walk runs at your own speed. Teleport is instant, the game blocks banking right after one. If the server pulls you back twice in a minute Corvus steps down one mode and tries again after 10 minutes",
+			Values = { "Fast", "Walk", "Teleport" },
+			Default = "Fast",
+			Tooltip = "Fast glides a bit above your own speed and is the default. Walk runs at your own speed. Teleport is instant, but the game blocks banking right after one. If the server pulls you back twice in a minute Corvus drops one mode, then tries the faster one again after 10 minutes",
 		})
 		MoveBox:AddToggle("TeleportSpeedCheck", {
 			Text = "Speed Check With Teleport",
@@ -36369,7 +36084,8 @@ do
 			Tooltip = "Also keeps to zones your speed can escape while teleporting. Off = farms the highest zone you can break eggs in",
 		})
 		MoveBox:AddSlider("FastBoost", { Text = "Fast Speed", Default = 110, Min = 100, Max = 300, Rounding = 0, Suffix = "% of your speed" })
-		MoveBox:AddToggle("TravelNoclip", { Text = "Noclip While Travelling", Default = true, Tooltip = "Fast mode only. Walk always passes through walls" })
+		MoveBox:AddToggle("Noclip", { Text = "Noclip", Default = false, Tooltip = "Walk through walls. Your run speed stays the one the game gives you" })
+			MoveBox:AddToggle("TravelNoclip", { Text = "Noclip While Travelling", Default = true, Tooltip = "Applies to Fast travel. Walk always passes through walls" })
 		MoveBox:AddToggle("LeaveHell", {
 			Text = "Leave Hell Event",
 			Default = true,
@@ -36401,13 +36117,7 @@ do
 		Labels.Move = MoveBox:AddLabel({ Text = "-", DoesWrap = true })
 		-- WalkSpeed, Fly and Infinite Jump were removed: the game sets WalkSpeed from your speed stat and its server
 		-- anticheat pulls back faster running and flying (notes.md Anticheat), so they could not do what they said.
-		local SpeedBox = Tabs.Player:AddRightGroupbox("Player", "user")
-		SpeedBox:AddToggle("Noclip", { Text = "Noclip", Default = false, Tooltip = "Walk through walls. Your run speed stays the one the game gives you" })
-		SpeedBox:AddLabel({
-			Text = '<font transparency="0.35">Your run speed comes from your speed stat: train on the treadmill to run faster. Right-click any toggle to give it a keybind.</font>',
-			DoesWrap = true,
-		})
-		local EspBox = Tabs.Player:AddLeftGroupbox("ESP", "eye")
+		local EspBox = Tabs.Player:AddRightGroupbox("ESP", "eye")
 		EspBox:AddToggle("ESPEggs", { Text = "Egg ESP", Default = false })
 		EspBox:AddToggle("ESPPickups", { Text = "Animal ESP", Default = false })
 		EspBox:AddToggle("ESPGuards", { Text = "Guard ESP", Default = false })
@@ -36420,7 +36130,7 @@ do
 	do
 		local QuickBox = N.QuickBox
 		for _, row in ipairs({
-			{ "AutoFarm", "Break Eggs" },
+			{ "AutoFarm", "Break Eggs In Best Zone" },
 			{ "StealPickups", "Steal Animals" },
 			{ "AutoPlace", "Auto Place Animals" },
 			{ "AutoTrain", "Auto Train" },
@@ -36587,7 +36297,7 @@ do
 				tostring(N.plotAttr("TreadmillLevel", "?")),
 				tostring(N.tutorial())
 			),
-			"Movement: mode " .. N.moveMode() .. (if N.Auto.isAuto("move") then " (auto)" else "") .. ", snapbacks " .. N.Moves.snaps .. ", blocked " .. N.Moves.blocked,
+			"Movement: mode " .. N.moveMode() ..", snapbacks " .. N.Moves.snaps .. ", blocked " .. N.Moves.blocked,
 			"Perf: " .. Debug.perfText(),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
 			string.rep("-", 70),
@@ -37078,14 +36788,14 @@ do
 			Library:AddCommand({
 				Name = "mode",
 				Aliases = { "move" },
-				Args = "<auto/walk/fast/teleport>",
+				Args = "<walk/fast/teleport>",
 				Description = "Sets how Corvus travels",
 				Source = GameName,
 				Callback = function(args)
 					local word = string.lower(tostring(args[1] or ""))
-					local pick = ({ walk = "Walk", safe = "Walk", fast = "Fast", teleport = "Teleport", tp = "Teleport", auto = N.Auto.Label })[word]
+					local pick = ({ walk = "Walk", safe = "Walk", fast = "Fast", teleport = "Teleport", tp = "Teleport" })[word]
 					if not pick then
-						return "Mode is " .. N.moveMode() .. ". Use: mode auto, mode walk, mode fast or mode teleport"
+						return "Mode is " .. N.moveMode() .. ". Use: mode walk, mode fast or mode teleport"
 					end
 					Options.MoveMode:SetValue(pick)
 					return "Mode set to " .. pick
@@ -37192,12 +36902,11 @@ do
 					Id = "move",
 					Title = "How should Corvus travel?",
 					Description = "You can change this later in the Player tab.",
-					Default = "Auto (best measured)",
+					Default = "Fast",
 					SingleColumn = true,
 					ChoiceHeight = 54,
 					Choices = {
-						{ Id = "Auto (best measured)", Title = "Auto (best measured)", Description = "Measures Walk, Fast and Teleport and keeps the one that banks the most without a pull-back", Icon = "gauge", Color = "#f2c94c" },
-						{ Id = "Fast", Title = "Fast", Description = "Glides a bit above your own speed, steps down to Walk if the server pulls you back", Icon = "wind", Color = "#5fb8ff" },
+						{ Id = "Fast", Title = "Fast", Description = "Glides a bit above your own speed, drops to Walk for a while if the server pulls you back", Icon = "wind", Color = "#5fb8ff" },
 						{ Id = "Walk", Title = "Walk", Description = "Runs with your own speed", Icon = "footprints", Color = "#60d696" },
 						{ Id = "Teleport", Title = "Teleport", Description = "Instant, the game blocks banking right after a teleport", Icon = "zap", Color = "#ff5d8f" },
 					},
@@ -37486,7 +37195,7 @@ do
 					best,
 					if zone then zone.rarity else "?",
 					if nextZone then string.format("\nNext: zone %d at <b>%s</b> speed", nextZone.index, formatNumber(nextZone.power)) else "\nEvery zone is open"
-				) .. (if N.tutorial() then '\n<font color="#fab428">Finish the game tutorial first, it blocks every purchase</font>' else "")
+				) .. (if N.tutorial() then '\n<font color="#fab428">Game tutorial: ' .. tostring(N.tutorialStage() or "running") .. ", Corvus plays it through</font>" else "")
 				-- Up next: what every enabled main toggle is doing, in plain words (raw PLAN lines only go to the log).
 				do
 					local P = N.Plan
@@ -37494,12 +37203,6 @@ do
 					if N.planOn() then
 						local top = P.valid and P.valid[1]
 						table.insert(lines, "<b>Smart Planner</b>: " .. (if P.activity == "train" then "training to " .. formatNumber(P.trainTarget or 0) .. " speed" else "farming zone " .. tostring(P.farmZone or N.bestZone())) .. (if top then string.format(", next buy %s for $%s %s", tostring(top.label), formatNumber(top.cost), if (top.eta or 0) <= 0 then "now" else "in " .. P.formatSeconds(math.min(top.eta, 1e7))) else ", saving up"))
-					end
-					do
-						local autoText = N.Auto.text()
-						if autoText then
-							table.insert(lines, autoText)
-						end
 					end
 					if on("AutoFarm") then
 						table.insert(lines, string.format("<b>Break Eggs</b>: zone %d, %s", N.bestZone(), optionText("EggPriority", "Best value per second")))
@@ -37636,10 +37339,10 @@ do
 					"Speed now <b>%s</b> studs/s%s%s\nSnapbacks <b>%d</b>  \u{00B7}  blocked <b>%d</b>",
 					if N.moveMode() == "Teleport" then "\u{221E}" else formatNumber(math.floor(N.modeSpeed())),
 					if os.clock() < N.Moves.slowUntil then '  <font color="#fab428">(slowed after a snapback)</font>' else "",
-				(function()
-					local fell, wait = N.moveFallback()
-					return if fell then string.format("\n%s after snapbacks, %s again in %dm", N.moveMode(), N.chosenMoveMode(), math.ceil(wait / 60)) else ""
-				end)(),
+					(function()
+						local fell, wait = N.moveFallback()
+						return if fell then string.format("\n%s after snapbacks, %s again in %dm", N.moveMode(), N.chosenMoveMode(), math.ceil(wait / 60)) else ""
+					end)(),
 					N.Moves.snaps,
 					N.Moves.blocked
 				)
@@ -37681,7 +37384,7 @@ do
 					group(function()
 						Labels.Status:SetText(Status)
 						Labels.Info:SetText(I.info or "-")
-Labels.UpNext:SetText(I.upnext or "-")
+					Labels.UpNext:SetText(I.upnext or "-")
 					end)
 				end
 				if shown(Tabs.Farm) then
