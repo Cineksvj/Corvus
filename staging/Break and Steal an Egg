@@ -33412,11 +33412,21 @@ do
 		local titanicFirst = on("TitanicFirst")
 		local others = if on("AvoidPlayers") then otherPositions() else {}
 		local best, bestScore
+		-- Tutorial stage "Break a Stronger Egg" (TutorialConfig.StrongEggMinTier 2, EggRarity.IsStrongerEgg, dump 123514-123531):
+		-- only a ZONE 1 egg of tier >= 2 (Rock Egg, Swamp Egg) completes it. Anything else, e.g. the zone 3 snow eggs the plan
+		-- prefers, was hit for 10 minutes without the stage moving (live 2026-10-06 23:27-23:40), so the pick is narrowed here.
+		local tutorialPick = nil
+		if N.tutorial() and N.tutorialStage() == "BreakStrongerEgg" then
+			tutorialPick = { ["Rock Egg"] = true, ["Swamp Egg"] = true }
+		end
 		-- Eggs in your zones that only fail the hit limit: when nothing else fits, the fewest-hits one is broken anyway,
 		-- so the last zone is never skipped just because its eggs are tough.
 		local tough, toughHits = nil, math.huge
 		N.EggSeen = 0
 		for _, info in ipairs(N.eggs()) do
+			if tutorialPick and not tutorialPick[info.kind] then
+				continue
+			end
 			if N.zoneAllowed(info.zone) then
 				N.EggSeen += 1
 				if
