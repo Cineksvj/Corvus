@@ -32952,7 +32952,7 @@ do
 		if not me then
 			return 0
 		end
-		local insta = optionText("AuraMode", "Insta-kill") == "Insta-kill"
+		local insta = N.auraInsta()
 		local ids = {}
 		for _, entry in ipairs(N.enemies("EnemyFolder")) do
 			if entry.dist <= range then
@@ -34607,10 +34607,10 @@ do
 		return string.sub(optionText(option, "Blatant"), 1, 7) == "Blatant"
 	end
 	N.SpeedValues = {
-		LootSpeed = { "Blatant (instant pickup)", "Legit (walk to drops)" },
-		TrainSpeed = { "Blatant (fastest the server takes)", "Legit (game speed)" },
-		TowerSpeed = { "Blatant (instant floors)", "Legit (fight every floor)" },
-		BossCards = { "Blatant (every card)", "Legit (one card)" },
+		LootSpeed = { "Auto (best measured)", "Blatant (instant pickup)", "Legit (walk to drops)" },
+		TrainSpeed = { "Auto (best measured)", "Blatant (fastest the server takes)", "Legit (game speed)" },
+		TowerSpeed = { "Auto (best measured)", "Blatant (instant floors)", "Legit (fight every floor)" },
+		BossCards = { "Auto (best measured)", "Blatant (every card)", "Legit (one card)" },
 	}
 	-- Short plain-words line for the status labels.
 	function N.probeText(name)
@@ -34629,6 +34629,7 @@ do
 	-- first; the kill and the 30 s respawn stay the game's. Accepted only when the bank really adds them.
 	N.Loot = { empty = 0, short = 0, last = "" }
 	function N.directLootWanted()
+		N.modeTouch("LootSpeed")
 		return N.blatant("LootSpeed") and N.probeOpen("stage_loot")
 	end
 	function N.directLoot(stageN)
@@ -34777,7 +34778,11 @@ do
 	end
 	N.trainOnceBoost = trainOnce
 	function N.boostContext()
-		if not N.want("AutoTrain") or not N.blatant("TrainSpeed") or N.dead() or N.manualRunning() then
+		if not N.want("AutoTrain") or N.dead() or N.manualRunning() then
+			return nil
+		end
+		N.modeTouch("TrainSpeed")
+		if not N.blatant("TrainSpeed") then
 			return nil
 		end
 		local mode = N.fightMode()
@@ -35015,6 +35020,7 @@ do
 	-- completes each floor back to back from the floor the run started on, never kills anything meanwhile (so the
 	-- game never completes a floor a second time) and leaves at the first floor the server does not pay.
 	function N.towerFastWanted()
+		N.modeTouch("TowerSpeed")
 		return N.blatant("TowerSpeed") and N.probeOpen("tower_fast")
 	end
 	function N.towerFast()
@@ -35085,6 +35091,7 @@ do
 		return mine, seen
 	end
 	function N.bossCards()
+		N.modeTouch("BossCards")
 		if not (N.blatant("BossCards") and N.probeOpen("boss_cards")) then
 			fire(N.R.bossCard, "1")
 			return 1
@@ -35103,6 +35110,198 @@ do
 			end
 		end
 		return mine
+	end
+end
+do
+	-- "Auto (best measured)" is the default of every speed dropdown (owner 2026-10-07, MODES ARE CHOSEN BY MEASURED
+	-- PROFIT). Per option the hub measures the fast (Blatant / Insta-kill) mode against the next safer one, 3 min
+	-- each, while the activity really runs, keeps the better one, measures again every hour and steps back to the safe
+	-- one on any danger signal (rejected probe, a death while fast). 3 step-backs = the fast mode is off for a day.
+	-- Movement has no Blatant/Fast/Legit dropdown in this hub (teleport only), so it is not part of the ladder.
+	local M = { opts = {}, window = 180, giveUp = 600, recheck = 3600, minUses = 3, margin = 1.03, dayFile = "Corvus_LTF_modes.txt" }
+	N.Modes = M
+	M.Names = { "LootSpeed", "TrainSpeed", "TowerSpeed", "BossCards", "AuraMode" }
+	M.Short = { LootSpeed = "Loot", TrainSpeed = "Train", TowerSpeed = "Tower", BossCards = "Boss cards", AuraMode = "Aura" }
+	-- Probe(s) whose rejection means the server refuses the fast way.
+	M.Probes = { LootSpeed = "stage_loot", TrainSpeed = "train_rate", TowerSpeed = "tower_fast", BossCards = "boss_cards" }
+	M.AutoText = "Auto (best measured)"
+	for _, name in ipairs(M.Names) do
+		M.opts[name] = { cur = "fast", phase = "fast", uses = 0, fb = 0, win = nil, fastRate = nil, safeRate = nil, nextAt = nil, off = 0, dead = false }
+	end
+	local function save()
+		if type(writefile) ~= "function" then
+			return
+		end
+		local lines = {}
+		for _, name in ipairs(M.Names) do
+			local S = M.opts[name]
+			if S.off > os.time() then
+				table.insert(lines, name .. "|" .. tostring(S.off))
+			end
+		end
+		pcall(writefile, M.dayFile, table.concat(lines, "\n"))
+	end
+	pcall(function()
+		if type(isfile) == "function" and type(readfile) == "function" and isfile(M.dayFile) then
+			for name, untilAt in string.gmatch(readfile(M.dayFile), "([%w_]+)|(%d+)") do
+				local S = M.opts[name]
+				if S and tonumber(untilAt) > os.time() then
+					S.off = tonumber(untilAt)
+					S.cur = "safe"
+					S.phase = "run"
+					log("MODE", name, "fast mode is off for the day (3 step-backs earlier)")
+				end
+			end
+		end
+	end)
+	function M.isAuto(option)
+		return string.sub(optionText(option, M.AutoText), 1, 4) == "Auto"
+	end
+	function N.modeFast(option)
+		local S = M.opts[option]
+		return S ~= nil and S.cur == "fast" and S.off <= os.time()
+	end
+	-- Called wherever the activity of the option happens (any mode): a measuring window only counts when it ran.
+	function N.modeTouch(option)
+		local S = M.opts[option]
+		if S then
+			S.uses += 1
+		end
+	end
+	function N.blatant(option)
+		local text = optionText(option, M.AutoText)
+		if string.sub(text, 1, 4) == "Auto" then
+			return N.modeFast(option)
+		end
+		return string.sub(text, 1, 7) == "Blatant"
+	end
+	-- Insta-kill for the aura: Auto follows the ladder, the explicit values are what they say.
+	function N.auraInsta()
+		N.modeTouch("AuraMode")
+		local text = optionText("AuraMode", M.AutoText)
+		if string.sub(text, 1, 4) == "Auto" then
+			return N.modeFast("AuraMode")
+		end
+		return text == "Insta-kill"
+	end
+	local function metric(option)
+		if option == "TrainSpeed" then
+			return N.power()
+		end
+		local P = N.Plan
+		return P and P.coin and P.coin.earned or 0
+	end
+	local function startWindow(S, option)
+		S.win = { at = os.clock(), uses = S.uses, m = metric(option), deaths = Session.deaths }
+	end
+	-- Danger signal while the fast mode is active: back to the safe mode, hourly retry, 3 of them = off for a day.
+	function N.modeFallback(option, reason)
+		local S = M.opts[option]
+		if not S or S.cur ~= "fast" then
+			return
+		end
+		S.cur, S.phase, S.win = "safe", "run", nil
+		S.nextAt = os.clock() + M.recheck
+		S.fb += 1
+		log("MODE fallback", option, "reason=" .. tostring(reason), "step-backs=" .. S.fb)
+		if S.fb >= 3 then
+			S.off = os.time() + 86400
+			S.nextAt = nil
+			log("MODE", option, "fast mode off for the day after 3 fallbacks")
+			save()
+		end
+	end
+	local function finishWindow(S, option, rate)
+		if S.phase == "fast" then
+			S.fastRate = rate
+			S.phase, S.cur = "safe", "safe"
+			startWindow(S, option)
+		else
+			S.safeRate = rate
+			local keep = if (S.fastRate or 0) > (S.safeRate or 0) * M.margin and (S.fastRate or 0) > 0 then "fast" else "safe"
+			S.cur, S.phase, S.win = keep, "run", nil
+			S.nextAt = os.clock() + M.recheck
+			log(string.format("MODE measure %s fast=%.3f/s safe=%.3f/s keep=%s", option, S.fastRate or 0, S.safeRate or 0, keep))
+		end
+	end
+	local function tickOne(option)
+		local S = M.opts[option]
+		if S.off > os.time() then
+			S.cur = "safe"
+			return
+		end
+		local probe = M.Probes[option]
+		local pr = probe and N.probe(probe)
+		if pr and pr.result == "rejected" then
+			if not S.dead then
+				S.dead = true
+				if S.cur == "fast" then
+					N.modeFallback(option, "probe_rejected " .. probe)
+				else
+					S.cur, S.phase, S.win = "safe", "run", nil
+				end
+			end
+			return
+		end
+		S.dead = false
+		if S.cur == "fast" and S.win and Session.deaths > S.win.deaths and S.phase == "fast" then
+			N.modeFallback(option, "death while fast")
+			return
+		end
+		local now = os.clock()
+		if S.phase == "run" then
+			if S.nextAt and now >= S.nextAt and S.uses > 0 then
+				S.phase, S.cur, S.fastRate, S.safeRate = "fast", "fast", nil, nil
+				startWindow(S, option)
+			end
+			return
+		end
+		if not S.win then
+			if S.uses > 0 then
+				startWindow(S, option)
+			end
+			return
+		end
+		local secs = now - S.win.at
+		if secs < M.window then
+			return
+		end
+		if S.uses - S.win.uses >= M.minUses then
+			finishWindow(S, option, math.max(metric(option) - S.win.m, 0) / secs)
+		elseif secs >= M.giveUp then
+			-- the activity never ran: keep what the mode is and look again in 10 min
+			S.phase, S.win = "run", nil
+			S.nextAt = now + M.giveUp
+		end
+	end
+	function N.modeTick()
+		for _, name in ipairs(M.Names) do
+			if M.isAuto(name) then
+				pcall(tickOne, name)
+			else
+				-- a fixed choice from the player: the ladder stands still and measures again when Auto is picked
+				local S = M.opts[name]
+				S.win = nil
+				if S.phase ~= "run" then
+					S.phase, S.cur = "fast", "fast"
+				end
+			end
+		end
+	end
+	-- Plain words for Up next.
+	function N.modeText()
+		local parts = {}
+		for _, name in ipairs(M.Names) do
+			if M.isAuto(name) then
+				local S = M.opts[name]
+				local state = if S.off > os.time() then "safe (off for today)" elseif S.cur == "fast" then "fast" else "safe"
+				if S.win then
+					state ..= if S.phase == "fast" then " (measuring fast)" else " (measuring safe)"
+				end
+				table.insert(parts, M.Short[name] .. " " .. state)
+			end
+		end
+		return if #parts > 0 then "Modes (auto, best measured): " .. table.concat(parts, ", ") else nil
 	end
 end
 local Window, Tabs, Labels
@@ -35343,7 +35542,7 @@ do
 			Text = "Ore Pickup",
 			Values = N.SpeedValues.LootSpeed,
 			Default = N.SpeedValues.LootSpeed[1],
-			Tooltip = "Blatant takes the ores of the deepest stage straight from the server as soon as they spawn, no walking to the drops. The hub checks the first bank and goes back to walking if the server does not pay them",
+			Tooltip = "Auto (default) measures Blatant against the safe way for 3 min, keeps the more profitable one, re-measures hourly and steps back on any problem. Blatant takes the ores of the deepest stage straight from the server as soon as they spawn, no walking to the drops. The hub checks the first bank and goes back to walking if the server does not pay them",
 		})
 		StageBox:AddSlider("StuckSeconds", { Text = "Give Up On A Stage After", Default = 20, Min = 5, Max = 120, Rounding = 0, Suffix = " s without damage" })
 		local SuperBox = Tabs.Farm:AddLeftGroupbox("Super Loot", "gem")
@@ -35361,9 +35560,9 @@ do
 		})
 		AuraBox:AddDropdown("AuraMode", {
 			Text = "Damage",
-			Values = { "Insta-kill", "Real damage" },
-			Default = "Insta-kill",
-			Tooltip = "Insta-kill finishes stage and tower enemies at once (they only exist on your screen). Real damage hits with your own weapon damage",
+			Values = { "Auto (best measured)", "Insta-kill", "Real damage" },
+			Default = "Auto (best measured)",
+			Tooltip = "Auto measures both and keeps the one that earns more, safe on any problem. Insta-kill finishes stage and tower enemies at once (they only exist on your screen). Real damage hits with your own weapon damage",
 		})
 		AuraBox:AddSlider("AuraRange", { Text = "Range", Default = 500, Min = 10, Max = 500, Rounding = 0, Suffix = " studs", Tooltip = "500 hits every enemy of the stage you are on" })
 		AuraBox:AddSlider("AuraSpeed", { Text = "Hit Every", Default = 0.1, Min = 0.1, Max = 1, Rounding = 2, Suffix = " s" })
@@ -35456,7 +35655,7 @@ do
 			Text = "Training Speed",
 			Values = N.SpeedValues.TrainSpeed,
 			Default = N.SpeedValues.TrainSpeed[1],
-			Tooltip = "Blatant measures the fastest training clicks the server still counts, tries the best free area and keeps training during stage runs. Anything that does not add exp goes back to the game's own speed",
+			Tooltip = "Auto (default) measures Blatant against the safe way for 3 min, keeps the more profitable one, re-measures hourly and steps back on any problem. Blatant measures the fastest training clicks the server still counts, tries the best free area and keeps training during stage runs. Anything that does not add exp goes back to the game's own speed",
 		})
 		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
@@ -35472,7 +35671,7 @@ do
 			Text = "Floor Speed",
 			Values = N.SpeedValues.TowerSpeed,
 			Default = N.SpeedValues.TowerSpeed[1],
-			Tooltip = "Blatant completes floor after floor right away and leaves at the first floor the server does not pay. If it pays none, the hub fights the floors as usual",
+			Tooltip = "Auto (default) measures Blatant against the safe way for 3 min, keeps the more profitable one, re-measures hourly and steps back on any problem. Blatant completes floor after floor right away and leaves at the first floor the server does not pay. If it pays none, the hub fights the floors as usual",
 		})
 		Labels.Tower = TowerBox:AddLabel({ Text = "-", DoesWrap = true })
 		local BossBox = Tabs.Farm:AddRightGroupbox("World Boss", "skull")
@@ -35485,7 +35684,7 @@ do
 			Text = "Reward Cards",
 			Values = N.SpeedValues.BossCards,
 			Default = N.SpeedValues.BossCards[1],
-			Tooltip = "Blatant clicks all 8 reward cards. If the server gives you only one, the next bosses get a single click",
+			Tooltip = "Auto (default) measures Blatant against the safe way for 3 min, keeps the more profitable one, re-measures hourly and steps back on any problem. Blatant clicks all 8 reward cards. If the server gives you only one, the next bosses get a single click",
 		})
 		Labels.Boss = BossBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
@@ -37864,6 +38063,7 @@ do
 			return
 		end
 		N.planTick()
+		N.modeTick()
 		if N.want("AutoEquip") and choreDue("equip", 3) then
 			N.equipStep()
 		end
@@ -37937,6 +38137,12 @@ do
 			local m = N.rebirthMath()
 			if m then
 				table.insert(next, "Rebirth " .. (r + 1) .. " at level " .. tostring(m.need))
+			end
+		end
+		if #next > 0 and N.modeText then
+			local modes = N.modeText()
+			if modes then
+				table.insert(next, modes)
 			end
 		end
 		return if #next > 0 then "\u{2022} " .. table.concat(next, "\n\u{2022} ") else "Turn on Smart Planner (or Auto Farm Stages, Auto Train) to get a plan"
