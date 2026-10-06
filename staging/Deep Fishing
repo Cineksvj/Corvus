@@ -31858,6 +31858,8 @@ do
 		Tutorial = true,
 		PondGuide = true,
 		DoubleSpeed = true,
+		OfflineNet = true,
+		StreakHold = true,
 	}
 	local Functions = { Sell = true, SellAll = true }
 	-- The fishing loop logs its own CAST/HOOK lines, these stay out of the SEND lines.
@@ -31868,6 +31870,7 @@ do
 		Pond = { Collect = true, AddFish = true, AddFood = true, BuyFood = true, Upgrade = true, EquipBest = true, SellAllDead = true, ReviveHeart = true },
 		MutationReroll = { Spin = true, Skip = true },
 		Settings = { RareCutscene = true, TeleportCutscene = true, AutoFeed = true },
+		OfflineNet = { Buy = true },
 	}
 	N.Sent = { count = 0, byName = {}, window = {}, recent = {} }
 	function N.remoteExists(name)
@@ -33001,10 +33004,63 @@ do
 	-- at step 6 (x2 luck, x1.3 distance, 2 free bounces; dump 188368-188506); the price is no playtime gifts, quests or
 	-- guaranteed scrolls while the tutorial is open. The game's own window would send step 7 after three catches, so the
 	-- Tutorial channel is guarded: numbers above 6 are dropped while the hold is on.
-	N.Tut = { at = -1e9, sentStep = nil, guarded = nil, dropped = 0, droppedAt = -1e9 }
+	N.Tut = { at = -1e9, sentStep = nil, guarded = nil, dropped = 0, droppedAt = -1e9, released = false }
 	local tutorialOnce
+	-- The hold is for accounts still inside the tutorial (new farm accounts): at step 7 or later the x2 step is gone for good.
 	function N.tutorialHold()
-		return on("TutorialHold") and (tonumber(N.data().Tutorial) or -1) < 100
+		local cur = tonumber(N.data().Tutorial) or -1
+		return on("TutorialHold") and not N.Tut.released and cur < 100 and cur <= 6
+	end
+	-- Smart Planner decision for the hold (blatant.md NEW 1). Holding = x2 luck and x1.3 distance on every cast (estimate:
+	-- +50% income, the low end of the doc's x1.6-x2.5). Finishing = the playtime gift (PlaytimeGiftConfig: 88 casts of
+	-- coins at the expected cast value of the moment of the claim + Bumble Bait + a Luck potion, 40 minutes after the
+	-- tutorial ends: deferred by the hold, not lost), plus quests and guaranteed scrolls (estimate 10% of income while the
+	-- tutorial is open). The planner finishes only when the gift can still be collected before the 24 h window ends and
+	-- finishing is worth more; otherwise it holds. Logs `TUTORIAL hold|finish reason=`.
+	function N.tutorialDecide()
+		local cur = tonumber(N.data().Tutorial) or -1
+		if not on("TutorialHold") then
+			N.Tut.released = false
+			return
+		end
+		if cur >= 100 or cur > 6 then
+			if N.due("tutNa", 3600) then
+				log("TUTORIAL hold", "n/a", "reason=" .. (if cur >= 100 then "the account finished the tutorial, step 6 cannot be reached again" else "step " .. cur .. " is past the x2 luck step"))
+			end
+			return
+		end
+		if cur ~= 6 or N.Tut.released or not N.planner() or not N.due("tutDecide", 300) then
+			return
+		end
+		local perHour = N.Econ.rate * 3600
+		local ev = N.Fish.evCast
+		if perHour <= 0 or ev <= 0 then
+			return
+		end
+		local P = N.sh("Config.PlaytimeGiftConfig")
+		local giftSeconds, giftCasts = 0, 0
+		pcall(function()
+			for _, stage in ipairs(P.Stages) do
+				giftSeconds += tonumber(stage.Duration) or 0
+				for _, reward in ipairs(stage.Rewards or {}) do
+					giftCasts += tonumber(reward.Casts) or 0
+				end
+			end
+		end)
+		if giftSeconds <= 0 then
+			giftSeconds, giftCasts = 2400, 88
+		end
+		local left = 24 - ((os.clock() - Session.started) / 3600) % 24
+		local holdValue = 0.5 * perHour * left
+		local finishValue = giftCasts * ev + 0.1 * perHour * left
+		local canFinish = left * 3600 > giftSeconds + 600
+		local text = string.format("x2 luck +50%% = %s over %.1f h vs gift %d casts + quests/scrolls = %s%s", formatNumber(holdValue), left, giftCasts, formatNumber(finishValue), if canFinish then "" else " (the gift no longer fits the window)")
+		if canFinish and finishValue > holdValue then
+			N.Tut.released = true
+			log("TUTORIAL finish", "reason=" .. text)
+		elseif N.due("tutHoldLog", 1800) then
+			log("TUTORIAL hold", "reason=" .. text)
+		end
 	end
 	function N.tutorialGuard()
 		if N.Tut.guarded then
@@ -33105,7 +33161,8 @@ do
 		-- (FishCaught 189470), so a near-full backpack sells first (Smart Sell rules and protect lists) instead of wasting casts.
 		local count, max = N.backpack()
 		if max - count < N.hookCapRaw() then
-			if N.wants("SmartSell") and N.due("sellFull", 20) then
+			-- Before every cast that would not fit (a sale at a distant NPC is throttled to once per 20 s, a remote sale to 6 s).
+			if N.wants("SmartSell") and N.due("sellFull", if N.Sell.needNpc then 20 else 6) then
 				local _, sellable = N.fishStats(true)
 				if sellable > 0 then
 					N.sellNow(string.format("backpack %d/%d before the cast", count, max))
@@ -33143,8 +33200,19 @@ do
 			task.wait(1)
 			return
 		end
+		N.tutorialDecide()
 		if (tonumber(N.data().Tutorial) or -1) < 100 then
 			N.tutorialStep()
+		end
+		-- A rare catch (Secret 4.2 s, Exotic 5.7 s, Exclusive 6.9 s) holds the next cast on the server while the player's own
+		-- Rare Cutscene setting would show it (RareShowcaseConfig, showcaseHold 187673-187709). "None" is one of the game's
+		-- own choices: sent once per session, from anywhere (Settings checks only the value, 186849).
+		if not F.rareCutscene and N.ready() then
+			F.rareCutscene = true
+			if N.tab("Settings").RareCutscene ~= "None" then
+				send("Settings", "RareCutscene", "None")
+				log("SETTING", "RareCutscene=None", "(a rare catch no longer holds the next cast for 4-7 s)")
+			end
 		end
 		-- Group members get the game's Double Speed (x1.5 cast speed); the server checks IsInGroup.
 		if N.data().IsInGroup and not F.doubleSpeed then
@@ -33835,6 +33903,28 @@ do
 		end)
 		return out
 	end
+	-- Offline net (OfflineNet "Buy": cash is the only server check, no NPC needed, 186038): one World 1 fish every
+	-- SecondsPerFish (quality 1.5), up to MaxFish, claimed by Auto Rewards (Offline) every 2 minutes. Whether the net also
+	-- fills while the account is online is not verified, so it is a spare-cash perk, never an investment that competes with
+	-- the payback list: bought only when it costs at most 0.2% of the cash on hand (see spendStep) and its modelled payback
+	-- fits the window. A net fish is modelled as a quarter of the average fish a cast hooks (a random fish of the cheapest
+	-- world: base prices jump about x100 per world).
+	function N.netCandidate()
+		local OC = cfg("OfflineConfig")
+		if not (OC and OC.Enabled and N.Fish.evCast > 0) then
+			return nil
+		end
+		local ok, price, spf, nextSpf = pcall(function()
+			local lv = OC.LevelFor(N.data())
+			return OC.PriceFor(lv), OC.SecondsPerFishFor(lv), OC.SecondsPerFishFor(lv + 1)
+		end)
+		if not (ok and price and price > 0 and spf and nextSpf and nextSpf < spf) then
+			return nil
+		end
+		local perFish = N.Fish.evCast / math.max(N.hookCapRaw(), 1) * 0.25 / 100 ^ math.max(select(2, N.bestFishingWorld()) - 1, 0)
+		local extraPerSecond = (1 / nextSpf - 1 / spf) * perFish
+		return { kind = "net", name = "Offline Net", price = price, frac = extraPerSecond / N.incomeRate(), payback = price / math.max(extraPerSecond, 1e-9) / 3600 }
+	end
 	local function owned(c)
 		local d = N.data()
 		if c.kind == "rod" then
@@ -33843,6 +33933,8 @@ do
 			return N.unlocked(c.name)
 		elseif c.kind == "upgrade" then
 			return (c.levelBefore or -1) < (tonumber(N.tab("Upgrades")[c.name]) or 0) or N.cash() < (c.cashBefore or 0) - c.price * 0.5 or d == nil
+		elseif c.kind == "net" then
+			return (c.levelBefore or -1) < (tonumber(d.OfflineNetLevel) or 1) or N.cash() < (c.cashBefore or 0) - c.price * 0.5
 		end
 		return false
 	end
@@ -33910,10 +34002,12 @@ do
 	function N.buy(c, why)
 		local before = N.cash()
 		c.cashBefore = before
-		c.levelBefore = tonumber(N.tab("Upgrades")[c.name]) or 0
+		c.levelBefore = if c.kind == "net" then (tonumber(N.data().OfflineNetLevel) or 1) else (tonumber(N.tab("Upgrades")[c.name]) or 0)
 		local function fire()
 			if c.kind == "upgrade" then
 				send("Upgrades", "Buy", c.name)
+			elseif c.kind == "net" then
+				send("OfflineNet", "Buy")
 			elseif c.kind == "rod" then
 				send("RodShop", "Buy", c.name)
 			elseif c.kind == "world" then
@@ -33956,7 +34050,7 @@ do
 			if c.kind == "rod" then
 				Session.rods += 1
 				send("RodShop", "Equip", c.name)
-			elseif c.kind == "upgrade" then
+			elseif c.kind == "upgrade" or c.kind == "net" then
 				Session.upgrades += 1
 			elseif c.kind == "world" then
 				Session.worlds += 1
@@ -33999,6 +34093,11 @@ do
 		local horizon = math.max((24 - ((os.clock() - Session.started) / 3600) % 24) * 0.9, 0.5)
 		P.horizon = horizon
 		if N.planner() then
+			-- Spare-cash perk: an offline net level that costs at most 0.2% of the cash on hand (never the reserve).
+			local net = N.netCandidate()
+			if net and N.cash() - N.reserve() >= net.price * 500 and net.payback <= horizon and N.buy(net, "planner spare cash") then
+				return true
+			end
 			-- Autopilot rule: the best payback that fits the horizon is bought NOW: from cash, or after selling the
 			-- backpack (Smart Sell rules, protect lists: kept fish never count) when that covers it. Only when even the
 			-- backpack is not enough does Corvus save, and saving = fishing on. While it saves, another purchase goes first
@@ -34376,6 +34475,173 @@ do
 		N.travel(back ~= "Pond" and back or N.bestFishingWorld())
 		return true
 	end
+	-- Probes (Fishing > Probes, all OFF, blatant.md NEW 8): one-shot experiments on hidden server handlers. Each runs once
+	-- per PlaceVersion on this account (the result is remembered in Corvus/FISH_probes_<UserId>.txt, a game update runs it
+	-- again), logs `PROBE <name> result=...`, then switches its own toggle off. They never feed the planner: a result only
+	-- tells the owner whether a shortcut exists.
+	N.Probe = { last = "-", names = { "ProbeSell2", "ProbeTpLocked", "ProbeStreakHold" } }
+	do
+		local ProbeFile = "Corvus/FISH_probes_" .. tostring(LocalPlayer.UserId) .. ".txt"
+		local memory = {}
+		pcall(function()
+			if isfile(ProbeFile) then
+				for line in string.gmatch(readfile(ProbeFile), "[^\n]+") do
+					local key, result = string.match(line, "^(%S+)%s+(.+)$")
+					if key then
+						memory[key] = result
+					end
+				end
+			end
+		end)
+		local function saveMemory()
+			pcall(function()
+				if makefolder and isfolder and not isfolder("Corvus") then
+					makefolder("Corvus")
+				end
+				local lines = {}
+				for key, result in pairs(memory) do
+					table.insert(lines, key .. " " .. result)
+				end
+				table.sort(lines)
+				writefile(ProbeFile, table.concat(lines, "\n"))
+			end)
+		end
+		local function placeVersion()
+			local ok, v = pcall(function()
+				return game.PlaceVersion
+			end)
+			return tostring(if ok and v ~= nil then v else 0)
+		end
+		local function switchOff(name)
+			local toggle = Toggles[name]
+			if toggle and toggle.Value then
+				local quiet = N.quiet
+				N.quiet = true
+				pcall(toggle.SetValue, toggle, false)
+				N.quiet = quiet
+			end
+		end
+		-- Double Sell (Sell = Invoke(5, guid) of the held fish, handler hidden, no visible lock): the same fish sold twice at
+		-- the same moment. Expected: one sale, one refusal. Needs one cheap unlocked, unprotected fish.
+		local function probeSell2()
+			local guid, cheapest
+			for g, item in pairs(N.inv()) do
+				if type(item) == "table" and item.Type == "Fish" and not N.isLocked(item) and not N.relicOf(item) and not N.keeps(item) then
+					local v = N.value(item)
+					if not cheapest or v < cheapest then
+						guid, cheapest = g, v
+					end
+				end
+			end
+			if not guid then
+				return nil, "needs one cheap unprotected fish in the backpack"
+			end
+			N.pauseFishing("probe sell2")
+			local pos = N.spot("NPC_Sell")
+			if pos then
+				N.goTo(pos, 8)
+			end
+			N.holdItem(guid)
+			local a, b, done = nil, nil, 0
+			task.spawn(function()
+				a = invoke("Sell", guid)
+				done += 1
+			end)
+			task.spawn(function()
+				b = invoke("Sell", guid)
+				done += 1
+			end)
+			waitFor(function()
+				return done >= 2
+			end, 12)
+			N.resumeFishing()
+			local x, y = tonumber(a) or 0, tonumber(b) or 0
+			if done < 2 then
+				return nil, "the sale did not answer in 12 s, trying again"
+			elseif x > 0 and y > 0 then
+				return string.format("DUPLICATE both paid %s + %s for one fish", formatNumber(x), formatNumber(y))
+			elseif x > 0 or y > 0 then
+				return string.format("refused the second sale (%s, %s)", formatNumber(x), formatNumber(y))
+			end
+			return "neither sale paid (not at the merchant or the fish is not for sale)"
+		end
+		-- Teleport to a locked world (the client gates by level and unlock, the server's Islands:Teleport is hidden): the
+		-- lowest fishing world above the level. Expected: refused. A world change = the server did not stop it.
+		local function probeTpLocked()
+			local W = cfg("WorldsConfig")
+			local key, def
+			for k, w in pairs(W and type(W.Worlds) == "table" and W.Worlds or {}) do
+				if not w.NoFishing and not N.unlocked(k) and N.level() < (tonumber(w.RequiredLevel) or 1) and (not def or (tonumber(w.WorldNumber) or 0) < (tonumber(def.WorldNumber) or 0)) then
+					key, def = k, w
+				end
+			end
+			if not key then
+				return "n/a (no locked fishing world above this level)"
+			end
+			local back = N.worldKey()
+			N.pauseFishing("probe tp_locked")
+			send("Teleport", key)
+			local moved = waitFor(function()
+				return N.worldKey() == key
+			end, 15)
+			local context = string.format("%s level=%d needs=%s cash=%s price=%s", key, N.level(), tostring(def.RequiredLevel), formatNumber(N.cash()), formatNumber(tonumber(def.UnlockPrice) or 0))
+			N.resumeFishing()
+			if moved then
+				N.travel(back)
+				return "TRAVELLED, the server did not stop it: " .. context
+			end
+			return "refused: " .. context
+		end
+		-- Streak hold (StreakHold(true) is what the client sends while a cutscene plays; HoldForCutscene is hidden): does
+		-- the server set StreakHeldUntil? Released again at once (false) like the game's own watcher does.
+		local function probeStreakHold()
+			local function heldUntil()
+				return tonumber(LocalPlayer:GetAttribute("StreakHeldUntil")) or 0
+			end
+			local before = heldUntil()
+			send("StreakHold", true)
+			local held = waitFor(function()
+				return heldUntil() > math.max(before, N.serverTime())
+			end, 4)
+			local seconds = heldUntil() - N.serverTime()
+			task.wait(0.5)
+			send("StreakHold", false)
+			return if held then string.format("held %.0f s ahead (StreakHeldUntil set)", seconds) else "no hold (StreakHeldUntil unchanged)"
+		end
+		local Probes = {
+			{ toggle = "ProbeSell2", name = "sell2", run = probeSell2 },
+			{ toggle = "ProbeTpLocked", name = "tp_locked", run = probeTpLocked },
+			{ toggle = "ProbeStreakHold", name = "streakhold", run = probeStreakHold },
+		}
+		-- One probe per call from the main loop (it owns the character); returns true when it did something.
+		function N.probeStep()
+			for _, p in ipairs(Probes) do
+				if on(p.toggle) and N.due("probe_" .. p.name, 20) then
+					local key = p.name .. "@" .. placeVersion()
+					if memory[key] then
+						N.Probe.last = p.name .. ": " .. memory[key] .. " (remembered)"
+						log("PROBE", p.name, "result=" .. memory[key], "(remembered for PlaceVersion " .. placeVersion() .. ")")
+						switchOff(p.toggle)
+						return false
+					end
+					local result, why = p.run()
+					if result then
+						memory[key] = result
+						saveMemory()
+						N.Probe.last = p.name .. ": " .. result
+						log("PROBE", p.name, "result=" .. result)
+						switchOff(p.toggle)
+						return true
+					end
+					setStatus("Probe " .. p.name .. " waits: " .. tostring(why))
+					if N.due("probeWait_" .. p.name, 300) then
+						log("PROBE", p.name, "waiting", tostring(why))
+					end
+				end
+			end
+			return false
+		end
+	end
 end
 local Window, Tabs, Labels
 do
@@ -34521,7 +34787,7 @@ do
 		FishBox:AddToggle("AutoFish", {
 			Text = "Auto Fish",
 			Default = false,
-			Tooltip = "Goes to the pier, holds your rod, finishes the tutorial and fishes. Mode picks how",
+			Tooltip = "Goes to the pier, holds your rod, finishes the tutorial and fishes. Mode picks how. It also sets the game's Rare Cutscene setting to None once, so a rare catch no longer holds the next cast for 4-7 s",
 			Callback = function(v)
 				if not v and not N.planner() then
 					N.fishOff()
@@ -34547,7 +34813,7 @@ do
 		FishBox:AddToggle("TutorialHold", {
 			Text = "Tutorial hold (x2 luck)",
 			Default = false,
-			Tooltip = "Stops the tutorial at step 6 and keeps it there: the server gives every cast x2 luck, x1.3 distance and 2 free bounces while you are on that step. The price: no playtime gifts, quests or guaranteed scrolls until the tutorial is finished. Off = the tutorial is finished for you. Does nothing on an account that already finished it",
+			Tooltip = "Stops the tutorial at step 6 and keeps it there: the server gives every cast x2 luck, x1.3 distance and 2 free bounces while you are on that step. The price: no playtime gifts, quests or guaranteed scrolls until the tutorial is finished. For new accounts only (an account that already finished the tutorial cannot go back, the toggle then does nothing). Off = the tutorial is finished for you. With the Smart Planner on, it compares the two and finishes the tutorial itself only when that is worth more (log TUTORIAL hold / TUTORIAL finish reason=)",
 		})
 		Labels.Fish = FishBox:AddLabel({ Text = "-", DoesWrap = true })
 		local SellBox = Tabs.Fishing:AddRightGroupbox("Smart Sell", "coins")
@@ -34588,7 +34854,7 @@ do
 		PlanBox:AddToggle("SmartPlanner", {
 			Text = "Smart Planner",
 			Default = false,
-			Tooltip = "Autopilot: plays the whole game by itself, even with every other toggle off. Fishes (Mode and Perfect Rate from Auto Fish), sells by the Smart Sell rules and protect lists when the backpack needs it or a purchase waits, buys upgrades, rods, bait, the next world and the pond in the order of the fastest payback (price / extra coins per second, within 24 h), visits the pond, claims rewards and codes, feeds the Big Mouth, opens chests, uses potions, relics and scrolls. Saving for something = fishing meanwhile. Your other toggles stay as you set them",
+			Tooltip = "Autopilot: plays the whole game by itself, even with every other toggle off. Fishes (Mode and Perfect Rate from Auto Fish), sells by the Smart Sell rules and protect lists when the backpack needs it or a purchase waits, buys upgrades, rods, bait, the next world, the pond and offline net levels in the order of the fastest payback (price / extra coins per second, within 24 h); with Tutorial hold on it also decides whether holding the tutorial still beats finishing it, visits the pond, claims rewards and codes, feeds the Big Mouth, opens chests, uses potions, relics and scrolls. Saving for something = fishing meanwhile. Your other toggles stay as you set them",
 			Callback = function(v)
 				if not v and not on("AutoFish") then
 					N.fishOff()
@@ -34596,6 +34862,23 @@ do
 			end,
 		})
 		Labels.Planner = PlanBox:AddLabel({ Text = "-", DoesWrap = true })
+		local ProbeBox = Tabs.Fishing:AddRightGroupbox("Probes", "flask-conical")
+		ProbeBox:AddToggle("ProbeSell2", {
+			Text = "Probe: sell one fish twice",
+			Default = false,
+			Tooltip = "One-shot experiment (once per game version): at the merchant, sells one cheap fish with two Sell calls at the same moment. The expected answer is one sale and one refusal; the result goes to the log (PROBE sell2 result=) and switches the toggle off",
+		})
+		ProbeBox:AddToggle("ProbeTpLocked", {
+			Text = "Probe: teleport to a locked world",
+			Default = false,
+			Tooltip = "One-shot experiment (once per game version): asks the server to teleport you to the next world above your level, which the game normally gates. The expected answer is a refusal; the result goes to the log (PROBE tp_locked result=)",
+		})
+		ProbeBox:AddToggle("ProbeStreakHold", {
+			Text = "Probe: streak hold",
+			Default = false,
+			Tooltip = "One-shot experiment (once per game version): sends the game's own StreakHold(true) and checks whether the server holds your streak, then releases it. The result goes to the log (PROBE streakhold result=)",
+		})
+		Labels.Probes = ProbeBox:AddLabel({ Text = "-", DoesWrap = true })
 		-- Main: Quick Start (filled at the end of this part) + Status.
 		N.QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "zap")
 		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
@@ -34917,6 +35200,12 @@ do
 	function N.stopAll()
 		N.quiet = true
 		for _, name in ipairs(N.AllAutoToggles) do
+			local toggle = Toggles[name]
+			if toggle and toggle.Value then
+				toggle:SetValue(false)
+			end
+		end
+		for _, name in ipairs(N.Probe.names) do
 			local toggle = Toggles[name]
 			if toggle and toggle.Value then
 				toggle:SetValue(false)
@@ -35678,6 +35967,9 @@ do
 		if N.sellStep() then
 			return
 		end
+		if N.probeStep() then
+			return
+		end
 		if spending() and N.due("spend", 4) and N.spendStep() then
 			return
 		end
@@ -35803,6 +36095,7 @@ do
 				I.pond = if not N.unlocked("Pond")
 					then "Pond locked (level 5, 25K). Auto Pond unlocks it"
 					else string.format("Level %s, pending %s\n%s\nTrips %d", tostring(pond.Level or 1), formatNumber(pond.PendingIncome or 0), N.Pond.last, Session.pondTrips)
+				I.probes = if N.Probe.last ~= "-" then "Last probe: " .. N.Probe.last else "Off. Each probe runs once per game version and logs PROBE <name> result="
 				I.planner = if N.planner()
 					then string.format("<b>On</b>  \u{00B7}  income %s/h\n%s\nLast buy: %s", formatNumber(N.Econ.rate * 3600), if N.Plan.say ~= "" then N.Plan.say else "Fishing and measuring the income (1 minute)", N.Shop.last)
 					else "Off. Turn it on and Corvus plays the whole game: fishing, selling, buying by payback, pond, rewards. Your other toggles stay as they are"
@@ -35866,6 +36159,7 @@ do
 						Labels.Bait:SetText(I.bait or "-")
 						Labels.Pond:SetText(I.pond or "-")
 						Labels.Planner:SetText(I.planner or "-")
+						Labels.Probes:SetText(I.probes or "-")
 					end)
 				end
 				if frame % 6 == 0 and N.syncMirrors then
