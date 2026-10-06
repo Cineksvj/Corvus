@@ -31796,7 +31796,7 @@ do
 	-- "RF/<Name>" (the game's own client calls Net:RemoteEvent(name) / Net:RemoteFunction(name)). Only the calls the
 	-- game's client makes for a normal player, with the same arguments (notes.md "Remotes"). Never: AdminPanelExecute,
 	-- PermissionCanUseCMD (any admin use flags the profile for review), trades, booths, parties, Robux prompts, rerolls
-	-- and self-select (their currency is unconfirmed), online time.
+	-- (diamonds), self-select without a voucher, online time.
 	local AllowedRE = {
 		DuelQuickPlayRequest = true,
 		Duel2v2QuickPlayRequest = true,
@@ -31804,6 +31804,9 @@ do
 		DuelTableJoinRequest = true,
 		DuelTableLeaveRequest = true,
 		DuelTableBallSelect = true,
+		-- free self-select (blatant.md #2): only with a 指定卡 voucher in hand, never with diamonds
+		DuelTableBallSelectPurchase = true,
+		DuelTableBallSelfSelect = true,
 		DuelTableUpgradeSelect = true,
 		DuelTableLaunchDirection = true,
 	}
@@ -32171,6 +32174,9 @@ do
 	function N.dailyCap()
 		return tonumber(N.coinsLimit()["每日金币上限"]) or 6000
 	end
+	function N.resetLabel()
+		return string.format("%02d:00", N.resetHour())
+	end
 	function N.resetHour()
 		return tonumber(N.coinsLimit()["每日重置时间"]) or 5
 	end
@@ -32180,6 +32186,29 @@ do
 			return 0
 		end
 		return tonumber(d.dailyEarned) or 0
+	end
+	-- Weekly cap "每周金币上限" (cloud only, the rules file bounds just the daily one, blatant.md #4). The week key is not
+	-- in the dump, so the weekly counter is trusted only while the profile row is of today's window (it is rewritten by
+	-- the same claim); a stale row = unknown = not capped, the server's DuelCoinLimitReached event decides.
+	function N.weeklyCap()
+		local v = tonumber(N.coinsLimit()["每周金币上限"])
+		return if v and v > 0 then v else nil
+	end
+	function N.weeklyEarned()
+		local d = N.pdTable("duelCoinLimit")
+		if tonumber(d.dailyKey) ~= N.dayKey(N.resetHour()) then
+			return 0
+		end
+		return tonumber(d.weeklyEarned) or 0
+	end
+	-- Duel coins the server can still pay in this window: the tighter of the daily and the weekly cap.
+	function N.coinsLeft()
+		local left = N.dailyCap() - N.duelEarnedToday()
+		local week = N.weeklyCap()
+		if week then
+			left = math.min(left, week - N.weeklyEarned())
+		end
+		return math.max(left, 0)
 	end
 	-- Coin Guard. VoucherExploitPenaltyRules.calculateCaps(firstSeen, now) is the "legal upper bound" of coins for the
 	-- account age; a balance above it wipes every coin (notes.md Anticheat 2). ExploitCleanup cuts any balance above
@@ -32266,6 +32295,9 @@ local Session = {
 	guardStops = 0,
 	capDays = 0,
 	byBall = {},
+	selfSelects = 0,
+	rotates = 0,
+	modeStats = {},
 }
 N.Events = {}
 N.Manual = { running = false }
@@ -32297,8 +32329,100 @@ N.Duel = {
 	pickWhy = "",
 	modeNote = nil,
 	rerollLogged = false,
+	oppCount = {},
+	oppDay = nil,
+	xpBest = 0,
+	xpDecay = false,
+	modeAt = -1e9,
+	modeCache = nil,
+	selfInfo = nil,
+	weeklyFree = nil,
 }
 local D = N.Duel
+-- Daily first-match coin boost (BoostService 121703): granted by the first match of the UTC day (00:00 key, the duel cap
+-- window resets at 05:00). afterCap = whether the boost still pays above the 6000 cap (probe `BOOST after-cap result=`).
+N.Boost = { grantedDay = nil, matchDay = nil, afterCap = nil, holdDay = nil }
+function N.boostMult()
+	local boost = N.pdTable("coinBoost")
+	return if (tonumber(boost.remaining) or 0) > 0 then math.max(tonumber(boost.multiplier) or 1, 1) else 1
+end
+-- True while today's first match (and with it the boost grant) has not happened yet.
+function N.boostPending()
+	local day = N.dayKey(0)
+	if N.Boost.grantedDay == day or N.Boost.matchDay == day then
+		return false
+	end
+	if tonumber(N.pdTable("coinBoost").dayKey) == day or tonumber(N.pd("dailyFirstMatchDayKey")) == day then
+		return false
+	end
+	return true
+end
+-- Smart Planner: between 00:00 and 05:00 UTC with the previous window already capped, the first match of the new UTC day
+-- waits for 05:00 (a fresh cap window), so the boost is never spent on a match that pays nothing.
+function N.holdForBoost()
+	if not N.planner() then
+		return false
+	end
+	if N.serverTime() % 86400 >= N.resetHour() * 3600 then
+		return false
+	end
+	return N.capReached() and N.boostPending()
+end
+function N.modeKey(mode)
+	return if mode == "TwoVTwo" then "2v2" else tostring(mode or "Duel")
+end
+-- Experience read (profile exp.dailyMatchXp {dayKey, amount}, template 148485): logged with every match.
+function N.dailyMatchXp()
+	local exp = N.PD.exp
+	local node = exp and exp.dailyMatchXp
+	local v = node and N.read(node)
+	if type(v) == "table" then
+		return tonumber(v.amount) or 0
+	end
+	return tonumber(v) or 0
+end
+-- Opponent rotation (blatant.md #6): same-opponent matches decay the XP (sameOpponentMatches). The first match against a
+-- new opponent sets the undecayed XP; a repeat that pays clearly less flags the decay, and RPS seat choice then avoids
+-- opponents met twice or more today.
+function N.noteOpponent(opp, xp)
+	local day = N.dayKey(0)
+	if D.oppDay ~= day then
+		D.oppDay = day
+		D.oppCount = {}
+		D.xpBest = 0
+		D.xpDecay = false
+	end
+	if type(opp) ~= "string" or opp == "" then
+		return 0
+	end
+	local n = (D.oppCount[opp] or 0) + 1
+	D.oppCount[opp] = n
+	if xp > 0 then
+		if n == 1 and xp > D.xpBest then
+			D.xpBest = xp
+		elseif n >= 2 and D.xpBest > 0 and xp < D.xpBest * 0.8 and not D.xpDecay then
+			D.xpDecay = true
+			Session.rotates += 1
+			log((if N.planner() then "PLAN" else "XP") .. " rotate opponent", "repeat=" .. n, "xp=" .. xp, "best=" .. D.xpBest, "(same opponent pays less)")
+		end
+	end
+	return n
+end
+-- First-match boost probe: a boosted win that would pass the cap tells whether the boost is applied before or after the
+-- DuelCoinLimitService clamp (gained = coins that arrived, counted = what the cap row counted).
+function N.boostProbe(m, result, earned, gained)
+	local mult = math.max(m.boostMult or 1, N.boostMult())
+	if mult <= 1 or result ~= "win" then
+		return
+	end
+	local base = N.baseWinCoins(N.modeKey(m.mode))
+	if m.earned0 + math.floor(base * mult) <= N.dailyCap() then
+		return
+	end
+	local applies = gained - earned >= base
+	N.Boost.afterCap = applies
+	log("BOOST after-cap result=" .. (if applies then "applies" else "clamped"), "gained=" .. gained, "counted=" .. earned, "base=" .. base, "mult=" .. mult, "today=" .. N.duelEarnedToday() .. "/" .. N.dailyCap())
+end
 N.ActiveStates = { Picking = true, Upgrading = true, Aiming = true, RoundStarting = true, Playing = true }
 local function playerId(p)
 	if type(p) == "number" then
@@ -32386,6 +32510,9 @@ local function matchStarted(entry)
 		d0 = d,
 		earned0 = N.duelEarnedToday(),
 		coins0 = N.coins(),
+		xp0 = N.expTotal(),
+		in0 = Session.coinsIn,
+		boostMult = N.boostMult(),
 		ball = nil,
 		rounds = 0,
 	}
@@ -32398,6 +32525,8 @@ local function matchStarted(entry)
 			table.insert(opponents, tostring(id))
 		end
 	end
+	D.match.opp = table.concat(opponents, ",")
+	N.Boost.matchDay = N.dayKey(0)
 	log("DUEL start", "mode", D.match.mode, "table", brief(entry.table or entry.tableId), "opponents", table.concat(opponents, ","))
 end
 local function matchEnded(reason)
@@ -32420,6 +32549,11 @@ function N.resolveResult(force)
 	local played = mt - m.m0
 	local result = if wt > m.w0 then "win" elseif dt > m.d0 then "draw" elseif played > 0 then "loss" else "left"
 	local earned = math.max(N.duelEarnedToday() - m.earned0, 0)
+	local secs = math.floor(os.clock() - m.startedAt)
+	local modeKey = N.modeKey(m.mode)
+	local gained = math.max(Session.coinsIn - (m.in0 or Session.coinsIn), 0)
+	local xp = math.max(N.expTotal() - (m.xp0 or N.expTotal()), 0)
+	local repeatN = 0
 	if result ~= "left" then
 		Session.matches += 1
 		if result == "win" then
@@ -32438,17 +32572,29 @@ function N.resolveResult(force)
 			end
 			Session.byBall[m.ball] = row
 		end
+		local mrow = Session.modeStats[modeKey] or { m = 0, secs = 0, coins = 0 }
+		mrow.m += 1
+		mrow.secs += secs
+		mrow.coins += earned
+		Session.modeStats[modeKey] = mrow
+		repeatN = N.noteOpponent(m.opp, xp)
+		N.boostProbe(m, result, earned, gained)
 	end
 	D.last = string.format("%s with %s, +%d coins", result, N.ballName(m.ball), earned)
 	log(
 		"DUEL result=" .. result,
 		"coins=+" .. earned,
+		"base=" .. N.baseWinCoins(modeKey),
 		"today=" .. N.duelEarnedToday() .. "/" .. N.dailyCap(),
 		"ball=" .. tostring(m.ball),
 		"rounds=" .. m.rounds,
-		"secs=" .. math.floor(os.clock() - m.startedAt),
+		"secs=" .. secs,
+		"mode=" .. modeKey,
 		"session=" .. Session.wins .. "W/" .. Session.losses .. "L/" .. Session.draws .. "D"
 	)
+	if result ~= "left" then
+		log("XP +" .. xp, "opp=" .. tostring(m.opp or "?"), "repeat=" .. repeatN, "daily=" .. N.dailyMatchXp())
+	end
 	if N.Events.match then
 		pcall(N.Events.match, result, earned, m.ball)
 	end
@@ -32520,14 +32666,58 @@ N.onEvent("DuelTableBallOffer", function(matchKey, data)
 	if type(data) ~= "table" then
 		return
 	end
-	D.offer = { key = matchKey, list = type(data.offer) == "table" and data.offer or {}, at = os.clock(), done = false }
+	D.offer = { key = matchKey, list = type(data.offer) == "table" and data.offer or {}, at = os.clock(), done = false, price = data.selectPrice }
+	D.weeklyFree = data.weeklyFreeRoleIds
 	if not D.rerollLogged then
 		D.rerollLogged = true
-		-- Reroll / self-select prices are shown for the record only: their currency is not in the dump (ideas.md 8).
-		log("REROLL price=" .. tostring(data.rerollPrice), "selectPrice=" .. tostring(data.selectPrice), "vouchers=" .. N.vouchers(), "(not used, currency unconfirmed)")
+		-- Reroll costs diamonds (never used); the self-select price is paid with a 指定卡 voucher first (client 85284).
+		log("REROLL price=" .. tostring(data.rerollPrice), "selectPrice=" .. tostring(data.selectPrice), "vouchers=" .. N.vouchers(), "weeklyFree=" .. brief(data.weeklyFreeRoleIds), "(reroll never used)")
+	end
+end)
+-- Free self-select result lines: SELECT price=.. vouchers=.. hp=../.. chose=.. result=ok|denied:<why>
+local function selfLog(result)
+	local s = D.selfInfo
+	if not s or s.logged then
+		return
+	end
+	s.logged = true
+	log("SELECT price=" .. tostring(s.price), "vouchers=" .. s.vouchers, "hp=" .. s.hp, "chose=" .. tostring(s.id), "gain=" .. string.format("%.1fpp", s.gain * 100), "result=" .. result)
+end
+N.onEvent("DuelTableBallSelectPurchaseResult", function(matchKey, data)
+	local o = D.offer
+	if not (o and o.key == matchKey and o.self and o.self.stage == "purchase") then
+		return
+	end
+	local ok = not (data == false or (type(data) == "table" and (data.ok == false or data.success == false)))
+	if ok then
+		o.self.stage = "paid"
+	else
+		selfLog("denied:purchase " .. brief(data))
+		o.self = nil
+		o.noSelf = true
+	end
+end)
+N.onEvent("DuelTableBallSelectConfirmed", function(matchKey)
+	if D.selfInfo and not D.selfInfo.logged and D.selfInfo.key == matchKey then
+		Session.selfSelects += 1
+		selfLog("ok")
+	end
+end)
+N.onEvent("DuelTableBallSelectConfirmDenied", function(matchKey, reason)
+	if D.selfInfo and not D.selfInfo.logged and D.selfInfo.key == matchKey then
+		selfLog("denied:" .. brief(reason))
+		if D.offer and D.offer.key == matchKey then
+			D.offer.self = nil
+			D.offer.noSelf = true
+		end
 	end
 end)
 N.onEvent("DuelTableBallLocked", function(matchKey, data)
+	local s = D.selfInfo
+	if s and not s.logged and s.sent and s.key == matchKey then
+		Session.selfSelects += 1
+		selfLog("ok (locked)")
+	end
 	if D.offer and D.offer.key == matchKey then
 		D.offer = nil
 	end
@@ -32546,7 +32736,9 @@ N.onEvent("DuelTableUpgradeLocked", function(matchKey)
 		D.upOffer = nil
 	end
 end)
-N.onEvent("DuelCoinLimitReached", function()
+-- The cap is noted once per window: from the server's DuelCoinLimitReached event or, when the last win lands exactly on
+-- the cap (no clamped match follows), from the profile counters in queueStep.
+function N.noteCap()
 	local day = N.dayKey(N.resetHour())
 	if D.capDay ~= day then
 		D.capDay = day
@@ -32556,9 +32748,23 @@ N.onEvent("DuelCoinLimitReached", function()
 			pcall(N.Events.cap)
 		end
 	end
+end
+N.onEvent("DuelCoinLimitReached", function()
+	N.noteCap()
 end)
 N.onEvent("DailyFirstMatchBoostGranted", function(...)
-	log("BOOST first match", brief({ ... }))
+	local args = { ... }
+	N.Boost.grantedDay = N.dayKey(0)
+	local function state(tag)
+		local b = N.pdTable("coinBoost")
+		log("BOOST " .. tag, "id=" .. brief(args[1]), "mult=" .. tostring(b.multiplier), "remain=" .. tostring(b.remaining), "args=" .. brief(args))
+	end
+	state("grant")
+	task.delay(2, function()
+		if alive() then
+			state("state")
+		end
+	end)
 end)
 N.onEvent("CurrencyChanged", function(currency, delta)
 	if currency == "coins" and type(delta) == "number" then
@@ -32701,11 +32907,97 @@ end
 function N.wantDuel()
 	return on("AutoDuel") or N.planner()
 end
+-- Free self-select (blatant.md #2): RE/DuelTableBallSelectPurchase then RE/DuelTableBallSelfSelect(matchKey, roleId)
+-- picks ANY owned ball instead of the 3 offered. The client pays with a 指定卡 voucher first and with diamonds only when
+-- none is left, so the hub fires it only while the profile shows a voucher (vouchers above the cap only flag a review).
+function N.matchHp()
+	local e = D.mine
+	local mine, theirs
+	for _, p in pairs(e and type(e.players) == "table" and e.players or {}) do
+		if type(p) == "table" then
+			local hp = tonumber(p.hp or p.raceHp or p.health or p.lives)
+			if hp then
+				if playerId(p) == LocalPlayer.UserId then
+					mine = hp
+				else
+					theirs = if theirs then math.min(theirs, hp) else hp
+				end
+			end
+		end
+	end
+	return mine, theirs
+end
+function N.selfSelectChoice(o)
+	if not (on("UseVouchers") or N.planner()) or not (on("SmartBallPick") or N.planner()) then
+		return nil
+	end
+	local vouchers = N.vouchers()
+	if vouchers <= 0 or not D.stats then
+		return nil
+	end
+	local owned = {}
+	for id in pairs(N.ownedBalls()) do
+		table.insert(owned, id)
+	end
+	table.sort(owned)
+	local best = N.chooseBall(owned)
+	local offered = N.chooseBall(o.list)
+	if not best or not offered or table.find(o.list, best) then
+		return nil
+	end
+	local gain = (N.ballRate(best) or 0.5) - (N.ballRate(offered) or 0.5)
+	local mineHp, theirHp = N.matchHp()
+	local rps = D.match ~= nil and D.match.mode == "RPS"
+	local need = 0.04
+	if rps then
+		if mineHp or theirHp then
+			-- RPS reselects every round: the voucher goes to a deciding round (a player on 1 HP)
+			if not (mineHp == 1 or theirHp == 1) then
+				return nil
+			end
+			need = 0.02
+		else
+			need = 0.06
+		end
+	end
+	if gain < need then
+		return nil
+	end
+	return best, { vouchers = vouchers, hp = tostring(mineHp or "?") .. "/" .. tostring(theirHp or "?"), gain = gain, price = o.price }
+end
 function N.pickStep()
 	local o = D.offer
 	if o and not o.done and N.wantDuel() then
 		o.delay = o.delay or pickDelay()
-		if os.clock() - o.at >= o.delay then
+		local ready = os.clock() - o.at >= o.delay
+		if o.self then
+			local s = o.self
+			if s.stage == "paid" then
+				fire("DuelTableBallSelfSelect", o.key, s.id)
+				s.stage = "sent"
+				s.at = os.clock()
+				if D.selfInfo then
+					D.selfInfo.sent = true
+				end
+			elseif os.clock() - s.at > 4 then
+				if D.selfInfo then
+					selfLog("denied:timeout " .. s.stage)
+				end
+				o.self = nil
+				o.noSelf = true
+			end
+		elseif ready and not o.noSelf then
+			o.noSelf = true
+			local id, info = N.selfSelectChoice(o)
+			if id then
+				info.id = id
+				info.key = o.key
+				D.selfInfo = info
+				o.self = { stage = "purchase", id = id, at = os.clock() }
+				fire("DuelTableBallSelectPurchase", o.key)
+			end
+		end
+		if ready and not o.self and not o.done then
 			local id, why = N.chooseBall(o.list)
 			o.done = true
 			if id then
@@ -32824,7 +33116,7 @@ function N.aimStep()
 end
 -- Queueing -----------------------------------------------------------------------------------------------------------
 function N.capReached()
-	return D.capDay == N.dayKey(N.resetHour()) or N.duelEarnedToday() >= N.dailyCap()
+	return D.capDay == N.dayKey(N.resetHour()) or N.coinsLeft() <= 0
 end
 -- Daily quests a duel can still finish (胜利 win, 3血模式 finish a 3 HP match; 好友单挑 needs a friend, skipped).
 function N.questsLeft()
@@ -32843,48 +33135,52 @@ end
 function N.playForQuests()
 	return (on("KeepForQuests") or N.planner()) and N.questsLeft() > 0
 end
+local function modeUnlocked(mode)
+	if mode ~= "2v2" or type(N.G.Exp.isFeatureUnlocked) ~= "function" then
+		return true
+	end
+	local ok, yes = pcall(N.G.Exp.isFeatureUnlocked, N.expTotal(), "2v2模式")
+	return not ok or yes == true
+end
 function N.duelMode()
-	local mode = optionText("DuelMode", "Duel")
-	if mode == "2v2" then
-		local unlocked = true
-		if type(N.G.Exp.isFeatureUnlocked) == "function" then
-			local ok, yes = pcall(N.G.Exp.isFeatureUnlocked, N.expTotal(), "2v2模式")
-			unlocked = not ok or yes == true
+	local mode = N.activeMode()
+	if mode == "2v2" and not modeUnlocked("2v2") then
+		if D.modeNote ~= "2v2" then
+			D.modeNote = "2v2"
+			log("MODE 2v2 still locked by level, playing Duel")
 		end
-		if not unlocked then
-			if D.modeNote ~= "2v2" then
-				D.modeNote = "2v2"
-				log("MODE 2v2 still locked by level, playing Duel")
-			end
-			return "Duel"
-		end
+		return "Duel"
 	end
 	return mode
 end
 -- RPS tables have no Quick Play: the hub takes a free seat at a waiting RPS table like the seat button (70155).
-local function freeRpsSeat()
+function N.freeRpsSeat()
 	local best, bestSeat, bestTaken = nil, nil, -1
 	for _, entry in pairs(D.tables) do
 		if N.tableMode(entry) == "RPS" and entry.state == "Waiting" and typeof(entry.table) == "Instance" and type(entry.seats) == "table" then
 			local taken, free = 0, nil
+			local repeated = false
 			for seatName, seat in pairs(entry.seats) do
 				if type(seat) == "table" and seat.userId ~= nil then
 					taken += 1
+					if D.xpDecay and (D.oppCount[tostring(seat.userId)] or 0) >= 2 then
+						repeated = true
+					end
 				elseif free == nil then
 					free = seatName
 				end
 			end
-			if free and taken > bestTaken then
+			if free and not repeated and taken > bestTaken then
 				best, bestSeat, bestTaken = entry, free, taken
 			end
 		end
 	end
 	return best, bestSeat
 end
--- Coins one more match can pay: the race's win coins (Config.race, the GUI's "Win %d") times an active coin boost,
--- doubled as margin for the daily first-match boost. The guard queues a match only when that still fits.
+-- Coins one win pays: the race's win coins (Config.race, the GUI's "Win %d"), without any boost.
 local RaceIds = { Duel = "极速模式", RPS = "剪刀石头布", ["2v2"] = "2v2模式" }
-function N.winCoins(mode)
+N.RaceIds = RaceIds
+function N.baseWinCoins(mode)
 	local byCn = N.tableOr(N.tableOr(N.G.Config.race).byCnId)
 	local row = byCn[RaceIds[mode or "Duel"] or "极速模式"]
 	local coins = tonumber(row and row.rewardCoins)
@@ -32897,12 +33193,57 @@ function N.winCoins(mode)
 			coins = 100
 		end
 	end
-	local boost = N.pdTable("coinBoost")
-	local mult = if (tonumber(boost.remaining) or 0) > 0 then math.max(tonumber(boost.multiplier) or 1, 1) else 1
-	return math.floor(coins * mult)
+	return coins
+end
+-- ... times an active coin boost.
+function N.winCoins(mode)
+	return math.floor(N.baseWinCoins(mode) * N.boostMult())
+end
+-- Mode choice (blatant.md #3): coins per minute = win coins x win rate x 60 / seconds per match (measured per mode after
+-- 3 matches, before that a prior: Duel 75 s, RPS 120 s with a 30 s pick every round, 2v2 100 s).
+local Prior = { Duel = 75, RPS = 120, ["2v2"] = 100 }
+function N.modeRate(mode)
+	local row = Session.modeStats[mode]
+	local secs = if row and row.m >= 3 then row.secs / row.m else Prior[mode]
+	return N.baseWinCoins(mode) * N.sessionRate() * 60 / math.max(secs, 10), secs
+end
+function N.plannedMode()
+	if D.modeCache and os.clock() - D.modeAt < 5 then
+		return D.modeCache
+	end
+	D.modeAt = os.clock()
+	local current = D.modeCache
+	local avail = { Duel = true, RPS = current == "RPS" or N.freeRpsSeat() ~= nil, ["2v2"] = modeUnlocked("2v2") }
+	local rates, best = {}, "Duel"
+	for _, mode in ipairs({ "Duel", "RPS", "2v2" }) do
+		rates[mode] = N.modeRate(mode)
+		if avail[mode] and rates[mode] > rates[best] then
+			best = mode
+		end
+	end
+	if current and avail[current] and best ~= current and rates[best] < rates[current] * 1.1 then
+		best = current
+	end
+	if best ~= current then
+		D.modeCache = best
+		N.planNote(string.format("mode=%s coins/min Duel=%.1f RPS=%.1f 2v2=%.1f", best, rates.Duel, rates.RPS, rates["2v2"]))
+	end
+	return best
+end
+function N.activeMode()
+	if N.planner() then
+		return N.plannedMode()
+	end
+	return optionText("DuelMode", "Duel")
 end
 function N.guardNeed()
-	return 2 * N.winCoins(optionText("DuelMode", "Duel"))
+	local need = 2 * N.winCoins(N.activeMode())
+	-- The caps bound what a win can pay, unless a boosted win was seen paying above the clamp.
+	local left = N.coinsLeft()
+	if left < need and not (N.boostMult() > 1 and N.Boost.afterCap ~= false) then
+		need = left
+	end
+	return need
 end
 function N.guardStep()
 	local room, limit = N.guardRoom()
@@ -32953,6 +33294,16 @@ function N.queueStep()
 	if not ok then
 		return string.format("Coin Guard: %s coins, safe limit %s (one more win could pass it). Duels paused, spend coins (Smart Buy)", formatNumber(N.coins()), formatNumber(limit))
 	end
+	if N.capReached() then
+		N.noteCap()
+	end
+	if N.holdForBoost() then
+		if N.Boost.holdDay ~= N.dayKey(0) then
+			N.Boost.holdDay = N.dayKey(0)
+			N.planNote("boost first match waits for " .. N.resetLabel() .. " UTC (" .. N.longTime(N.secondsToHour(N.resetHour())) .. "), the last window is capped")
+		end
+		return "Waiting for " .. N.resetLabel() .. " UTC: the first match of the day carries the coin boost (" .. N.longTime(N.secondsToHour(N.resetHour())) .. ")"
+	end
 	if N.capReached() and not N.playForQuests() then
 		return "Daily duel cap reached (" .. formatNumber(N.duelEarnedToday()) .. "/" .. formatNumber(N.dailyCap()) .. "), next reset in " .. N.longTime(N.secondsToHour(N.resetHour()))
 	end
@@ -32964,7 +33315,7 @@ function N.queueStep()
 	if mode == "2v2" then
 		fire("Duel2v2QuickPlayRequest")
 	elseif mode == "RPS" then
-		local entry, seat = freeRpsSeat()
+		local entry, seat = N.freeRpsSeat()
 		if not entry then
 			if D.modeNote ~= "rps" then
 				D.modeNote = "rps"
@@ -33162,7 +33513,7 @@ do
 		if on("AutoQuests") and due("quests", 20) and N.questStep() then
 			return
 		end
-		if on("AutoCheckIn") and due("checkin", 600) and N.checkInStep() then
+		if on("AutoCheckIn") and due("checkin", if N.planner() and N.secondsToHour(0) < 900 then 60 else 600) and N.checkInStep() then
 			R.at.checkin = os.clock() + 5
 			return
 		end
@@ -33498,35 +33849,75 @@ function N.dedupeCount()
 	end
 	return n
 end
--- Chance that one roll of <crate> is a ball you do not own yet.
-function N.newBallChance(crate)
+-- Crate maths (blatant.md #5): one RF/GachaRoll pays the crate price ONCE and returns drawCount (1..100, cloud) items
+-- (purchaseBatch charges the price once for the whole batch), so the cost per item is price / drawCount.
+function N.crateDraw(crate)
+	return math.clamp(math.floor(tonumber(crate.drawCount) or 1), 1, 100)
+end
+-- Does the dedupe protection (misc.ballGachaDedupeCount, 133649) guarantee new balls from this crate right now?
+function N.crateDedupe(crate)
 	local limit = tonumber(N.tableOr(N.G.Config.misc).ballGachaDedupeCount)
-	if crate.dedup or ((crate.gachaCnId == "金币小球箱子" or crate.gachaCnId == "钻石小球箱子") and limit and N.dedupeCount() <= limit) then
-		return 1, "new ball guaranteed (dedupe)"
-	end
+	return crate.dedup == true or ((crate.gachaCnId == "金币小球箱子" or crate.gachaCnId == "钻石小球箱子") and limit ~= nil and N.dedupeCount() <= limit)
+end
+-- Pool rows of a crate: weight of the balls you do not own, total weight, count of distinct unowned balls.
+function N.poolFresh(gachaCnId)
 	local getChances = N.G.Pool.getChances
 	if type(getChances) ~= "function" then
-		return nil, "odds unreadable"
+		return nil
 	end
-	local ok, rows, total = pcall(getChances, crate.gachaCnId)
+	local ok, rows, total = pcall(getChances, gachaCnId)
 	if not ok or type(rows) ~= "table" then
-		return nil, "odds unreadable"
+		return nil
 	end
 	local owned = N.ownedBalls()
-	local sum, fresh = 0, 0
+	local sum, fresh, seen, count = 0, 0, {}, 0
 	for _, row in ipairs(rows) do
 		local w = tonumber(row.weight) or 0
 		local id = row.targetId or (type(row.row) == "table" and row.row.targetId) or (type(row.definition) == "table" and row.definition.cnId)
 		sum += w
 		if w > 0 and type(id) == "string" and not owned[id] and (row.itemType == nil or row.itemType == "小球" or row.itemType == "Ball") then
 			fresh += w
+			if not seen[id] then
+				seen[id] = true
+				count += 1
+			end
 		end
 	end
 	total = tonumber(total) or sum
 	if total <= 0 then
+		return nil
+	end
+	return fresh, total, count
+end
+-- Chance that one item of <crate> is a ball you do not own yet.
+function N.newBallChance(crate)
+	if N.crateDedupe(crate) then
+		return 1, "new ball guaranteed (dedupe)"
+	end
+	local fresh, total = N.poolFresh(crate.gachaCnId)
+	if not fresh then
 		return nil, "odds unreadable"
 	end
 	return fresh / total, string.format("%.0f%% new", fresh / total * 100)
+end
+-- Expected new balls from ONE roll (drawCount items, never more than the unowned balls left in the pool).
+function N.crateYield(crate)
+	local chance, why = N.newBallChance(crate)
+	if not chance then
+		return nil, why
+	end
+	local draw = N.crateDraw(crate)
+	local yield = chance * draw
+	local _, _, count = N.poolFresh(crate.gachaCnId)
+	if count then
+		yield = math.min(yield, count)
+	end
+	return yield, why
+end
+function N.logCrateCfg()
+	for _, c in ipairs(N.coinCrates()) do
+		log("CFG crate " .. c.cnId, "price=" .. tostring(c.coinsPrice), "draw=" .. N.crateDraw(c), "dedupe=" .. tostring(N.crateDedupe(c)), "pool=" .. tostring(c.gachaCnId), "perItem=" .. string.format("%.0f", c.coinsPrice / N.crateDraw(c)))
+	end
 end
 -- Daily Shop coin slots with a ball you do not own (DailyShopService.getOffer: currency 金币, price).
 function N.shopPick()
@@ -33559,16 +33950,17 @@ function N.nextBuy()
 	local room, limit = N.guardRoom()
 	local pressure = room < N.guardNeed()
 	local crates = N.coinCrates()
-	local crate, chance, chanceWhy = nil, nil, ""
+	local crate, chance, chanceWhy, yield = nil, nil, "", nil
 	for _, c in ipairs(crates) do
 		local ch, why = N.newBallChance(c)
-		if ch and (not chance or ch / c.coinsPrice > chance / crate.coinsPrice) then
-			crate, chance, chanceWhy = c, ch, why
+		local y = N.crateYield(c)
+		if ch and y and (not yield or y / c.coinsPrice > yield / crate.coinsPrice) then
+			crate, chance, chanceWhy, yield = c, ch, why, y
 		end
 	end
 	if on("UseDailyShop") or N.planner() then
 		local s = N.shopPick()
-		if s and coins - s.price >= reserve and (not crate or chance == nil or s.price <= crate.coinsPrice / math.max(chance, 0.01)) then
+		if s and coins - s.price >= reserve and (not crate or yield == nil or s.price <= crate.coinsPrice / math.max(yield, 0.01)) then
 			return { kind = "shop", slot = s.slot, ball = s.ball, price = s.price, why = "unowned ball in the Daily Shop" }
 		end
 	end
@@ -33578,11 +33970,16 @@ function N.nextBuy()
 	if coins - crate.coinsPrice < reserve then
 		return nil, string.format("saving: %s coins, keep %s, crate %s", formatNumber(coins), formatNumber(reserve), formatNumber(crate.coinsPrice))
 	end
+	local draw = N.crateDraw(crate)
+	-- a batch of unowned-or-not copies lands on the untradable groups: keep the worst one under the 20 copy trigger
+	if chance < 1 and draw > 1 and worst + draw > 20 then
+		return nil, string.format("paused: one roll gives %d items and could lift an untradable ball past 20 copies (now %d)", draw, worst)
+	end
 	local minChance = optionNumber("MinNewChance", 35) / 100
 	if chance < minChance and not pressure then
 		return nil, string.format("saving: crate only %s, below %d%% (coins are safe under the guard)", chanceWhy, math.floor(minChance * 100))
 	end
-	return { kind = "crate", crate = crate.cnId, price = crate.coinsPrice, chance = chance, why = chanceWhy .. (if pressure and chance < minChance then ", Coin Guard pressure (limit " .. formatNumber(limit) .. ")" else "") }
+	return { kind = "crate", crate = crate.cnId, price = crate.coinsPrice, chance = chance, draw = draw, yield = yield, why = (if draw > 1 then draw .. " items for one price, " else "") .. chanceWhy .. (if pressure and chance < minChance then ", Coin Guard pressure (limit " .. formatNumber(limit) .. ")" else "") }
 end
 function N.spendStep()
 	if not (on("SmartBuy") or N.planner()) then
@@ -33620,6 +34017,7 @@ function N.spendStep()
 			table.insert(fresh, N.ballName(id))
 		end
 	end
+	local items = if pick.kind == "shop" then 1 elseif type(result.results) == "table" then #result.results else (pick.draw or 1)
 	Session.spent += pick.price
 	if pick.kind == "shop" then
 		Session.shopBuys += 1
@@ -33628,7 +34026,7 @@ function N.spendStep()
 	end
 	Session.newBalls += #fresh
 	N.Spend.last = string.format("%s for %s: %s", if pick.kind == "shop" then "Daily Shop" else "Crate", formatNumber(pick.price), if #fresh > 0 then "NEW " .. table.concat(fresh, ", ") else "duplicate")
-	log("SPEND " .. pick.kind .. "=" .. tostring(pick.crate or pick.slot), "price=" .. pick.price, "coins " .. coins .. "->" .. N.coins(), "newBall=" .. tostring(#fresh > 0), "owned=" .. n, "|", pick.why)
+	log("SPEND " .. pick.kind .. "=" .. tostring(pick.crate or pick.slot), "price=" .. pick.price, "coins " .. coins .. "->" .. N.coins(), "items=" .. items, "new=" .. #fresh, "newBall=" .. tostring(#fresh > 0), "owned=" .. n, "|", pick.why)
 	if #fresh > 0 and N.Events.newBall then
 		pcall(N.Events.newBall, fresh)
 	end
@@ -33657,9 +34055,10 @@ end
 function N.planTick()
 	local P = N.Plan
 	local cap, earned = N.dailyCap(), N.duelEarnedToday()
-	local win = N.winCoins(optionText("DuelMode", "Duel"))
+	local mode = N.activeMode()
+	local win = N.winCoins(mode)
 	local rate = N.sessionRate()
-	local left = math.max(cap - earned, 0)
+	local left = N.coinsLeft()
 	local matches = if left > 0 then math.ceil(left / math.max(win * rate, 1)) else 0
 	local limit, legal = N.guardLimit()
 	local pick, why = N.nextBuy()
@@ -33667,16 +34066,20 @@ function N.planTick()
 	local duel
 	if N.coins() + N.guardNeed() > limit then
 		duel = "paused by Coin Guard"
+	elseif N.holdForBoost() then
+		duel = "first match of the UTC day waits for " .. N.resetLabel() .. " UTC (boost)"
 	elseif left > 0 then
 		duel = string.format("duel %d more matches (~%s)", matches, N.longTime(matches * 75))
 	elseif quests > 0 then
 		duel = quests .. " quest(s) left, duel for them"
 	else
-		duel = "cap done, idle until " .. N.resetHour() .. ":00 UTC (" .. N.longTime(N.secondsToHour(N.resetHour())) .. ")"
+		duel = "cap done, idle until " .. N.resetLabel() .. " UTC (" .. N.longTime(N.secondsToHour(N.resetHour())) .. ")"
 	end
 	P.say = string.format("Today %s/%s duel coins, win rate %d%%: %s", formatNumber(earned), formatNumber(cap), math.floor(rate * 100 + 0.5), duel)
 	P.spendText = if pick then string.format("Next buy: %s for %s (%s)", pick.kind, formatNumber(pick.price), pick.why) else "Next buy: " .. tostring(why or "-")
-	local line = string.format("day earned=%d/%d win=%d rate=%.2f matchesLeft=%d quests=%d coins=%d guard=%d legal=%d | %s | %s", earned, cap, win, rate, matches, quests, N.coins(), limit, legal, duel, P.spendText)
+	local week = N.weeklyCap()
+	local clocks = string.format("week=%s boost=%s mode=%s reset00=%s reset05=%s", if week then N.weeklyEarned() .. "/" .. week else "-", if N.boostPending() then "pending" else "done", mode, N.longTime(N.secondsToHour(0)), N.longTime(N.secondsToHour(N.resetHour())))
+	local line = string.format("day earned=%d/%d win=%d rate=%.2f matchesLeft=%d quests=%d coins=%d guard=%d legal=%d %s | %s | %s", earned, cap, win, rate, matches, quests, N.coins(), limit, legal, clocks, duel, P.spendText)
 	local key = string.gsub(line, "%d+", "#")
 	if key ~= P.lastLine or os.clock() - P.lineAt > 60 then
 		P.lastLine = key
@@ -33691,8 +34094,10 @@ function N.upNext()
 		local cap, earned = N.dailyCap(), N.duelEarnedToday()
 		if N.coins() + N.guardNeed() > N.guardLimit() then
 			table.insert(lines, "Coin Guard holds duels: spend coins first (Smart Buy)")
+		elseif N.holdForBoost() then
+			table.insert(lines, "First match of the day waits for " .. N.resetLabel() .. " UTC (" .. N.longTime(N.secondsToHour(N.resetHour())) .. "): the daily boost then lands in a fresh cap window")
 		elseif N.capReached() then
-			table.insert(lines, if N.playForQuests() then "Cap reached, dueling for the daily quests" else "Cap reached, duels resume at " .. N.resetHour() .. ":00 UTC (" .. N.longTime(N.secondsToHour(N.resetHour())) .. ")")
+			table.insert(lines, if N.playForQuests() then "Cap reached, dueling for the daily quests" else "Cap reached, duels resume at " .. N.resetLabel() .. " UTC (" .. N.longTime(N.secondsToHour(N.resetHour())) .. ")")
 		else
 			table.insert(lines, string.format("Duel until the daily cap: %s / %s coins", formatNumber(earned), formatNumber(cap)))
 		end
@@ -33777,6 +34182,7 @@ do
 		{ "AutoDuel", "Duel" },
 		{ "SmartBallPick", "Smart Ball Pick" },
 		{ "SmartUpgradePick", "Smart Upgrade Pick" },
+		{ "UseVouchers", "Free self-select" },
 		{ "AutoQuests", "Daily quests" },
 		{ "AutoCheckIn", "Check-in" },
 		{ "AutoOnline", "Online rewards" },
@@ -33872,6 +34278,11 @@ do
 			Text = "Smart Upgrade Pick",
 			Default = false,
 			Tooltip = "Each round, picks the upgrade card with the most stars (the game's rarity). Off = the first card",
+		})
+		PickBox:AddToggle("UseVouchers", {
+			Text = "Free self-select",
+			Default = false,
+			Tooltip = "Only while you hold a free Pick-a-ball voucher (the online rewards give them): instead of the 3 offered balls it picks your best owned ball by win rate, when that is clearly better (4+ points; in RPS only on a deciding round). Never pays with diamonds",
 		})
 		local ballNames = {}
 		for _, row in ipairs(N.tableOr(N.tableOr(N.G.Config.ball).list)) do
@@ -34170,7 +34581,7 @@ do
 				Session.codes,
 				Session.guardStops
 			),
-			"Status: " .. tostring(Status) .. "  |  planner " .. (if N.planner() then "on" else "off") .. "  |  mode " .. optionText("DuelMode", "Duel") .. ", aim " .. optionText("AimMode", "Straight"),
+			"Status: " .. tostring(Status) .. "  |  planner " .. (if N.planner() then "on" else "off") .. "  |  mode " .. N.activeMode() .. ", aim " .. optionText("AimMode", "Straight"),
 			"Running: " .. table.concat(Debug.running(), ", "),
 			string.format("Game: coins %d, diamonds %d, duel today %d/%d, guard %d, legal bound %d (first join: %s), vouchers %d, balls %d, worst untradable %d, quests left %d", N.coins(), N.diamonds(), N.duelEarnedToday(), N.dailyCap(), limit, legal, N.Guard.source, N.vouchers(), select(2, N.ownedBalls()), (N.untradableMax()), N.questsLeft()),
 			"Perf: " .. Debug.perfText(),
@@ -34634,7 +35045,7 @@ do
 		pcall(function()
 			toggleCommand("planner", { "smart" }, { "SmartPlanner" }, "Smart Planner")
 			toggleCommand("duel", { "play" }, { "AutoDuel" }, "Auto Duel")
-			toggleCommand("pick", {}, { "SmartBallPick", "SmartUpgradePick" }, "Smart picks")
+			toggleCommand("pick", {}, { "SmartBallPick", "SmartUpgradePick", "UseVouchers" }, "Smart picks and free self-select")
 			toggleCommand("buy", { "spend" }, { "SmartBuy" }, "Smart Buy")
 			toggleCommand("copies", { "upgrade" }, { "AutoUpgrade" }, "Copy Control")
 			toggleCommand("rewards", { "claim" }, { "AutoQuests", "AutoCheckIn", "AutoOnline", "AutoMail", "AutoCodes" }, "Rewards")
@@ -34981,6 +35392,9 @@ do
 			"crates=" .. (if #crates > 0 then table.concat(crates, ",") else "-"),
 			"quests=" .. #N.tableOr(N.tableOr(cfg.dailyQuest).list)
 		)
+		log("CFG race", "极速模式=" .. N.baseWinCoins("Duel"), "剪刀石头布=" .. N.baseWinCoins("RPS"), "2v2模式=" .. N.baseWinCoins("2v2"))
+		log("CFG clocks", "reset00=" .. N.longTime(N.secondsToHour(0)), "reset" .. string.format("%02d", N.resetHour()) .. "=" .. N.longTime(N.secondsToHour(N.resetHour())), "dailyCap=" .. N.dailyCap(), "weeklyCap=" .. tostring(N.weeklyCap()), "weekEarned=" .. N.weeklyEarned(), "boostPending=" .. tostring(N.boostPending()))
+		N.logCrateCfg()
 		log("GUARD start coins=" .. N.coins(), "limit=" .. limit, "legalCap=" .. legal, "first=" .. N.Guard.source, "untradableMax=" .. (N.untradableMax()))
 	end
 	-- Duel loop (10 a second): the only code that sends match choices.
@@ -35075,7 +35489,7 @@ do
 				)
 				I.duel = string.format(
 					"Mode %s  \u{00B7}  %s\nLast: %s\nQueued %d, left empty tables %d",
-					optionText("DuelMode", "Duel"),
+					N.activeMode(),
 					if N.capReached() then "daily cap reached" else formatNumber(math.max(N.dailyCap() - N.duelEarnedToday(), 0)) .. " coins left today",
 					if N.Duel.last ~= "" then N.Duel.last else "-",
 					Session.queues,
