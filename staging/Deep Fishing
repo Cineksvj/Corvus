@@ -32537,22 +32537,109 @@ N.Fish = {
 }
 do
 	local F = N.Fish
-	-- Auto Fish mode: Safe (default) or Blatant (opt-in). Blatant steps back to Safe for 10 minutes on any refusal signal.
+	-- Auto Fish mode (default "Auto (best measured)"): a ladder measures Safe for 5 min, then Blatant for 5 min (coins per
+	-- minute from the planner's worth line) and keeps the faster one; it re-measures every hour. Any danger signal while
+	-- Blatant (refused casts, casts without an answer or catch window, a client error/kick message) = Safe for 30 minutes,
+	-- and 3 such fallbacks in a day switch Blatant off for the day. "Safe" / "Blatant" in the dropdown pin the mode.
+	F.ladder = { phase = "measureSafe", mode = "safe", t0 = nil, w0 = 0, safe = nil, blat = nil, keep = "safe", falls = {}, dayOffUntil = 0, ratio = nil }
+	local L = F.ladder
+	local function worthNow()
+		local s = N.Econ.samples
+		local last = s[#s]
+		return if last then last.w else 0
+	end
+	local function modeChoice()
+		return string.sub(optionText("FishMode", "Auto (best measured)"), 1, 4)
+	end
 	function N.fishMode()
-		if string.sub(optionText("FishMode", "Safe"), 1, 7) == "Blatant" and os.clock() >= F.fallbackUntil then
+		local c = modeChoice()
+		if c == "Safe" or os.clock() < F.fallbackUntil or os.clock() < L.dayOffUntil then
+			return "safe"
+		end
+		if c == "Blat" then
 			return "blatant"
 		end
-		return "safe"
+		return L.mode
+	end
+	local function startMeasure()
+		L.phase, L.mode, L.t0, L.w0 = "measureSafe", "safe", os.clock(), worthNow()
+	end
+	function N.ladderTick()
+		if modeChoice() ~= "Auto" then
+			return
+		end
+		local now = os.clock()
+		if not L.t0 then
+			startMeasure()
+			return
+		end
+		if L.phase == "cooldown" then
+			if now >= F.fallbackUntil and now >= L.dayOffUntil then
+				startMeasure()
+			end
+			return
+		end
+		local el = now - L.t0
+		if L.phase == "measureSafe" and el >= 300 then
+			L.safe = (worthNow() - L.w0) / (el / 60)
+			L.phase, L.mode, L.t0, L.w0 = "measureBlatant", "blatant", now, worthNow()
+		elseif L.phase == "measureBlatant" and el >= 300 then
+			L.blat = (worthNow() - L.w0) / (el / 60)
+			L.keep = if L.blat > (L.safe or 0) then "blatant" else "safe"
+			L.ratio = if (L.safe or 0) > 0 then L.blat / L.safe else nil
+			L.phase, L.mode, L.t0 = "keep", L.keep, now
+			log("MODE measure", "safe=" .. formatNumber(L.safe) .. "/min", "blatant=" .. formatNumber(L.blat) .. "/min", "keep=" .. L.keep)
+		elseif L.phase == "keep" and el >= 3600 then
+			startMeasure()
+		end
+	end
+	-- Status text: the active mode and why.
+	function N.modeText()
+		local c = modeChoice()
+		local m = if N.fishMode() == "blatant" then "Blatant" else "Safe"
+		if os.clock() < F.fallbackUntil then
+			return "Mode Safe: Blatant paused 30 min (" .. F.fallbackReason .. ")"
+		end
+		if os.clock() < L.dayOffUntil then
+			return "Mode Safe: Blatant off for the day (3 fallbacks)"
+		end
+		if c ~= "Auto" then
+			return "Mode " .. m .. " (picked by you)"
+		end
+		if L.phase == "measureSafe" or L.phase == "measureBlatant" then
+			return "Mode " .. m .. ": measuring " .. m .. " (5 min)"
+		end
+		if L.keep == "blatant" then
+			return "Mode Blatant: " .. (if L.ratio then string.format("%.1fx Safe", L.ratio) else "faster than Safe") .. " (measured)"
+		end
+		return "Mode Safe: " .. (if L.ratio then string.format("Blatant measured %.1fx Safe", L.ratio) else "Blatant measured no better") .. ", kept Safe"
 	end
 	function N.fallback(reason)
 		if os.clock() < F.fallbackUntil then
 			return
 		end
-		F.fallbackUntil = os.clock() + 600
+		local now = os.clock()
+		F.fallbackUntil = now + 1800
 		F.fallbackReason = reason
-		log("MODE fallback safe", "reason=" .. tostring(reason), "retry in 10m")
-		notify("Auto Fish", "Blatant paused for 10 minutes (" .. tostring(reason) .. "), fishing Safe meanwhile", 6)
+		L.phase, L.mode, L.keep = "cooldown", "safe", "safe"
+		table.insert(L.falls, now)
+		while #L.falls > 0 and now - L.falls[1] > 86400 do
+			table.remove(L.falls, 1)
+		end
+		log("MODE fallback blatant -> safe", "reason=" .. tostring(reason), "retry in 30m", "falls today=" .. #L.falls)
+		if #L.falls >= 3 then
+			L.dayOffUntil = now + 86400
+			log("MODE blatant off for the day", "falls=" .. #L.falls)
+		end
+		notify("Auto Fish", "Blatant paused for 30 minutes (" .. tostring(reason) .. "), fishing Safe meanwhile", 6)
 	end
+	pcall(function()
+		game:GetService("GuiService").ErrorMessageChanged:Connect(function(msg)
+			if alive() and N.fishMode() == "blatant" and tostring(msg) ~= "" then
+				N.fallback("client message: " .. string.sub(tostring(msg), 1, 60))
+			end
+		end)
+	end)
 	-- Hooks per cast exactly like the game's client (ThrowCinematic:GetBaitCapacity): Capacity upgrade of this world +
 	-- HookSlots enchants, never more than the free backpack slots.
 	function N.hookCapRaw()
@@ -32706,8 +32793,13 @@ do
 			while #F.refusals > 0 and now - F.refusals[1] > 60 do
 				table.remove(F.refusals, 1)
 			end
-			if #F.refusals >= 3 and N.fishMode() == "blatant" then
-				N.fallback("server refused 3 casts in a minute")
+			if N.fishMode() == "blatant" then
+				local code = string.lower(tostring(a))
+				if string.find(code, "flag", 1, true) or string.find(code, "suspect", 1, true) or string.find(code, "cheat", 1, true) then
+					N.fallback("server answer " .. tostring(a))
+				elseif #F.refusals >= 3 then
+					N.fallback("server refused 3 casts in a minute")
+				end
 			end
 		end
 	end)
@@ -32771,7 +32863,7 @@ do
 	function N.castOnce(blatant)
 		local cast = { sentAt = os.clock(), blatant = blatant, hooked = {}, value = 0 }
 		F.cast = cast
-		local power, perfect = throwPower(math.clamp(optionNumber("PerfectRate", 60) / 100, 0, 0.95))
+		local power, perfect = throwPower(math.clamp(optionNumber("PerfectRate", 60) / 100, 0, if blatant then 0.6 else 0.95))
 		send("ThrowRod", power)
 		Session.casts += 1
 		if perfect then
@@ -32807,6 +32899,12 @@ do
 			return cast.windowOpen or cast.closed
 		end, waitOpen) then
 			log("CAST no catch window", "throw=" .. tostring(p.throwId))
+			F.noWindow = (F.noWindow or 0) + 1
+			if blatant and F.noWindow >= 2 then
+				N.fallback("2 casts without a catch window")
+			end
+		else
+			F.noWindow = 0
 		end
 		local hookedList = {}
 		local function hook(pick)
@@ -33164,6 +33262,7 @@ do
 	-- Main fishing step (called by the main loop when Auto Fish or the Smart Planner is on and nothing else needs the
 	-- character).
 	function N.fishStep()
+		N.ladderTick()
 		F.mode = N.fishMode()
 		if F.paused then
 			task.wait(0.3)
@@ -34149,7 +34248,7 @@ do
 				elseif fund then fund.name .. " (sell first)"
 				elseif P.need then string.format("- (fishing, saving for %s, eta %s)", P.need.name, N.longTime(P.eta * 3600))
 				else "-"
-			local key = (best and best.name or "-") .. "/" .. action
+			local key = (best and best.name or "-") .. "/" .. (if not pick and not fund and P.need then "saving " .. P.need.name else action)
 			if key ~= P.lastKey or os.clock() - P.lastAt > 60 then
 				P.lastKey, P.lastAt = key, os.clock()
 				local parts = {}
@@ -34158,7 +34257,7 @@ do
 				end
 				log("PLAN", "rate=" .. formatNumber(N.incomeRate()) .. "/s", "horizon=" .. string.format("%.1fh", horizon), "best: " .. (if #parts > 0 then table.concat(parts, " | ") else "-"), "buy=" .. action)
 			end
-			local fishing = if N.fishMode() == "blatant" then "Fishing Blatant" else "Fishing Safe"
+			local fishing = N.modeText()
 			P.say = if pick
 				then string.format("Buying %s (%s, payback %.1f h), then %s", pick.name, formatNumber(pick.price), pick.payback, string.lower(fishing))
 				elseif fund then string.format("Selling the backpack to buy %s (%s, payback %.1f h)", fund.name, formatNumber(fund.price), fund.payback)
@@ -34808,9 +34907,9 @@ do
 		})
 		FishBox:AddDropdown("FishMode", {
 			Text = "Mode",
-			Values = { "Safe", "Blatant" },
-			Default = "Safe",
-			Tooltip = "Safe (default): the game's own auto fishing, aimed at the most valuable fish, Perfect throws at the rate below. Blatant: casts through the game's remotes, hooks the best fish of the whole school, finds first, reels right away (about 2x faster). It steps back to Safe for 10 minutes when the server refuses casts",
+			Values = { "Auto (best measured)", "Safe", "Blatant" },
+			Default = "Auto (best measured)",
+			Tooltip = "Auto (default): measures Safe for 5 minutes, then Blatant for 5 minutes, keeps the one that earns more coins per minute and re-measures every hour. Any danger signal in Blatant (refused casts, no answer, an error message) = Safe for 30 minutes; 3 of those in a day = Blatant off for the day. Safe: the game's own auto fishing, aimed at the most valuable fish. Blatant: casts through the game's remotes, hooks the best fish of the whole school, reels right away (about 2x faster)",
 		})
 		FishBox:AddSlider("PerfectRate", {
 			Text = "Perfect Rate",
@@ -36043,7 +36142,7 @@ do
 			table.insert(out, if N.Plan.say ~= "" then "Smart Planner: " .. N.Plan.say else "Smart Planner: fishing and measuring the income (first minute)")
 		end
 		if N.wants("AutoFish") and not N.planner() then
-			table.insert(out, (if N.fishMode() == "blatant" then "Fishing Blatant: best fish of each school, instant reel" else "Fishing Safe: the game's auto fishing aimed at the best fish") .. string.format(", %d%% Perfect", math.floor(optionNumber("PerfectRate", 60))))
+			table.insert(out, N.modeText() .. string.format(", %d%% Perfect", math.floor(optionNumber("PerfectRate", 60))))
 		end
 		if N.wants("SmartSell") then
 			table.insert(out, who .. string.format("selling at %d%% backpack, before a cast that would not fit%s", math.floor(optionNumber("SellAt", 80)), if N.planner() then " and to fund the next buy" else ""))
@@ -36083,8 +36182,8 @@ do
 				I.plan = if #upNext > 0 then "<b>Up next</b>\n" .. '<font transparency="0.2">\u{2022} ' .. table.concat(upNext, "\n\u{2022} ") .. "</font>" else "Up next: nothing running"
 				local F = N.Fish
 				I.fish = string.format(
-					"Mode <b>%s</b> (%s)%s\nLast cast: %s\nCasts %d, Perfect %d, caught %d, finds %d, fights %d\nCast %.1f s, %s coins per cast",
-					if N.fishMode() == "blatant" then "Blatant" else "Safe",
+					"<b>%s</b> (%s)%s\nLast cast: %s\nCasts %d, Perfect %d, caught %d, finds %d, fights %d\nCast %.1f s, %s coins per cast",
+					N.modeText(),
 					tostring(F.engine),
 					if os.clock() < F.fallbackUntil then "\nBlatant paused " .. N.longTime(F.fallbackUntil - os.clock()) .. ": " .. F.fallbackReason else "",
 					if F.last ~= "" then F.last else "-",
