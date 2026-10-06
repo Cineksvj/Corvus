@@ -32239,9 +32239,12 @@ do
 			char:PivotTo(CFrame.new(pos))
 		end))
 	end
-	-- Goes next to a part. Teleport (default) pivots there; a position that snaps back twice within a minute switches to
-	-- walking for 10 minutes (MOVE fallback) and the hub keeps working. Walk uses Humanoid:MoveTo.
-	N.Move = { snaps = { near = {}, far = {} }, walkUntil = 0, walkFar = 0, teleports = 0 }
+	-- Goes next to a part. Ladder (CLAUDE.md ACTION SPEED LADDER): teleport on top of the target; a REAL snapback (back within
+	-- 10 studs of the origin 0.35 s later) twice in 60 s degrades one rung to a stepped tween for 10 minutes, then teleport is
+	-- retried. A bad landing (not near the target, but also not back at the origin) is not a snapback: re-aim 2 studs N/E/S/W,
+	-- up to 3 times. Walking is never used.
+	N.Move = { snaps = { near = {}, far = {} }, walkUntil = 0, walkFar = 0, teleports = 0, landLogs = 0 }
+	local ReAim = { Vector3.zero, Vector3.new(2, 0, 0), Vector3.new(0, 0, 2), Vector3.new(-2, 0, 0) }
 	function N.goTo(target, near, timeout)
 		local pos = if typeof(target) == "Vector3" then target else N.partPos(target)
 		if not pos then
@@ -32259,53 +32262,155 @@ do
 		if dist() <= near then
 			return true
 		end
-		local up = pos + Vector3.new(0, 3, 0)
+		-- Landing point: on top of the target part (its top face + 3 studs), else 3 studs above its centre.
+		local land = pos + Vector3.new(0, 3, 0)
+		if typeof(target) == "Instance" and target:IsA("BasePart") then
+			land = pos + Vector3.new(0, target.Size.Y / 2 + 3, 0)
+		end
 		local region = N.moveRegion(pos)
-		local walkUntil = if region == "far" then N.Move.walkFar else N.Move.walkUntil
-		if os.clock() >= walkUntil then
-			N.tp(up)
-			N.Move.teleports += 1
-			task.wait(0.35)
-			if dist() <= near + 3 then
-				return true
+		local tweenUntil = if region == "far" then N.Move.walkFar else N.Move.walkUntil
+		local M = N.Move
+		if os.clock() >= tweenUntil then
+			if tweenUntil > 0 then
+				if region == "far" then
+					M.walkFar = 0
+				else
+					M.walkUntil = 0
+				end
+				log("MOVE retry", "teleport again in the " .. region .. " region")
 			end
-			local snaps = N.Move.snaps[region]
+			local origin = N.myPos() or pos
+			local snapped = false
+			for i = 1, #ReAim do
+				N.tp(land + ReAim[i])
+				M.teleports += 1
+				task.wait(0.35)
+				local here = N.myPos() or origin
+				local dOrigin = (here - origin).Magnitude
+				local d = dist()
+				M.landLogs += 1
+				if M.landLogs <= 12 or M.landLogs % 20 == 0 or d > near + 3 then
+					log("MOVE land", string.format("dist=%.1f origin=%.1f", d, dOrigin), "try=" .. i)
+				end
+				if dOrigin < 10 and (origin - pos).Magnitude > 15 then
+					snapped = true
+					break
+				end
+				if d <= near + 3 then
+					return true
+				end
+			end
+			if not snapped then
+				return false
+			end
+			local snaps = M.snaps[region]
 			table.insert(snaps, os.clock())
 			while #snaps > 0 and os.clock() - snaps[1] > 60 do
 				table.remove(snaps, 1)
 			end
 			if #snaps >= 2 then
 				table.clear(snaps)
-				-- Walking for 3 minutes in this region only, then teleport is tried again.
+				-- One rung down (stepped tween) in this region only for 10 minutes; the plot actions never walk.
 				if region == "far" then
-					N.Move.walkFar = os.clock() + 180
+					M.walkFar = os.clock() + 600
 				else
-					N.Move.walkUntil = os.clock() + 180
+					M.walkUntil = os.clock() + 600
 				end
-				log("MOVE fallback", "teleport snapped back twice in 60 s in the " .. region .. " region, walking there for 3 min")
+				log("MOVE fallback", "teleport snapped back twice in 60 s in the " .. region .. " region, teleport -> tween step=4.5 for 10 min")
 			end
 			return false
 		end
-		local hum = N.humanoid()
-		if not hum then
-			return false
-		end
+		-- Tween rung: short steps along the straight line (4.5 studs per 0.05 s = 90 studs/s), never Humanoid walking.
 		local started = os.clock()
 		timeout = timeout or 20
-		local sentAt = -1e9
 		while os.clock() - started < timeout and alive() do
-			if os.clock() - sentAt >= 2 then
-				sentAt = os.clock()
-				pcall(function()
-					hum:MoveTo(pos)
-				end)
+			local p = N.myPos()
+			if not p then
+				return false
 			end
-			if dist() <= near + 3 then
+			local delta = land - p
+			if delta.Magnitude <= 2 or dist() <= near then
 				return true
 			end
-			task.wait(0.1)
+			N.tp(p + delta.Unit * math.min(4.5, delta.Magnitude))
+			task.wait(0.05)
 		end
 		return dist() <= near + 3
+	end
+	-- ACTION LADDER per action: remote (fired from where we stand) > teleport > tween (inside goTo). Each action fires its
+	-- real remote first; the server's real result (verify) decides. 2 rejections in a row (within 10 min, rare actions like the obby never see two in 60 s) = remote rejected for this
+	-- PlaceVersion (remembered in the probe file as act_<action>), teleport from then on, the remote is retried after
+	-- 10 minutes. Log: ACT <action> via=<rung> ok|rejected.
+	N.Acts = {
+		sellCrate = true, pickupCrate = true, depositCrate = true, collectPolisher = true, placeBox = true, openBox = true,
+		removeUnit = true, levelUp = true, skinApply = true, merchantSell = true, vtoken = true, itemrain = true,
+		pickup = true, obby = true,
+	}
+	N.ActMem = {}
+	local function actMem(action)
+		local m = N.ActMem[action]
+		if not m then
+			m = { rejects = {}, rung = "remote", retryAt = 0, logs = 0 }
+			if N.probeResult("act_" .. action) == "rejected" then
+				m.rung, m.retryAt = "teleport", os.clock() + 600
+			end
+			N.ActMem[action] = m
+		end
+		return m
+	end
+	function N.actMemoryLine()
+		local out = {}
+		for action in pairs(N.Acts) do
+			table.insert(out, action .. "=" .. (N.probeResult("act_" .. action) or "new"))
+		end
+		table.sort(out)
+		return table.concat(out, " ")
+	end
+	-- fire() sends the real remote (and equips what it needs); verify() is the server's truth (state changed), nil = fire's
+	-- return value. Returns ok, tried (tried = the action was fired at least once).
+	function N.act(action, part, near, fire, verify, wait)
+		local m = actMem(action)
+		local function try(rung)
+			local res = fire()
+			local ok = if verify then waitFor(verify, wait or 1.5) else res and true or false
+			m.logs += 1
+			if m.logs <= 3 or m.logs % 25 == 0 or not ok then
+				log("ACT", action, "via=" .. rung, if ok then "ok" else "rejected")
+			end
+			return ok
+		end
+		if m.rung ~= "remote" and m.retryAt > 0 and os.clock() >= m.retryAt then
+			m.rung, m.retryAt, m.retried = "remote", 0, true
+			log("ACT retry", action, "remote again")
+		end
+		if m.rung == "remote" then
+			if try("remote") then
+				table.clear(m.rejects)
+				m.retried = false
+				if N.probeResult("act_" .. action) ~= "accepted" then
+					N.probeSet("act_" .. action, "accepted", "no movement")
+				end
+				return true, true
+			end
+			table.insert(m.rejects, os.clock())
+			while #m.rejects > 0 and os.clock() - m.rejects[1] > 600 do
+				table.remove(m.rejects, 1)
+			end
+			if #m.rejects >= 2 or m.retried then
+				m.retried = false
+				table.clear(m.rejects)
+				m.rung, m.retryAt = "teleport", os.clock() + 600
+				N.probeSet("act_" .. action, "rejected", "-")
+				log("ACT fallback", action, "remote -> teleport")
+			end
+			if not part then
+				return false, true
+			end
+		end
+		if not part or not N.goTo(part, near) then
+			return false, false
+		end
+		return try("teleport"), true
 	end
 end
 local Session = {
@@ -32715,6 +32820,8 @@ function N.conveyorStep()
 		setStatus("Waiting for the roll station")
 		return false
 	end
+	-- Parked on the roll station for the whole roll session (prompt range 17): every other chore is a remote and does not
+	-- move us; only a teleport-rung action leaves and the next roll flies back once.
 	if not N.goTo(part, 12) then
 		return false
 	end
@@ -32781,8 +32888,12 @@ function N.lockerStep()
 	for _, d in ipairs(N.droppers()) do
 		if d.kind == "Box" and N.boxReady(d) and os.clock() - (L.openAt[d.part] or -1e9) > 8 then
 			L.openAt[d.part] = os.clock()
-			if N.goTo(d.part, 8) then
-				local ok, unit, variant = invoke("OpenBoxOnDropper", 10, d.part)
+			local ok, unit, variant
+			local _, tried = N.act("openBox", d.part, 8, function()
+				ok, unit, variant = invoke("OpenBoxOnDropper", 10, d.part)
+				return ok and unit
+			end)
+			if tried then
 				if ok and unit then
 					Session.opened += 1
 					L.last = string.format("Opened %s: %s %s", tostring(d.box), tostring(variant or ""), tostring(unit))
@@ -32815,8 +32926,12 @@ function N.lockerStep()
 			-- Compared at the weakest unit's level when the new unit will be leveled (planner or Auto Level Up).
 			local leveled = if N.planner() or on("AutoLevel") then 1.18 ^ ((tonumber(weakest and weakest.unit.level) or 1) - 1) else 1
 			if weakest and N.boxEV(best.name, best.variant) * leveled > weakest.unit.cpd * 1.15 then
-				if N.goTo(weakest.part, 8) then
-					send("RemovePlayerUnitFromDropper", weakest.part)
+				local removed = N.act("removeUnit", weakest.part, 8, function()
+					return send("RemovePlayerUnitFromDropper", weakest.part)
+				end, function()
+					return weakest.part:GetAttribute("Type") ~= "PlayerUnit"
+				end)
+				if removed then
 					Session.replaced += 1
 					log("REPLACE", tostring(weakest.unit.name), "cpd", formatNumber(weakest.unit.cpd), "with", best.name, best.variant, "ev", formatNumber(N.boxEV(best.name, best.variant)))
 					task.wait(0.6)
@@ -32827,11 +32942,15 @@ function N.lockerStep()
 		if free then
 			L.placeAt = os.clock()
 			local tool = N.findBoxTool(best.name, best.variant)
-			if tool then
-				N.equip(tool)
-			end
-			if N.goTo(free.part, 8) then
-				send("PlaceBoxOnDropper", free.part, best.name, best.variant)
+			local placed = N.act("placeBox", free.part, 8, function()
+				if tool then
+					N.equip(tool)
+				end
+				return send("PlaceBoxOnDropper", free.part, best.name, best.variant)
+			end, function()
+				return free.part:GetAttribute("Type") == "Box"
+			end)
+			if placed then
 				Session.placed += 1
 				L.last = string.format("Placed %s %s", best.variant, best.name)
 				log("PLACE", best.name, best.variant, "on", free.part.Parent and free.part.Parent.Parent and free.part.Parent.Parent.Name or "?", free.part.Name)
@@ -32882,50 +33001,36 @@ function N.sellCrates()
 	if #crates == 0 then
 		return false
 	end
-	-- Gem B8: SellCrate takes only the crate guid. Probe once per PlaceVersion: sell one crate from where we stand; when
-	-- the server takes it, crates are sold without walking to the NPC, else the NPC route stays.
-	if N.probeResult("sellcrate_far") == nil then
-		local tool = crates[1]
-		local guid = tool:GetAttribute("InventoryKey")
-		local value = tonumber(tool:GetAttribute("Cash")) or 0
-		N.equip(tool)
-		send("SellCrate", guid)
-		local gone = waitFor(function()
-			return tool.Parent == nil or tool.Parent == workspace
-		end, 2)
-		N.probeSet("sellcrate_far", if gone then "accepted" else "rejected", if gone then formatNumber(value) .. " sold without walking" else "-")
-		if gone then
-			Session.sold += 1
-			Session.soldCash += value
-		end
-		crates = N.tools("Crate")
-		if #crates == 0 then
-			N.unequip()
-			return true
-		end
-	end
-	if N.probeResult("sellcrate_far") ~= "accepted" then
-		local npc = N.sellNpc()
-		if not (npc and N.goTo(npc, 8)) then
-			return false
-		end
-	end
+	-- Gem B8: SellCrate takes only the crate guid (no distance in the shared code). Action ladder: fire it from where we
+	-- stand, verify by the crate leaving the bag, teleport to the Sell NPC only after 2 rejections (N.act).
+	local npc = N.sellNpc()
+	local sold = 0
 	for _, tool in ipairs(crates) do
 		if not alive() then
 			break
 		end
 		local guid = tool:GetAttribute("InventoryKey")
 		local value = tonumber(tool:GetAttribute("Cash")) or 0
-		N.equip(tool)
-		if guid and send("SellCrate", guid) then
+		local ok, tried = N.act("sellCrate", npc, 8, function()
+			N.equip(tool)
+			return guid and send("SellCrate", guid)
+		end, function()
+			return tool.Parent == nil or tool.Parent == workspace
+		end, 2)
+		if ok then
+			sold += 1
 			Session.sold += 1
 			Session.soldCash += value
+		elseif not tried then
+			break
 		end
-		task.wait(0.25)
 	end
 	N.unequip()
-	K.last = "Sold " .. #crates .. " crate(s)"
-	log("SELL crates", #crates, "cash now", formatNumber(N.cash()))
+	if sold == 0 then
+		return false
+	end
+	K.last = "Sold " .. sold .. " crate(s)"
+	log("SELL crates", sold, "cash now", formatNumber(N.cash()))
 	return true
 end
 function N.crateStep()
@@ -32935,32 +33040,45 @@ function N.crateStep()
 	-- Polisher first: collect a finished crate, then feed it one crate.
 	if on("AutoPolisher") and N.polisherUnlocked() then
 		local pp = N.polisherPart()
-		if pp and (tonumber(pp:GetAttribute("PolishedBallCount")) or 0) > 0 and N.goTo(pp, 8) then
-			send("CollectPolisherCrate", pp)
-			log("POLISHER collect", tostring(pp:GetAttribute("PolishedCashDisplay")))
-			task.wait(0.5)
-			return N.sellCrates() or true
+		if pp and (tonumber(pp:GetAttribute("PolishedBallCount")) or 0) > 0 then
+			local hadCrates = #N.tools("Crate")
+			local got = N.act("collectPolisher", pp, 8, function()
+				return send("CollectPolisherCrate", pp)
+			end, function()
+				return #N.tools("Crate") > hadCrates or (tonumber(pp:GetAttribute("PolishedBallCount")) or 0) == 0
+			end, 2)
+			if got then
+				log("POLISHER collect", tostring(pp:GetAttribute("PolishedCashDisplay")))
+				return N.sellCrates() or true
+			end
 		end
 	end
 	if part and pending > 0 and (pending >= minBalls or os.clock() - K.pickedAt > 90) then
-		if N.goTo(part, 8) then
+		local before = #N.tools("Crate")
+		local picked = N.act("pickupCrate", part, 8, function()
+			return send("PickupCrateBox", part)
+		end, function()
+			return #N.tools("Crate") > before
+		end, 3)
+		if picked then
 			K.pickedAt = os.clock()
-			local before = #N.tools("Crate")
-			send("PickupCrateBox", part)
-			waitFor(function()
-				return #N.tools("Crate") > before
-			end, 3)
 			Session.crates += 1
 			if on("AutoPolisher") and N.polisherUnlocked() then
 				local pp = N.polisherPart()
 				local model = pp and pp.Parent and pp.Parent.Parent
 				local busy = model and model:GetAttribute("PolisherActive") == true
 				local crate = N.tools("Crate")[1]
-				if pp and crate and not busy and N.goTo(pp, 8) then
-					N.equip(crate)
-					send("DepositCrate", pp)
-					log("POLISHER deposit", tostring(crate:GetAttribute("Cash")))
-					task.wait(0.4)
+				if pp and crate and not busy then
+					local cash = tostring(crate:GetAttribute("Cash"))
+					local dep = N.act("depositCrate", pp, 8, function()
+						N.equip(crate)
+						return send("DepositCrate", pp)
+					end, function()
+						return crate.Parent == nil or crate.Parent == workspace
+					end, 2)
+					if dep then
+						log("POLISHER deposit", cash)
+					end
 					N.unequip()
 				end
 			end
@@ -32987,11 +33105,12 @@ function N.levelUp(d)
 	if not cost or cost > N.cash() then
 		return false
 	end
-	if not N.goTo(d.part, 10) then
-		return false
-	end
 	local before = d.part:GetAttribute("PlayerUnitLevel") or 1
-	if send("RequestPlayerUnitLevelUp", d.part) then
+	if N.act("levelUp", d.part, 10, function()
+		return send("RequestPlayerUnitLevelUp", d.part)
+	end, function()
+		return (d.part:GetAttribute("PlayerUnitLevel") or 1) > before
+	end, 1) then
 		Session.levels += 1
 		Session.spent += cost
 		log("LEVEL", tostring(d.unit.name), before, "->", before + 1, "cost", formatNumber(cost))
@@ -33244,15 +33363,22 @@ function N.obbyStep()
 		return false
 	end
 	setStatus("Obby bonus: " .. name)
-	if not N.goTo(part, 4) then
-		return false
+	local function stampOf()
+		local stamp = N.state().ObbyBonuses
+		return tonumber(type(stamp) == "table" and stamp[name]) or 0
 	end
-	-- The game's own hitbox claims on enter; the hub claims too when it did not.
-	task.wait(0.6)
-	local stamp = N.state().ObbyBonuses
-	local last = tonumber(type(stamp) == "table" and stamp[name]) or 0
-	if N.serverTime() - last > 5 then
-		send("ClaimObbyBonus", part)
+	local before = stampOf()
+	-- The game's own hitbox claims on enter (teleport rung); the hub claims by remote too when it did not.
+	local _, tried = N.act("obby", part, 4, function()
+		if N.serverTime() - stampOf() > 5 then
+			send("ClaimObbyBonus", part)
+		end
+		return true
+	end, function()
+		return stampOf() > before
+	end, 2)
+	if not tried then
+		return false
 	end
 	Session.obby += 1
 	N.Obby.last = name .. " claimed"
@@ -33304,8 +33430,12 @@ function N.pickupStep()
 	end
 	P.at[target.node] = os.clock()
 	setStatus("Picking up a map token")
-	if N.goTo(target.pos, 3) then
-		send(target.remote, target.arg)
+	local _, tried = N.act("pickup", target.pos, 3, function()
+		return send(target.remote, target.arg)
+	end, function()
+		return target.node:GetAttribute("Occupied") ~= true
+	end, 1.5)
+	if tried then
 		Session.pickups += 1
 		P.last = target.remote
 		log("PICKUP", target.remote)
@@ -33628,11 +33758,12 @@ function N.tokenStep()
 				return false
 			end
 			setStatus("Variant token: " .. tostring(variant))
-			if N.goTo(node, 3) then
-				send("CollectVariantTokenSpawn", node)
-				local got = waitFor(function()
-					return node:GetAttribute("Occupied") ~= true
-				end, 1.5)
+			local got, tried = N.act("vtoken", node, 3, function()
+				return send("CollectVariantTokenSpawn", node)
+			end, function()
+				return node:GetAttribute("Occupied") ~= true
+			end, 1.5)
+			if tried then
 				if got then
 					V.won += 1
 					V.streak += 1
@@ -33662,28 +33793,17 @@ function N.rainStep()
 	for id, drop in pairs(P.rain) do
 		if typeof(drop.LandPosition) == "Vector3" and (tonumber(drop.LandAt) or 0) <= now and os.clock() - (P.at[id] or -1e9) > 4 then
 			P.at[id] = os.clock()
-			local far = N.probeResult("itemrain_far")
-			if far == nil then
-				send("CollectItemRainItem", id)
-				local gone = waitFor(function()
-					return P.rain[id] == nil
-				end, 2)
-				N.probeSet("itemrain_far", if gone then "accepted" else "rejected", if gone then "every drop without moving" else "-")
-				if gone then
-					Session.pickups += 1
-					return true
-				end
-			elseif far == "accepted" then
-				send("CollectItemRainItem", id)
-				Session.pickups += 1
-				log("RAIN collect", tostring(id))
-				return true
-			end
 			setStatus("Item rain")
-			if N.goTo(drop.LandPosition + Vector3.new(0, 3, 0), 3) then
-				send("CollectItemRainItem", id)
-				Session.pickups += 1
-				log("RAIN collect", tostring(id), "by teleport")
+			local got, tried = N.act("itemrain", drop.LandPosition + Vector3.new(0, 3, 0), 3, function()
+				return send("CollectItemRainItem", id)
+			end, function()
+				return P.rain[id] == nil
+			end, 2)
+			if tried then
+				if got then
+					Session.pickups += 1
+					log("RAIN collect", tostring(id))
+				end
 				return true
 			end
 		end
@@ -34067,11 +34187,14 @@ function N.applySkinStep()
 	end)
 	for _, d in ipairs(placed) do
 		if N.skinMult(d.unit.skin) < mult then
+			local old = d.part:GetAttribute("PlayerUnitBallSkin")
 			N.equip(tool)
-			if N.goTo(d.part, 10) then
-				send("ApplyBallSkinToDropper", d.part, tool.Name)
+			if N.act("skinApply", d.part, 10, function()
+				return send("ApplyBallSkinToDropper", d.part, tool.Name)
+			end, function()
+				return d.part:GetAttribute("PlayerUnitBallSkin") ~= old
+			end, 1.5) then
 				log("SKIN apply", tool.Name, "on", tostring(d.unit.name))
-				task.wait(0.4)
 			end
 			N.unequip()
 			return true
@@ -34147,18 +34270,19 @@ function N.junkStep()
 	local systems = workspace:FindFirstChild("Systems")
 	local inter = systems and systems:FindFirstChild("Interactables")
 	local merchant = inter and inter:FindFirstChild("Merchant")
-	if not (merchant and N.goTo(merchant, 10)) then
-		return false
-	end
-	N.equip(tool)
-	if send("MerchantSell", "HeldItem") then
+	local _, tried = N.act("merchantSell", merchant, 10, function()
+		N.equip(tool)
+		return send("MerchantSell", "HeldItem")
+	end, function()
+		return tool.Parent == nil or tool.Parent == workspace
+	end, 2)
+	if ok then
 		Session.junkSold += 1
 		N.Junk.last = "Sold " .. item.say
 		log("JUNK sell", item.kind, item.say)
 	end
-	task.wait(0.4)
 	N.unequip()
-	return true
+	return tried
 end
 -- Plain words for Main: what the enabled toggles do next.
 function N.upNext()
@@ -34674,7 +34798,7 @@ do
 				Session.obby,
 				Session.pickups
 			),
-			"Status: " .. tostring(Status) .. "  |  planner " .. (if N.planner() then "on" else "off") .. "  |  move " .. (if N.safeMove() then "walk" else "teleport"),
+			"Status: " .. tostring(Status) .. "  |  planner " .. (if N.planner() then "on" else "off") .. "  |  move " .. (if N.safeMove() then "tween" else "teleport"),
 			"Running: " .. table.concat(Debug.running(), ", "),
 			string.format(
 				"Game: cash %s, income %s/s, cash x%s, slots %d/%d (%d opening), tokens grade %d trait %d, tutorial %s, loyalty %s, data %s",
@@ -35471,6 +35595,7 @@ do
 		end)
 	end
 	N.data()
+	log("ACT memory", "pv=" .. tostring(game.PlaceVersion or 0), N.actMemoryLine())
 	-- The movement loop owns the character: crates, lockers, purchases at droppers, obby, pickups, then the conveyor.
 	loop("main loop", function()
 		if N.Manual.running then
