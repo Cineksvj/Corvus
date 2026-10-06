@@ -35709,6 +35709,7 @@ end
 		local function sellCandidates()
 			local data = Data()
 			local list = {}
+			local protectedList = {}
 			local why = { total = 0, special = 0, protected = 0, locked = 0, event = 0, filters = 0, below = 0, kept = 0 }
 			local below = parseAmount(Options.SellBelow and Options.SellBelow.Value)
 			local smartMode = Game.sellMode() == "Smart"
@@ -35721,6 +35722,9 @@ end
 						why.special += 1
 					elseif isProtected(info) then
 						why.protected += 1
+						if not isLocked then
+							table.insert(protectedList, { key = key, info = info, kind = entry.itemType, locked = isLocked })
+						end
 					elseif isLocked and not TempLocked[key] then
 						why.locked += 1
 					elseif Game.event ~= nil and Game.event.wanted(info) then
@@ -35776,6 +35780,17 @@ end
 						table.insert(list, keptItems[i])
 					end
 					log("PLAN full backpack, selling lowest value kept items", #list)
+				end
+				-- everything left is protected by the Protect lists (a late account holds only Cosmic+ items): the planner owns the loop and
+				-- may not sit on a full backpack, so it sells the cheaper half of the protected items too (never game-locked or special ones)
+				if #list == 0 and #protectedList > 0 and Game.plannerOn() and inventoryCount() >= inventoryLimit() then
+					table.sort(protectedList, function(a, b)
+						return a.info.value < b.info.value
+					end)
+					for i = 1, math.min(math.max(math.ceil(#protectedList / 2), 1), 40) do
+						table.insert(list, protectedList[i])
+					end
+					log("PLAN full backpack of protected items, selling the cheapest", #list)
 				end
 			end
 			return list, why
