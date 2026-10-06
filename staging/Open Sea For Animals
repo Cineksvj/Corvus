@@ -27506,6 +27506,7 @@ end
                     "CorvusConfigList",
                     "CorvusShareCode",
                     "CorvusAutoSave",
+                    "CorvusNoRender",
                 })
                 SaveManager:SetFolder(Folder)
                 if Info.SubFolder then
@@ -36119,6 +36120,13 @@ end
 				local useless = id == "MovementSpeed" and (move == "Blatant" or move == "Teleport")
 				if not useless and allows(Options.UpgradeFilter, label) and (UpgradeBackoff[id] or 0) <= os.clock() then
 					local amount = maxBuyable(id, if Game.plannerOn() then Game.budget(id) elseif id == "Carry" then cash() else spendable())
+					if amount > 1 and Game.plannerOn() and Game.levelCap then
+						local capped = Game.levelCap(id, id, amount)
+						if capped < amount then
+							log("PLAN cap " .. label .. " x" .. amount .. " -> x" .. capped .. " (marginal payback)")
+							amount = capped
+						end
+					end
 					if amount > 0 then
 						local level = upgradeLevel(id)
 						setStatus("Buying " .. label .. " x" .. amount)
@@ -36127,6 +36135,7 @@ end
 							return upgradeLevel(id) > level
 							end, 2.5) then
 							Session.bought += 1
+							if Game.planDirty then Game.planDirty() end
 							Track.event("Upgrade", label .. " " .. level .. " -> " .. upgradeLevel(id), nil, "trending-up", "#c77dff")
 							emit("upgrade", label, upgradeLevel(id))
 							return true
@@ -37587,6 +37596,37 @@ end
 			PlanCache = plan
 			Game.lastPlan = plan
 			return plan
+		end
+		-- Marginal-level cap (2026-10-06 audit): a batch buy (GetMaxBuyable) was sized by the FIRST level's payback; later
+		-- levels cost more for the same extra income, so every level whose own payback (price / gain) is longer than the
+		-- horizon (or than the time to save up the target, when it is not the target itself) is left out.
+		function Game.levelCap(key, id, amount)
+			local plan = Game.plan()
+			local item = plan and plan.byKey[key]
+			if not item or amount <= 1 or type(Game.UpgradeConfig) ~= "table" or type(Game.UpgradeConfig.GetPrice) ~= "function" then
+				return amount
+			end
+			local limit = plan.H
+			local target = plan.target
+			local eta = if target then math.max(target.cost - cash(), 0) / math.max(plan.income, 1e-9) else 0
+			if target and target.key ~= key and item.payback <= eta then
+				limit = math.min(limit, eta)
+			end
+			local level = upgradeLevel(id)
+			local lo, hi = 1, amount
+			while lo < hi do
+				local mid = math.ceil((lo + hi) / 2)
+				local ok, price = pcall(Game.UpgradeConfig.GetPrice, id, level + mid)
+				if ok and tonumber(price) and tonumber(price) / item.gain <= limit then
+					lo = mid
+				else
+					hi = mid - 1
+				end
+			end
+			return lo
+		end
+		function Game.planDirty()
+			PlanCache = nil
 		end
 		local function saveEta(plan)
 			local target = plan.target
