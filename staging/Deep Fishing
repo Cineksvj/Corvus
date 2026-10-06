@@ -32562,7 +32562,7 @@ do
 		return L.mode
 	end
 	local function startMeasure()
-		L.phase, L.mode, L.t0, L.w0 = "measureSafe", "safe", os.clock(), worthNow()
+		L.phase, L.mode, L.t0, L.w0 = "measureBlatant", "blatant", os.clock(), worthNow()
 	end
 	function N.ladderTick()
 		if modeChoice() ~= "Auto" then
@@ -32580,11 +32580,11 @@ do
 			return
 		end
 		local el = now - L.t0
-		if L.phase == "measureSafe" and el >= 300 then
-			L.safe = (worthNow() - L.w0) / (el / 60)
-			L.phase, L.mode, L.t0, L.w0 = "measureBlatant", "blatant", now, worthNow()
-		elseif L.phase == "measureBlatant" and el >= 300 then
+		if L.phase == "measureBlatant" and el >= 180 then
 			L.blat = (worthNow() - L.w0) / (el / 60)
+			L.phase, L.mode, L.t0, L.w0 = "measureSafe", "safe", now, worthNow()
+		elseif L.phase == "measureSafe" and el >= 180 then
+			L.safe = (worthNow() - L.w0) / (el / 60)
 			L.keep = if L.blat > (L.safe or 0) then "blatant" else "safe"
 			L.ratio = if (L.safe or 0) > 0 then L.blat / L.safe else nil
 			L.phase, L.mode, L.t0 = "keep", L.keep, now
@@ -32607,7 +32607,7 @@ do
 			return "Mode " .. m .. " (picked by you)"
 		end
 		if L.phase == "measureSafe" or L.phase == "measureBlatant" then
-			return "Mode " .. m .. ": measuring " .. m .. " (5 min)"
+			return "Mode " .. m .. ": measuring " .. m .. " (3 min)"
 		end
 		if L.keep == "blatant" then
 			return "Mode Blatant: " .. (if L.ratio then string.format("%.1fx Safe", L.ratio) else "faster than Safe") .. " (measured)"
