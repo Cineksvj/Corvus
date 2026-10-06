@@ -32449,6 +32449,7 @@ local Session = {
 	winsSpent = 0,
 	padPasses = 0,
 	padWins = 0,
+	padSecs = 0,
 	tongueCalls = 0,
 	peppers = 0,
 	rewards = 0,
@@ -33338,6 +33339,23 @@ function N.lifeResetProbe(route)
 	N.probeSet("liferesets", "rejected")
 	return false
 end
+-- Value of one off-treadmill pad run: the Wins it pays fund a fraction of the best Wins item (tongue gain g, price c) for the
+-- rest of the 24 h horizon, against the seconds of training it costs. Unknown history = allowed (measure first).
+function N.padRunWorth()
+	local best = N.Plan.list[1] or N.planCandidates()[1]
+	if not best then
+		return false
+	end
+	local runs = Session.padPasses
+	if runs < 2 or Session.padSecs <= 0 then
+		return true
+	end
+	local winsPerRun = Session.padWins / runs
+	local secsPerRun = Session.padSecs / runs
+	local horizon = math.max(86400 - (os.clock() - Session.started), 3600)
+	local fraction = math.min(winsPerRun / math.max(best.cost, 1), 1)
+	return (best.gain - 1) * fraction * horizon > secsPerRun
+end
 function N.padsStep()
 	local P = N.Pads
 	if os.clock() < P.nextAt then
@@ -33351,6 +33369,12 @@ function N.padsStep()
 	N.probeReady()
 	local chosen = N.winsRoute()
 	local route = N.activeRoute()
+	-- off-treadmill routes cost training time: the planner runs them only when the Wins they pay buy more tongue than the lost training
+	if N.planner() and not on("AutoWins") and route ~= "Touch" and not N.padRunWorth() then
+		P.say = "Pad runs skipped: the Wins they pay buy less tongue than the training they cost"
+		P.nextAt = os.clock() + 600
+		return false
+	end
 	local note = nil
 	if chosen == "Touch" and route ~= chosen then
 		note = if N.touchSupported() then "The server did not pay pad touches from the treadmill on this game version: the " .. (if route == "Teleport" then "Teleport" else "Walk") .. " route takes over" else "Your executor has no firetouchinterest: the " .. (if route == "Teleport" then "Teleport" else "Walk") .. " route takes over"
@@ -33373,6 +33397,7 @@ function N.padsStep()
 	end
 	setStatus("Running the wins pads (" .. route .. ")")
 	local before = N.wins()
+	local passStart = os.clock()
 	local total, reached
 	if route == "Touch" then
 		if P.touch == "new" then
@@ -33386,6 +33411,9 @@ function N.padsStep()
 		total, reached = N.padWalkPass()
 	end
 	Session.padPasses += 1
+	if route ~= "Touch" then
+		Session.padSecs += os.clock() - passStart
+	end
 	Session.padWins += total
 	local delta = N.wins() - before
 	P.last = string.format("+%s wins, reached pad %d", formatNumber(math.max(delta, total)), reached or 0)
