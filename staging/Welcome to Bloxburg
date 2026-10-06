@@ -32330,6 +32330,9 @@ do
 	--    out (JobHandler startedWorking: left ShiftArea/ShiftRadius -> StopWorking), then the button once more.
 	-- After 3 failures in a row it stops trying for 5 minutes (no endless retry loop).
 	function N.endShift(why)
+		if N.modeOwnEnd then
+			N.modeOwnEnd()
+		end
 		local job = N.currentJob()
 		if job == "" then
 			return true
@@ -32376,7 +32379,7 @@ do
 	end
 	-- Delay between actions: Blatant is as fast as the game takes, Legit looks like a fast player.
 	function N.actionDelay()
-		local mode = optionText("JobSpeed", "Blatant")
+		local mode = N.jobSpeed()
 		if mode == "Blatant" then
 			return 0.05
 		elseif mode == "Legit" then
@@ -33070,6 +33073,9 @@ do
 			if N.capRecord then
 				N.capRecord(job, math.max(gained, 0), seconds)
 			end
+			if N.modeRecord then
+				N.modeRecord(job, math.max(gained, 0), seconds)
+			end
 		end
 	end
 	function N.paySave()
@@ -33427,7 +33433,7 @@ do
 		return (-math.atan2(look.Z, look.X) - math.pi / 2) % (2 * math.pi)
 	end
 	local function placeDelay()
-		return if optionText("JobSpeed", "Blatant") == "Blatant" then 0.15 else 0.35 + math.random() * 0.25
+		return if N.jobSpeed() == "Blatant" then 0.15 else 0.35 + math.random() * 0.25
 	end
 	-- the model a floor object stands on: the floor model under it, else the plot ground
 	local function surfaceAt(plot, house, pos)
@@ -35466,7 +35472,7 @@ do
 		return node
 	end
 	local function boardTime()
-		local mode = optionText("JobSpeed", "Blatant")
+		local mode = N.jobSpeed()
 		if mode == "Blatant" then
 			return 1.2
 		elseif mode == "Legit" then
@@ -35916,7 +35922,7 @@ do
 		return if hasDrink then { burger, side, drink } else { burger, side }
 	end
 	local function thinkTime()
-		local mode = optionText("JobSpeed", "Blatant")
+		local mode = N.jobSpeed()
 		if mode == "Blatant" then
 			return 0.4
 		elseif mode == "Legit" then
@@ -36197,7 +36203,7 @@ do
 			task.wait(0.3)
 			return
 		end
-		local mode = optionText("JobSpeed", "Blatant")
+		local mode = N.jobSpeed()
 		local topSpeed = if mode == "Legit" then 0.75 else 1
 		local deadline = os.clock() + 1
 		while alive() and N.workOn() and os.clock() < deadline and N.Taxi.task == T do
@@ -36318,7 +36324,7 @@ do
 		end)
 	end
 	local function afterAction()
-		local mode = optionText("JobSpeed", "Blatant")
+		local mode = N.jobSpeed()
 		if mode == "Blatant" then
 			return 0.3
 		elseif mode == "Legit" then
@@ -36547,7 +36553,7 @@ do
 			if W.swings <= 6 or W.swings % 50 == 0 then
 				log("WOOD swing", W.swings, "tree", best.Name, "dist", math.floor(bestDist))
 			end
-			task.wait(math.max(N.actionDelay(), if optionText("JobSpeed", "Blatant") == "Blatant" then 0.45 else 1.0))
+			task.wait(math.max(N.actionDelay(), if N.jobSpeed() == "Blatant" then 0.45 else 1.0))
 		end
 		if not W.down[best] then
 			W.skip[best] = os.clock() + 90
@@ -37352,7 +37358,7 @@ do
 	end
 
 	local function choppingTime()
-		local mode = optionText("JobSpeed", "Blatant")
+		local mode = N.jobSpeed()
 		if mode == "Blatant" then
 			return 1.5
 		elseif mode == "Legit" then
@@ -37542,6 +37548,278 @@ do
 		end
 		task.wait(if worked then N.actionDelay() else 0.25)
 	end
+end
+-- Job speed "Auto (best measured)" (default of the Speed dropdown; owner rule: modes are chosen by measured profit).
+-- Per job the engine measures every mode (Blatant, Fast; Legit only when both are out) for ~4 min of shift time: $/h
+-- and tasks/h from the ShiftEarnings samples (N.paySample -> N.modeRecord), keeps the best mode and re-measures after
+-- 1 h of shift time. Score = min(measured $/h, Earnings cap limit) (no limit when Skill breaks is off); a safer mode
+-- within 5 % of the best score wins. Danger signals (notes.md Anticheat: no client guard, the server judges answers, staff
+-- read money logs): (1) tasks rejected, wrong answers > 35 % of the last tasks (>= 4 wrong, >= 6 tasks); (2) the
+-- shift ended by the server (job gone, no own end shift / needs / garden / cap break / death); (3) money log plausibility:
+-- measured $/h above 2x the human maximum (N.capHuman); (4) position snapback, > 80 studs in 1 s without our own
+-- travel. Any signal = one step safer (`MODE fallback`); 3 fallbacks of one mode = that mode is off for the day.
+-- A mode picked by hand in the dropdown is used as is. Long trips "Auto" = bus with the same measure/fallback (below in
+-- p05_travel). Logs: `MODE measure <job> <mode> ...`, `MODE measure <job> keep=<mode> ...`, `MODE fallback ...`.
+N.Mode = { jobs = {}, last = "Blatant", ownEndAt = -1e9 }
+do
+	local M = N.Mode
+	local AUTO = "Auto (best measured)"
+	local ORDER = { "Blatant", "Fast", "Legit" }
+	local MEASURE_SEC, MEASURE_MIN_TASKS, MEASURE_MAX = 240, 4, 480
+	local WARM = 15
+	local KEEP_SEC = 3600
+	local function today()
+		return math.floor(os.time() / 86400)
+	end
+	local function isAuto()
+		return optionText("JobSpeed", AUTO) == AUTO
+	end
+	local function indexOf(mode)
+		for i, m in ipairs(ORDER) do
+			if m == mode then
+				return i
+			end
+		end
+		return 1
+	end
+	local function banned(s, mode)
+		return s.ban[mode] == today()
+	end
+	local function setMode(s, mode, phase)
+		s.cur, s.phase, s.warm = mode, phase, WARM
+		s.win = { done = 0, wrong = 0 }
+		M.last = mode
+	end
+	local function newState()
+		return { stats = {}, bad = {}, ban = {}, fb = {}, phase = "measure", cur = "Blatant", warm = WARM, win = { done = 0, wrong = 0 }, keepSec = 0, keepM = 0, queue = {}, qi = 1, why = "measuring", fallbackFrom = nil }
+	end
+	local function startMeasure(s, job)
+		local queue = {}
+		for _, mode in ipairs({ "Blatant", "Fast" }) do
+			if not banned(s, mode) and not (s.bad[mode] and os.clock() - s.bad[mode] < KEEP_SEC) then
+				table.insert(queue, mode)
+			end
+		end
+		if #queue == 0 then
+			setMode(s, "Legit", "keep")
+			s.keepSec, s.keepM, s.why = 0, 0, "faster modes are off (signals or 3 fallbacks today)"
+			log("MODE measure", job, "keep=Legit", "reason=Blatant and Fast are off for now")
+			return
+		end
+		s.queue, s.qi, s.stats = queue, 1, {}
+		setMode(s, queue[1], "measure")
+		s.why = "measuring " .. queue[1]
+		log("MODE measure start", job, "modes=" .. table.concat(queue, ","), "each ~" .. MEASURE_SEC .. "s of shift")
+	end
+	local function state(job)
+		local s = M.jobs[job]
+		if not s then
+			s = newState()
+			M.jobs[job] = s
+			startMeasure(s, job)
+		end
+		return s
+	end
+	-- the speed every job action uses (replaces optionText("JobSpeed")); a hand-picked mode wins
+	function N.jobSpeed()
+		local pick = optionText("JobSpeed", AUTO)
+		if pick ~= AUTO then
+			return pick
+		end
+		local job = N.currentJob()
+		local s = job ~= "" and M.jobs[job] or nil
+		return if s then s.cur else M.last
+	end
+	function N.modeOwnEnd()
+		M.ownEndAt = os.clock()
+	end
+	-- one step safer, a mode off for the day after 3 fallbacks; debounced 30 s
+	function N.modeSignal(job, reason)
+		local s = M.jobs[job]
+		if not s or not isAuto() then
+			return
+		end
+		local now = os.clock()
+		if now - (s.sigAt or -1e9) < 30 then
+			return
+		end
+		s.sigAt = now
+		local from = s.cur
+		if from == "Legit" then
+			log("MODE signal", job, "Legit reason=" .. reason, "(no safer mode)")
+			return
+		end
+		s.bad[from] = now
+		s.fb[from] = (s.fb[from] or 0) + 1
+		if s.fb[from] >= 3 then
+			s.ban[from] = today()
+			log("MODE disabled", job, from, "for today", "3 fallbacks")
+		end
+		local to = "Legit"
+		for i = indexOf(from) + 1, #ORDER do
+			if not banned(s, ORDER[i]) then
+				to = ORDER[i]
+				break
+			end
+		end
+		setMode(s, to, "keep")
+		s.keepSec, s.keepM = 0, 0
+		s.why = string.format("fell back from %s (%s)", from, reason)
+		log("MODE fallback", job, from .. " -> " .. to, "reason=" .. reason, "count=" .. s.fb[from])
+	end
+	local function rate(st)
+		return if st.sec > 0 then st.m / st.sec * 3600 else 0, if st.sec > 0 then st.n / st.sec * 3600 else 0
+	end
+	-- end of a measure sweep: best score, a safer mode within 5 % wins
+	local function decide(s, job)
+		local limit = N.capLimit(job, N.workPickName)
+		local rows = {}
+		for _, mode in ipairs(s.queue) do
+			local st = s.stats[mode]
+			if st and st.sec > 0 then
+				local r = rate(st)
+				table.insert(rows, { mode = mode, rate = r, score = math.min(r, limit or 1e12), i = indexOf(mode) })
+			end
+		end
+		local best
+		for _, row in ipairs(rows) do
+			if not best or row.score > best.score then
+				best = row
+			end
+		end
+		local keep, why
+		if not best or best.score <= 0 then
+			keep, why = "Fast", "no pay measured yet, Fast until the next measure"
+		else
+			keep = best
+			for _, row in ipairs(rows) do
+				if row.i > keep.i and row.score >= best.score * 0.95 then
+					keep = row
+				end
+			end
+			local parts = {}
+			for _, row in ipairs(rows) do
+				table.insert(parts, string.format("%s $%s/h", row.mode, formatNumber(math.floor(row.rate))))
+			end
+			why = "best measured: " .. table.concat(parts, ", ") .. (if limit then string.format(", capped at $%s/h", formatNumber(math.floor(limit))) else "")
+			keep = keep.mode
+		end
+		setMode(s, keep, "keep")
+		s.keepSec, s.keepM, s.why = 0, 0, why
+		log("MODE measure", job, "keep=" .. keep, why, "next measure in " .. N.longTime(KEEP_SEC))
+	end
+	-- one second of shift pay (called from N.paySample)
+	function N.modeRecord(job, gained, seconds)
+		if not isAuto() then
+			return
+		end
+		local s = state(job)
+		local done, wrong = Session.done, Session.wrong
+		if M.sampleJob ~= job then
+			s.lastDone, s.lastWrong, s.warm = nil, nil, WARM
+		end
+		M.sampleJob = job
+		local dd = if s.lastDone and done >= s.lastDone then done - s.lastDone else 0
+		local dw = if s.lastWrong and wrong >= s.lastWrong then wrong - s.lastWrong else 0
+		s.lastDone, s.lastWrong = done, wrong
+		if s.warm > 0 then
+			s.warm -= seconds
+			return
+		end
+		s.win.done += dd
+		s.win.wrong += dw
+		-- signal: the server rejects tasks
+		if s.cur ~= "Legit" and s.win.done >= 6 and s.win.wrong >= 4 and s.win.wrong / s.win.done > 0.35 then
+			N.modeSignal(job, string.format("rejected tasks %d of %d wrong", s.win.wrong, s.win.done))
+			return
+		end
+		-- rolling window: halve the counts after 40 tasks so old tasks fade out
+		if s.win.done >= 40 then
+			s.win.done, s.win.wrong = s.win.done // 2, s.win.wrong // 2
+		end
+		if s.phase == "keep" then
+			s.keepSec += seconds
+			s.keepM += gained
+			if s.keepSec >= KEEP_SEC then
+				startMeasure(s, job)
+			end
+			return
+		end
+		local st = s.stats[s.cur]
+		if not st then
+			st = { m = 0, n = 0, sec = 0 }
+			s.stats[s.cur] = st
+		end
+		st.m += gained
+		st.n += dd
+		st.sec += seconds
+		if (st.sec >= MEASURE_SEC and st.n >= MEASURE_MIN_TASKS) or st.sec >= MEASURE_MAX then
+			local r, tph = rate(st)
+			log("MODE measure", job, s.cur, string.format("$%d/h tasks %d/h n=%d in %ds", math.floor(r), math.floor(tph), st.n, math.floor(st.sec)))
+			-- signal: money log plausibility (more than twice what a human can earn here)
+			local okH, human = pcall(N.capHuman, job, N.workPickName)
+			if okH and human and human > 0 and s.cur ~= "Legit" and r > 2 * human then
+				N.modeSignal(job, string.format("money log implausible $%d/h vs human $%d/h", math.floor(r), math.floor(human)))
+				return
+			end
+			s.qi += 1
+			if s.queue[s.qi] then
+				setMode(s, s.queue[s.qi], "measure")
+				s.why = "measuring " .. s.cur
+			else
+				decide(s, job)
+			end
+		end
+	end
+	-- status line for Up next
+	function N.modeText()
+		local job = N.currentJob()
+		if not isAuto() then
+			return "Speed: " .. optionText("JobSpeed", AUTO) .. " (your choice)"
+		end
+		local s = job ~= "" and M.jobs[job] or nil
+		if not s then
+			return "Speed: Auto, measures Blatant and Fast per job while you work"
+		end
+		if s.phase == "measure" then
+			return string.format("Speed: measuring %s (%d of %d modes), keeps the best", s.cur, s.qi, #s.queue)
+		end
+		return string.format("Speed: %s (auto, %s), re-measure in %s", s.cur, s.why, N.longTime(math.max(KEEP_SEC - s.keepSec, 0)))
+	end
+	-- watcher: shift ended by the server, position snapback (only while a job runs in Auto)
+	task.spawn(function()
+		local prevJob, lastPos = "", nil
+		while alive() do
+			task.wait(1)
+			local ok, err = pcall(function()
+				if not (isAuto() and N.workOn()) then
+					prevJob, lastPos = "", nil
+					return
+				end
+				local now = os.clock()
+				local job = N.currentJob()
+				local own = now - M.ownEndAt < 20 or N.Needs.active or N.Garden.running or N.Cap.active or N.dead()
+				if prevJob ~= "" and job == "" and not own then
+					N.modeSignal(prevJob, "shift ended by the server")
+				end
+				local root = N.root()
+				if job ~= "" and prevJob ~= "" and root then
+					local pos = root.Position
+					local T = N.Travel
+					if lastPos and (pos - lastPos).Magnitude > 80 and not own and not T.busy and now - (T.movedAt or -1e9) > 15 then
+						N.modeSignal(job, string.format("position snapback %d studs in 1 s", math.floor((pos - lastPos).Magnitude)))
+					end
+					lastPos = pos
+				else
+					lastPos = nil
+				end
+				prevJob = job
+			end)
+			if not ok then
+				log("ERROR", "mode watcher", tostring(err))
+			end
+		end
+	end)
 end
 -- Auto Needs. Bloxburg keeps four moods in ClientStats "MoodData" (StringValue = mood name, children Energy, Hunger,
 -- Hygiene, Fun = 0..100, each with a Rate child). The server computes the shift Efficiency (pay factor, 0..1); the
@@ -38355,6 +38633,9 @@ do
 	-- The game's own "go to my plot" teleport (HouseHandler:ToPlot = InvokeServer ToPlot). force = also when you
 	-- already stand on your plot (the walk's fallback: it puts you back at the plot's spawn).
 	function N.goHome(force)
+		if N.modeOwnEnd then
+			N.modeOwnEnd()
+		end
 		local root = N.root()
 		local plot = N.myPlot()
 		if not (root and plot) then
@@ -39605,6 +39886,26 @@ do
 	local function flat(a, b)
 		return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
 	end
+	-- "Auto (best measured)": the bus is measured by the trip time; a fall = walking for 1 h, 3 falls = off for the day
+	local AUTO = "Auto (best measured)"
+	local function autoTrips()
+		return optionText("LongTrips", AUTO) == AUTO
+	end
+	local function today()
+		return math.floor(os.time() / 86400)
+	end
+	function N.travelFallback(reason)
+		if not autoTrips() then
+			return
+		end
+		T.fb = (T.fb or 0) + 1
+		T.offUntil = math.max(T.offUntil, os.clock() + 3600)
+		log("MODE fallback", "travel", "bus -> walk for 1 h", "reason=" .. reason, "count=" .. T.fb)
+		if T.fb >= 3 then
+			T.dayOff = today()
+			log("MODE disabled", "travel", "bus", "for today", "3 fallbacks")
+		end
+	end
 	local function walkSpeed()
 		local hum = N.humanoid()
 		return math.max(hum and hum.WalkSpeed or 16, 8)
@@ -39641,6 +39942,7 @@ do
 			return false
 		end
 		local from = root.Position
+		T.movedAt = os.clock()
 		setStatus("Travel: bus to " .. name)
 		N.detach()
 		local t0 = os.clock()
@@ -39669,6 +39971,7 @@ do
 				T.fails = 0
 				T.offUntil = os.clock() + 600
 				log("TRAVEL fast off 10 min", "2 trips did not move you, walking instead")
+				N.travelFallback("2 trips did not move you")
 			end
 		end
 		return ok
@@ -39679,6 +39982,7 @@ do
 			return false
 		end
 		T.yieldAt = os.clock()
+		T.movedAt = T.yieldAt
 		local from = root.Position
 		local d0 = flat(from, pos)
 		N.detach()
@@ -39717,7 +40021,8 @@ do
 					return true
 				end
 			end
-			if not NoArea[N.currentJob()] or optionText("LongTrips", "Bus (FastTravel)") ~= "Bus (FastTravel)" or os.clock() < T.offUntil then
+			local trips = optionText("LongTrips", AUTO)
+			if not NoArea[N.currentJob()] or trips == "Walk" or os.clock() < T.offUntil or (trips == AUTO and T.dayOff == today()) then
 				return false
 			end
 			local bestName, bestD
@@ -39731,8 +40036,20 @@ do
 			if direct - via < 15 then
 				return false
 			end
+			local t0 = os.clock()
 			local moved = N.fastTravel(bestName, string.format("%s, %d studs, saves ~%ds", tostring(why), math.floor(d), math.floor(direct - via)))
 			if moved then
+				-- measured: trip time + the walk from the stop against the direct walk
+				local took = os.clock() - t0 + bestD / speed
+				if trips == AUTO then
+					local keepBus = took <= direct
+					log("MODE measure", "travel", "bus took ~" .. math.floor(took) .. "s vs walk ~" .. math.floor(direct) .. "s", "keep=" .. (if keepBus then "bus" else "walk"))
+					T.slow = if keepBus then 0 else (T.slow or 0) + 1
+					if T.slow >= 2 then
+						T.slow = 0
+						N.travelFallback("bus slower than walking twice")
+					end
+				end
 				T.saved += direct - via
 			end
 			return moved
@@ -39889,9 +40206,9 @@ do
 	})
 	JobBox:AddDropdown("JobSpeed", {
 		Text = "Speed",
-		Values = { "Blatant", "Fast", "Legit" },
-		Default = "Blatant",
-		Tooltip = "Blatant does each job action as fast as the game takes it. Fast waits like a quick player, Legit like a careful one.",
+		Values = { "Auto (best measured)", "Blatant", "Fast", "Legit" },
+		Default = "Auto (best measured)",
+		Tooltip = "Auto = measures Blatant and Fast on every job for a few minutes ($/h, tasks/h), keeps the most profitable one without danger signs (tasks rejected, shift ended by the server, pay far above a human, position snapback), never above the Earnings cap, and measures again every hour. A danger sign steps one mode safer; 3 of them switch that mode off for the day. Blatant does each action as fast as the game takes it, Fast waits like a quick player, Legit like a careful one. A mode you pick yourself is used as is.",
 	})
 	JobBox:AddToggle("AutoJob", {
 		Text = "Auto Work",
@@ -39915,9 +40232,9 @@ do
 	local TravelBox = Tabs.Jobs:AddLeftGroupbox("Travel", "bus")
 	TravelBox:AddDropdown("LongTrips", {
 		Text = "Long trips",
-		Values = { "Bus (FastTravel)", "Walk" },
-		Default = "Bus (FastTravel)",
-		Tooltip = "Bus = the game's free fast travel to the bus stop nearest the goal when that saves 15 s or more (pizza addresses, the way home), then walking the last meters. Never during a shift with a work area",
+		Values = { "Auto (best measured)", "Bus (FastTravel)", "Walk" },
+		Default = "Auto (best measured)",
+		Tooltip = "Auto = the bus, but measured: a bus trip slower than walking twice (or 2 trips that did not move you) means walking for an hour, 3 such falls switch the bus off for the day. Bus = the game's free fast travel to the bus stop nearest the goal when that saves 15 s or more (pizza addresses, the way home), then walking the last meters. Never during a shift with a work area",
 	})
 	TravelBox:AddToggle("ServerTeleport", {
 		Text = "Server teleport",
@@ -40171,7 +40488,7 @@ do
 			),
 			"Status: " .. tostring(Status),
 			"Running: " .. table.concat(Debug.running(), ", "),
-			"Job: " .. tostring(N.InfoText.job or "-") .. ", speed " .. optionText("JobSpeed", "Blatant") .. ", job handler " .. tostring(N.jobHandler() ~= nil),
+			"Job: " .. tostring(N.InfoText.job or "-") .. ", speed " .. N.jobSpeed() .. ", job handler " .. tostring(N.jobHandler() ~= nil),
 			"Needs: " .. tostring(N.needsStatus and (string.gsub(N.needsStatus(), "\n", " | ")) or "-"),
 			"Perf: " .. Debug.perfText(),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
@@ -41050,6 +41367,9 @@ do
 			else
 				table.insert(lines, "Work " .. optionText("JobPick", "Hairdresser"))
 			end
+		end
+		if working and N.modeText then
+			table.insert(lines, N.modeText())
 		end
 		if daily then
 			local text = N.objectiveText(true)
