@@ -32965,11 +32965,13 @@ function N.nitroTick(car)
 	end
 end
 -- ===== Loot Rain / Zeus drops (blatant.md G1): the server accepts claimDrop up to ClaimReach 45 studs from the car, the
--- client collects at 6. Claims every landed crate inside a measured reach: 20 studs first, +5 after every 5 accepted
--- claims up to 40, back to 6 (the client's own reach) after 2 claims with no dropGone. Remembered per PlaceVersion. =====
-N.Loot = { crates = {}, r = 20, ok = 0, miss = 0, lastClaim = -1e9, say = "-", file = "Corvus/BKZ_probe.txt", logAt = -1e9 }
+-- client collects at 6. ONE MODE: claims every landed crate at the full audited reach (ClaimReach - 1) from the first
+-- crate; after 2 claims with no dropGone it steps down (to 20, then to the client's own 6) and remembers the step per
+-- PlaceVersion. =====
+N.Loot = { crates = {}, r = 44, ok = 0, miss = 0, lastClaim = -1e9, say = "-", file = "Corvus/BKZ_reach.txt", logAt = -1e9 }
 do
 	local L = N.Loot
+	L.r = math.max(math.floor((tonumber(N.G.Mini and N.G.Mini.LootRain and N.G.Mini.LootRain.ClaimReach) or 45) - 1), 6)
 	local version = tostring(game.PlaceVersion)
 	pcall(function()
 		local text = readfile(L.file)
@@ -33016,22 +33018,18 @@ do
 			L.ok += 1
 			L.miss = 0
 			Session.loot += 1
-			if L.ok == 1 or (L.ok % 5 == 0 and L.r < 40) then
-				local before = L.r
-				if L.ok % 5 == 0 and L.r < 40 then
-					L.r = math.min(L.r + 5, 40)
-					save()
-				end
-				log("PROBE lootreach r=" .. before, "dist=" .. string.format("%.0f", c.dist or 0), "result=accepted", "next=" .. L.r, "claimed=" .. Session.loot)
+			if L.ok == 1 or L.ok % 10 == 0 then
+				log("PROBE lootreach r=" .. L.r, "dist=" .. string.format("%.0f", c.dist or 0), "result=accepted", "claimed=" .. Session.loot)
 			end
 			L.say = "reach " .. L.r .. " studs, " .. Session.loot .. " crates"
 		else
 			L.miss += 1
 			log("PROBE lootreach r=" .. L.r, "dist=" .. string.format("%.0f", c.dist or 0), "result=rejected", "miss=" .. L.miss)
 			if L.miss >= 2 and L.r > 6 then
-				L.r = 6
+				L.r = if L.r > 20 then 20 else 6
+				L.miss = 0
 				save()
-				log("PROBE lootreach fallback r=6 (the client's own reach)")
+				log("PROBE lootreach fallback r=" .. L.r)
 			end
 			L.say = "reach " .. L.r .. " studs (fallback)"
 		end
@@ -33280,7 +33278,7 @@ function N.driveRun()
 end
 -- ===== Rolls and Smart Buy =====
 N.Inv = {}
-N.Roll = { shown = {}, decision = {}, at = -1e9, last = "-", total = 0, good = 0, noResult = 0, promptsLogged = {}, station = "RollBlocks", count = 0, sinceRun = 0 }
+N.Roll = { shown = {}, decision = {}, at = -1e9, last = "-", total = 0, good = 0, noResult = 0, resultAt = {}, promptsLogged = {}, station = "RollBlocks", count = 0, sinceRun = 0 }
 do
 	local R = N.Roll
 	local function mine(plotName)
@@ -33291,12 +33289,23 @@ do
 		if mine(plotName) then
 			R.shown[station] = { id = partId, at = os.clock() }
 			R.decision[station] = nil
+			R.resultAt[station] = os.clock()
+		elseif (R.foreign or 0) < 3 then
+			R.foreign = (R.foreign or 0) + 1
+			log("ROLL display not mine", tostring(plotName), tostring(station), "my plot " .. tostring(N.myPlot() and N.myPlot().Name))
+		end
+	end)
+	-- the spin of my own roll (RollSpin) and a skipped part (RollClear) also answer the prompt
+	N.onPacket("RollSpin", function(plotName, station, _, userId)
+		if mine(plotName) or userId == LocalPlayer.UserId then
+			R.resultAt[station] = os.clock()
 		end
 	end)
 	N.onPacket("RollClear", function(plotName, station)
 		if mine(plotName) then
 			R.shown[station] = nil
 			R.decision[station] = nil
+			R.resultAt[station] = os.clock()
 		end
 	end)
 	N.onPacket("RollPurchased", function(plotName, station, userId)
@@ -33312,6 +33321,7 @@ do
 		local skip = R.decision[station] ~= "buy"
 		-- the roll goes through after the answer: the server's cooldown starts now
 		R.at = os.clock()
+		R.resultAt[station] = os.clock()
 		task.spawn(send, "ConfirmRollSkip", requestId, skip)
 		log("ROLL confirm", station, tostring(partId), "skip=" .. tostring(skip))
 	end)
@@ -33524,8 +33534,7 @@ function N.rollStep()
 	setStatus("Rolling at the " .. (if station == "RollBlocks" then "blocks" else "weapons") .. " station (" .. Session.rolls .. " rolls)")
 	N.firePrompt(roll)
 	local got = waitFor(function()
-		local s = R.shown[station]
-		return s ~= nil and s.at >= R.at
+		return (R.resultAt[station] or -1e9) >= R.at
 	end, 7)
 	if not got then
 		R.noResult += 1
@@ -34701,7 +34710,7 @@ do
 		LootBox:AddToggle("AutoLootRain", {
 			Text = "Auto Loot Rain",
 			Default = false,
-			Tooltip = "Drives during Loot Rain (every hour at :20 for 5 min) and claims every landed crate in reach (also Zeus drops). The server accepts claims up to 45 studs: Corvus starts at 20 and steps up to 40 while the server pays, back to the game's own 6 studs if it refuses",
+			Tooltip = "Drives during Loot Rain (every hour at :20 for 5 min) and claims every landed crate in reach (also Zeus drops). The server accepts claims up to 45 studs: Corvus claims at the full 44 studs and steps back to 20, then the game's own 6 studs, if the server refuses",
 		})
 		Labels.Loot = LootBox:AddLabel({ Text = "-", DoesWrap = true })
 		local BossBox = Tabs.Drive:AddRightGroupbox("Boss", "skull")
@@ -34717,8 +34726,8 @@ do
 			Default = false,
 			Tooltip = "Runs the loop by profit math: rolls while your cash can buy parts that pay back, drives otherwise, buys parts, skills and event parts by payback, joins the boss while it still pays. Other toggles stay as you set them",
 		})
-		PlanBox:AddSlider("RollsPerRun", { Text = "Rolls between runs", Default = 10, Min = 1, Max = 60, Rounding = 0, Tooltip = "With Auto Drive and Auto Roll both on and Smart Planner off" })
-		PlanBox:AddSlider("PaybackHours", { Text = "Payback horizon", Default = 24, Min = 1, Max = 72, Rounding = 0, Suffix = " h", Tooltip = "A part or skill is bought when it earns its price back inside this time" })
+		PlanBox:AddSlider("RollsPerRun", { Text = "Rolls Between Runs", Default = 10, Min = 1, Max = 60, Rounding = 0, Tooltip = "With Auto Drive and Auto Roll both on and Smart Planner off" })
+		PlanBox:AddSlider("PaybackHours", { Text = "Payback Horizon", Default = 24, Min = 1, Max = 72, Rounding = 0, Suffix = " h", Tooltip = "A part or skill is bought when it earns its price back inside this time" })
 		Labels.Planner = PlanBox:AddLabel({ Text = "-", DoesWrap = true })
 		N.QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "zap")
 		local StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
@@ -34731,7 +34740,7 @@ do
 		RollBox:AddToggle("AutoRoll", { Text = "Auto Roll", Default = false, Tooltip = "Walks to your roll stations and rolls at the server's cooldown. Smart Buy decides what to keep" })
 		RollBox:AddDropdown("RollStation", { Text = "Station", Values = { "Both", "Blocks", "Weapons" }, Default = "Both", Tooltip = "Blocks = engines, fuel, wheels and blocks; Weapons = guns, bumpers and turbos" })
 		RollBox:AddDropdown("RollCategories", {
-			Text = "Blocks station rolls",
+			Text = "Blocks Station Rolls",
 			Values = { "Block", "Engine", "Fuel", "Wheel" },
 			Default = { "Engine", "Fuel", "Wheel" },
 			Multi = true,
@@ -34741,8 +34750,8 @@ do
 		Labels.Roll = RollBox:AddLabel({ Text = "-", DoesWrap = true })
 		local BuyBox = Tabs.Plot:AddRightGroupbox("Smart Buy", "coins")
 		BuyBox:AddToggle("SmartBuy", { Text = "Smart Buy", Default = false, Tooltip = "Buys a rolled part when it pays back inside the horizon (price / extra cash per second on your car). Never without the cash, so no Robux prompt" })
-		BuyBox:AddDropdown("AlwaysBuy", { Text = "Always buy", Values = { "Legendary", "Mythical", "Secret", "Divine" }, Default = {}, Multi = true, AllowNull = true, Tooltip = "Rarities bought whenever the cash is there" })
-		BuyBox:AddSlider("KeepCash", { Text = "Keep cash", Default = 0, Min = 0, Max = 100000, Rounding = 0, Tooltip = "Never spend below this" })
+		BuyBox:AddDropdown("AlwaysBuy", { Text = "Always Buy", Values = { "Legendary", "Mythical", "Secret", "Divine" }, Default = {}, Multi = true, AllowNull = true, Tooltip = "Rarities bought whenever the cash is there" })
+		BuyBox:AddSlider("KeepCash", { Text = "Keep Cash", Default = 0, Min = 0, Max = 100000, Rounding = 0, Tooltip = "Never spend below this" })
 		Labels.Buy = BuyBox:AddLabel({ Text = "-", DoesWrap = true })
 		local BuildBox = Tabs.Plot:AddLeftGroupbox("Auto Build", "hammer")
 		BuildBox:AddToggle("AutoBuild", { Text = "Auto Build", Default = false, Tooltip = "Places parts from your inventory where they raise income the most: swaps a weaker engine, tank, wheel or weapon, or adds it next to the car above the wheels. Uses the build menu's own place and remove" })
@@ -34761,20 +34770,20 @@ do
 	end
 	do
 		local RewardBox = Tabs.Rewards:AddLeftGroupbox("Rewards", "gift")
-		RewardBox:AddToggle("AutoQuests", { Text = "Claim Weekly Quests", Default = false })
-		RewardBox:AddToggle("AutoMastery", { Text = "Claim Boss Mastery", Default = false })
-		RewardBox:AddToggle("AutoOffline", { Text = "Claim Offline Cash", Default = false, Tooltip = "The free claim only" })
-		RewardBox:AddToggle("AutoChest", { Text = "Claim Group Chest", Default = false, Tooltip = "Once, only when you are in the game's group (walks to your plot's chest)" })
+		RewardBox:AddToggle("AutoQuests", { Text = "Auto Claim Quests", Default = false, Tooltip = "Claims every finished weekly quest" })
+		RewardBox:AddToggle("AutoMastery", { Text = "Auto Claim Mastery", Default = false, Tooltip = "Claims every boss mastery level you reached" })
+		RewardBox:AddToggle("AutoOffline", { Text = "Auto Claim Offline Cash", Default = false, Tooltip = "The free claim only" })
+		RewardBox:AddToggle("AutoChest", { Text = "Auto Claim Group Chest", Default = false, Tooltip = "Once, only when you are in the game's group (walks to your plot's chest)" })
 		Labels.Rewards = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
 		local CodeBox = Tabs.Rewards:AddRightGroupbox("Codes", "ticket")
 		CodeBox:AddToggle("AutoCodes", { Text = "Auto Redeem Codes", Default = false, Tooltip = "Every active code once on this account (the game's code list plus the online Corvus list), distance codes once your record allows" })
 		CodeBox:AddButton({
-			Text = "Redeem all known",
+			Text = "Redeem All Known Codes",
 			Func = function()
 				N.redeemAllCodes()
 			end,
 		})
-		CodeBox:AddInput("CodeText", { Text = "Code", Placeholder = "Type a code from the game's socials", Finished = false, Default = "" })
+		CodeBox:AddInput("CodeText", { Text = "Code", Placeholder = "Code from the game's socials", Finished = false, Default = "" })
 		CodeBox:AddButton({
 			Text = "Redeem",
 			Func = function()
