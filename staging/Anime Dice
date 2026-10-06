@@ -34012,7 +34012,9 @@ do
 		Sp.retGain *= fade
 		Sp.retPrice *= fade
 		Sp.retAt = now
-		local rho = math.max(if Sp.retPrice > 0 then Sp.retGain / Sp.retPrice else 0, 1 / left)
+		-- The last purchases are cheap slot levels whose gain/$ collapses within seconds (0.03 -> 0.0002): that is a vanishing
+		-- opportunity, not the return of the next dollar, so it counts a quarter (owner 2026-10-06: luck dice were undervalued).
+		local rho = math.max(if Sp.retPrice > 0 then Sp.retGain / Sp.retPrice * 0.25 else 0, 1 / left)
 		local buffLuck = N.buff("Luck", 1) or 1
 		local diceLuck = N.diceLuck(tostring(N.field("Dice", "Basic")))
 		local ctx = {
