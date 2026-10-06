@@ -32081,9 +32081,44 @@ do
 		end
 		return list
 	end
+	-- Smart Planner = autopilot (CLAUDE.md SMART PLANNER = AUTOPILOT): with the planner on, every loop it owns runs
+	-- as if its own toggle were on (rolling, plot, selling with the protect lists, towers, rewards, tickets, boosts),
+	-- even with every other toggle off. Not owned: Auto Friend (friend requests to strangers) and the plain buy
+	-- toggles (Auto Level, Buy Dice, Upgrades, Rebirth), which the payback engine replaces.
+	N.PlannerOwns = {
+		AutoRoll = true,
+		AutoSpin = true,
+		AutoCollect = true,
+		AutoEquipBest = true,
+		AutoSell = true,
+		AutoFuse = true,
+		AutoRebirthStats = true,
+		AutoTower = true,
+		TowerEquipTeam = true,
+		AutoBoosts = true,
+		AutoTrait = true,
+		AutoGrade = true,
+		AutoTicketPasses = true,
+		AutoTicketSpins = true,
+		AutoEquipDice = true,
+		AutoGear = true,
+		AutoDaily = true,
+		AutoGroup = true,
+		AutoOffline = true,
+		AutoCodes = true,
+		AutoKnownCodes = true,
+		AutoQuests = true,
+	}
 	function on(name)
 		local t = Toggles[name]
-		return t ~= nil and t.Value == true
+		if t ~= nil and t.Value == true then
+			return true
+		end
+		if N.PlannerOwns[name] then
+			local planner = Toggles.SmartPlanner
+			return planner ~= nil and planner.Value == true
+		end
+		return false
 	end
 	function optionNumber(name, default)
 		local option = Options[name]
@@ -32515,8 +32550,18 @@ do
 	--     levelled weak one (its levels stay on that unit in the backpack).
 	--   Rarity first: highest rarity, then income right now.
 	N.EquipModes = { "Current income", "Same level (true strength)", "Rarity first" }
+	-- Smart Planner equips by true strength: with "Current income" a levelled weak unit keeps its slot against every
+	-- stronger drop and the planner keeps levelling it (soak 2026-10-06: a Silver Gamma Lv 29 held a slot while a
+	-- Delta went to the backpack, -18 % income after 1 h). Its levels are not lost: they stay on the unit and count in
+	-- its sale price.
+	function N.equipMode()
+		if on("SmartPlanner") then
+			return "Same level (true strength)"
+		end
+		return optionText("EquipMode", "Current income")
+	end
 	function N.equipValue(info, mode)
-		mode = mode or optionText("EquipMode", "Current income")
+		mode = mode or N.equipMode()
 		if mode == "Same level (true strength)" then
 			return info.baseIncome, info.income
 		elseif mode == "Rarity first" then
@@ -32526,7 +32571,7 @@ do
 	end
 	function N.plotWanted()
 		local list = table.clone(N.units())
-		local mode = optionText("EquipMode", "Current income")
+		local mode = N.equipMode()
 		table.sort(list, function(a, b)
 			local a1, a2 = N.equipValue(a, mode)
 			local b1, b2 = N.equipValue(b, mode)
@@ -32576,7 +32621,7 @@ do
 			return false
 		end
 		N.Plot.equipAt = os.clock()
-		if optionText("EquipMode", "Current income") == "Current income" then
+		if N.equipMode() == "Current income" then
 			fire(R.equipBest)
 			Session.equips += 1
 			log("EQUIP best, new on plot:", N.unitText(unit))
@@ -32604,7 +32649,7 @@ do
 				local slot = table.remove(free, 1)
 				if N.placeUnit(info, slot) then
 					placed += 1
-					log("EQUIP", optionText("EquipMode", "?"), N.unitText(info), "on slot", slot)
+					log("EQUIP", N.equipMode(), N.unitText(info), "on slot", slot)
 				end
 			end
 		end
@@ -32737,7 +32782,7 @@ do
 		return true
 	end
 	function N.levelStep()
-		if not on("AutoLevel") or on("SmartSpend") or os.clock() - N.Plot.levelAt < 0.3 then
+		if not on("AutoLevel") or on("SmartPlanner") or os.clock() - N.Plot.levelAt < 0.3 then
 			return false
 		end
 		local info = N.levelPick()
@@ -32923,7 +32968,7 @@ do
 		return if ok and type(data) == "table" then data else nil
 	end
 	function N.rebirthStep()
-		if not on("AutoRebirth") or on("SmartSpend") then
+		if not on("AutoRebirth") or on("SmartPlanner") then
 			return false
 		end
 		local nextData = N.nextRebirth()
@@ -32988,7 +33033,7 @@ do
 				return true
 			end
 		end
-		if not on("AutoBuyDice") or on("SmartSpend") then
+		if not on("AutoBuyDice") or on("SmartPlanner") then
 			return false
 		end
 		local money = N.money()
@@ -33084,7 +33129,7 @@ do
 		return nil, priorityPrice
 	end
 	function N.upgradeStep()
-		if not on("AutoUpgrade") or on("SmartSpend") then
+		if not on("AutoUpgrade") or on("SmartPlanner") then
 			return false
 		end
 		local money = N.money()
@@ -33428,7 +33473,7 @@ do
 				end
 			end
 		end
-		if on("SmartSpend") then
+		if on("SmartPlanner") then
 			-- Profit engine: passes and spins ranked by income gained per ticket (p05_spend).
 			if (on("AutoTicketPasses") or on("AutoTicketSpins")) and due("ticketPlan", 15) then
 				N.ticketStep()
@@ -33451,7 +33496,7 @@ do
 				end
 			end
 		end
-		if not on("SmartSpend") and on("AutoTicketSpins") and due("ticketSpins", 10) then
+		if not on("SmartPlanner") and on("AutoTicketSpins") and due("ticketSpins", 10) then
 			local allPasses = true
 			for _, name in ipairs(N.TicketPasses) do
 				if not N.ownsPass(name) then
@@ -33867,13 +33912,15 @@ do
 		end
 		return total
 	end
-	-- Plot units (incomes before money buffs, high to low) and the slot count.
+	-- Plot units (incomes before money buffs, high to low) and the slot count. info.income has no money buff in it
+	-- (N.plotIncome multiplies it in): dividing by the multiplier again made the plot look 100x weaker after a few
+	-- rebirths, so every slot level looked like 280 days of payback and the planner stopped buying (soak 2026-10-06).
 	local function currentPlot()
 		local mult = math.max(N.buff("Money Multiplier", 1) or 1, 1e-9)
 		local plot = {}
 		for _, info in ipairs(N.units()) do
 			if info.slot then
-				table.insert(plot, info.income / mult)
+				table.insert(plot, info.income)
 			end
 		end
 		table.sort(plot, function(a, b)
@@ -34029,11 +34076,21 @@ do
 	end
 	-- Share of the horizon a plot unit is expected to stay on the plot (better drops push it out).
 	local function survival(ctx, info)
-		local v = info.income / ctx.mult
+		local v = info.income
 		local rank = 1
-		for _, other in ipairs(ctx.plot) do
-			if other > v then
-				rank += 1
+		if N.equipMode() == "Same level (true strength)" then
+			-- Equipped by true strength: any drop with a higher level-1 income takes the slot, levels do not protect it.
+			v = info.baseIncome or info.income
+			for _, other in ipairs(N.units()) do
+				if other.slot and (other.baseIncome or other.income) > v then
+					rank += 1
+				end
+			end
+		else
+			for _, other in ipairs(ctx.plot) do
+				if other > v then
+					rank += 1
+				end
 			end
 		end
 		local q = qAbove(luckTable(ctx.luck), v)
@@ -34041,7 +34098,7 @@ do
 		for _, t in ipairs(ctx.samples) do
 			sum += poissonAtMost(ctx.rate * t * q, ctx.slots - rank)
 		end
-		return sum / #ctx.samples
+			return sum / #ctx.samples
 	end
 	local function newDelta()
 		return { money = 0, luck = 0, duration = 0, sell = 0, storage = 0 }
@@ -34141,7 +34198,7 @@ do
 			local left = opened
 			for _, info in ipairs(N.units()) do
 				if not info.slot and left > 0 then
-					table.insert(plot, info.income / ctx.mult)
+					table.insert(plot, info.income)
 					left -= 1
 				end
 			end
@@ -34157,10 +34214,15 @@ do
 		local ctx = N.spendContext()
 		Sp.ctx = ctx
 		local owned = N.field("Upgrades", {}) or {}
+		-- The closest option that missed the horizon: named in the PLAN line when nothing pays back.
+		Sp.skipped = nil
 		local function add(kind, name, price, gain, buy, done, progress, net)
 			if price and price > 0 and gain and gain > 0 and (Sp.failed[name] or 0) <= now then
 				-- net: the price minus what stays in the unit as resale value (slot levels), else the price.
 				local payback = (net or price) / gain
+				if payback > ctx.left and not progress and (not Sp.skipped or payback < Sp.skipped.payback) then
+					Sp.skipped = { name = name, payback = payback, price = price, gain = gain }
+				end
 				-- Rolling 24 h horizon: what cannot pay back within it is skipped, unless it is progress that counts on
 				-- its own (rebirth).
 				if payback <= ctx.left or progress then
@@ -34317,10 +34379,10 @@ do
 		end)
 		log(
 			string.format(
-				"PLAN best=%s gain/$=%s eta=%ds alt=%s | buy=%s drops/s=%s blocked=%d%% income=%s/s rho=%s left=%.1fh friend=+%d%%",
+				"PLAN best=%s gain/$=%s eta=%s alt=%s | buy=%s drops/s=%s blocked=%d%% income=%s/s rho=%s left=%.1fh friend=+%d%%",
 				name,
 				if target then short(target.ratio) else "0",
-				math.floor(wait or 0),
+				if (wait or 0) < 1e7 then math.floor(wait or 0) .. "s" else "never",
 				if #alts > 0 then table.concat(alts, ", ") else "none",
 				if pick then pick.label or pick.name else "wait",
 				short(ctx.rate),
@@ -34329,7 +34391,7 @@ do
 				short(ctx.rho),
 				ctx.left / 3600,
 				math.floor(friend * 100 + 0.5)
-			)
+			) .. (if not target and Sp.skipped then string.format(" skipped=%s payback=%ds", Sp.skipped.name, math.floor(math.min(Sp.skipped.payback, 1e9))) else "")
 		)
 	end
 	-- Cash that is still sitting on the plot slots.
@@ -34345,7 +34407,7 @@ do
 		return total
 	end
 	function N.spendStep()
-		if not on("SmartSpend") then
+		if not on("SmartPlanner") then
 			return false
 		end
 		local now = os.clock()
@@ -34524,7 +34586,7 @@ do
 		return best, bestGain, bestMult
 	end
 	function N.rstatStep()
-		if not (on("AutoRebirthStats") or on("SmartSpend")) then
+		if not (on("AutoRebirthStats") or on("SmartPlanner")) then
 			return false
 		end
 		local R = N.RStat
@@ -34568,7 +34630,7 @@ do
 		local ctx = N.spendContext()
 		local added = {}
 		local order = {}
-		while free >= 1 and alive() and (on("AutoRebirthStats") or on("SmartSpend")) do
+		while free >= 1 and alive() and (on("AutoRebirthStats") or on("SmartPlanner")) do
 			local name, gain, mult = N.rstatPick(ctx, stats)
 			if not name then
 				break
@@ -34807,7 +34869,8 @@ do
 			end
 			table.insert(rows, string.format("%d. %s (costs $%s, pays itself back in %s)", i, option.label or option.name, formatNumber(option.price), N.longTime(option.payback)))
 		end
-		return (if #rows > 0 then table.concat(rows, "\n") else "Nothing worth buying yet") .. (if Sp.last ~= "" then "\n" .. Sp.last else "")
+		local now = if on("SmartPlanner") then "Now: <b>" .. tostring(Status) .. "</b>\n" else ""
+		return now .. (if #rows > 0 then table.concat(rows, "\n") else "Nothing worth buying yet") .. (if Sp.last ~= "" then "\n" .. Sp.last else "")
 	end
 end
 -- Towers are fought on the server: PlayTower starts a run with your tower team, every CompleteTowerFloor plays out
@@ -35117,7 +35180,7 @@ do
 	Tabs.Roll = Tabs.Main
 	Tabs.Plot = N.addTab("Plot", "layout-grid", "Income, selling and every slot with its unit")
 	Tabs.Slots = Tabs.Plot
-	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Smart Spending, upgrade tree, rebirth, gear and towers")
+	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Smart Planner, upgrade tree, rebirth, gear and towers")
 	Tabs.Towers = Tabs.Upgrades
 	Tabs.Rewards = N.addTab("Rewards", "gift", "Daily, codes, quests, tickets, boosts and rerolls")
 	Tabs.Items = Tabs.Rewards
@@ -35371,12 +35434,26 @@ do
 		buildGrid(Tabs.Plot:AddRightGroupbox("Slots " .. (half + 1) .. "-" .. count, "layout-grid"), half + 1, count)
 	end
 	do
-		local SpendBox = Tabs.Upgrades:AddLeftGroupbox("Smart Spending", "calculator")
-		SpendBox:AddToggle("SmartSpend", {
-			Text = "Smart Spending",
+		local SpendBox = Tabs.Upgrades:AddLeftGroupbox("Smart Planner", "calculator")
+		SpendBox:AddToggle("SmartPlanner", {
+			Text = "Smart Planner",
 			Default = false,
-			Tooltip = "Puts slot levels, dice, every upgrade, rebirths and ticket gamepasses on one scale: extra cash per second for each $ spent, with luck and roll speed valued from the game's exact roll odds over the next 24 hours. Buys the best first and saves for it. Also spends free rebirth points. Replaces Auto Level, Auto Buy Dice, Auto Upgrade, Auto Rebirth and the gamepass order while on",
+			Tooltip = "Plays the whole game by itself, even with every other switch off: rolls at the server's speed, puts the best units on the plot, collects, sells junk (your keep and Never Sell filters stay), runs towers, claims quests, rewards and codes, uses spins and boosts, spends rebirth points and tickets. Cash goes to slot levels, dice, upgrades and rebirths by payback over the next 24 hours, the best first",
 		})
+		-- Configs saved before the rename keep working: the old key SmartSpend reads the same toggle (not iterated, so it is
+		-- never saved twice or listed twice in AUTOLOAD).
+		pcall(function()
+			if getmetatable(Toggles) == nil then
+				setmetatable(Toggles, {
+					__index = function(_, key)
+						if key == "SmartSpend" then
+							return rawget(Toggles, "SmartPlanner")
+						end
+						return nil
+					end,
+				})
+			end
+		end)
 		SpendBox:AddDropdown("SpendOn", {
 			Text = "May Spend On",
 			Values = { "Dice", "Upgrades", "Rebirth" },
@@ -35413,7 +35490,7 @@ do
 		RebirthBox:AddToggle("AutoRebirthStats", {
 			Text = "Auto Rebirth Points",
 			Default = false,
-			Tooltip = "Spends every free rebirth point (one per rebirth) on Money or Luck, whichever adds more cash per second. At start and after every rebirth. Smart Spending does this too. A Reset Token you already own is used once if points sit in stats that earn nothing",
+			Tooltip = "Spends every free rebirth point (one per rebirth) on Money or Luck, whichever adds more cash per second. At start and after every rebirth. Smart Planner does this too. A Reset Token you already own is used once if points sit in stats that earn nothing",
 		})
 		Labels.Rebirth = RebirthBox:AddLabel({ Text = "-", DoesWrap = true })
 		local GearBox = Tabs.Upgrades:AddRightGroupbox("Gear", "shirt")
@@ -35594,7 +35671,7 @@ do
 	-- the real toggle and the mirror follows within 0.1 s (N.syncMirrors in the draw thread).
 	N.Mirrors = {}
 	-- At most 6 (quality bar): Auto Equip Best stays in the Plot tab.
-	N.QuickStart = { "AutoRoll", "SmartSpend", "AutoRebirthStats", "AutoSell", "AutoTower", "AutoCollect" }
+	N.QuickStart = { "SmartPlanner", "AutoRoll", "AutoRebirthStats", "AutoSell", "AutoTower", "AutoCollect" }
 	function N.mirrorToggle(idx, box, opts)
 		local original = Toggles[idx]
 		if not original then
@@ -35633,7 +35710,7 @@ do
 		local box = N.QuickBox
 		local texts = {
 			AutoRoll = { Text = "Auto Roll (Fast)" },
-			SmartSpend = { Text = "Smart Spending", Tooltip = "Spends cash and tickets on what pays back fastest (slot levels, dice, upgrades, rebirth, ticket gamepasses). Same switch as in Upgrades" },
+			SmartPlanner = { Text = "Smart Planner", Tooltip = "Autopilot: rolls, places, sells, runs towers, claims rewards and spends cash and tickets on what pays back fastest, even with the switches below off. Same switch as in Upgrades" },
 			AutoRebirthStats = { Text = "Auto Rebirth Points", Tooltip = "Spends free rebirth points on Money or Luck by profit. Same switch as in Upgrades" },
 			AutoSell = { Text = "Auto Sell Weak Units" },
 			AutoTower = { Text = "Auto Tower" },
@@ -35826,7 +35903,7 @@ do
 	Log.header = Debug.header
 end
 N.AllAutoToggles = {
-	"SmartSpend",
+	"SmartPlanner",
 	"AutoRoll",
 	"AutoSpin",
 	"AutoCollect",
@@ -36267,7 +36344,7 @@ do
 			toggleCommand("collect", { "cash" }, { "AutoCollect" }, "Auto Collect")
 			toggleCommand("sell", { "autosell" }, { "AutoSell" }, "Auto Sell")
 			toggleCommand("level", { "levels" }, { "AutoLevel" }, "Auto Level Up")
-			toggleCommand("upgrades", { "buy", "shop" }, { "SmartSpend", "AutoUpgrade", "AutoBuyDice" }, "Smart Spending, auto upgrades and dice")
+			toggleCommand("upgrades", { "buy", "shop" }, { "SmartPlanner", "AutoUpgrade", "AutoBuyDice" }, "Smart Planner, auto upgrades and dice")
 			toggleCommand("rebirth", {}, { "AutoRebirth" }, "Auto Rebirth")
 			toggleCommand("tower", { "towers" }, { "AutoTower" }, "Auto Tower")
 			Library:AddCommand({
@@ -36320,7 +36397,7 @@ do
 		pcall(function()
 			Library:SetQuickBar({
 				{ Toggle = "AutoRoll", Icon = "dice-5", Label = "Roll" },
-				{ Toggle = "SmartSpend", Icon = "sparkles", Label = "Spend" },
+				{ Toggle = "SmartPlanner", Icon = "sparkles", Label = "Planner" },
 				{ Toggle = "AutoSell", Icon = "badge-dollar-sign", Label = "Sell" },
 				{ Toggle = "AutoUpgrade", Icon = "arrow-big-up", Label = "Upgrades" },
 				{ Toggle = "AutoRebirth", Icon = "refresh-cw", Label = "Rebirth" },
@@ -36374,7 +36451,7 @@ do
 					roll = { "AutoRoll", "AutoEquipDice" },
 					plot = { "AutoCollect", "AutoEquipBest", "AutoLevel" },
 					sell = { "AutoSell" },
-					upgrades = { "SmartSpend", "AutoBuyDice", "AutoUpgrade", "AutoRebirth", "AutoRebirthStats", "AutoGear" },
+					upgrades = { "SmartPlanner", "AutoBuyDice", "AutoUpgrade", "AutoRebirth", "AutoRebirthStats", "AutoGear" },
 					towers = { "AutoTower", "TowerEquipTeam" },
 					rewards = { "AutoDaily", "AutoOffline", "AutoGroup", "AutoCodes", "AutoQuests", "AutoTicketPasses" },
 				}
@@ -36794,7 +36871,7 @@ do
 						I.towerOdds = if #team > 0 then table.concat(odds, "\n") else "You need units first"
 					end
 				end
-				if on("SmartSpend") then
+				if on("SmartPlanner") then
 					I.spend = N.spendText()
 				elseif (upTab or mainTab) and choreDue("spendText", if slow then 30 else 10) then
 					N.Spend.plan = N.spendOptions()
@@ -37084,7 +37161,7 @@ do
 	end
 	if Library.ShowWizard and not N.setupDone() then
 		task.delay(1.5, function()
-			if on("AutoRoll") or on("SmartSpend") or on("AutoTower") or on("AutoUpgrade") then
+			if on("AutoRoll") or on("SmartPlanner") or on("AutoTower") or on("AutoUpgrade") then
 				N.markSetupDone()
 				return
 			end
