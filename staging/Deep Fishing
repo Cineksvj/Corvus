@@ -32078,9 +32078,29 @@ do
 		local value = option and option.Value
 		return if type(value) == "string" and value ~= "" then value else default
 	end
-	-- Smart Planner (one toggle, default off): buys upgrades, rods, bait, worlds and pond slots by payback and times sales.
+	-- Smart Planner (one toggle, default off) = autopilot: it plays the whole game by itself (fishes, sells, buys by payback,
+	-- pond, rewards, codes, Big Mouth, items) even when every other toggle is off, through the same functions the toggles use.
 	function N.planner()
 		return on("SmartPlanner")
+	end
+	-- A job runs when its own toggle is on or the planner drives it. Sub-options (mode, thresholds, protect lists) still apply.
+	function N.wants(name)
+		return on(name) or N.planner()
+	end
+	-- Cash the planner keeps for the purchase it is saving for (only while that purchase is minutes away).
+	function N.reserve()
+		local P = N.Plan
+		return if P and N.planner() and P.need and (P.eta or 1) <= 0.25 then (tonumber(P.need.price) or 0) else 0
+	end
+	-- The planner never waits without a reason: when it cannot act, the real reason goes to the log (once a minute per reason)
+	-- and to the Status line.
+	local IdleAt = {}
+	function N.planIdle(reason, status)
+		setStatus(status or ("Waiting: " .. reason))
+		if N.planner() and os.clock() - (IdleAt[reason] or -1e9) > 60 then
+			IdleAt[reason] = os.clock()
+			log("PLAN idle", "reason=" .. reason)
+		end
 	end
 	-- Movement: Teleport (default, the game checks no player movement) or Walk.
 	function N.safeMove()
@@ -32231,8 +32251,20 @@ do
 		end
 		return nil
 	end
-	-- Fish in the backpack: count, sellable count and sellable value (not locked, not an unused relic).
-	-- Values are cached per item for a minute and the whole scan for 2 s (a full backpack holds 2500 fish).
+	-- Fish the Keep lists protect (rarities, species, mutated): Smart Sell locks them right before every sale, so they are
+	-- never part of the sellable value the planner counts on (a kept 361K Secret fish once made a "fund" sale come up
+	-- short of the rod price and the buy never followed).
+	function N.keeps(item, def)
+		def = def or N.fishDef(item.Name)
+		local rarity = def and def.Rarity or "Common"
+		if selected(Options.KeepRarities, rarity) or selected(Options.KeepFish, tostring(item.Name)) then
+			return true
+		end
+		return on("KeepMutated") and type(item.Data) == "table" and item.Data.Mutation ~= nil
+	end
+	-- Fish in the backpack: count, sellable count and sellable value (not locked, not kept, not an unused relic) and the
+	-- value of every fish (the income tracker's worth). Values are cached per item for a minute and the whole scan for
+	-- 2 s (a full backpack holds 2500 fish).
 	local ValueCache, Stats = {}, { at = -1e9 }
 	function N.cachedValue(guid, item)
 		local now = os.clock()
@@ -32246,18 +32278,22 @@ do
 	function N.fishStats(fresh)
 		local now = os.clock()
 		if not fresh and now - Stats.at < 2 then
-			return Stats.count, Stats.sellable, Stats.value
+			return Stats.count, Stats.sellable, Stats.value, Stats.total
 		end
-		local count, sellable, value = 0, 0, 0
+		local count, sellable, value, total = 0, 0, 0, 0
 		local inv = N.inv()
 		for guid, item in pairs(inv) do
 			if type(item) == "table" and item.Type == "Fish" then
 				count += 1
-				if not N.isLocked(item) and not N.relicOf(item) then
+				if not N.relicOf(item) then
 					local def = N.fishDef(item.Name)
 					if not def or def.SellPrice then
-						sellable += 1
-						value += N.cachedValue(guid, item)
+						local v = N.cachedValue(guid, item)
+						total += v
+						if not N.isLocked(item) and not N.keeps(item, def) then
+							sellable += 1
+							value += v
+						end
 					end
 				end
 			end
@@ -32270,8 +32306,8 @@ do
 				end
 			end
 		end
-		Stats.at, Stats.count, Stats.sellable, Stats.value = now, count, sellable, value
-		return count, sellable, value
+		Stats.at, Stats.count, Stats.sellable, Stats.value, Stats.total = now, count, sellable, value, total
+		return count, sellable, value, total
 	end
 	function N.backpack()
 		local bp = N.sh("Services.Backpack")
@@ -32504,6 +32540,22 @@ do
 	end
 	-- Hooks per cast exactly like the game's client (ThrowCinematic:GetBaitCapacity): Capacity upgrade of this world +
 	-- HookSlots enchants, never more than the free backpack slots.
+	function N.hookCapRaw()
+		local d = N.data()
+		local U = N.sh("Config.UpgradesConfig")
+		local cap = 3
+		pcall(function()
+			local key = U.KeyForData(d)
+			local level = U.LevelOf(d, "Capacity", key)
+			local W = N.sh("Config.WorldsConfig")
+			local effect = (W.ForPlayerData(d).UpgradeEffect or 1)
+			cap = U.CapacityValue(level, effect, key)
+		end)
+		pcall(function()
+			cap += N.sh("Modules.Enchant").Add(d, "HookSlots") or 0
+		end)
+		return math.max(cap, 1)
+	end
 	function N.hookCap()
 		local d = N.data()
 		local U = N.sh("Config.UpgradesConfig")
@@ -32786,9 +32838,10 @@ do
 					fishHooked += 1
 				end
 			end
-			-- The game's client reels by itself once the hook is full; Blatant reels right after the last hook.
+			-- The game's client reels by itself once the hook is full; Blatant reels right after the last hook. `true` is the
+			-- client's early reel (RequestReel(true)): the server returns the line 22% faster (reelEarly, dump 187974).
 			if cast.windowOpen and (blatant or (cap > 0 and fishHooked >= cap)) then
-				send("ReelBait", blatant)
+				send("ReelBait", true)
 			end
 		end
 		local landWait = (tonumber(p.pullUpDuration) or 10) + (tonumber(p.returnDuration) or 2) + 20
@@ -32883,7 +32936,7 @@ do
 		F.orig = { PickTarget = rawget(AF, "PickTarget"), Boost = rawget(AF, "Boost") }
 		F.patched = AF
 		AF.PickTarget = function(self, list, hangY)
-			if not (alive() and on("AutoFish")) then
+			if not (alive() and N.wants("AutoFish")) then
 				return F.orig.PickTarget(self, list, hangY)
 			end
 			local best, bestScore
@@ -32899,7 +32952,7 @@ do
 			return best
 		end
 		AF.Boost = function(self)
-			if alive() and on("AutoFish") then
+			if alive() and N.wants("AutoFish") then
 				return math.clamp(optionNumber("PerfectRate", 60) / 100, 0, 0.95)
 			end
 			return F.orig.Boost(self)
@@ -32944,9 +32997,50 @@ do
 	-- Tutorial (Events.Tutorial): the server takes increasing step numbers 1..8 (8 = done, Beginner potion + baits).
 	-- Corvus sends each step after the matching real action (pier, cast, catch, sale, Strength, three catches, rod),
 	-- with a 90 s fallback so it never stalls. Step 5 tops the cash up to the first Strength, step 7 to the cheapest rod.
-	N.Tut = { at = -1e9, sentStep = nil }
+	-- Tutorial hold (option, off): the tutorial stops at step 6 and stays there. The server doubles the luck of every cast
+	-- at step 6 (x2 luck, x1.3 distance, 2 free bounces; dump 188368-188506); the price is no playtime gifts, quests or
+	-- guaranteed scrolls while the tutorial is open. The game's own window would send step 7 after three catches, so the
+	-- Tutorial channel is guarded: numbers above 6 are dropped while the hold is on.
+	N.Tut = { at = -1e9, sentStep = nil, guarded = nil, dropped = 0, droppedAt = -1e9 }
 	local tutorialOnce
+	function N.tutorialHold()
+		return on("TutorialHold") and (tonumber(N.data().Tutorial) or -1) < 100
+	end
+	function N.tutorialGuard()
+		if N.Tut.guarded then
+			return true
+		end
+		local obj = N.event("Tutorial")
+		if not obj then
+			return false
+		end
+		local ok = pcall(function()
+			local fire = obj.Fire
+			obj.Fire = function(self, reliable, n, ...)
+				if type(n) == "number" and n > 6 and N.tutorialHold() then
+					N.Tut.dropped += 1
+					if os.clock() - N.Tut.droppedAt > 60 then
+						N.Tut.droppedAt = os.clock()
+						log("TUTORIAL hold", "dropped step " .. tostring(n), "(x2 luck stays)")
+					end
+					return
+				end
+				return fire(self, reliable, n, ...)
+			end
+		end)
+		N.Tut.guarded = ok or nil
+		if ok then
+			log("TUTORIAL guard on", "steps above 6 are held back while Tutorial hold is on")
+		end
+		return ok
+	end
 	function N.tutorialStep()
+		if N.tutorialHold() then
+			N.tutorialGuard()
+			if N.due("tutHoldPlan", 1800) then
+				log("PLAN tutorial", "hold=on", "step=" .. tostring(N.data().Tutorial), "value=x2 luck, x1.3 distance per cast", "cost=no playtime gifts, quests or guaranteed scrolls")
+			end
+		end
 		for _ = 1, 3 do
 			if not tutorialOnce() then
 				return
@@ -32957,6 +33051,9 @@ do
 	function tutorialOnce()
 		local cur = tonumber(N.data().Tutorial) or -1
 		if cur >= 100 or cur >= 8 then
+			return false
+		end
+		if cur >= 6 and N.tutorialHold() then
 			return false
 		end
 		local nextStep = math.max(cur + 1, 1)
@@ -32996,20 +33093,36 @@ do
 		end
 		return false
 	end
-	-- Main fishing step (called by the main loop when Auto Fish is on and nothing else needs the character).
+	-- Main fishing step (called by the main loop when Auto Fish or the Smart Planner is on and nothing else needs the
+	-- character).
 	function N.fishStep()
 		F.mode = N.fishMode()
 		if F.paused then
 			task.wait(0.3)
 			return
 		end
+		-- Sell before the cast when the backpack cannot take a whole school: the server drops every fish over the cap
+		-- (FishCaught 189470), so a near-full backpack sells first (Smart Sell rules and protect lists) instead of wasting casts.
 		local count, max = N.backpack()
-		if count >= max then
-			N.pauseFishing("backpack full")
-			F.paused = false
-			setStatus("Backpack full: Smart Sell or Sell Now makes room")
-			task.wait(2)
-			return
+		if max - count < N.hookCapRaw() then
+			if N.wants("SmartSell") and N.due("sellFull", 20) then
+				local _, sellable = N.fishStats(true)
+				if sellable > 0 then
+					N.sellNow(string.format("backpack %d/%d before the cast", count, max))
+					count, max = N.backpack()
+				end
+			end
+			if count >= max then
+				N.pauseFishing("backpack full")
+				F.paused = false
+				if N.wants("SmartSell") then
+					N.planIdle("backpack full of protected fish", "Backpack full of kept fish: unlock some or shorten the Keep lists")
+				else
+					setStatus("Backpack full: Smart Sell or Sell Now makes room")
+				end
+				task.wait(2)
+				return
+			end
 		end
 		if (N.data().World and N.worldCfg() and N.worldCfg().NoFishing) then
 			setStatus("In a world without fishing, going back")
@@ -33017,11 +33130,16 @@ do
 			return
 		end
 		if not N.goPier() then
+			if not N.pierPos() then
+				N.planIdle("pier not loaded in " .. N.worldKey(), "Waiting for the pier to load")
+			else
+				N.planIdle("could not reach the pier", "Going to the pier")
+			end
 			task.wait(1)
 			return
 		end
 		if not N.equipRod() then
-			setStatus("Equipping the rod")
+			N.planIdle("rod " .. tostring(N.data().RodEquipped) .. " not in the backpack", "Equipping the rod")
 			task.wait(1)
 			return
 		end
@@ -33068,11 +33186,12 @@ do
 		N.castOnce(true)
 		task.wait(0.3 + math.random() * 0.3)
 	end
+	-- Auto Fish and the planner both off: the game's auto fishing is restored; a cast in flight finishes by itself (its
+	-- hooks and claim still belong to the server's active throw).
 	function N.fishOff()
 		if F.patched then
 			N.unpatch()
 		end
-		F.cast = nil
 	end
 end
 N.Reward = { log = {}, last = "" }
@@ -33094,7 +33213,7 @@ do
 	end
 	-- Remote-only claims (no movement, no held item): each one only when the game's own config says it is ready.
 	function N.rewardStep()
-		if not on("AutoRewards") then
+		if not N.wants("AutoRewards") then
 			return
 		end
 		local d = N.data()
@@ -33111,8 +33230,10 @@ do
 				return c.CanClaim(dr, now)
 			end)
 			if ok and can then
-				send("DailyRewards", "Claim", math.max(tonumber(dr.Unlocked) or 1, (tonumber(dr.Claimed) or 0) + 1))
-				claimed("Daily reward day " .. ((tonumber(dr.Claimed) or 0) + 1))
+				-- One call with the highest unlocked day: the server claims every day from Claimed+1 up to it (183443).
+				local from, to = (tonumber(dr.Claimed) or 0) + 1, math.max(tonumber(dr.Unlocked) or 1, (tonumber(dr.Claimed) or 0) + 1)
+				send("DailyRewards", "Claim", to)
+				claimed(if to > from then string.format("Daily rewards days %d-%d (catch-up)", from, to) else "Daily reward day " .. from)
 			end
 		end
 		-- Free daily roll (DailyClaimableConfig.State == "Free"; the ad "Watch" claim is never used).
@@ -33273,7 +33394,7 @@ do
 	end
 	function N.codeStep()
 		local d = N.data()
-		if on("AutoCodes") and N.due("codeScan", 30) then
+		if N.wants("AutoCodes") and N.due("codeScan", 30) then
 			local have = N.tab("Codes")
 			for _, code in ipairs(C.known) do
 				if not have[code] and not C.tried[code] and not table.find(C.queue, code) then
@@ -33316,7 +33437,7 @@ do
 			return false
 		end
 		local did = false
-		if on("AutoOpen") and N.due("open", 5) then
+		if N.wants("AutoOpen") and N.due("open", 5) then
 			for _, kind in ipairs({ "Chest", "Cage", "Exclusive" }) do
 				local list = N.itemsOf(kind)
 				if #list > 0 then
@@ -33335,7 +33456,7 @@ do
 				end
 			end
 		end
-		if on("AutoPotions") and N.worldKey() ~= "Pond" and N.due("potions", 10) then
+		if N.wants("AutoPotions") and N.worldKey() ~= "Pond" and N.due("potions", 10) then
 			for _, entry in ipairs(N.itemsOf("Potion")) do
 				local name = tostring(entry.item.Name)
 				if selected(Options.PotionKinds, name) and not potionActive(name) then
@@ -33353,7 +33474,7 @@ do
 		end
 		-- Boss relics: luck relics (SunkenKing, SunkenQueen) right away; the sell relic (Kraken x10) only right before a
 		-- big sale (Smart Sell calls N.useSellRelics).
-		if on("AutoRelics") and N.due("relics", 15) then
+		if N.wants("AutoRelics") and N.due("relics", 15) then
 			local BR = N.sh("Config.BossRelicConfig")
 			for guid, item in pairs(N.inv()) do
 				if type(item) == "table" and item.Type == "Fish" then
@@ -33400,7 +33521,7 @@ do
 	-- Big Mouth (World 1): feed it the cheapest fish until it is full, every 12 h. Each round raises luck for good
 	-- (+10% for the first five, then +5%, up to +200%) and rolls a reward.
 	function N.bigMouthStep()
-		if not on("AutoBigMouth") or not N.unlocked("World 1") then
+		if not N.wants("AutoBigMouth") or not N.unlocked("World 1") then
 			return false
 		end
 		local bm = N.tab("BigMouth")
@@ -33429,7 +33550,7 @@ do
 			task.wait(1)
 		end
 		local fed = 0
-		while fed < 40 and alive() and on("AutoBigMouth") and (tonumber(N.tab("BigMouth").ReadyAt) or 0) <= N.serverTime() do
+		while fed < 40 and alive() and N.wants("AutoBigMouth") and (tonumber(N.tab("BigMouth").ReadyAt) or 0) <= N.serverTime() do
 			local cheapest, cheapValue
 			for guid, item in pairs(N.inv()) do
 				if type(item) == "table" and item.Type == "Fish" and not N.isLocked(item) and not N.relicOf(item) then
@@ -33478,7 +33599,7 @@ do
 		return nil, nil
 	end
 	function N.enchantStep()
-		if not on("AutoEnchant") or not N.due("enchant", 20) then
+		if not N.wants("AutoEnchant") or not N.due("enchant", 20) then
 			return false
 		end
 		local s1, s2 = N.enchantNames()
@@ -33515,7 +33636,7 @@ do
 	-- Mutation Dealer: spend free Mutation Scrolls (the game counts them in MutationRerolls) on the most valuable
 	-- unmutated fish; the mutation multiplies its sell value (x2..x15).
 	function N.mutationStep()
-		if not on("AutoMutate") or not N.due("mutate", 30) then
+		if not N.wants("AutoMutate") or not N.due("mutate", 30) then
 			return false
 		end
 		local scrolls = 0
@@ -33569,12 +33690,33 @@ do
 		local c = N.sh("Config." .. name)
 		return if type(c) == "table" then c else nil
 	end
-	-- Worth = cash + sell value of the backpack + what Corvus spent; its slope is the real income per second.
+	-- Worth = cash + sell value of the backpack (without a server CashBoost, which would fake a jump) + the pond's fish +
+	-- what Corvus spent; its slope is the real income per second. A drop (fish fed to the Big Mouth, a sale under the
+	-- estimate, a boost that ended) is an accounting event, not negative income: it is carried in E.adjust so the measured
+	-- rate never falls to 0 while the casts keep earning.
 	function N.backpackValue()
-		return (select(3, N.fishStats()))
+		return (select(4, N.fishStats())) or 0
 	end
+	local function pondValue()
+		local total = 0
+		pcall(function()
+			for _, f in pairs(N.tab("Pond").Fish or {}) do
+				if type(f) == "table" and f.Name and not f.Dead then
+					total += N.value(f)
+				end
+			end
+		end)
+		return total
+	end
+	E.adjust = 0
 	function N.econTick()
-		local worth = N.cash() + N.backpackValue() + E.spent
+		local boost = math.max(tonumber(workspace:GetAttribute("ServerCash")) or 1, 1)
+		local worth = N.cash() + N.backpackValue() / boost + pondValue() + E.spent + E.adjust
+		local prev = E.samples[#E.samples]
+		if prev and worth < prev.w then
+			E.adjust += prev.w - worth
+			worth = prev.w
+		end
 		local now = os.clock()
 		table.insert(E.samples, { t = now, w = worth })
 		while #E.samples > 2 and now - E.samples[1].t > 900 do
@@ -33682,7 +33824,7 @@ do
 				end
 			end
 		end
-		if on("AutoPond") and not N.unlocked("Pond") and N.level() >= 5 then
+		if N.wants("AutoPond") and not N.unlocked("Pond") and N.level() >= 5 then
 			table.insert(out, { kind = "world", name = "Pond", price = 25000, frac = 0.15 })
 		end
 		for _, c in ipairs(out) do
@@ -33704,7 +33846,34 @@ do
 		end
 		return false
 	end
-	-- Travels to a world (Teleport remote; the first visit unlocks it with the price and level).
+	-- Rejoin through the game's own IdleRejoin channel: the server saves the profile and moves the character to a server
+	-- (same one when it has room) with resume data; the hub starts again there (Misc > Keep after teleport). Used only
+	-- to recover a stuck state (a world change that fails twice, 10 minutes on one status), never as anti idle.
+	function N.rejoin(reason)
+		local keep = Toggles.KeepOnTeleport
+		if not (keep and keep.Value) then
+			log("REJOIN skipped", "Keep after teleport is off", "reason=" .. tostring(reason))
+			return false
+		end
+		if os.clock() - (N.World.rejoinAt or -1e9) < 600 then
+			return false
+		end
+		N.World.rejoinAt = os.clock()
+		local obj = N.event("IdleRejoin")
+		if not obj then
+			log("NO REMOTE", "IdleRejoin")
+			return false
+		end
+		log("REJOIN", "reason=" .. tostring(reason), "(IdleRejoin: the server saves and moves us, the hub restarts after the teleport)")
+		flushLog(true)
+		N.Sent.count += 1
+		N.Sent.byName.IdleRejoin = (N.Sent.byName.IdleRejoin or 0) + 1
+		return (pcall(function()
+			obj:Fire(true, { AutoFishing = false, DoubleSpeed = N.data().IsInGroup == true })
+		end))
+	end
+	-- Travels to a world (Teleport remote; the first visit unlocks it with the price and level). Two failed travels in a
+	-- row within 10 minutes = a stuck client (cutscene, missing folder): the rejoin above resets it.
 	function N.travel(key)
 		if not key or N.worldKey() == key then
 			return true
@@ -33721,12 +33890,23 @@ do
 		task.wait(2)
 		N.World.last = (if ok then "Arrived in " else "Could not reach ") .. tostring(key)
 		log("WORLD", if ok then "arrived" else "failed", tostring(key))
+		if ok then
+			N.World.fails = 0
+		else
+			N.World.fails = (if os.clock() - (N.World.failAt or -1e9) < 600 then (N.World.fails or 0) else 0) + 1
+			N.World.failAt = os.clock()
+			if N.World.fails >= 2 then
+				N.World.fails = 0
+				N.rejoin("world change to " .. tostring(key) .. " failed twice")
+			end
+		end
 		N.resumeFishing()
 		return ok
 	end
-	-- One purchase through the game's remote; when the server ignores it from the pier, the shop spot is tried once
-	-- (Rods/Baits/Upgrades counters) and remembered.
-	local ShopSpot = { upgrade = "Upgrades", rod = "Rods", bait = "Baits" }
+	-- One purchase through the game's remote. Upgrades are server-checked by cash and level only (190509): bought from the
+	-- pier, never a walk. Rods and bait: when the server ignores the buy from the pier, the shop spot is tried once
+	-- (Rods/Baits counters) and remembered.
+	local ShopSpot = { rod = "Rods", bait = "Baits" }
 	function N.buy(c, why)
 		local before = N.cash()
 		c.cashBefore = before
@@ -33819,40 +33999,76 @@ do
 		local horizon = math.max((24 - ((os.clock() - Session.started) / 3600) % 24) * 0.9, 0.5)
 		P.horizon = horizon
 		if N.planner() then
+			-- Autopilot rule: the best payback that fits the horizon is bought NOW: from cash, or after selling the
+			-- backpack (Smart Sell rules, protect lists: kept fish never count) when that covers it. Only when even the
+			-- backpack is not enough does Corvus save, and saving = fishing on. While it saves, another purchase goes first
+			-- only when its payback is shorter than the saving eta: by the time the best could be afforded it has paid
+			-- for itself, so the best is never delayed (a 300K rod with a 0.9 h payback waits when the 600K rod is 5
+			-- minutes away; a 400K Capacity with 1.1 h goes first when World 2 is 12 hours away).
 			local best = list[1]
-			local pick
-			P.need = nil
+			local pick, fund
+			P.need, P.eta = nil, nil
+			local cash = N.cash()
+			local _, sellable, value = N.fishStats(true)
+			local funds = cash + value * 0.95
 			if best and best.payback <= horizon then
-				if N.cash() >= best.price then
+				if cash >= best.price then
 					pick = best
+				elseif sellable > 0 and funds >= best.price then
+					fund = best
 				else
-					-- Saving only pays when the best option is minutes away; otherwise the best affordable option that
-					-- pays back in time goes first (it earns while Corvus saves for the next one).
-					local eta = (best.price - N.cash()) / N.incomeRate() / 3600
 					P.need = best
-					if eta > 0.25 then
-						for _, c in ipairs(list) do
-							if c.payback <= horizon and N.cash() >= c.price then
+					P.eta = math.max(best.price - funds, 0) / N.incomeRate() / 3600
+					local limit = math.min(P.eta, horizon)
+					for _, c in ipairs(list) do
+						if c ~= best and c.payback <= limit then
+							if cash >= c.price then
 								pick = c
+								break
+							elseif sellable > 0 and funds >= c.price then
+								fund = c
 								break
 							end
 						end
 					end
 				end
 			end
-			local key = (best and best.name or "-") .. "/" .. (pick and pick.name or "-")
+			local action = if pick
+				then pick.name
+				elseif fund then fund.name .. " (sell first)"
+				elseif P.need then string.format("- (fishing, saving for %s, eta %s)", P.need.name, N.longTime(P.eta * 3600))
+				else "-"
+			local key = (best and best.name or "-") .. "/" .. action
 			if key ~= P.lastKey or os.clock() - P.lastAt > 60 then
 				P.lastKey, P.lastAt = key, os.clock()
 				local parts = {}
 				for i = 1, math.min(3, #list) do
 					table.insert(parts, string.format("%s %s %s payback %.1fh", list[i].kind, list[i].name, formatNumber(list[i].price), list[i].payback))
 				end
-				log("PLAN", "rate=" .. formatNumber(N.incomeRate()) .. "/s", "best: " .. (if #parts > 0 then table.concat(parts, " | ") else "-"), "buy=" .. (pick and pick.name or "-"))
+				log("PLAN", "rate=" .. formatNumber(N.incomeRate()) .. "/s", "horizon=" .. string.format("%.1fh", horizon), "best: " .. (if #parts > 0 then table.concat(parts, " | ") else "-"), "buy=" .. action)
 			end
-			P.say = if pick then string.format("Buying %s (%s, payback %.1f h)", pick.name, formatNumber(pick.price), pick.payback) elseif P.need then string.format("Saving for %s: %s (payback %.1f h)", P.need.name, formatNumber(P.need.price), P.need.payback) else string.format("Nothing pays back within %.0f h yet", horizon)
+			local fishing = if N.fishMode() == "blatant" then "Fishing Blatant" else "Fishing Safe"
+			P.say = if pick
+				then string.format("Buying %s (%s, payback %.1f h), then %s", pick.name, formatNumber(pick.price), pick.payback, string.lower(fishing))
+				elseif fund then string.format("Selling the backpack to buy %s (%s, payback %.1f h)", fund.name, formatNumber(fund.price), fund.payback)
+				elseif P.need then string.format("%s, saving for %s: %s (payback %.1f h, about %s)", fishing, P.need.name, formatNumber(P.need.price), P.need.payback, N.longTime(P.eta * 3600))
+				else string.format("%s. Nothing pays back within %.0f h yet", fishing, horizon)
+			if fund then
+				N.sellNow("fund " .. fund.name)
+				if N.cash() >= fund.price then
+					pick = fund
+				else
+					-- The sale came up short (server value under the estimate): keep saving for it, the reserve holds the
+					-- cash back from bait, the next casts close the gap.
+					P.need = fund
+					P.eta = math.max(fund.price - N.cash(), 0) / N.incomeRate() / 3600
+					P.say = string.format("%s, saving for %s: %s (payback %.1f h, about %s)", fishing, fund.name, formatNumber(fund.price), fund.payback, N.longTime(P.eta * 3600))
+					log("PLAN fund short", fund.name, "cash=" .. formatNumber(N.cash()), "price=" .. formatNumber(fund.price), "eta=" .. N.longTime(P.eta * 3600))
+				end
+			end
 			if pick then
 				if N.buy(pick, "planner") then
-					P.need = nil
+					P.need, P.eta = nil, nil
 					N.equipBestRod()
 					return true
 				end
@@ -33906,17 +34122,12 @@ do
 	-- Kraken relic (x10 on the next sale) is used right before.
 	function N.protectStep()
 		local n = 0
-		local keepR = Options.KeepRarities
-		local keepNames = Options.KeepFish
 		for guid, item in pairs(N.inv()) do
 			if n >= 25 then
 				break
 			end
 			if type(item) == "table" and item.Type == "Fish" and not N.isLocked(item) and not N.relicOf(item) and not N.Sell.locked[guid] then
-				local def = N.fishDef(item.Name)
-				local rarity = def and def.Rarity or "Common"
-				local mutated = type(item.Data) == "table" and item.Data.Mutation ~= nil
-				if selected(keepR, rarity) or selected(keepNames, tostring(item.Name)) or (mutated and on("KeepMutated")) then
+				if N.keeps(item) then
 					send("Lock", "Toggle", guid)
 					N.Sell.locked[guid] = true
 					n += 1
@@ -33935,7 +34146,7 @@ do
 			return false
 		end
 		N.protectStep()
-		if on("AutoRelics") then
+		if N.wants("AutoRelics") then
 			N.useSellRelics()
 		end
 		local cashBefore = N.cash()
@@ -33980,7 +34191,7 @@ do
 		return ok
 	end
 	function N.sellStep()
-		if not on("SmartSell") or not N.due("sellCheck", 5) then
+		if not N.wants("SmartSell") or not N.due("sellCheck", 5) then
 			return false
 		end
 		local count, max = N.backpack()
@@ -33995,7 +34206,7 @@ do
 			reason = string.format("backpack %d%%", math.floor(fill * 100))
 		elseif boost > 1 and sellable >= 5 then
 			reason = "CashBoost x" .. boost
-		elseif N.planner() and P.need and N.cash() < P.need.price and N.cash() + value >= P.need.price then
+		elseif N.planner() and P.need and N.cash() < P.need.price and N.cash() + value * 0.95 >= P.need.price then
 			reason = "fund " .. P.need.name
 		elseif optionNumber("SellEvery", 0) > 0 and os.clock() - N.Sell.at >= optionNumber("SellEvery", 0) * 60 then
 			reason = "timer"
@@ -34007,10 +34218,11 @@ do
 		end
 		return N.sellNow(reason)
 	end
-	-- Bait: one item = 5 casts (ConsumeBait, up to 10 at once). Keeps a bait active; buys the strongest bait whose cost
-	-- per cast stays under the budget share of the measured value of a cast.
+	-- Bait: one item = 5 casts (ConsumeBait arms up to 10 items = 50 casts in one call, 182807). Keeps a bait active; buys
+	-- the strongest bait whose cost per cast stays under the budget share of the measured value of a cast, 10 at a time
+	-- when the stack is cheap against the cash, never from the planner's reserve.
 	function N.baitStep()
-		if not on("AutoBait") or not N.due("bait", 10) then
+		if not N.wants("AutoBait") or not N.due("bait", 10) then
 			return false
 		end
 		local active = 0
@@ -34032,9 +34244,10 @@ do
 			end
 		end
 		if bestGuid then
-			send("ConsumeBait", bestGuid, math.clamp(bestAmount, 1, 10))
-			Session.baits += 1
-			log("BAIT use", "luck=" .. tostring(bestLuck), "x" .. math.clamp(bestAmount, 1, 10))
+			local n = math.clamp(bestAmount, 1, 10)
+			send("ConsumeBait", bestGuid, n)
+			Session.baits += n
+			log("BAIT use", "luck=" .. tostring(bestLuck), "x" .. n, "=" .. (n * 5) .. " casts")
 			return true
 		end
 		if not on("BuyBait") then
@@ -34042,18 +34255,21 @@ do
 		end
 		local perCast = math.max(N.Fish.evCast, N.incomeRate() * math.max(N.Fish.cycle, 15))
 		local budget = perCast * optionNumber("BaitBudget", 10) / 100
+		local free = N.cash() - N.reserve()
 		local pick, pickLuck
 		for name, def in pairs(defs) do
 			local price = tonumber(def.Price) or math.huge
-			if price / 5 <= budget and price * 2 <= N.cash() and (N.Shop.stockOut[name] or 0) < os.clock() and (not pick or (tonumber(def.Luck) or 0) > pickLuck) then
+			if price / 5 <= budget and price * 2 <= free and (N.Shop.stockOut[name] or 0) < os.clock() and (not pick or (tonumber(def.Luck) or 0) > pickLuck) then
 				pick, pickLuck = name, tonumber(def.Luck) or 0
 			end
 		end
 		if not pick then
 			return false
 		end
+		local price = tonumber(defs[pick].Price) or 0
+		local count = if price * 10 <= free * 0.05 then 10 else 2
 		local before = #N.itemsOf("Bait")
-		send("BaitShop", "Buy", pick, 2)
+		send("BaitShop", "Buy", pick, count)
 		if not waitFor(function()
 			return #N.itemsOf("Bait") > before
 		end, 3) then
@@ -34061,14 +34277,14 @@ do
 			log("BAIT buy failed", pick, "(out of stock or too far), retry in 5m")
 			return false
 		end
-		N.spent((tonumber(defs[pick].Price) or 0) * 2)
-		log("BAIT buy", pick, "x2", "cost/cast=" .. formatNumber((tonumber(defs[pick].Price) or 0) / 5), "cast value=" .. formatNumber(perCast))
+		N.spent(price * count)
+		log("BAIT buy", pick, "x" .. count, "cost/cast=" .. formatNumber(price / 5), "cast value=" .. formatNumber(perCast))
 		return true
 	end
 	-- Pond (idle income): a trip every Pond Every minutes: collect, the game's EquipBest roster, revive or clear dead
 	-- fish, food stock, capacity upgrades. Potions pause in the pond world, so trips stay short.
 	function N.pondStep()
-		if not on("AutoPond") then
+		if not N.wants("AutoPond") then
 			return false
 		end
 		if not N.unlocked("Pond") then
@@ -34307,7 +34523,7 @@ do
 			Default = false,
 			Tooltip = "Goes to the pier, holds your rod, finishes the tutorial and fishes. Mode picks how",
 			Callback = function(v)
-				if not v then
+				if not v and not N.planner() then
 					N.fishOff()
 				end
 			end,
@@ -34328,6 +34544,11 @@ do
 			Tooltip = "Share of Perfect throws (+33% distance, deeper water, more fish). 60% is what the game's AutoBoost enchant gives",
 		})
 		FishBox:AddToggle("IndexHunt", { Text = "Index Hunt", Default = false, Tooltip = "Counts species missing from your index 50% higher when picking fish (every 10/25/50/75/100 species = +10% on all sales)" })
+		FishBox:AddToggle("TutorialHold", {
+			Text = "Tutorial hold (x2 luck)",
+			Default = false,
+			Tooltip = "Stops the tutorial at step 6 and keeps it there: the server gives every cast x2 luck, x1.3 distance and 2 free bounces while you are on that step. The price: no playtime gifts, quests or guaranteed scrolls until the tutorial is finished. Off = the tutorial is finished for you. Does nothing on an account that already finished it",
+		})
 		Labels.Fish = FishBox:AddLabel({ Text = "-", DoesWrap = true })
 		local SellBox = Tabs.Fishing:AddRightGroupbox("Smart Sell", "coins")
 		SellBox:AddToggle("SmartSell", {
@@ -34367,7 +34588,12 @@ do
 		PlanBox:AddToggle("SmartPlanner", {
 			Text = "Smart Planner",
 			Default = false,
-			Tooltip = "Buys upgrades, rods, the next world and the pond in the order of the fastest payback (price / extra coins per second, within 24 h) and tells Smart Sell when to fund it. Your other toggles stay as you set them",
+			Tooltip = "Autopilot: plays the whole game by itself, even with every other toggle off. Fishes (Mode and Perfect Rate from Auto Fish), sells by the Smart Sell rules and protect lists when the backpack needs it or a purchase waits, buys upgrades, rods, bait, the next world and the pond in the order of the fastest payback (price / extra coins per second, within 24 h), visits the pond, claims rewards and codes, feeds the Big Mouth, opens chests, uses potions, relics and scrolls. Saving for something = fishing meanwhile. Your other toggles stay as you set them",
+			Callback = function(v)
+				if not v and not on("AutoFish") then
+					N.fishOff()
+				end
+			end,
 		})
 		Labels.Planner = PlanBox:AddLabel({ Text = "-", DoesWrap = true })
 		-- Main: Quick Start (filled at the end of this part) + Status.
@@ -34494,7 +34720,7 @@ do
 		end
 		mirror("AutoFish", "Auto Fish", "Same as Fishing > Auto Fish (the mode is picked there)")
 		mirror("SmartSell", "Smart Sell", "Same as Fishing > Smart Sell")
-		mirror("SmartPlanner", "Smart Planner", "Same as Fishing > Smart Planner: upgrades, rods, worlds and the pond by payback")
+		mirror("SmartPlanner", "Smart Planner", "Same as Fishing > Smart Planner: the autopilot fishes, sells, buys by payback, visits the pond and claims everything by itself")
 		mirror("AutoPond", "Auto Pond", "Same as Fishing > Auto Pond")
 		mirror("AutoRewards", "Auto Rewards", "Same as Rewards > Auto Rewards")
 		QuickBox:AddButton({
@@ -35191,7 +35417,7 @@ do
 					Choices = {
 						{ Id = "fish", Title = "Fish", Description = "Auto Fish (Safe) on the best fish of every cast", Icon = "fish", Color = "#5fb8ff" },
 						{ Id = "sell", Title = "Sell", Description = "Smart Sell when the backpack fills, keeps Secret and Exotic fish", Icon = "coins", Color = "#fab428" },
-						{ Id = "planner", Title = "Smart Planner", Description = "Upgrades, rods, worlds and the pond by payback", Icon = "brain", Color = "#3ccf91" },
+						{ Id = "planner", Title = "Smart Planner", Description = "Autopilot: fishes, sells, buys by payback, pond, rewards, the whole game", Icon = "brain", Color = "#3ccf91" },
 						{ Id = "pond", Title = "Pond", Description = "Unlock, fill, feed and collect the pond", Icon = "droplets", Color = "#4fd1c5" },
 						{ Id = "rewards", Title = "Claim rewards", Description = "Daily, playtime, season, achievements, offline and the Big Mouth", Icon = "gift", Color = "#ff5d8f" },
 						{ Id = "codes", Title = "Redeem codes", Description = "Every known code and your secret code", Icon = "ticket", Color = "#b18cff" },
@@ -35468,7 +35694,8 @@ do
 			return
 		end
 		N.baitStep()
-		if on("AutoFish") then
+		-- Auto Fish or the Smart Planner (the autopilot owns the main loop) fish; the planner never waits for Auto Fish.
+		if N.wants("AutoFish") then
 			N.resumeFishing()
 			N.fishStep()
 			return
@@ -35476,7 +35703,7 @@ do
 		if not anyAutoOn() then
 			setStatus("Idle")
 		else
-			setStatus("Waiting (Auto Fish is off)")
+			setStatus("Waiting (Auto Fish is off: turn it or the Smart Planner on to fish)")
 		end
 		task.wait(0.5)
 	end)
@@ -35507,20 +35734,24 @@ do
 	N.InfoText = {}
 	function N.upNext()
 		local out = {}
-		if on("AutoFish") then
+		local who = if N.planner() then "Smart Planner: " else ""
+		if N.planner() then
+			table.insert(out, if N.Plan.say ~= "" then "Smart Planner: " .. N.Plan.say else "Smart Planner: fishing and measuring the income (first minute)")
+		end
+		if N.wants("AutoFish") and not N.planner() then
 			table.insert(out, (if N.fishMode() == "blatant" then "Fishing Blatant: best fish of each school, instant reel" else "Fishing Safe: the game's auto fishing aimed at the best fish") .. string.format(", %d%% Perfect", math.floor(optionNumber("PerfectRate", 60))))
 		end
-		if on("SmartSell") then
-			table.insert(out, string.format("Selling at %d%% backpack%s", math.floor(optionNumber("SellAt", 80)), if N.planner() then " or when the planner needs cash" else ""))
+		if N.wants("SmartSell") then
+			table.insert(out, who .. string.format("selling at %d%% backpack, before a cast that would not fit%s", math.floor(optionNumber("SellAt", 80)), if N.planner() then " and to fund the next buy" else ""))
 		end
-		if N.planner() then
-			table.insert(out, if N.Plan.say ~= "" then N.Plan.say else "Smart Planner measuring income")
+		if N.wants("AutoPond") then
+			table.insert(out, who .. (if N.unlocked("Pond") then "pond trip every " .. math.floor(optionNumber("PondEvery", 60)) .. " min" else "pond unlock at level 5 when it pays back"))
 		end
-		if on("AutoPond") then
-			table.insert(out, "Pond trip every " .. math.floor(optionNumber("PondEvery", 60)) .. " min")
+		if N.wants("AutoRewards") then
+			table.insert(out, who .. "claiming rewards" .. (if N.wants("AutoCodes") then " and codes" else "") .. " when ready")
 		end
-		if on("AutoRewards") then
-			table.insert(out, "Claiming rewards when ready")
+		if N.tutorialHold() then
+			table.insert(out, "Tutorial held at step 6: x2 luck on every cast (no playtime gifts or quests meanwhile)")
 		end
 		return out
 	end
@@ -35573,8 +35804,8 @@ do
 					then "Pond locked (level 5, 25K). Auto Pond unlocks it"
 					else string.format("Level %s, pending %s\n%s\nTrips %d", tostring(pond.Level or 1), formatNumber(pond.PendingIncome or 0), N.Pond.last, Session.pondTrips)
 				I.planner = if N.planner()
-					then string.format("<b>On</b>  \u{00B7}  income %s/h\n%s\nLast buy: %s", formatNumber(N.Econ.rate * 3600), if N.Plan.say ~= "" then N.Plan.say else "Measuring income (1 minute)", N.Shop.last)
-					else "Off. Turn it on to buy upgrades, rods, worlds and the pond in payback order. Your other toggles stay as they are"
+					then string.format("<b>On</b>  \u{00B7}  income %s/h\n%s\nLast buy: %s", formatNumber(N.Econ.rate * 3600), if N.Plan.say ~= "" then N.Plan.say else "Fishing and measuring the income (1 minute)", N.Shop.last)
+					else "Off. Turn it on and Corvus plays the whole game: fishing, selling, buying by payback, pond, rewards. Your other toggles stay as they are"
 				local up = N.tab("Upgrades")
 				I.upgrades = string.format("Capacity %s  \u{00B7}  Strength %s  \u{00B7}  Weight %s  \u{00B7}  Bounce %s\nHooks per cast %d\nBought %d this session", tostring(up.Capacity or 0), tostring(up.Strength or 0), tostring(up.Weight or 0), tostring(up.Bounce or 0), N.hookCap(), Session.upgrades)
 				local luck, strength = N.rodPower(d.RodEquipped or "Wooden Rod")
@@ -35703,6 +35934,10 @@ do
 				if Log.statusAt and os.clock() - Log.statusAt > 600 and Log.stuckAt ~= Log.statusAt and anyAutoOn() and not string.find(Status, "Fishing", 1, true) and string.sub(Status, 1, 7) ~= "Waiting" then
 					Log.stuckAt = Log.statusAt
 					logProblem("Stuck for 10 minutes on: " .. tostring(Status))
+					-- The autopilot never stays stuck: a rejoin through the game's own channel resets the client state.
+					if N.planner() then
+						N.rejoin("stuck 10 minutes on: " .. tostring(Status))
+					end
 				end
 			end)
 		end
