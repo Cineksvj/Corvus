@@ -33690,6 +33690,10 @@ function N.queueTimeout(mode, waited)
 	D.queueAt = -1e9
 end
 function N.plannedMode()
+	-- A match in progress is never re-planned: the mode we play is the mode we are in (the table decides it).
+	if D.match and D.match.mode then
+		return D.match.mode
+	end
 	if D.modeCache and os.clock() - D.modeAt < 5 and not N.modeCooling(D.modeCache) then
 		return D.modeCache
 	end
@@ -35410,7 +35414,7 @@ do
 				Session.codes,
 				Session.guardStops
 			),
-			"Status: " .. tostring(Status) .. "  |  planner " .. (if N.planner() then "on" else "off") .. "  |  mode " .. N.activeMode() .. ", aim " .. optionText("AimMode", "Straight"),
+			"Status: " .. tostring(Status) .. "  |  planner " .. (if N.planner() then "on" else "off") .. "  |  mode " .. N.activeMode() .. ", aim " .. N.aimStyle(),
 			"Running: " .. table.concat(Debug.running(), ", "),
 			string.format("Learned: balls %s | aim %s | coins/min %s | receives %d", N.ballsText(3), N.aimText(), N.modeText(), Session.receives),
 			string.format("Game: coins %d, diamonds %d, duel today %d/%d, guard %d, legal bound %d (first join: %s), vouchers %d, balls %d, worst untradable %d, quests left %d", N.coins(), N.diamonds(), N.duelEarnedToday(), N.dailyCap(), limit, legal, N.Guard.source, N.vouchers(), select(2, N.ownedBalls()), (N.untradableMax()), N.questsLeft()),
