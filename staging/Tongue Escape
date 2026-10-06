@@ -31786,12 +31786,15 @@ do
 		["Events.LeaveBonusClaim"] = true, -- LeaveBonusSystem (7609)
 		["Events.RedeemPromoCode"] = true, -- CodeSystem (5909)
 		["Events.TrailAction"] = { BuyWins = true, BuySpice = true, Equip = true, Unequip = true }, -- TrailShopSystem (30155, 30183)
-		["Events.ReviveAction"] = { Dismiss = true }, -- ReviveSystem (23053), never "Buy"
+		-- ReviveSystem Close button (23053); "Died" is what UIEffects sends after a KillPart (47358), only the Life Reset
+		-- probe sends it; never "Buy" (Robux)
+		["Events.ReviveAction"] = { Dismiss = true, Died = true },
 		["Remotes.BuySpiceReward"] = true, -- PepperShopSystem (8326)
 		["Remotes.EquipChiliTongue"] = true, -- PepperShopSystem (8351)
 		["TongueRemotes.TongueEvent"] = { traversal = true, start = true, retract = true }, -- TongueClient (27200, 27358, 26219)
+		["TongueRemotes.FocusEvent"] = true, -- CameraFocus (22946): the streaming focus, used only when RequestStreamAroundAsync fails
 	}
-	local Quiet = { ["Events.AddTongue"] = true, ["Events.TrainerBubble"] = true, ["TongueRemotes.TongueEvent"] = true }
+	local Quiet = { ["Events.AddTongue"] = true, ["Events.TrainerBubble"] = true, ["TongueRemotes.TongueEvent"] = true, ["TongueRemotes.FocusEvent"] = true }
 	N.Sent = { count = 0, byName = {} }
 	function N.remote(path)
 		local node = ReplicatedStorage
@@ -32511,7 +32514,7 @@ function N.bubbleStep()
 end
 -- Auto Train: stands on the best usable treadmill (the server sets Training/TrainingOn and fires TrainerHit; the game's
 -- own client plays the practice tongue). Trainers that never start training are skipped for 10 minutes.
-N.Train = { target = nil, since = nil, bad = {}, lastRateLog = -1e9, last = "-", startedAt = nil, rate60 = 0 }
+N.Train = { target = nil, since = nil, bad = {}, lastRateLog = -1e9, last = "-", startedAt = nil, rate60 = 0, ratePP = 0 }
 function N.trainTarget()
 	local now = os.clock()
 	for _, t in ipairs(N.trainers()) do
@@ -32536,6 +32539,8 @@ function N.trainStep()
 		end
 		if os.clock() - T.startedAt > 60 then
 			T.rate60 = N.rateOver(60)
+			-- per tongue-per-point, so off-treadmill modes compare fairly after rebirths and new skins
+			T.ratePP = T.rate60 / math.max(N.perPoint(), 1e-9)
 		end
 		if os.clock() - T.lastRateLog > 300 then
 			T.lastRateLog = os.clock()
@@ -32614,33 +32619,85 @@ N.Probe = {
 	checkAt = 0,
 	holdTrain = false,
 	say = "not tested yet",
+	-- N2 session variant: a launch ("start"), k calls at once, "retract"; kept only when it beats the cadence ladder
+	session = { state = "new", perSec = 0, perPP = 0, gap = 0.25, kept = false },
 }
+-- Probe memory (Corvus/TONGUE_probe.txt): every probe result is kept per PlaceVersion; a game update starts them over.
+-- Keys: tongue/rate/variant/gain (cadence ladder), session*, winpads (teleport), touchpad, liferesets, padcost,
+-- padequip, peppercommit.
 function N.probeLoad()
 	local P = N.Probe
 	P.loaded = true
+	local data = {}
 	local ok, text = pcall(readfile, P.file)
 	if ok and type(text) == "string" then
 		for k, v in string.gmatch(text, "([%w_]+)=([^\n]+)") do
-			P.data[k] = v
+			data[k] = v
 		end
 	end
-	if P.data.pv == tostring(game.PlaceVersion) then
-		P.state = P.data.tongue or "new"
-		P.rate = tonumber(P.data.rate) or 0
-		P.variant = P.data.variant or "plain"
-		P.perSec = tonumber(P.data.gain) or 0
-		if P.state ~= "new" then
-			log("PROBE tongue remembered", "pv " .. tostring(game.PlaceVersion), "result=" .. P.state, "cadence=" .. P.rate .. "/s", "variant=" .. P.variant)
+	local pv = tostring(game.PlaceVersion)
+	if data.pv ~= pv then
+		if data.pv then
+			log("PROBE memory reset", "pv " .. data.pv .. " -> " .. pv, "(game update: every probe runs again)")
 		end
+		data = {}
+	end
+	P.data = data
+	if not data.pv then
+		return
+	end
+	P.state = data.tongue or "new"
+	P.rate = tonumber(data.rate) or 0
+	P.variant = data.variant or "plain"
+	P.perSec = tonumber(data.gain) or 0
+	local s = P.session
+	s.state = data.session or "new"
+	s.perSec = tonumber(data.sessiongain) or 0
+	s.perPP = tonumber(data.sessionpp) or 0
+	s.gap = tonumber(data.sessiongap) or 0.25
+	s.kept = data.sessionkept == "yes"
+	N.Pads.state = data.winpads or "new"
+	N.Pads.touch = data.touchpad or "new"
+	if data.liferesets == "died" or data.liferesets == "respawn" then
+		N.Life.state, N.Life.variant = "accepted", data.liferesets
+	elseif data.liferesets == "rejected" then
+		N.Life.state = "rejected"
+	end
+	if data.padcost then
+		N.Shop.requirementOnly = data.padcost == "kept"
+	end
+	N.Shop.padEquip = data.padequip
+	N.Pepper.commit = data.peppercommit
+	log(
+		"PROBE remembered",
+		"pv " .. pv,
+		"tongue=" .. P.state .. (if P.rate > 0 then "@" .. P.rate .. "/s/" .. P.variant else ""),
+		"session=" .. s.state .. (if s.kept then "/kept" else ""),
+		"touchpad=" .. N.Pads.touch,
+		"winpads=" .. N.Pads.state,
+		"liferesets=" .. (data.liferesets or "new"),
+		"padcost=" .. (data.padcost or "?"),
+		"peppercommit=" .. (data.peppercommit or "?")
+	)
+end
+function N.probeReady()
+	if not N.Probe.loaded then
+		N.probeLoad()
 	end
 end
 function N.probeSave()
 	local P = N.Probe
+	local s = P.session
 	P.data.pv = tostring(game.PlaceVersion)
 	P.data.tongue = P.state
 	P.data.rate = tostring(P.rate)
 	P.data.variant = P.variant
 	P.data.gain = tostring(math.floor(P.perSec * 100) / 100)
+	P.data.session = s.state
+	P.data.sessiongain = tostring(math.floor(s.perSec * 100) / 100)
+	P.data.sessionpp = tostring(math.floor(s.perPP * 1000) / 1000)
+	P.data.sessiongap = tostring(s.gap)
+	P.data.sessionkept = if s.kept then "yes" else "no"
 	local lines = {}
 	for k, v in pairs(P.data) do
 		table.insert(lines, k .. "=" .. v)
@@ -32652,6 +32709,10 @@ function N.probeSave()
 		end
 		writefile(P.file, table.concat(lines, "\n"))
 	end)
+end
+function N.probeSet(key, value)
+	N.Probe.data[key] = tostring(value)
+	N.probeSave()
 end
 -- Fires AddTongue at `rate` per second for `seconds`; with the tongue variant a launch is opened first and closed after.
 local function tongueOpen()
@@ -32710,17 +32771,72 @@ function N.medianRate(fromAt, toAt)
 	table.sort(list)
 	return list[math.floor((#list + 1) / 2)]
 end
--- One measured window: tongue per second while firing at `rate` (rate 0 = baseline).
-function N.measure(rate, seconds, variant)
+-- N2: the real client fires AddTongue only while its tongue extends; one stretch lasts reach / 43.75 studs a second
+-- (EXTEND_SPEED, reach 35 + 7 (L - 1), TongueShared 45949-45962, 46029-46040), so one launch holds at most
+-- k = floor(reach / 43.75) + 1 calls. The session variant opens a launch, sends its k calls at once and retracts.
+function N.sessionK()
+	local sh = N.G.Shared
+	local reach = (tonumber(sh.BASE_STRETCH_STUDS) or 35) + (N.level() - 1) * (tonumber(sh.STUDS_PER_LEVEL) or 7)
+	return math.floor(reach / (tonumber(sh.EXTEND_SPEED) or 43.75)) + 1
+end
+function N.tongueSession(gap, seconds)
+	local stopAt = os.clock() + seconds
+	N.fire("TongueRemotes.TongueEvent", "traversal", true)
+	while os.clock() < stopAt and alive() do
+		local root = N.root()
+		N.fire("TongueRemotes.TongueEvent", "start", if root then root.Position + Vector3.new(0, 1.5, 0) else Vector3.zero)
+		for _ = 1, N.sessionK() do
+			if N.fire("Events.AddTongue") then
+				Session.tongueCalls += 1
+			end
+		end
+		N.fire("TongueRemotes.TongueEvent", "retract")
+		task.wait(gap)
+	end
+	N.fire("TongueRemotes.TongueEvent", "traversal", false)
+end
+-- One measured window: tongue per second while firing at `rate` (rate 0 = baseline; variant "session" uses `gap`).
+function N.measure(rate, seconds, variant, gap)
 	N.meterStep()
 	local from = os.clock()
-	if rate > 0 then
+	if variant == "session" then
+		N.tongueSession(gap or 0.25, seconds)
+	elseif rate > 0 then
 		N.tongueBurst(rate, seconds, variant)
 	else
 		task.wait(seconds)
 	end
 	N.meterStep()
 	return N.medianRate(from, os.clock())
+end
+-- Session probe: 12 s at a launch every 0.25 s, then every 0.1 s, off the treadmill. Kept when it pays 15% more than
+-- the cadence ladder (it can never run beside training: the client refuses a launch while training, 27144).
+function N.sessionProbe(base)
+	local P = N.Probe
+	local s = P.session
+	P.holdTrain = true
+	if base == nil then
+		setStatus("Testing the Auto Tongue launch sessions (off the treadmill for about 30 s)")
+		N.leaveTreadmill()
+		base = N.measure(0, 6)
+	end
+	local best, bestGap = 0, 0.25
+	for _, gap in ipairs({ 0.25, 0.1 }) do
+		local got = N.measure(0, 12, "session", gap) - base
+		log("PROBE tongue", "cadence=" .. N.sessionK() .. "/burst", "variant=session", "gap=" .. gap, "result=" .. (if got > 0.05 then "accepted" else "rejected"), "gain=" .. formatNumber(got) .. "/s")
+		if got > 0.05 and got > best * 1.15 then
+			best, bestGap = got, gap
+		end
+	end
+	P.holdTrain = false
+	local ladder = if P.state == "accepted" then P.perSec else 0
+	s.state = if best > 0 then "accepted" else "rejected"
+	s.perSec, s.gap = best, bestGap
+	s.perPP = best / math.max(N.perPoint(), 1e-9)
+	s.kept = best > 0 and best > ladder * 1.15
+	log("PROBE tongue", "variant=session", "result=" .. (if s.kept then "kept" elseif best > 0 then "dropped" else "rejected"), "gain=" .. formatNumber(best) .. "/s", "ladder=" .. formatNumber(ladder) .. "/s")
+	P.checkAt = os.clock() + 600
+	N.probeSave()
 end
 function N.probeRun()
 	local P = N.Probe
@@ -32743,7 +32859,6 @@ function N.probeRun()
 			break
 		end
 	end
-	P.holdTrain = false
 	if best > 0 then
 		P.state, P.rate, P.variant, P.perSec = "accepted", bestRate, bestVariant, best
 	else
@@ -32752,26 +32867,87 @@ function N.probeRun()
 	P.checkAt = os.clock() + 600
 	N.probeSave()
 	log("PROBE tongue", "cadence=" .. P.rate .. "/s", "variant=" .. P.variant, "result=" .. P.state, "gain=" .. formatNumber(P.perSec) .. "/s")
+	-- the session variant right after, on the same baseline (sessionProbe releases the treadmill hold)
+	N.sessionProbe(base)
 	return P.state
+end
+function N.Probe.pending()
+	local P = N.Probe
+	return not P.loaded or P.state == "new" or P.session.state == "new"
+end
+-- Which Auto Tongue mode pays most now: "session" (off the treadmill), the ladder variant, or nil (training only).
+-- Off-treadmill modes are compared per tongue-per-point with what the treadmill paid, and only after the treadmill
+-- was measured once (60 s), so a fresh start trains first instead of guessing.
+function N.tongueMode()
+	local P = N.Probe
+	local s = P.session
+	if s.state == "accepted" and s.kept then
+		if not N.want("AutoTrain") then
+			return "session"
+		end
+		local train = N.Train.ratePP or 0
+		if train > 0 and s.perPP > train * 1.1 then
+			return "session"
+		end
+	end
+	if P.state ~= "accepted" then
+		return nil
+	end
+	if P.variant == "tongue" and N.want("AutoTrain") and not N.tongueBeatsTraining() then
+		return nil
+	end
+	return P.variant
 end
 -- While Auto Tongue is on: probe once, then fire at the accepted cadence; every 10 min a 20 s check compares the rate
 -- with and without the calls and steps the cadence down when the server stops paying.
 function N.tongueStep()
 	local P = N.Probe
-	if not P.loaded then
-		N.probeLoad()
-	end
+	N.probeReady()
 	if P.state == "new" then
 		N.probeRun()
 		return
 	end
-	if P.state == "rejected" then
-		P.say = "The server does not pay extra AddTongue calls (tested on this game version). Training only"
+	if P.session.state == "new" then
+		N.sessionProbe()
 		return
 	end
-	-- the open-tongue variant cannot run on a treadmill (the client refuses a tongue while training, 27144)
-	if P.variant == "tongue" and N.want("AutoTrain") and not N.tongueBeatsTraining() then
-		P.say = string.format("Works with an open tongue (+%s/s), but training pays more now", formatNumber(P.perSec))
+	local mode = N.tongueMode()
+	if not mode then
+		if P.state ~= "accepted" and not P.session.kept then
+			P.say = "The server does not pay extra AddTongue calls (tested on this game version). Training only"
+		else
+			-- the open-tongue and session variants cannot run on a treadmill (the client refuses a tongue while training, 27144)
+			P.say = string.format("Works off the treadmill (+%s/s), but training pays more now", formatNumber(math.max(if P.state == "accepted" then P.perSec else 0, if P.session.kept then P.session.perSec else 0)))
+		end
+		return
+	end
+	if mode == "session" and os.clock() >= P.checkAt then
+		-- a 15 s recheck every 10 min off the treadmill; a session that stops paying falls back to the ladder
+		P.checkAt = os.clock() + 600
+		P.holdTrain = true
+		task.wait(0.6)
+		N.leaveTreadmill()
+		local base = N.measure(0, 5)
+		local extra = N.measure(0, 10, "session", P.session.gap) - base
+		P.holdTrain = false
+		log("PROBE tongue recheck", "variant=session", "result=" .. (if extra > 0.05 then "accepted" else "rejected"), "gain=" .. formatNumber(extra) .. "/s")
+		if extra <= 0.05 then
+			P.session.state, P.session.kept = "rejected", false
+			N.probeSave()
+		else
+			P.session.perSec = extra
+			P.session.perPP = extra / math.max(N.perPoint(), 1e-9)
+		end
+		return
+	end
+	if mode == "session" then
+		if N.training() then
+			-- the farm loop steps off the treadmill first
+			task.wait(0.5)
+			return
+		end
+		P.say = string.format("Server pays <b>+%s/s</b> in launch sessions of %d calls (off the treadmill: beats training)", formatNumber(P.session.perSec), N.sessionK())
+		N.tongueSession(P.session.gap, 3)
 		return
 	end
 	if os.clock() >= P.checkAt then
@@ -32804,12 +32980,14 @@ function N.tongueStep()
 end
 function N.tongueBeatsTraining()
 	local P = N.Probe
-	return P.state == "accepted" and P.perSec > N.Train.rate60 or false
+	-- only against a measured treadmill rate: a fresh start trains first
+	return P.state == "accepted" and N.Train.rate60 > 0 and P.perSec > N.Train.rate60 or false
 end
 -- Wins pads at the end of every stage (Map.GiveWins.OneWin/TwoWin.Button1..15, WinAmount 1..8000). Walk (Legit) walks
--- toward the next pad and stops where the path ends; Teleport (Probe) hops pad to pad (the game itself moves the
--- character by CFrame on sticks) and checks every Wins change: off until an alt test, opt-in in the Wins tab.
-N.Pads = { state = "new", nextAt = 0, backoff = 60, lastPass = 0, last = "-", walkFails = 0, walkBest = 0, say = "-" }
+-- toward the next pad and stops where the path ends; Touch (Probe) stays on the treadmill and touches every pad by
+-- firetouchinterest (N1, no movement, training never stops); Teleport (Probe) hops pad to pad (the game itself moves the
+-- character by CFrame on sticks). Both probes check every Wins change and are remembered per game version.
+N.Pads = { state = "new", touch = "new", nextAt = 0, backoff = 60, lastPass = 0, last = "-", walkFails = 0, walkBest = 0, say = "-", resetNext = false, afterReset = false }
 function N.winPads()
 	local out = {}
 	local map = N.map()
@@ -32866,7 +33044,7 @@ function N.padTeleportPass()
 		local before = N.wins()
 		N.tp(N.padSpot(pad))
 		task.wait(0.4)
-		local touch = pad.model:FindFirstChild("Touch")
+		local touch = N.streamPad(pad)
 		if touch then
 			N.touch(touch)
 		end
@@ -32911,6 +33089,246 @@ function N.padWalkPass()
 	end
 	return total, P.walkBest
 end
+-- Pads past stage 3 are outside the streaming radius (the dump shows only their pivots): the spot is streamed in first
+-- (Player:RequestStreamAroundAsync; if that fails, the game's own FocusEvent like CameraFocus 22946), then Touch is
+-- awaited 5 s.
+function N.streamPad(pad)
+	local touch = pad.model:FindFirstChild("Touch")
+	if touch then
+		return touch
+	end
+	local pos = pad.model:GetPivot().Position
+	local requested = pcall(function()
+		LocalPlayer:RequestStreamAroundAsync(pos, 5)
+	end)
+	local function found()
+		return pad.model:FindFirstChild("Touch") ~= nil
+	end
+	if not (requested and waitFor(found, 3)) then
+		N.fire("TongueRemotes.FocusEvent", pos)
+		N.Pads.focused = true
+		if not waitFor(found, if requested then 2 else 5) then
+			log("WINPAD stream timeout", "pad=" .. pad.lane .. pad.index)
+			return nil
+		end
+	end
+	return pad.model:FindFirstChild("Touch")
+end
+-- After a FocusEvent the streaming focus goes back to the character (the game's camera script moves it on its own too).
+function N.restoreFocus()
+	if N.Pads.focused then
+		N.Pads.focused = false
+		local root = N.root()
+		if root then
+			N.fire("TongueRemotes.FocusEvent", root.Position)
+		end
+	end
+end
+function N.touchSupported()
+	return type(firetouchinterest) == "function"
+end
+-- One pad touched from where the character stands; returns the Wins it paid (waits `seconds` for the change).
+function N.touchPadFromHere(pad, seconds)
+	local touch = N.streamPad(pad)
+	if not touch then
+		return 0
+	end
+	local before = N.wins()
+	N.touch(touch)
+	waitFor(function()
+		return N.wins() > before
+	end, seconds or 1.5)
+	return N.wins() - before
+end
+-- A full lap by touch: every pad in order, 0.1 s apart, the Wins are counted once at the end.
+function N.padTouchPass(skip)
+	local before = N.wins()
+	local touched, reached = 0, 0
+	for _, pad in ipairs(N.winPads()) do
+		if not alive() then
+			break
+		end
+		if not (skip and skip[pad.lane .. pad.index]) then
+			local touch = N.streamPad(pad)
+			if touch then
+				N.touch(touch)
+				touched += 1
+				reached = math.max(reached, pad.index)
+				task.wait(0.1)
+			end
+		end
+	end
+	N.restoreFocus()
+	task.wait(1.5)
+	local total = math.max(N.wins() - before, 0)
+	log("WINPAD touch pass", "+" .. formatNumber(total), "pads " .. touched, "training=" .. tostring(N.training()))
+	return total, reached
+end
+-- N1 probe: OneWin pad 1, then 3 (skipping 2), then 15, each by touch from the treadmill, proof = the Wins stat.
+function N.touchProbe()
+	local P = N.Pads
+	local byKey = {}
+	for _, pad in ipairs(N.winPads()) do
+		byKey[pad.lane .. pad.index] = pad
+	end
+	local total, reached, paid, done = 0, 0, 0, {}
+	for _, key in ipairs({ "OneWin1", "OneWin3", "OneWin15" }) do
+		local pad = byKey[key]
+		if pad and alive() then
+			local delta = N.touchPadFromHere(pad, 1.5)
+			done[key] = true
+			log("PROBE touchpad", "pad=" .. key, "result=" .. (if delta > 0 then "accepted" else "rejected"), "delta=" .. formatNumber(delta), "training=" .. tostring(N.training()))
+			if delta > 0 then
+				total += delta
+				paid += 1
+				reached = math.max(reached, pad.index)
+			end
+		end
+	end
+	N.restoreFocus()
+	P.touch = if paid > 0 then "accepted" else "rejected"
+	if paid == 0 and P.state == "accepted" then
+		log("PROBE touchpad", "note=distance", "(teleport touches pay, touches from the treadmill do not)")
+	end
+	if paid > 0 then
+		local more, last = N.padTouchPass(done)
+		total += more
+		reached = math.max(reached, last)
+	end
+	N.probeSet("touchpad", P.touch)
+	log("PROBE touchpad", "result=" .. P.touch, "gain=" .. formatNumber(total), "reached=" .. reached)
+	return total, reached
+end
+-- The route a pad run uses: the dropdown, except that the Smart Planner moves a Walk dropdown to a route its probe
+-- already accepted on this game version (Touch first: no movement; Teleport only with Allow Teleport Probe on), and a
+-- rejected Touch probe (or an executor without firetouchinterest) falls back to Walk.
+function N.activeRoute()
+	local route = N.winsRoute()
+	local P = N.Pads
+	if route == "Walk (Legit)" and N.planner() then
+		if P.touch == "accepted" and N.touchSupported() then
+			return "Touch (Probe)"
+		end
+		if P.state == "accepted" and on("AllowTeleport") then
+			return "Teleport (Probe)"
+		end
+	end
+	if route == "Touch (Probe)" and (P.touch == "rejected" or not N.touchSupported()) then
+		return "Walk (Legit)"
+	end
+	return route
+end
+-- N5 life resets. Death is client-side in this game: on a KillPart the client moves itself to Start and sends
+-- ReviveAction "Died" (UIEffects 47335-47359); the server answers "open" with the stage and a Robux revive price.
+-- Probe (Life Reset Probe toggle, once per game version) when the pads stop paying: "Died" + "Dismiss" and a re-touch
+-- of OneWin pad 1; if it does not pay, a real respawn (Humanoid.Health = 0) and a re-touch. An accepted reset is then
+-- used (toggle or Smart Planner) after every pad pass while Wins still buy something. N6 rule: never during the Spice
+-- Festival or while pepper pickups wait for a commit (a reset drops them, SpicePepperFeedback "Reset").
+N.Life = { state = "new", variant = nil, openStage = nil, resets = 0, misses = 0, say = "-" }
+N.onEvent("Events.ReviveAction", function(kind, stage)
+	if kind == "open" then
+		N.Life.openStage = tonumber(stage) or 0
+	end
+end)
+function N.lifeResetBlocked()
+	if N.festival() then
+		return "the Spice Festival is running"
+	end
+	if N.Pepper.pending > 0 then
+		return "pepper pickups wait for a commit"
+	end
+	return nil
+end
+function N.lifeResetsWanted()
+	local L = N.Life
+	if L.state == "accepted" then
+		return on("LifeResets") or N.planner()
+	end
+	return L.state == "new" and on("LifeResets")
+end
+function N.lifeReset(variant)
+	local L = N.Life
+	L.openStage = nil
+	if variant == "died" then
+		N.fire("Events.ReviveAction", "Died")
+		waitFor(function()
+			return L.openStage ~= nil
+		end, 3)
+	else
+		local hum = N.humanoid()
+		if not hum then
+			return false
+		end
+		pcall(function()
+			hum.Health = 0
+		end)
+		waitFor(function()
+			return not N.alive()
+		end, 3)
+		if not waitFor(function()
+			return N.alive()
+		end, 15) then
+			return false
+		end
+		task.wait(0.5)
+	end
+	if L.openStage ~= nil then
+		-- the revive window (Robux) is closed like the game's Close button
+		N.fire("Events.ReviveAction", "Dismiss")
+	end
+	L.resets += 1
+	if L.resets <= 3 or L.resets % 20 == 0 then
+		log("LIFE reset", variant, "total " .. L.resets, "stage " .. tostring(L.openStage))
+	end
+	return true
+end
+-- Re-touch of OneWin pad 1 on the active route (proof for the life reset probe).
+local function retouchFirstPad(route)
+	local pad
+	for _, p in ipairs(N.winPads()) do
+		if p.lane == "OneWin" and p.index == 1 then
+			pad = p
+			break
+		end
+	end
+	if not pad then
+		return 0
+	end
+	if route == "Teleport (Probe)" then
+		N.tp(N.padSpot(pad))
+		task.wait(0.4)
+	end
+	local delta = N.touchPadFromHere(pad, 2)
+	N.restoreFocus()
+	if route == "Teleport (Probe)" then
+		backToLobby()
+	end
+	return delta
+end
+function N.lifeResetProbe(route)
+	local L = N.Life
+	setStatus("Testing whether a new life resets the wins pads")
+	for _, variant in ipairs({ "died", "respawn" }) do
+		if N.lifeReset(variant) then
+			if variant == "died" then
+				local root = N.root()
+				log("PROBE stage", "server=" .. tostring(L.openStage), "x=" .. (if root then string.format("%.0f", root.Position.X) else "?"))
+			end
+			local delta = retouchFirstPad(route)
+			log("PROBE liferesets", "variant=" .. variant, "result=" .. (if delta > 0 then "accepted" else "rejected"), "delta=" .. formatNumber(delta))
+			if delta > 0 then
+				L.state, L.variant = "accepted", variant
+				N.probeSet("liferesets", variant)
+				return true
+			end
+		else
+			log("PROBE liferesets", "variant=" .. variant, "result=rejected", "reason=no character")
+		end
+	end
+	L.state = "rejected"
+	N.probeSet("liferesets", "rejected")
+	return false
+end
 function N.padsStep()
 	local P = N.Pads
 	if os.clock() < P.nextAt then
@@ -32921,18 +33339,13 @@ function N.padsStep()
 		P.nextAt = os.clock() + 300
 		return false
 	end
-	if not P.loaded then
-		P.loaded = true
-		if not N.Probe.loaded then
-			N.probeLoad()
-		end
-		local d = N.Probe.data
-		if d.pv == tostring(game.PlaceVersion) and d.winpads then
-			P.state = d.winpads
-			log("PROBE winpads remembered", "result=" .. P.state)
-		end
+	N.probeReady()
+	local chosen = N.winsRoute()
+	local route = N.activeRoute()
+	local note = nil
+	if chosen == "Touch (Probe)" and route ~= chosen then
+		note = if N.touchSupported() then "The server did not pay pad touches from the treadmill on this game version: walking instead" else "Your executor has no firetouchinterest: walking instead"
 	end
-	local route = N.winsRoute()
 	if route == "Teleport (Probe)" and not on("AllowTeleport") then
 		P.say = "Teleport route is off until you allow the probe (test it on an alt first)"
 		P.nextAt = os.clock() + 30
@@ -32943,11 +33356,27 @@ function N.padsStep()
 		P.nextAt = os.clock() + 3600
 		return false
 	end
-	N.leaveTreadmill()
+	local L = N.Life
+	if P.resetNext then
+		P.resetNext = false
+		if not N.lifeResetBlocked() then
+			P.afterReset = N.lifeReset(L.variant)
+		end
+	end
+	-- Touch keeps the character on the treadmill: training never stops
+	if route ~= "Touch (Probe)" then
+		N.leaveTreadmill()
+	end
 	setStatus("Running the wins pads (" .. route .. ")")
 	local before = N.wins()
 	local total, reached
-	if route == "Teleport (Probe)" then
+	if route == "Touch (Probe)" then
+		if P.touch == "new" then
+			total, reached = N.touchProbe()
+		else
+			total, reached = N.padTouchPass()
+		end
+	elseif route == "Teleport (Probe)" then
 		total, reached = N.padTeleportPass()
 	else
 		total, reached = N.padWalkPass()
@@ -32956,21 +33385,52 @@ function N.padsStep()
 	Session.padWins += total
 	local delta = N.wins() - before
 	P.last = string.format("+%s wins, reached pad %d", formatNumber(math.max(delta, total)), reached or 0)
-	if route == "Teleport (Probe)" then
-		local result = if total > 0 then "accepted" elseif P.state == "accepted" then "cooldown" else "rejected"
-		log("PROBE winpads", "result=" .. result, "gain=" .. formatNumber(total), "reached=" .. tostring(reached))
+	if route ~= "Walk (Legit)" then
+		local key = if route == "Touch (Probe)" then "touch" else "state"
+		local result = if total > 0 then "accepted" elseif P[key] == "accepted" then "cooldown" else "rejected"
+		if route == "Teleport (Probe)" then
+			log("PROBE winpads", "result=" .. result, "gain=" .. formatNumber(total), "reached=" .. tostring(reached))
+		end
 		if result == "accepted" then
-			P.state = "accepted"
+			P[key] = "accepted"
 			P.backoff = 60
 		elseif result == "cooldown" then
 			P.backoff = math.min(P.backoff * 2, 1800)
 		else
-			P.state = "rejected"
+			P[key] = "rejected"
 		end
-		N.Probe.data.winpads = P.state
-		N.probeSave()
+		N.probeSet(if key == "touch" then "touchpad" else "winpads", P[key])
 		P.nextAt = os.clock() + P.backoff
-		P.say = if P.state == "accepted" then "Teleport pads pay. Next run in " .. N.longTime(P.backoff) else "Teleport pad touches were not paid"
+		local name = if key == "touch" then "Pad touches from the treadmill" else "Teleport pads"
+		P.say = if P[key] == "accepted" then name .. " pay. Next run in " .. N.longTime(P.backoff) elseif key == "touch" then name .. " were not paid on this game version: walking instead" else name .. " were not paid"
+		-- a pass right after a life reset that pays nothing twice means the reset stopped working
+		if P.afterReset then
+			P.afterReset = false
+			if total > 0 then
+				L.misses = 0
+			else
+				L.misses += 1
+				if L.misses >= 2 then
+					L.state = "rejected"
+					N.probeSet("liferesets", "rejected")
+					log("PROBE liferesets recheck", "variant=" .. tostring(L.variant), "result=rejected")
+				end
+			end
+		end
+		if result ~= "rejected" and N.lifeResetsWanted() and N.winsWanted() then
+			local blocked = N.lifeResetBlocked()
+			if blocked then
+				L.say = "Life resets wait: " .. blocked
+			elseif L.state == "new" and result == "cooldown" then
+				if N.lifeResetProbe(route) then
+					P.resetNext, P.nextAt = true, os.clock() + 2
+				end
+			elseif L.state == "accepted" then
+				-- a new life every pass while Wins still buy something (16,000 wins a lap from the two pad 15s)
+				P.resetNext, P.nextAt = true, os.clock() + 2
+				L.say = "New life after every pass (" .. tostring(L.variant) .. ")"
+			end
+		end
 	else
 		if total > 0 then
 			P.walkFails = 0
@@ -32980,10 +33440,13 @@ function N.padsStep()
 			-- the planner alone does not repeat a walk that never reached a pad (6 h): it only costs training time
 			P.nextAt = os.clock() + (if not on("AutoWins") and P.walkBest == 0 then 21600 elseif P.walkFails >= 3 or not on("AutoWins") then 1800 else 120)
 			if P.walkFails == 3 then
-				log("WINPAD walk cannot reach the pads on foot; the Teleport route needs an alt test")
+				log("WINPAD walk cannot reach the pads on foot; the Touch or Teleport route needs a test")
 			end
 		end
-		P.say = if P.walkFails >= 3 then "Walking cannot reach the stage pads (the stages need the tongue). Teleport (Probe) is the fast route, test it on an alt" else P.last
+		P.say = if P.walkFails >= 3 then "Walking cannot reach the stage pads (the stages need the tongue). Touch (Probe) or Teleport (Probe) are the fast routes" else P.last
+	end
+	if note then
+		P.say = note
 	end
 	return true
 end
@@ -33017,11 +33480,14 @@ function N.buyPad(pad)
 	local spent = winsBefore - N.wins()
 	Session.upgrades += 1
 	Session.winsSpent += math.max(spent, 0)
-	if N.Shop.requirementOnly == nil then
-		N.Shop.requirementOnly = spent <= 0 and pad.cost > 0
+	if N.Shop.requirementOnly == nil and pad.cost > 0 then
+		N.Shop.requirementOnly = spent <= 0
 		if N.Shop.requirementOnly then
 			log("UPGRADE pads keep the wins (a requirement, not a cost)")
 		end
+		-- remembered per game version: decides whether owned pads may be touched again to re-equip a skin (N8)
+		log("PROBE padcost", "result=" .. (if N.Shop.requirementOnly then "kept" else "spent"), "wins " .. formatNumber(winsBefore) .. " -> " .. formatNumber(N.wins()))
+		N.probeSet("padcost", if N.Shop.requirementOnly then "kept" else "spent")
 	end
 	N.Shop.lastBuy = pad.name .. " (+" .. (1 + pad.bonus) .. " per point)"
 	log("UPGRADE", pad.name, "ok", "+" .. (1 + pad.bonus) .. " tongue per point", "wins " .. formatNumber(winsBefore) .. " -> " .. formatNumber(N.wins()))
@@ -33106,7 +33572,16 @@ function N.pepperBuyStep()
 	end
 	return false
 end
--- Equips the owned skin with the most tongue per point (a chili tongue beats pads up to Button13).
+-- Equips the owned skin with the most tongue per point (a chili tongue beats pads up to Button13). Chili tongues equip
+-- by remote. A pad skin equips by touching its owned pad again (UpgradeVisuals marks the touched owned pad EQUIPPED,
+-- 31426-31437), e.g. after the lobby walk crossed a lower pad (N8). The hub re-touches only when the first purchase
+-- showed that pads keep the wins (PROBE padcost result=kept), so a re-touch can never charge; never while a chili
+-- tongue is the best skin (pads top out at +46, chili tongues give 50 and 67).
+function N.equippedSkin()
+	local folder = LocalPlayer:FindFirstChild("Upgrades")
+	local eq = folder and folder:FindFirstChild("Equipped")
+	return eq and eq.Value or ""
+end
 function N.equipBestSkin()
 	local ups = N.ownedUpgrades()
 	local cur, curName = N.skinPerPoint()
@@ -33121,7 +33596,77 @@ function N.equipBestSkin()
 		log("CHILI equip", bestId, "+" .. bestPer .. " per point (was " .. cur .. ")")
 		return true
 	end
+	local bestPad
+	for _, pad in ipairs(N.pads()) do
+		if pad.owned and 1 + pad.bonus > cur and (not bestPad or pad.bonus > bestPad.bonus) then
+			bestPad = pad
+		end
+	end
+	local Shop = N.Shop
+	if not bestPad or bestId then
+		return false
+	end
+	if Shop.requirementOnly ~= true then
+		if Shop.retouchSaid ~= curName .. bestPad.name then
+			Shop.retouchSaid = curName .. bestPad.name
+			log("SKIN", curName .. " is equipped, " .. bestPad.name .. " is better: re-touch skipped (pads may charge wins again)")
+		end
+		return false
+	end
+	if Shop.padEquip == "rejected" or os.clock() < (Shop.retouchPauseUntil or 0) then
+		return false
+	end
+	-- the farm loop owns the character
+	N.Plan.retouch = bestPad
 	return false
+end
+-- Walks onto the owned pad and touches it; verified by Upgrades.Equipped. Three re-touches in 10 minutes (the lobby
+-- walk keeps crossing a lower pad) pause it for 30 minutes; two touches that never equip stop it for this game version.
+function N.retouchPad(pad)
+	local Shop = N.Shop
+	-- a request queued while the last re-touch was walking is stale once the skin is back
+	if N.equippedSkin() == pad.name or not N.ownedUpgrades()[pad.name] then
+		return false
+	end
+	local touch = pad.model:FindFirstChild("Touch")
+	local pos = (touch and touch.Position or pad.model:GetPivot().Position) + Vector3.new(0, 3, 0)
+	local now = os.clock()
+	Shop.retouchAt = Shop.retouchAt or {}
+	while #Shop.retouchAt > 0 and now - Shop.retouchAt[1] > 600 do
+		table.remove(Shop.retouchAt, 1)
+	end
+	if #Shop.retouchAt >= 3 then
+		Shop.retouchAt = {}
+		Shop.retouchPauseUntil = now + 1800
+		log("SKIN re-touch paused 30 min (the skin keeps changing: the lobby walk crosses an owned pad)")
+		return false
+	end
+	table.insert(Shop.retouchAt, now)
+	N.leaveTreadmill()
+	setStatus("Re-equipping the " .. pad.name .. " skin")
+	if not N.goTo(pos, 2.5) then
+		log("SKIN re-touch", pad.name, "result=unreachable")
+		Shop.retouchPauseUntil = os.clock() + 300
+		return false
+	end
+	if touch then
+		N.touch(touch)
+	end
+	local ok = waitFor(function()
+		return N.equippedSkin() == pad.name
+	end, 3)
+	log("SKIN re-touch", pad.name, "result=" .. (if ok then "ok" else "not equipped"), "+" .. (1 + pad.bonus) .. " per point")
+	if ok then
+		Shop.retouchFails = 0
+	else
+		Shop.retouchFails = (Shop.retouchFails or 0) + 1
+		if Shop.retouchFails >= 2 then
+			Shop.padEquip = "rejected"
+			log("PROBE padequip", "result=rejected", "(touching an owned pad does not equip it)")
+			N.probeSet("padequip", "rejected")
+		end
+	end
+	return ok
 end
 -- Rebirth: RequestRebirth when Level >= 10 (R + 1) (RebirthSystem 22513-22527). Every rebirth is +0.5x tongue for good;
 -- the level reset only shortens the tongue reach, which the hub's routes do not use.
@@ -33149,47 +33694,135 @@ function N.rebirthStep()
 end
 -- Spice Festival (ReplicatedStorage SpiceFestivalActive, 25 min every 4 h): peppers tagged SpicePepper sit in the stages,
 -- so they are picked up only on the Teleport route (one hop per pepper, verified by the SpicePeppers attribute).
-N.Pepper = { last = "-", state = "new" }
+-- N6 commit rule: a pickup is pending until the server commits it (SpicePepperFeedback "Collected" -> "Committed",
+-- or "Reset" on a death, 24288-24303). Which step commits is measured once per game version (PROBE peppercommit
+-- after=pickup|pad|lobby): the route then ends every stage with that stage's own win pad (or the lobby) and never
+-- resets a life while pickups are pending.
+N.Pepper = { last = "-", state = "new", pending = 0, commit = nil }
+N.onEvent("Remotes.SpicePepperFeedback", function(_, _, kind)
+	local Pp = N.Pepper
+	if kind == "Collected" then
+		Pp.pending += 1
+	elseif kind == "Committed" or kind == "Reset" then
+		if N.want("AutoPeppers") then
+			log("PEPPER " .. kind, "pending " .. Pp.pending, "have " .. N.peppers())
+		end
+		Pp.pending = 0
+	elseif kind == "EventEnded" then
+		Pp.pending = 0
+	end
+end)
 function N.festival()
 	return ReplicatedStorage:GetAttribute("SpiceFestivalActive") == true
 end
+-- The stage a pepper sits in ends at the first OneWin pad past it (stages run toward -X, pad 1 at x 2893.5).
+function N.stagePadFor(pos)
+	local best, bestX
+	for _, pad in ipairs(N.winPads()) do
+		if pad.lane == "OneWin" then
+			local x = pad.model:GetPivot().Position.X
+			if x < pos.X and (not bestX or x > bestX) then
+				best, bestX = pad, x
+			end
+		end
+	end
+	return best
+end
 function N.pepperStep()
+	local Pp = N.Pepper
 	if not N.festival() then
-		N.Pepper.last = "Spice Festival is not running"
+		Pp.last = "Spice Festival is not running"
 		return false
 	end
 	if not N.teleportAllowed() then
-		N.Pepper.last = "Peppers sit in the stages: needs the Teleport route (Wins tab)"
+		Pp.last = "Peppers sit in the stages: needs the Teleport route (Wins tab)"
 		return false
 	end
 	local list = game:GetService("CollectionService"):GetTagged("SpicePepper")
 	if #list == 0 then
-		N.Pepper.last = "Festival on, no peppers left in streaming range"
+		Pp.last = "Festival on, no peppers left in streaming range"
 		return false
 	end
+	N.probeReady()
 	N.leaveTreadmill()
-	local got = 0
+	-- peppers grouped by stage, nearest stage first
+	local groups, order = {}, {}
 	for i, pepper in ipairs(list) do
-		if i > 20 or not alive() or not N.alive() then
+		if i > 20 then
 			break
 		end
 		local part = if pepper:IsA("BasePart") then pepper else pepper:FindFirstChildWhichIsA("BasePart", true)
 		if part then
-			local before = N.peppers()
+			local pad = N.stagePadFor(part.Position)
+			local key = if pad then pad.index else 0
+			if not groups[key] then
+				groups[key] = { pad = pad, parts = {} }
+				table.insert(order, key)
+			end
+			table.insert(groups[key].parts, part)
+		end
+	end
+	table.sort(order)
+	local start = N.peppers()
+	for _, key in ipairs(order) do
+		local g = groups[key]
+		if not alive() or not N.alive() then
+			break
+		end
+		local before, pendingBefore = N.peppers(), Pp.pending
+		for _, part in ipairs(g.parts) do
+			if not alive() or not N.alive() then
+				break
+			end
+			local had, hadPending = N.peppers(), Pp.pending
 			N.tp(part.Position + Vector3.new(0, 2, 0))
 			N.touch(part)
 			waitFor(function()
-				return N.peppers() > before
+				return N.peppers() > had or Pp.pending > hadPending
 			end, 1)
-			if N.peppers() > before then
-				got += N.peppers() - before
+		end
+		local afterPickup = N.peppers()
+		local picked = afterPickup > before or Pp.pending > pendingBefore
+		-- the stage ends with its own pad, like a player who finishes it (unless pickups commit at once)
+		if picked and Pp.commit ~= "pickup" and Pp.commit ~= "lobby" and g.pad then
+			N.tp(N.padSpot(g.pad))
+			task.wait(0.3)
+			local touch = N.streamPad(g.pad)
+			if touch then
+				N.touch(touch)
+			end
+			waitFor(function()
+				return N.peppers() > afterPickup
+			end, 1.5)
+		end
+		if Pp.commit == nil and picked then
+			local after = if afterPickup > before then "pickup" elseif N.peppers() > afterPickup then "pad" else nil
+			if after then
+				Pp.commit = after
+				log("PROBE peppercommit", "after=" .. after, "peppers=" .. N.peppers())
+				N.probeSet("peppercommit", after)
 			end
 		end
 	end
-	Session.peppers += got
-	log("PROBE peppers", "result=" .. (if got > 0 then "accepted" else "rejected"), "gain=" .. got)
-	N.Pepper.last = string.format("Picked %d peppers (have %d)", got, N.peppers())
+	local beforeLobby = N.peppers()
 	backToLobby()
+	if Pp.commit == nil or Pp.commit == "lobby" then
+		waitFor(function()
+			return N.peppers() > beforeLobby
+		end, 1.5)
+		if Pp.commit == nil then
+			local after = if N.peppers() > beforeLobby then "lobby" else "none"
+			log("PROBE peppercommit", "after=" .. after, "peppers=" .. N.peppers(), "pending " .. Pp.pending)
+			if after == "lobby" then
+				Pp.commit = after
+				N.probeSet("peppercommit", after)
+			end
+		end
+	end
+	local got = math.max(N.peppers() - start, 0)
+	Session.peppers += got
+	log("PROBE peppers", "result=" .. (if got > 0 then "accepted" else "rejected"), "gain=" .. got, "pending " .. Pp.pending)
+	Pp.last = string.format("Picked %d peppers (have %d)%s", got, N.peppers(), if Pp.commit then ", committed after " .. Pp.commit else "")
 	return got > 0
 end
 -- Anti AFK: the game rejoins after 900 s without UserInputService input (AntiAfkSystem 5659-5673), Roblox kicks after
@@ -33526,7 +34159,7 @@ end
 -- skin (1 + TongueBonus of the pad, or a chili tongue's TonguePerTrain) x trail TongueBoost x (1 + 0.5 x Rebirths).
 -- Wins have no other use than skins and trails, so every Wins item is ranked by tongue growth per win
 -- (log(gain) / price) and its payback is the time the current Wins income needs to pay it.
-N.Plan = { list = {}, say = "-", spendText = "", lastBuy = "-", lastLogAt = -1e9, lastText = "", rebirthWaitUntil = 0, padWanted = nil }
+N.Plan = { list = {}, say = "-", spendText = "", lastBuy = "-", lastLogAt = -1e9, lastText = "", rebirthWaitUntil = 0, padWanted = nil, retouch = nil }
 function N.winsPerHour()
 	local elapsed = math.max(os.clock() - Session.started, 60)
 	return Session.winsGained / elapsed * 3600
@@ -33635,6 +34268,7 @@ function N.planStep()
 		log("PLAN idle reason=no usable treadmill found in the lobby")
 	end
 	N.Plan.padWanted = nil
+	N.Plan.retouch = nil
 	if buying then
 		local list = N.planCandidates()
 		N.Plan.list = list
@@ -33664,11 +34298,20 @@ function N.planStep()
 		N.equipBestTrail()
 	end
 	if planner then
-		do
-			table.insert(lines, if N.winsWanted() then "Run the wins pads: Wins still buy tongue" else "Skip pad runs: nothing left to buy with Wins")
+		-- accepted probes only (a probe never starts from the planner): Touch/Teleport route, life resets, session
+		if N.winsWanted() then
+			local route = N.activeRoute()
+			local resets = if N.Life.state == "accepted" then ", new life after each pass (" .. tostring(N.Life.variant) .. ")" else ""
+			table.insert(lines, "Run the wins pads by " .. route .. resets .. ": Wins still buy tongue")
+		else
+			table.insert(lines, "Skip pad runs: nothing left to buy with Wins")
 		end
 		do
-			table.insert(lines, "Auto Tongue: " .. N.Probe.state .. (if N.Probe.rate > 0 then " at " .. N.Probe.rate .. "/s" else ""))
+			local mode = N.tongueMode()
+			table.insert(lines, "Auto Tongue: " .. (if mode == "session" then "launch sessions off the treadmill" elseif mode then N.Probe.state .. " at " .. N.Probe.rate .. "/s " .. mode else N.Probe.state))
+		end
+		if N.festival() then
+			table.insert(lines, "Spice Festival: peppers commit after " .. (N.Pepper.commit or "? (measured on the first run)") .. ", no life resets until it ends")
 		end
 		local text = table.concat(lines, " | ")
 		if text ~= N.Plan.say and os.clock() - N.Plan.lastLogAt > 60 or os.clock() - N.Plan.lastLogAt > 600 then
@@ -33690,13 +34333,14 @@ function N.upNext()
 		table.insert(out, "Pop training bubbles (" .. N.Bubble.popped .. " so far)")
 	end
 	if N.want("AutoTongue") then
-		table.insert(out, "Auto Tongue: " .. (if N.Probe.state == "new" then "test the server once" else N.Probe.state))
+		local mode = N.Probe.loaded and N.tongueMode()
+		table.insert(out, "Auto Tongue: " .. (if N.Probe.pending() then "test the server once" elseif mode == "session" then "launch sessions (beat training)" elseif mode then N.Probe.state .. " " .. mode else N.Probe.state))
 	end
 	if N.want("AutoRebirth") or N.planner() then
 		table.insert(out, N.rebirthText())
 	end
 	if N.want("AutoWins") then
-		table.insert(out, "Wins pads (" .. N.winsRoute() .. "): " .. N.Pads.say)
+		table.insert(out, "Wins pads (" .. N.activeRoute() .. "): " .. N.Pads.say)
 	end
 	if N.want("SmartBuy") or N.planner() then
 		local best = N.Plan.list[1]
@@ -33851,7 +34495,7 @@ do
 		TongueBox:AddToggle("AutoTongue", {
 			Text = "Auto Tongue",
 			Default = false,
-			Tooltip = "Sends the game's +1 Tongue call (one per second of tongue stretch in the real game). Tests once per game version what the server pays at 1, 2, 4 and 10 calls a second, keeps the best cadence and stops if the server stops paying",
+			Tooltip = "Sends the game's +1 Tongue call (one per second of tongue stretch in the real game). Tests once per game version what the server pays at 1, 2, 4 and 10 calls a second and in launch sessions (one launch, all its calls, retract), keeps what pays most next to training and stops if the server stops paying",
 		})
 		Labels.Tongue = TongueBox:AddLabel({ Text = "-", DoesWrap = true })
 		local RebirthBox = Tabs.Farm:AddLeftGroupbox("Rebirth", "refresh-cw")
@@ -33876,14 +34520,19 @@ do
 		})
 		WinsBox:AddDropdown("WinsRoute", {
 			Text = "Route",
-			Values = { "Walk (Legit)", "Teleport (Probe)" },
+			Values = { "Walk (Legit)", "Touch (Probe)", "Teleport (Probe)" },
 			Default = "Walk (Legit)",
-			Tooltip = "Walk follows the floor and stops where the stage needs the tongue. Teleport hops pad to pad and checks every pad's pay",
+			Tooltip = "Walk follows the floor and stops where the stage needs the tongue. Touch stays on the treadmill and touches every pad from there (tested once per game version, back to Walk if the server does not pay). Teleport hops pad to pad and checks every pad's pay",
 		})
 		WinsBox:AddToggle("AllowTeleport", {
 			Text = "Allow Teleport Probe",
 			Default = false,
 			Tooltip = "Needed for the Teleport route and peppers. Untested on this game: try it on an alt first",
+		})
+		WinsBox:AddToggle("LifeResets", {
+			Text = "Life Reset Probe",
+			Default = false,
+			Tooltip = "When the pads stop paying on the Touch or Teleport route, tests once per game version whether a new life (the game's own death report, then a respawn) makes them pay again, and keeps using what works while Wins still buy something. Never during the Spice Festival",
 		})
 		Labels.Wins = WinsBox:AddLabel({ Text = "-", DoesWrap = true })
 		local PepperBox = Tabs.Farm:AddRightGroupbox("Spice Festival", "flame")
@@ -34854,6 +35503,8 @@ do
 		return false
 	end
 	N.anyAutoOn = anyAutoOn
+	-- probe results of this game version (Corvus/TONGUE_probe.txt) before any loop runs
+	pcall(N.probeReady)
 	local function loop(name, body)
 		task.spawn(function()
 			while alive() do
@@ -34901,6 +35552,12 @@ do
 			end
 			return
 		end
+		local again = N.Plan.retouch
+		if again and (N.planner() or on("SmartBuy")) then
+			N.Plan.retouch = nil
+			N.retouchPad(again)
+			return
+		end
 		if N.want("AutoPeppers") and N.festival() and choreDue("peppers", 60) then
 			if N.pepperStep() then
 				return
@@ -34909,11 +35566,13 @@ do
 		if N.want("AutoWins") and N.padsStep() then
 			return
 		end
-		if N.want("AutoTongue") and (N.Probe.state == "new" or not N.Probe.loaded) then
+		if N.want("AutoTongue") and N.Probe.pending() then
 			N.tongueStep()
 			return
 		end
-		local tongueFirst = N.want("AutoTongue") and N.Probe.variant == "tongue" and N.tongueBeatsTraining()
+		-- the session and open-tongue modes run off the treadmill (the client never trains and launches at once)
+		local mode = N.want("AutoTongue") and N.tongueMode()
+		local tongueFirst = mode == "session" or mode == "tongue"
 		if tongueFirst and N.training() then
 			N.leaveTreadmill()
 		end
@@ -34924,7 +35583,7 @@ do
 	end)
 	-- Auto Tongue firing runs beside the farm loop (remote only), except while the farm loop runs the probe.
 	loop("tongue", function()
-		if N.want("AutoTongue") and N.Probe.loaded and N.Probe.state ~= "new" and not N.Manual.running then
+		if N.want("AutoTongue") and not N.Probe.pending() and not N.Manual.running then
 			N.tongueStep()
 			task.wait(0.1)
 			return
@@ -34990,13 +35649,33 @@ do
 					formatNumber(N.Train.rate60),
 					N.Bubble.popped
 				)
-				I.tongue = string.format("Probe: <b>%s</b>%s\n%s\nCalls sent %s", N.Probe.state, if N.Probe.rate > 0 then " at " .. N.Probe.rate .. "/s (" .. N.Probe.variant .. ")" else "", N.Probe.say, formatNumber(Session.tongueCalls))
+				local ses = N.Probe.session
+				I.tongue = string.format(
+					"Probe: <b>%s</b>%s\nLaunch sessions: %s%s\n%s\nCalls sent %s",
+					N.Probe.state,
+					if N.Probe.rate > 0 then " at " .. N.Probe.rate .. "/s (" .. N.Probe.variant .. ")" else "",
+					ses.state,
+					if ses.state == "accepted" then string.format(" +%s/s%s", formatNumber(ses.perSec), if ses.kept then ", kept" else ", the ladder pays more") else "",
+					N.Probe.say,
+					formatNumber(Session.tongueCalls)
+				)
 				I.rebirth = string.format("%s\nRebirths %d (x%.1f tongue), this session %d", N.rebirthText(), N.rebirths(), N.rebirthMult(), Session.rebirths)
 				I.planner = if N.planner()
 					then string.format("<b>On</b>\n%s\nLast buy: %s", N.Plan.say, N.Plan.lastBuy)
 					else "Off. Turn it on to let Corvus rebirth, pick the treadmill and spend Wins and peppers by tongue math. Your other toggles stay as they are"
-				I.wins = string.format("Route: %s\n%s\nLast run: %s\nRuns %d, wins from pads %s", N.winsRoute(), N.Pads.say, N.Pads.last, Session.padPasses, formatNumber(Session.padWins))
-				I.peppers = string.format("%s\nPeppers %d, festival %s", N.Pepper.last, N.peppers(), if N.festival() then "<b>on</b>" else "off")
+				I.wins = string.format(
+					"Route: %s\n%s\nLast run: %s\nRuns %d, wins from pads %s\nProbes: touch %s, teleport %s, life resets %s%s",
+					N.activeRoute(),
+					N.Pads.say,
+					N.Pads.last,
+					Session.padPasses,
+					formatNumber(Session.padWins),
+					N.Pads.touch,
+					N.Pads.state,
+					N.Life.state,
+					(if N.Life.variant then " (" .. N.Life.variant .. ")" else "") .. (if N.Life.say ~= "-" then "\n" .. N.Life.say else "")
+				)
+				I.peppers = string.format("%s\nPeppers %d, festival %s\nCommit after: %s", N.Pepper.last, N.peppers(), if N.festival() then "<b>on</b>" else "off", N.Pepper.commit or "not measured yet")
 				local skin, skinName = N.skinPerPoint()
 				I.buy = string.format("Skin %s (+%s per point)\nTrail %s (x%s)\nLast buy: %s", skinName, formatNumber(skin), if N.equippedTrail() ~= "" then N.equippedTrail() else "none", formatNumber(N.trailBoost()), N.Shop.lastBuy)
 				local rows = {}
