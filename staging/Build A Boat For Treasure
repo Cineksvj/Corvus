@@ -32167,22 +32167,19 @@ N.Manual = { running = false }
 -- Auto Farm Gold: the river route without a boat. The character flies (CFrame steps, no physics) through every
 -- CaveStage DarknessPart and stays inside each one until the server writes the next OtherData.Stage* value (stepping out
 -- and back in every 0.5 s so the touch is fresh): the server credits about one stage per 2-3 s (owner's log 2026-10-06:
--- Instant hops credited 1-2 of 10, Blatant 450 credited 8 of 10), so this credit gate makes every run 10/10 in every
--- movement mode. Then down to TheEnd.GoldenChest.Trigger: the touch starts the treasure sequence (the server clones
+-- Instant hops credited 1-2 of 10, Blatant 450 credited 8 of 10), so this credit gate makes every run 10/10. Then down to TheEnd.GoldenChest.Trigger: the touch starts the treasure sequence (the server clones
 -- TreasureEndEffectsLS: fog to 100 studs, chest light, gold bars), writes OtherData.End about 11 s later and respawns the
 -- character. That "respawn by the game after 11 s" is the normal end of a run, not a kill zone. The results are claimed
 -- like the RiverResultsGui Collect button (ClaimRiverResultsGold:FireServer()) and the gold stat is polled for up to 15 s
 -- because the credit lands late: a run is settled from the measured gold, never from a timer.
 -- Payout = 8 + 8 x Stage1..9 + 25 (End), x Multiplier (RiverResultsGui 10457-10797). No anticheat on the client
--- (notes.md "Anticheat"); when the server refuses a movement (under half the stages twice) the ladder steps down
--- (MOVE fallback, tried again after 10 min) and Instant hops are a probe (PROBE instant_route) remembered per PlaceVersion.
+-- (notes.md "Anticheat"). ONE mode: Blatant flight (450 studs/s); only when the server refuses it (under half the
+-- stages twice) the hub steps down (MOVE fallback, Blatant is tried again after 10 min), never a measuring phase.
 N.Modes = {
-	{ id = "Instant", speed = math.huge, hold = 0.4, text = "Instant stage hops" },
 	{ id = "Blatant", speed = 450, hold = 0.3, text = "Blatant flight 450 studs/s" },
-	{ id = "Fast", speed = 250, hold = 0.3, text = "Fast flight 250 studs/s" },
-	{ id = "Safe", speed = 120, hold = 0.45, text = "Safe flight 120 studs/s" },
+	{ id = "Reduced", speed = 250, hold = 0.3, text = "Reduced flight 250 studs/s (the server refused Blatant)" },
+	{ id = "Slow", speed = 120, hold = 0.45, text = "Slow flight 120 studs/s (the server refused faster)" },
 }
-N.ModeChoices = { "Auto (fastest that pays)", "Blatant", "Fast", "Safe" }
 N.CruiseY = 60
 N.StageWait = 5 -- seconds inside a stage for the server's credit (8 when the server turned out slower)
 N.EndWait = 13 -- seconds at the chest for OtherData.End (the server writes it about 11 s after the touch)
@@ -32232,45 +32229,24 @@ do
 		N.probesLoad()
 		return M.probes[name]
 	end
-	-- The player's own choice from the Movement dropdown (nil = Auto).
-	function N.fixedLevel()
-		local choice = optionText("RouteMode", N.ModeChoices[1])
-		for i, m in ipairs(N.Modes) do
-			if m.id == choice then
-				return i
-			end
-		end
-		return nil
-	end
-	-- A mode the server did not refuse (two runs under half the stages block it for 10 minutes; a rejected Instant probe for good).
+		-- A mode the server did not refuse (two runs under half the stages block it for 10 minutes).
 	function N.modeAllowed(i)
-		if i == 1 and N.probe("instant_route") == "rejected" then
-			return false
-		end
 		local until_ = M.refusedUntil[N.Modes[i].id]
 		return until_ == nil or os.clock() >= until_
 	end
-	-- The fastest mode the player allows: Auto starts at Instant (unless the probe was rejected on this PlaceVersion).
+	-- The one mode: Blatant flight.
 	function N.topLevel()
-		return N.fixedLevel() or (if N.probe("instant_route") == "rejected" then 2 else 1)
+		return 1
 	end
-	-- The mode of the next run: the player's fixed choice, else the Smart Planner's pick (measured gold per hour, p05),
-	-- else the fastest allowed level of the ladder (a refused mode is tried again after 10 minutes: MOVE retry).
+	-- The mode of the next run: always Blatant, unless the server refused it (auto-degrade, MOVE fallback); a refused mode
+	-- is tried again after 10 minutes (MOVE retry).
 	function N.currentMode()
-		local fixed = N.fixedLevel()
-		local level
-		if fixed then
-			level = fixed
-		elseif N.planner() and N.Plan.level then
-			level = N.Plan.level
-		else
-			level = N.topLevel()
-			while level < #N.Modes and not N.modeAllowed(level) do
-				level += 1
-			end
-			if M.level and level < M.level then
-				log("MOVE retry", N.Modes[M.level].id, "->", N.Modes[level].id, "(10 minutes passed)")
-			end
+		local level = N.topLevel()
+		while level < #N.Modes and not N.modeAllowed(level) do
+			level += 1
+		end
+		if M.level and level < M.level then
+			log("MOVE retry", N.Modes[M.level].id, "->", N.Modes[level].id, "(10 minutes passed)")
 		end
 		M.level = level
 		return N.Modes[level], level
@@ -32553,7 +32529,7 @@ do
 			end
 		end
 	end
-	-- Results of a settled run: Session numbers, per-mode stats, the Instant probe and the auto-degrade.
+	-- Results of a settled run: Session numbers, per-mode stats and the auto-degrade.
 	function N.finishRun(run, n, ended, first, paying, gold, claimAt)
 		-- The cycle ends when the claim goes out: the next run starts right after it, the gold is settled on the side.
 		local seconds = math.max((claimAt or os.clock()) - run.start, 1)
@@ -32617,14 +32593,6 @@ do
 		if M.failMode ~= run.mode then
 			M.failMode, M.fails = run.mode, 0
 		end
-		-- Instant hops are a probe: the first full run accepts it, two refused runs reject it for this PlaceVersion.
-		if run.mode == "Instant" and N.probe("instant_route") == nil then
-			if full then
-				N.probeSet("instant_route", "accepted", string.format("%.0fs per run", seconds))
-			elseif refused and M.fails >= 1 then
-				N.probeSet("instant_route", "rejected", 0)
-			end
-		end
 		if refused then
 			M.fails += 1
 			if M.fails >= 2 and run.level < #N.Modes then
@@ -32637,7 +32605,7 @@ do
 				while next_ < #N.Modes and not N.modeAllowed(next_) do
 					next_ += 1
 				end
-				log("MOVE fallback", run.mode, "->", N.Modes[next_].id, if run.mode == "Instant" and N.probe("instant_route") == "rejected" then "(instant hops rejected on this version)" else "(2 runs under half the stages, tried again in 10 min)")
+				log("MOVE fallback", run.mode, "->", N.Modes[next_].id, "(2 runs under half the stages, tried again in 10 min)")
 			end
 		else
 			M.fails = 0
@@ -33182,15 +33150,13 @@ function N.discoverStep()
 end
 -- Smart Planner = the autopilot (CLAUDE.md "SMART PLANNER = AUTOPILOT"). With the toggle on the hub plays the gold loop
 -- by itself through the same functions as the toggles (N.wants: farm runs, claims, codes, one-time quests, discovery
--- hops) even when every other toggle is off, and never flips a toggle. Gold per run is fixed by the server
--- ((8 + 8 x Stage1..9 + 25) x Multiplier), so gold per hour = gold per run / cycle time: the planner measures every
--- movement mode with full 10/10 runs (the credit gate in p03), starts with the mode that completes runs reliably
--- (Blatant), probes Instant hops next, keeps the best measured gold per hour and re-measures the others every hour.
+-- hops) even when every other toggle is off, and never flips a toggle. ONE MODE: Blatant flight with the credit gate
+-- (p03) is the fastest movement that reaches 10/10 stages and the full payout ((8 + 8 x Stage1..9 + 25) x Multiplier);
+-- there is no measuring phase. Only when the server refuses it twice does p03 step down (MOVE fallback) and retry later.
 -- Spending: chests give blocks only and the route is flown, so payback = never -> keep the gold. The free group join
 -- (x1.25) is shown with its value per hour; a discovery hop happens only while the measured bonus beats the time it costs.
-N.Plan = { say = "", routeText = "", spendText = "", groupText = "", discoverText = "", level = nil, phase = "", measureRuns = 2, remeasureAt = nil, lastLogKey = "", lastLogAt = -1e9, idleSince = nil, idleLogAt = -1e9 }
+N.Plan = { say = "", routeText = "", spendText = "", groupText = "", discoverText = "", level = nil, phase = "", lastLogKey = "", lastLogAt = -1e9, idleSince = nil, idleLogAt = -1e9 }
 do
-	local MeasureOrder = { 2, 1, 3, 4 } -- Blatant first (completes runs reliably), the Instant probe next, slower modes only when both fast ones fail
 	function N.goldPerHour()
 		local seconds = Session.runSeconds
 		if seconds < 30 then
@@ -33198,97 +33164,15 @@ do
 		end
 		return Session.runGold / seconds * 3600
 	end
-	-- Blatant or Instant has a full run in its window: the slower modes cannot beat them (same credit gate, longer flight).
-	local function fastOk()
-		for _, i in ipairs({ 1, 2 }) do
-			if N.modeFull(N.Modes[i].id) > 0 then
-				return true
-			end
-		end
-		return false
-	end
-	local function candidate(i)
-		return N.modeAllowed(i) and (i <= 2 or not fastOk())
-	end
-	-- The mode of the next run: the player's fixed Movement, else a candidate still measuring (fewer than measureRuns
-	-- settled runs in its window), else the best measured gold per hour (2 % hysteresis keeps the current one).
+	-- The mode of the next run = the one the route uses (Blatant, or the step-down after a refusal).
 	function N.planMode()
-		local fixed = N.fixedLevel()
-		if fixed then
-			N.Plan.level = fixed
-			N.Plan.phase = "Movement set by you"
-			N.Plan.routeText = N.Modes[fixed].text .. string.format(" %s/h", formatNumber(N.modeRate(N.Modes[fixed].id)))
-			return fixed
-		end
-		local now = os.clock()
-		if N.Plan.remeasureAt and now >= N.Plan.remeasureAt then
-			-- Hourly: the faster modes are measured again (2 runs each); a slower mode only when the current one stopped
-			-- completing every run or lost more than 10 % of its best gold per hour (a slower flight with the same credit
-			-- gate cannot beat a faster one that completes every run).
-			N.Plan.remeasureAt = nil
-			N.Plan.remeasures = (N.Plan.remeasures or 0) + 1
-			local cur = N.Plan.level
-			local curId = cur and N.Modes[cur].id
-			local s = cur and N.modeStats(curId)
-			local degraded = cur ~= nil and (N.modeFull(curId) < #s.window or N.modeRate(curId) < (s.best or 0) * 0.9)
-			local cleared = {}
-			for i, m in ipairs(N.Modes) do
-				if i ~= cur and candidate(i) and N.modeMeasured(m.id) > 0 and (cur == nil or i < cur or degraded) then
-					table.clear(N.modeStats(m.id).window)
-					table.insert(cleared, m.id)
-				end
-			end
-			if #cleared > 0 then
-				log("PLAN re-measure", table.concat(cleared, ", "), "(an hour passed, 2 runs each)")
-			elseif curId then
-				log("PLAN re-measure skipped", curId, "still completes every run at", formatNumber(N.modeRate(curId)) .. "/h; a slower mode cannot beat it, faster ones are not allowed")
-			end
-		end
-		local parts = {}
-		for _, m in ipairs(N.Modes) do
-			local runs = N.modeMeasured(m.id)
-			if runs > 0 then
-				local s, rate = N.modeStats(m.id), N.modeRate(m.id)
-				if runs >= 2 and rate > (s.best or 0) then
-					s.best = rate
-				end
-				table.insert(parts, string.format("%s %s/h (%d runs, %d full)", m.id, formatNumber(rate), runs, N.modeFull(m.id)))
-			end
-		end
-		N.Plan.routeText = if #parts > 0 then table.concat(parts, ", ") else "no run measured yet"
-		for _, i in ipairs(MeasureOrder) do
-			if candidate(i) and N.modeMeasured(N.Modes[i].id) < N.Plan.measureRuns then
-				N.Plan.level = i
-				N.Plan.phase = string.format("measuring %s, run %d/%d", N.Modes[i].id, N.modeMeasured(N.Modes[i].id) + 1, N.Plan.measureRuns)
-				return i
-			end
-		end
-		local best, bestRate = nil, 0
-		for i, m in ipairs(N.Modes) do
-			if N.modeAllowed(i) then
-				local r = N.modeRate(m.id)
-				if r > bestRate then
-					best, bestRate = i, r
-				end
-			end
-		end
-		if not best then
-			-- nothing measured pays: the ladder's fastest allowed mode
-			best = N.topLevel()
-			while best < #N.Modes and not N.modeAllowed(best) do
-				best += 1
-			end
-		end
-		local current = N.Plan.level
-		if current and current ~= best and N.modeAllowed(current) and N.modeRate(N.Modes[current].id) >= bestRate * 0.98 then
-			best = current
-		end
-		N.Plan.level = best
-		N.Plan.phase = string.format("best measured: %s %s/h", N.Modes[best].id, formatNumber(bestRate))
-		if not N.Plan.remeasureAt then
-			N.Plan.remeasureAt = now + 3600
-		end
-		return best
+		local _, level = N.currentMode()
+		local m = N.Modes[level]
+		N.Plan.level = level
+		N.Plan.phase = m.text
+		local runs = N.modeMeasured(m.id)
+		N.Plan.routeText = if runs > 0 then string.format("%s: %s gold/h over the last %d runs (%d full)", m.id, formatNumber(N.modeRate(m.id)), runs, N.modeFull(m.id)) else m.text
+		return level
 	end
 	function N.planSpend()
 		N.Plan.spendText = "Keep gold: chests only give blocks and the flown route uses no boat, so no purchase raises gold per hour (payback never)"
@@ -33356,7 +33240,7 @@ do
 		local mode = N.Modes[level]
 		local endText = if N.Run.endSeconds then string.format("End after ~%.1fs", N.Run.endSeconds) else "End awaited up to " .. N.EndWait .. "s"
 		local creditText = if N.Run.creditSeconds then string.format("stage credit ~%.1fs", N.Run.creditSeconds) else "stage credit not measured yet"
-		N.Plan.say = string.format("Run #%d in %s (%s)", Session.started + (if N.Run.current then 0 else 1), mode.id, N.Plan.phase)
+		N.Plan.say = string.format("Run #%d: %s", Session.started + (if N.Run.current then 0 else 1), mode.text)
 		local now = os.clock()
 		local idle = idleReason()
 		if idle then
@@ -33377,8 +33261,8 @@ do
 		local list = {}
 		local planner = N.planner()
 		if planner then
-			local mode = N.Modes[N.Plan.level or N.topLevel()]
-			table.insert(list, string.format("Smart Planner: run #%d in %s (%s), full 10-stage route, chest, claim", Session.started + (if N.Run.current then 0 else 1), mode.id, if N.Plan.phase ~= "" then N.Plan.phase else "measuring"))
+			local mode = N.Modes[N.Move.level or N.topLevel()]
+			table.insert(list, string.format("Smart Planner: run #%d, %s, full 10-stage route, chest, claim", Session.started + (if N.Run.current then 0 else 1), mode.text))
 		elseif on("AutoFarm") then
 			local mode = N.Modes[N.Move.level or N.topLevel()]
 			table.insert(list, string.format("Farm gold: fly the 10 cave stages to the chest (%s), run #%d", mode.text, Session.started + 1))
@@ -33449,7 +33333,7 @@ do
 		end)
 	end
 	Tabs.Main = N.addTab("Main", "house", "Quick Start and what Corvus does next")
-	Tabs.Farm = N.addTab("Farm", "sailboat", "Auto Farm Gold, movement, Smart Planner and teleports")
+	Tabs.Farm = N.addTab("Farm", "sailboat", "Auto Farm Gold, Smart Planner and teleports")
 	Tabs.Rewards = N.addTab("Rewards", "gift", "Codes, the group bonus and chests")
 	Tabs.Stats = N.addTab("Stats", "chart-column", "Gold per hour, runs and stages")
 	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts")
@@ -33525,13 +33409,7 @@ do
 		FarmBox:AddToggle("AutoFarm", {
 			Text = "Auto Farm Gold",
 			Default = false,
-			Tooltip = "Flies through all 10 cave stages, waits in each one until the server credits it, touches the treasure chest and claims the results after the respawn. 105 gold x your multiplier per full run",
-		})
-		FarmBox:AddDropdown("RouteMode", {
-			Text = "Movement",
-			Values = N.ModeChoices,
-			Default = N.ModeChoices[1],
-			Tooltip = "Auto starts with instant stage hops and steps down to the fastest flight the server still credits (Blatant 450, Fast 250, Safe 120 studs/s), trying the faster one again after 10 minutes. With the Smart Planner on, Auto = the mode with the best measured gold per hour",
+			Tooltip = "Blatant flight (450 studs/s) through all 10 cave stages, waits in each one until the server credits it, touches the treasure chest and claims the results after the respawn. 105 gold x your multiplier per full run. If the server ever refuses the flight, Corvus slows down by itself and tries Blatant again after 10 minutes",
 		})
 		FarmBox:AddToggle("AutoClaim", {
 			Text = "Auto Claim Results",
@@ -33551,7 +33429,7 @@ do
 		PlanBox:AddToggle("SmartPlanner", {
 			Text = "Smart Planner",
 			Default = false,
-			Tooltip = "Autopilot: plays the gold loop by itself even with every other toggle off. Full 10-stage runs in the movement with the best measured gold per hour (re-measured every hour), claims, codes, one-time quests, discovery hops when they pay, never a wasted purchase (blocks do not raise gold per hour). Other toggles stay as you set them",
+			Tooltip = "Autopilot: plays the gold loop by itself even with every other toggle off. Full 10-stage Blatant runs, claims, codes, one-time quests and discovery hops when they pay. It never wastes gold on chests (blocks do not raise gold per hour). Your other toggles stay as you set them",
 		})
 		Labels.Planner = PlanBox:AddLabel({ Text = "-", DoesWrap = true })
 		local TpBox = Tabs.Farm:AddLeftGroupbox("Teleports", "map-pin")
@@ -33814,7 +33692,7 @@ do
 			),
 			"Status: " .. tostring(Status) .. "  |  movement " .. N.Modes[N.Move.level or N.topLevel()].id .. "  |  planner " .. (if N.planner() then "on" else "off"),
 			"Running: " .. table.concat(Debug.running(), ", "),
-			string.format("Game: gold %s, multiplier x%s, players %d, probes instant=%s double_claim=%s claimEarly=%s, quests %d, discoveries %d, hops %d", formatNumber(N.gold()), tostring(N.multiplier()), N.playerCount(), tostring(N.probe("instant_route") or "untested"), tostring(N.probe("double_claim") or "untested"), tostring(N.probe("claimEarly") or "untested"), Session.quests, Session.discoveries, Session.hops),
+			string.format("Game: gold %s, multiplier x%s, players %d, probes double_claim=%s claimEarly=%s, quests %d, discoveries %d, hops %d", formatNumber(N.gold()), tostring(N.multiplier()), N.playerCount(), tostring(N.probe("double_claim") or "untested"), tostring(N.probe("claimEarly") or "untested"), Session.quests, Session.discoveries, Session.hops),
 			"Perf: " .. Debug.perfText(),
 			"Plan: " .. (if N.planner() and N.Plan.say ~= "" then N.Plan.say else "planner off") .. " | " .. (if N.Plan.routeText ~= "" then N.Plan.routeText else "-") .. (if N.Run.creditSeconds then string.format(" | stage credit ~%.1fs", N.Run.creditSeconds) else "") .. (if N.Run.endSeconds then string.format(" | End after ~%.1fs", N.Run.endSeconds) else ""),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
@@ -34316,7 +34194,7 @@ do
 						{ Id = "farm", Title = "Farm gold", Description = "Flies the 10 cave stages to the treasure chest, run after run", Icon = "coins", Color = "#fab428" },
 						{ Id = "claim", Title = "Claim results", Description = "Collects the river results after every run", Icon = "check", Color = "#3ccf91" },
 						{ Id = "codes", Title = "Redeem codes", Description = "Every known code once on this account", Icon = "ticket", Color = "#7fd9bf" },
-						{ Id = "planner", Title = "Smart Planner", Description = "Autopilot: full runs in the best measured movement, claims, codes, quests, no wasted gold", Icon = "brain", Color = "#5fb8ff" },
+						{ Id = "planner", Title = "Smart Planner", Description = "Autopilot: full runs in Blatant flight, claims, codes, quests, no wasted gold", Icon = "brain", Color = "#5fb8ff" },
 					},
 				},
 			},
@@ -34619,7 +34497,7 @@ do
 		end
 		task.wait(1)
 	end)
-	-- Smart Planner: the autopilot's decisions (mode by measured gold per hour, PLAN lines) only while its toggle is on;
+	-- Smart Planner: the autopilot's decisions (PLAN lines) only while its toggle is on;
 	-- the runs themselves go through the farm loop above (N.wants).
 	loop("planner", function()
 		N.planTick()
@@ -34654,15 +34532,14 @@ do
 				)
 				I.farm = string.format("Runs <b>%d</b>  \u{00B7}  gold/h <b>%s</b>\nLast claim: %s", Session.runs, formatNumber(N.goldPerHour()), N.Claim.last)
 				I.route = string.format(
-					"Movement: <b>%s</b>%s\nInstant hops probe: %s\n%s",
+					"Movement: <b>%s</b>%s\n%s",
 					mode.text,
 					if N.Move.retryAt then string.format(" (faster again in %s)", N.longTime(N.Move.retryAt - os.clock())) else "",
-					tostring(N.probe("instant_route") or "not tested yet"),
 					if #N.Run.history > 0 then table.concat(N.Run.history, "\n") else "No run yet"
 				)
 				I.planner = if N.planner()
-					then string.format("<b>On: autopilot</b>\n%s\n%s\n%s", if N.Plan.say ~= "" then N.Plan.say else "Measuring the first run...", if N.Plan.routeText ~= "" then N.Plan.routeText else "-", if N.Plan.groupText ~= "" then N.Plan.groupText else "-")
-					else "Off. Turn it on and Corvus plays the gold loop by itself: full 10-stage runs in the movement with the best measured gold per hour (re-measured every hour), claims, codes, one-time quests and discovery hops when they pay. Your other toggles stay as they are"
+					then string.format("<b>On: autopilot</b>\n%s\n%s\n%s", if N.Plan.say ~= "" then N.Plan.say else "Starting the first run...", if N.Plan.routeText ~= "" then N.Plan.routeText else "-", if N.Plan.groupText ~= "" then N.Plan.groupText else "-")
+					else "Off. Turn it on and Corvus plays the gold loop by itself: full 10-stage runs in Blatant flight, claims, codes, one-time quests and discovery hops when they pay. Your other toggles stay as they are"
 				local okCodes, doneCodes = N.codeCounts()
 				I.codes = string.format("Redeemed <b>%d</b>, invalid or used %d\nLast: %s", okCodes, doneCodes, N.Codes.last)
 				I.group = string.format("Gold multiplier <b>x%s</b>%s\n%s", tostring(N.multiplier()), if N.inGroup() then " (group bonus on)" else "", if N.inGroup() then "Nothing to do" else "Join the Chillz Studios group for x1.25 gold every run. " .. N.Group.last)
