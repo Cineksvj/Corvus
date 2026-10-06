@@ -35170,6 +35170,11 @@ do
 		return ok
 	end
 	function N.buyPlot()
+		-- The upgrade board shows its unlock face until the treadmill is unlocked (applyFaceVisibility, dump 75956-75966):
+		-- a plot upgrade asked before that is dropped by the server (live 2026-10-06), so the unlock comes first.
+		if not N.treadmillUnlocked() then
+			return N.unlockTreadmill()
+		end
 		local level = tonumber(N.plotAttr("PlotLevel", 1)) or 1
 		local costs = N.G.Plot.Costs
 		local cost = type(costs) == "table" and tonumber(costs[level]) or nil
@@ -35212,7 +35217,23 @@ do
 			return false
 		end
 		fire("UnlockTreadmillRequest")
-		if waitFor(N.treadmillUnlocked, 2.5) then
+		local ok = waitFor(N.treadmillUnlocked, 2.5)
+		if not ok then
+			-- same ladder as the plot upgrade: the real client presses the board at the plot, so stand there and ask again
+			local plot = N.plot()
+			local marker = plot and plot:FindFirstChild("TUTHere")
+			local spot = if marker and marker:IsA("Attachment") then marker.WorldPosition elseif marker and marker:IsA("BasePart") then marker.Position else nil
+			local hitbox = N.plotHitbox()
+			spot = spot or (hitbox and hitbox.Position)
+			log("ACT treadmillUnlock via=remote rejected", if spot then "going to the upgrade board" else "no board marker")
+			if spot and N.travelNear(spot, 5) then
+				task.wait(0.3)
+				fire("UnlockTreadmillRequest")
+				ok = waitFor(N.treadmillUnlocked, 2.5)
+				log("ACT treadmillUnlock via=travel", if ok then "ok" else "rejected")
+			end
+		end
+		if ok then
 			shopNote("Treadmill unlocked")
 			return true
 		end
@@ -35379,7 +35400,9 @@ do
 			end
 			local did = false
 			if stage == "UpgradePen" then
-				did = N.buyPlot()
+				-- "Upgrade your Pen" on a fresh plot = the board's Purchase button, which fires UnlockTreadmillRequest while the
+				-- treadmill is locked (TreadmillUnlockConfig.UnlockRemote, dump 76096); UpgradePlotRequest only exists once unlocked
+				did = (not N.treadmillUnlocked()) and N.unlockTreadmill() or N.buyPlot()
 			elseif stage == "UseTreadmill" or stage == "EarnPickaxeCash" then
 				did = (not N.treadmillUnlocked()) and N.unlockTreadmill() or false
 			elseif stage == "BuyPickaxe" then
