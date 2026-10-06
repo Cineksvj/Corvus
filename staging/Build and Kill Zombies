@@ -33437,6 +33437,11 @@ function N.pickStation()
 	-- the rolls so a station that starts paying is noticed); Both without the planner: blocks 3 of 4 rolls.
 	R.stat = R.stat or { RollBlocks = { rolls = 0, buys = 0, gain = 0 }, RollWeapons = { rolls = 0, buys = 0, gain = 0 } }
 	if N.planner() then
+		-- bootstrap: a car that cannot run needs a car part, weapons rolls cannot supply one
+		local _, bootStuds = N.carScore(N.aggregates(N.readBuild()))
+		if bootStuds <= 0 then
+			return "RollBlocks"
+		end
 		local st = R.stat
 		local prior = N.avgGain(N.driveRate())
 		local function value(s)
