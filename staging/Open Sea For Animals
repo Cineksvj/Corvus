@@ -33076,9 +33076,9 @@ end
 			Moves.last = { pos = position, at = os.clock() }
 			return true
 		end
-		-- Movement "Auto (best measured)" = always the fastest mode that works (Blatant); steps down only on a real danger signal, retries after 10 min
+		-- Movement "Blatant" = always the fastest mode that works; steps down only on a real danger signal (snapback, refused instant catch, kick), retries after 10 min
 		do
-			local AutoName = "Auto (best measured)"
+			local AutoName = "Blatant"
 			local Steps = { "Blatant", "Teleport", "Glide", "Walk" }
 			local Auto = {
 				mode = "Blatant", falls = {}, off = {}, rate = {}, phase = "hold", why = "fastest that works",
@@ -33192,7 +33192,10 @@ end
 				if not Auto.isOn() then
 					return nil
 				end
-				return "Movement: " .. Auto.mode .. " (" .. Auto.why .. ")"
+				if Auto.mode == "Blatant" then
+					return nil
+				end
+				return "Movement stepped down to " .. Auto.mode .. " (" .. Auto.why .. "), Blatant is retried in a few minutes"
 			end
 			task.spawn(function()
 				while alive() do
@@ -34834,10 +34837,10 @@ end
 			if inventoryCount() >= inventoryLimit() then
 				Sea.full = true
 				setStatus(
-					"Your inventory is full ("
-					.. inventoryCount()
+					"Inventory full ("
+					.. math.floor(inventoryCount())
 					.. "/"
-					.. inventoryLimit()
+					.. math.floor(inventoryLimit())
 					.. ")"
 					.. (if Sea.fullHint then Sea.fullHint() else "")
 				)
@@ -35809,7 +35812,7 @@ end
 					table.insert(parts, why[k] .. " " .. ({ protected = "protected (Protect lists)", locked = "locked", filters = "outside the sell filters", below = "above Only Below", kept = "kept for the plot", special = "special", event = "event wanted" })[k])
 				end
 			end
-			return "nothing matches of " .. why.total .. " items: " .. (if #parts > 0 then table.concat(parts, ", ") else "inventory empty")
+			return if #parts > 0 then "none of " .. why.total .. " items can be sold (" .. table.concat(parts, ", ") .. ")" else "the inventory is empty"
 		end
 		function Game.sellMode()
 			if Game.drivenBy("AutoSell") or Game.plannerOn() then
@@ -35819,15 +35822,15 @@ end
 		end
 		Sea.fullHint = function()
 			if Game.plannerOn() then
-				return ", the planner is selling the lowest value items"
+				return ": the planner is selling the lowest value items"
 			end
 			if not on("AutoSell") then
-				return ", turn on Auto Sell or sell some items"
+				return ": turn on Auto Sell or sell some items"
 			end
 			if (Options.SellMode and Options.SellMode.Value) == "Sell All Unlocked" or #sellCandidates() > 0 then
-				return ", selling first"
+				return ": selling first"
 			end
-			return ". Nothing matches your sell filters, add more Sell Rarities or sell by hand"
+			return ": nothing matches your Sell filters, add Sell Rarities or sell by hand"
 		end
 		local LastSell, SellQuietUntil = os.clock(), 0
 		function sellNow(force)
@@ -37268,7 +37271,7 @@ end
 			local luck = tonumber(ReplicatedStorage:GetAttribute("ServerLuckMultiplier"))
 			if luck and luck > 1 then
 				local left = tonumber(ReplicatedStorage:GetAttribute("ServerLuckRemainingTime"))
-				table.insert(lines, "Server luck x" .. luck .. (if left then " for " .. clockText(left) else ""))
+				table.insert(lines, "Server luck x" .. string.format("%g", luck) .. (if left then " for " .. clockText(left) else ""))
 			end
 			return table.concat(lines, "\n")
 		end
@@ -37925,9 +37928,9 @@ end
 			})
 			MoveBox:AddDropdown("SeaMove", {
 				Text = "Movement",
-				Values = { "Auto (best measured)", "Blatant", "Teleport", "Glide", "Walk" },
-				Default = "Auto (best measured)",
-				Tooltip = "Auto measures every mode for a few minutes, keeps the most profitable one without server refusals, re-checks every hour and steps back on any warning sign. Blatant opens the sea and takes the best items instantly, many waves a second. Teleport flies to each item. Glide flies at the speed below. Walk uses your own speed.",
+				Values = { "Blatant", "Teleport", "Glide", "Walk" },
+				Default = "Blatant",
+				Tooltip = "Blatant opens the sea and takes the best items instantly, many waves a second; it steps down by itself after a snapback or refusal and tries again later. Teleport flies to each item. Glide flies at the speed below. Walk uses your own speed.",
 			})
 			MoveBox:AddSlider(
 				"GlideSpeed",
@@ -37956,16 +37959,6 @@ end
 				Text = "Close Sea After Banking",
 				Default = true,
 				Tooltip = "Once the catch is safe on the shore the wave is ended (the game's Close Sea button) so the next one starts right away",
-			})
-			TuneBox:AddToggle("AutoStars", {
-				Text = "Collect Stars (event)",
-				Default = false,
-				Tooltip = "During the Stars event, sweeps the stars in the open sea after the catch.",
-			})
-			TuneBox:AddToggle("EventRush", {
-				Text = "Event Rush",
-				Default = false,
-				Tooltip = "Values the event milestones (potions, event eggs) and rushes them when they pay: stars at the server limit, event animals and eggs first in every wave, no lucky blocks, ads, luck hops or training phases until the goal. Back to normal by itself.",
 			})
 			TuneBox:AddSlider("SeaMargin", {
 				Text = "Safety Margin",
@@ -38090,6 +38083,17 @@ end
 			StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 			Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 			Labels.Wave = StatusBox:AddLabel({ Text = "", DoesWrap = true })
+			StatusBox:AddButton({
+				Text = "Open Sea Once",
+				Func = function()
+					task.spawn(runManual, seaCycle, true)
+				end,
+			}):AddButton({
+				Text = "Close Sea",
+				Func = function()
+					task.spawn(endWave)
+				end,
+			})
 			StatusBox:AddButton({
 				Text = "Go To Shore",
 				Func = function()
@@ -38278,7 +38282,7 @@ end
 				{ Text = "Auto Buy Upgrades", Default = false, Tooltip = "Buys as many levels as your cash allows" }
 			)
 			UpgradeBox:AddDropdown("UpgradeFilter", {
-				Text = "Upgrades",
+				Text = "Which Upgrades",
 				Values = { "Carry", "Upgrade Base", "Speed" },
 				Default = { "Carry", "Upgrade Base", "Speed" },
 				Multi = true,
@@ -38321,7 +38325,7 @@ end
 				Tooltip = "Blatant only: keeps the server training while waves run. It tests itself once and switches off if the sea stops opening or power does not rise. Needs Auto Train.",
 			})
 			TrainBox:AddDropdown("TrainMode", {
-				Text = "Train",
+				Text = "Training Pattern",
 				Values = { "When the sea is off", "Alternate with the sea" },
 				Default = "Alternate with the sea",
 			})
@@ -38407,7 +38411,7 @@ end
 			PotionBox:AddDropdown(
 				"PotionTypes",
 				{
-					Text = "Potions",
+					Text = "Which Potions",
 					Values = { "Cash", "Train", "Luck" },
 					Default = { "Cash", "Train", "Luck" },
 					Multi = true,
@@ -38421,6 +38425,16 @@ end
 			})
 			Labels.Potions = PotionBox:AddLabel({ Text = "-", DoesWrap = true })
 			local EventBox = Tabs.Rewards:AddRightGroupbox("Events", "sparkles")
+			EventBox:AddToggle("AutoStars", {
+				Text = "Collect Stars",
+				Default = false,
+				Tooltip = "During the Stars event, sweeps the stars in the open sea after the catch.",
+			})
+			EventBox:AddToggle("EventRush", {
+				Text = "Event Rush",
+				Default = false,
+				Tooltip = "Values the event milestones (potions, event eggs) and rushes them when they pay: stars at the server limit, event animals and eggs first in every wave, no lucky blocks, ads, luck hops or training phases until the goal. Back to normal by itself.",
+			})
 			Labels.Events = EventBox:AddLabel({ Text = "-", DoesWrap = true })
 			-- Index Hunter: the game's index has one tab per mutation (EggsConfig.IsInMutationIndex, MutationConfig ids);
 			-- every egg completed in any tab adds +10% cash for good (Modifiers CompletedEggs, CashMulti * (1 + 0.1 * done))
@@ -38489,7 +38503,6 @@ end
 					end)
 				end
 			end
-			Library:MirrorToggle("AutoSell", SeaBox)
 			Library:MirrorToggle("EventRush", SeaBox)
 			SeaBox:AddLabel({
 				Text = '<font transparency="0.35">Every switch also lives in its own tab and nothing turns on by itself. Smart Planner runs the sea, training, eggs, selling and spending for you; off, only your own switches run.</font>',
@@ -38518,17 +38531,6 @@ end
 				Tooltip = "Every toggle, dropdown, slider and input goes back to its default. Saved configs are not deleted.",
 				Func = function()
 					Library:AskResetHubOptions(SaveManager and SaveManager.Ignore or nil)
-				end,
-			})
-			SeaBox:AddButton({
-				Text = "Open Sea Once",
-				Func = function()
-					task.spawn(runManual, seaCycle, true)
-				end,
-			}):AddButton({
-				Text = "Close Sea",
-				Func = function()
-					task.spawn(endWave)
 				end,
 			})
 		end
@@ -39461,7 +39463,7 @@ end
 							{
 								Id = "Teleport",
 								Title = "Teleport",
-								Description = "Fastest, grabs the most per wave",
+								Description = "Flies to each item, one wave at a time",
 								Icon = "zap",
 								Color = "#5fb8ff",
 							},
@@ -39598,7 +39600,7 @@ end
 		function Debug.perfText()
 			local last = Perf.last
 			if not last then
-				return "still measuring"
+				return "no sample yet"
 			end
 			return string.format(
 				"fps %d, worst frame %dms, hitches %d, freezes %d, Corvus used %dms in %ds (%.2f%%), ping %sms, memory %sMB",
@@ -39685,7 +39687,7 @@ end
 					tostring(waveReach()),
 					tostring(maxPickup()),
 					tostring(hum and hum.WalkSpeed or "?"),
-					tostring(currentLuck()),
+					string.format("%g", currentLuck()),
 					math.floor(inventoryCount()),
 					math.floor(inventoryLimit()),
 					formatNumber(power()),
@@ -39974,7 +39976,7 @@ end
 		pcall(function()
 			Labels.PerfTab = Tabs.Misc or Tabs.Main
 			local PerfBox = Labels.PerfTab:AddLeftGroupbox("Performance", "gauge")
-			Labels.Perf = PerfBox:AddLabel({ Text = "Measuring...", DoesWrap = true })
+			Labels.Perf = PerfBox:AddLabel({ Text = "Waiting for the first sample...", DoesWrap = true })
 		end)
 		if Library.AddCommand then
 			pcall(function()
@@ -40177,16 +40179,7 @@ end
 			if Library.OnAutoload then pcall(Library.OnAutoload) end
 		end)
 	end
-	-- one time: configs still on the old fixed Blatant default move to Auto (best measured)
-	pcall(function()
-		if not Library:GetSetting("OSFA_AutoMoveDefault") then
-			Library:SetSetting("OSFA_AutoMoveDefault", true)
-			if Options.SeaMove and Options.SeaMove.Value == "Blatant" then
-				Options.SeaMove:SetValue("Auto (best measured)")
-				log("MIGRATE movement Blatant -> Auto (best measured)")
-			end
-		end
-	end)
+	-- the old "Auto (best measured)" entry is gone: Blatant is the fastest mode and steps down on its own
 	-- one time: configs saved before Blatant existed still say Teleport, the instant catch is much faster
 	pcall(function()
 		if not Library:GetSetting("OSFA_BlatantDefault") then
@@ -40618,7 +40611,7 @@ end
 					local waveText = string.format(
 						"Reach <b>%d</b> plates  \u{00B7}  Luck <b>x%s</b>  \u{00B7}  Open <b>~%ds</b>\nCarry <b>%d</b> per trip  \u{00B7}  Inventory <b>%d/%d</b>",
 						reach,
-						tostring(currentLuck()),
+						string.format("%g", currentLuck()),
 						math.floor(window),
 						math.floor(tripLimit()),
 						math.floor(inventoryCount()),
@@ -40732,7 +40725,7 @@ end
 						string.format(
 							"Equipped <b>%s</b>  \u{00B7}  luck x%s  \u{00B7}  %ss%s",
 							staff and tostring(staff.name or staffKey) or tostring(staffKey or "-"),
-							tostring(currentLuck()),
+							string.format("%g", currentLuck()),
 							tostring(staff and staff.time or waveTime()),
 							if nextStaff
 							then '\n<font transparency="0.4">Next: '
@@ -40833,7 +40826,7 @@ end
 							Moves.snaps
 						)
 						else string.format(
-							'Measuring the first 30 seconds...\n<font transparency="0.4">Log %d lines  \u{00B7}  problems %d</font>',
+							'Collecting the first 30 seconds...\n<font transparency="0.4">Log %d lines  \u{00B7}  problems %d</font>',
 							#Log.lines,
 							Log.problemCount
 						)
