@@ -32038,21 +32038,25 @@ do
 		local value = option and option.Value
 		return if type(value) == "string" and value ~= "" then value else default
 	end
+	-- "Auto (best measured)" state of Throw Speed and Movement (owned by the Smart Planner tick, p03 "MODE").
+	N.Auto = { step = 0, stepUntil = 0, falls = {}, dayOffUntil = 0, walkUntil = 0, moveFalls = {}, moveDayUntil = 0, ready = {}, tpFails = {}, lastLog = -1e9, probeSay = "" }
 	-- Throw Speed and Movement in two words (debug header, Main info).
 	function N.paceText()
 		local speed = N.throwSpeed()
 		local mode = if N.throwMode then N.throwMode() else speed
-		return (if speed == "blatant" then "Blatant" elseif speed == "fast" then "Fast" else "Legit") .. (if speed ~= "legit" then " (" .. mode .. ")" else "") .. ", " .. (if optionText("MoveMode", "Teleport (Fast)") == "Teleport (Fast)" then "Teleport" else "Walk")
+		return (if speed == "blatant" then "Blatant" elseif speed == "fast" then "Fast" else "Legit") .. (if speed ~= "legit" then " (" .. mode .. ")" else "") .. ", " .. (if N.safeMove() then "Walk" else "Teleport")
 	end
 	-- Throw Speed: "blatant" = direct Throw right after ThrowFinished plus a second throw in flight when the server takes it,
 	-- "fast" = direct Throw right after ThrowFinished, "legit" = the game's button at the game's Auto Wins pace. A saved
 	-- "Max (Blatant)" from older configs counts as Blatant.
 	function N.throwSpeed()
-		local text = optionText("ThrowSpeed", "Blatant")
+		local text = optionText("ThrowSpeed", "Auto (best measured)")
 		if text == "Legit (game pace)" then
 			return "legit"
 		elseif text == "Fast" then
 			return "fast"
+		elseif text == "Auto (best measured)" then
+			return N.autoTier()
 		end
 		return "blatant"
 	end
@@ -32067,7 +32071,11 @@ do
 	end
 	-- Movement: Walk walks like a player; Teleport (opt-in) moves the character instantly.
 	function N.safeMove()
-		return optionText("MoveMode", "Teleport (Fast)") ~= "Teleport (Fast)"
+		local text = optionText("MoveMode", "Auto (best measured)")
+		if text == "Auto (best measured)" then
+			return os.clock() < N.Auto.walkUntil
+		end
+		return text ~= "Teleport (Fast)"
 	end
 	function N.pickText(name, default)
 		return optionText(name, default)
@@ -32339,6 +32347,7 @@ do
 					return true
 				end
 			end
+			N.autoTeleportFailed()
 			logProblem(string.format("Teleport did not land on the spot (%.0f studs off after 2 tries)", flat()))
 			return false
 		end
@@ -32474,6 +32483,7 @@ do
 		N.Event.notice = text
 		N.Event.noticeAt = os.clock()
 		log("NOTICE", text)
+		N.autoNotice(text)
 	end)
 	N.onEvent("WorldUnlockStarted", function(data)
 		log("WORLD unlock started", brief(data))
@@ -32635,6 +32645,7 @@ N.onEvent("ThrowRejected", function(data)
 		N.Throw.extraGap = math.min(1.5, N.Throw.extraGap + (if mine then 0.05 else 0.15))
 		N.Throw.okRun = 0
 		log("THROW gap=" .. string.format("%.2f", os.clock() - N.Throw.finishedAt), "accepted=false", "backoff", string.format("%.2f", N.Throw.extraGap), tostring(data.Message))
+			N.autoThrowRefused(data.Message)
 	end
 end)
 local function throwEnded(kind, data)
@@ -32950,6 +32961,166 @@ function N.directHook()
 	log("THROW direct hook", if ok then "on" else "failed: " .. tostring(err))
 	return ok
 end
+-- MODE: "Auto (best measured)" for Throw Speed and Movement (default). The Smart Planner's tick (N.autoTick) owns it:
+-- measures the throw paths (PROBE throw_*, 60 s each), keeps the best, re-measures every hour and watches the danger
+-- signals (3 refused throws in 60 s such as "Ready in a moment...", 3 direct throws refused/cancelled in a row, a server
+-- notice that names a flag, a teleport that does not land twice in 60 s). Any signal steps back ONE level: direct ->
+-- the game's button -> legit pace (movement: teleport -> walk). 3 fallbacks in a day switch the risky level off for the day.
+local DAY = 86400
+local function autoOn(name)
+	return optionText(name, "Auto (best measured)") == "Auto (best measured)"
+end
+function N.autoThrow()
+	return autoOn("ThrowSpeed")
+end
+function N.autoMove()
+	return autoOn("MoveMode")
+end
+function N.autoTier()
+	if N.Auto.step >= 2 or os.clock() < N.Auto.dayOffUntil then
+		return "legit"
+	end
+	return "blatant"
+end
+local function recentCount(list, now, window)
+	for i = #list, 1, -1 do
+		if now - list[i] > window then
+			table.remove(list, i)
+		end
+	end
+	return #list
+end
+function N.autoFallback(reason)
+	if not N.autoThrow() then
+		return
+	end
+	local A, now = N.Auto, os.clock()
+	if A.step >= 2 or (A.lastFall and now - A.lastFall < 20) then
+		return
+	end
+	A.lastFall = now
+	A.lastWhy = reason
+	table.insert(A.falls, now)
+	local n = recentCount(A.falls, now, DAY)
+	local from = N.throwMode()
+	A.step += 1
+	local to = "button"
+	if A.step == 1 then
+		N.Direct.offUntil = now + 600
+		A.stepUntil = now + 600
+	else
+		to = "legit"
+		A.stepUntil = now + 900
+	end
+	if n >= 3 then
+		A.step, A.dayOffUntil, A.stepUntil, to = 2, now + DAY, now + DAY, "legit"
+		log("MODE risky off", "3 fallbacks, direct and button-at-max-pace off for the day")
+	end
+	N.ThrowProbe.cur, N.ThrowProbe.win, N.ThrowProbe.say = nil, nil, "stepped back: " .. reason
+	log("MODE fallback", from .. "->" .. to, "reason=" .. reason, "fallbacks=" .. n)
+end
+-- A refused throw ("Ready in a moment...", "Finish your current throw first."): 3 within 60 s is a danger signal. A
+-- server message that names a flag counts at once.
+function N.autoThrowRefused(message)
+	local A, now = N.Auto, os.clock()
+	local low = string.lower(tostring(message))
+	for _, word in ipairs({ "suspicious", "cheat", "exploit", "detect", "flagged", "violation", "too fast" }) do
+		if string.find(low, word, 1, true) then
+			N.autoFallback("server flag: " .. string.sub(tostring(message), 1, 60))
+			return
+		end
+	end
+	table.insert(A.ready, now)
+	if recentCount(A.ready, now, 60) >= 3 then
+		table.clear(A.ready)
+		N.autoFallback("3 refused throws in 60 s (" .. string.sub(tostring(message), 1, 40) .. ")")
+	end
+end
+function N.autoNotice(text)
+	local low = string.lower(tostring(text))
+	for _, word in ipairs({ "suspicious", "cheat", "exploit", "detect", "flagged", "violation" }) do
+		if string.find(low, word, 1, true) then
+			N.autoFallback("server notice: " .. string.sub(tostring(text), 1, 60))
+			return
+		end
+	end
+end
+function N.autoTeleportFailed()
+	if not N.autoMove() then
+		return
+	end
+	local A, now = N.Auto, os.clock()
+	table.insert(A.tpFails, now)
+	if recentCount(A.tpFails, now, 60) >= 2 and now >= A.walkUntil then
+		table.clear(A.tpFails)
+		table.insert(A.moveFalls, now)
+		local n = recentCount(A.moveFalls, now, DAY)
+		A.walkUntil = now + (if n >= 3 then DAY else 600)
+		A.moveWhy = "teleport did not land twice in 60 s"
+		log("MODE fallback", "move teleport->walk", "reason=" .. A.moveWhy, "fallbacks=" .. n)
+		if n >= 3 then
+			log("MODE risky off", "3 fallbacks, teleport off for the day")
+		end
+	end
+end
+-- Zone Probe stands on locked stands and walks into locked worlds: only while the modes are not stepped back.
+function N.autoAllowsProbe()
+	if not (N.autoThrow() or N.autoMove()) then
+		return true
+	end
+	return N.Auto.step == 0 and os.clock() >= N.Auto.walkUntil
+end
+-- Called every second by the planner loop while Auto Throw / Smart Planner runs (it runs no other loop).
+function N.autoTick()
+	local A, now = N.Auto, os.clock()
+	if A.step > 0 and now >= A.stepUntil and N.autoThrow() then
+		A.step -= 1
+		A.stepUntil = now + 300
+		if A.step == 0 then
+			A.dayOffUntil, N.Direct.offUntil, N.Direct.rejectRun = 0, 0, 0
+			local TP = N.ThrowProbe
+			TP.score, TP.cur, TP.win, TP.reprobeAt = {}, nil, nil, 0
+			log("MODE measure", "throw re-measure after the fallback window")
+		end
+	end
+	if A.walkUntil > 0 and now >= A.walkUntil and N.autoMove() then
+		A.walkUntil = 0
+		log("MODE measure", "move retry teleport after the walk window")
+	end
+	if now - A.lastLog >= 3600 and (N.autoThrow() or N.autoMove()) then
+		A.lastLog = now
+		log("MODE measure", "hourly", "throw=" .. (if N.autoThrow() then N.throwMode() else "manual"), "move=" .. (if N.safeMove() then "walk" else "teleport"), "probe=" .. (if N.autoAllowsProbe() then "allowed" else "skipped (stepped back)"), "keep=" .. (if N.autoThrow() then N.throwMode() else "manual"))
+	end
+end
+-- One plain sentence for Status / Up next: which mode runs and why.
+function N.autoSay()
+	if not (N.autoThrow() or N.autoMove()) then
+		return nil
+	end
+	local A, TP = N.Auto, N.ThrowProbe
+	local parts = {}
+	if N.autoThrow() then
+		if N.autoTier() == "legit" then
+			table.insert(parts, "legit pace (stepped back: " .. tostring(A.lastWhy or "server signal") .. ")")
+		else
+			local sc = {}
+			for _, m in ipairs({ "direct", "button" }) do
+				if TP.score[m] then
+					table.insert(sc, m .. " " .. string.format("%.1f", TP.score[m]))
+				end
+			end
+			local why = if #sc > 0 then "measured " .. table.concat(sc, ", ") .. " throws/min" else "measuring"
+			if A.step == 1 then
+				why = "direct off 10 min: " .. tostring(A.lastWhy or "server signal")
+			end
+			table.insert(parts, N.throwMode() .. " throws (" .. why .. ")")
+		end
+	end
+	if N.autoMove() then
+		table.insert(parts, if N.safeMove() then "walking (" .. tostring(A.moveWhy or "teleport failed") .. ")" else "teleport")
+	end
+	return "Auto mode: " .. table.concat(parts, ", ")
+end
 -- Which throw path runs now: "direct", "button" (the game's button, no pause) or "legit". The pick comes from the
 -- self-measuring probe (N.ThrowProbe) among what the Throw Speed allows and what is not switched off by the server's
 -- answers. A second throw in flight was removed: the server refuses it ("Finish your current throw first.", owner log
@@ -33061,6 +33232,9 @@ function N.throwProbeTick(mode)
 		TP.say = "kept " .. best .. " (" .. table.concat(parts, ", ") .. " throws/min)"
 		if TP.cur ~= best or TP.reprobeAt <= now then
 			log("PROBE keep", best, table.concat(parts, ", "))
+				if N.autoThrow() then
+					log("MODE measure", "throw", table.concat(parts, ", "), "keep=" .. best)
+				end
 		end
 		TP.cur = best
 		if TP.reprobeAt <= now then
@@ -33088,6 +33262,7 @@ local function directFailed(why)
 		D.rejectRun = 0
 		D.offUntil = os.clock() + 600
 		log("THROW direct fallback", "the game's button for 10 min after 3 refusals")
+		N.autoFallback("3 direct throws refused or cancelled in a row")
 	end
 end
 function N.noteDirectCancel(_mine)
@@ -33629,7 +33804,7 @@ end
 -- faster there, else back to the open zone. Logs TRAIN zone probe + PROBE zone_<name>. Returns nil when nothing to do.
 function N.zoneProbeStep()
 	local Z = N.ZoneProbe
-	if not on("ZoneProbe") then
+	if not on("ZoneProbe") or not N.autoAllowsProbe() then
 		return nil
 	end
 	zoneBaseSample()
@@ -33729,7 +33904,7 @@ function N.worldProbeStep()
 		log("WORLD probe back", W.from, "moved=" .. tostring(N.worldId() == W.from))
 		return true
 	end
-	if not on("ZoneProbe") or N.activity() ~= "Idle" then
+	if not on("ZoneProbe") or not N.autoAllowsProbe() or N.activity() ~= "Idle" then
 		return false
 	end
 	local cfg = N.worldCfg()
@@ -35995,6 +36170,10 @@ do
 		elseif mode == "throw" then
 			table.insert(lines, "Throw" .. (if left > 0 and P.f < 1 then " for ~" .. N.longTime(left) .. ", then train" else ""))
 		end
+		local autoLine = N.autoSay()
+		if autoLine then
+			table.insert(lines, autoLine)
+		end
 		local planner = N.planner()
 		if planner then
 			if P.say ~= "" then
@@ -36054,6 +36233,8 @@ do
 		return lines
 	end
 	function N.planTick()
+		-- The planner owns the "Auto (best measured)" mode choice (Throw Speed, Movement, Zone Probe).
+		N.autoTick()
 		local ok, err = pcall(sample)
 		if not ok then
 			log("ERROR", "plan sample", tostring(err))
@@ -36210,15 +36391,15 @@ do
 		ThrowBox:AddToggle("AutoThrow", { Text = "Auto Throw", Default = false, Tooltip = "Throws from the launch zone for Wins. Throw Speed picks how fast" })
 		ThrowBox:AddDropdown("ThrowSpeed", {
 				Text = "Throw Speed",
-				Values = { "Legit (game pace)", "Fast", "Blatant" },
-				Default = "Blatant",
-				Tooltip = "Blatant (default): throws again 0.82 s after a throw lands (the server's own cooldown), measures it against the game's button and keeps the faster. Fast: the same 0.82 s throws without the measuring. Legit: the game's own button at its Auto Wins pace (about 2.4 s between throws)",
+				Values = { "Auto (best measured)", "Legit (game pace)", "Fast", "Blatant" },
+				Default = "Auto (best measured)",
+				Tooltip = "Auto (default): the Smart Planner's mode choice. Measures direct throws against the game's button for 60 s each, keeps the one that lands more throws per minute, re-measures every hour and steps back one level (direct, the game's button, legit pace) when the server refuses throws or flags; 3 fallbacks switch the risky level off for the day. Blatant: throws again 0.82 s after a throw lands (the server's own cooldown), measures it against the game's button and keeps the faster. Fast: the same 0.82 s throws without the measuring. Legit: the game's own button at its Auto Wins pace (about 2.4 s between throws)",
 			})
 			ThrowBox:AddDropdown("MoveMode", {
 				Text = "Movement",
-				Values = { "Walk (Safe)", "Teleport (Fast)" },
-				Default = "Teleport (Fast)",
-				Tooltip = "Teleport moves you to the launch zone, training stands, shops and eggs instantly (default). Walk follows a pathfinding route like a player",
+				Values = { "Auto (best measured)", "Walk (Safe)", "Teleport (Fast)" },
+				Default = "Auto (best measured)",
+				Tooltip = "Auto (default): teleports, and walks for 10 minutes when a teleport does not land twice in a minute (3 times: walking for the day). Teleport moves you to the launch zone, training stands, shops and eggs instantly (default). Walk follows a pathfinding route like a player",
 			})
 			ThrowBox:AddToggle("SkipAnimations", {
 			Text = "Skip Animations",
@@ -37746,7 +37927,7 @@ do
 					then "Speed: Legit, the game's button at its own pace"
 					else string.format(
 						"Speed: %s, now <b>%s</b>%s%s",
-						if speed == "blatant" then "Blatant" else "Fast",
+						if N.autoThrow() then "Auto" elseif speed == "blatant" then "Blatant" else "Fast",
 						N.throwMode(),
 						if N.ThrowProbe.say ~= "" then " (" .. N.ThrowProbe.say .. ")" else "",
 						if on("SecretReroll") then "\nSecret Reroll: " .. (if N.Reroll.say ~= "" then N.Reroll.say else "waiting for the throw speed measurement") .. N.secretOddsText() else N.secretOddsText()
