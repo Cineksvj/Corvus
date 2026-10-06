@@ -33228,7 +33228,18 @@ end
 		end
 		local function moveMode()
 			local v = Game.effMove()
-			return if v == "Glide" or v == "Walk" then v else "Teleport"
+			if v == "Walk" then
+				return v
+			end
+			-- ACT ladder: teleport is rung 1; two real snapbacks in 60 s drop sea trips to glide for 10 min, then teleport is retried
+			if Moves.tpOff then
+				if os.clock() < Moves.tpOff then
+					return "Glide"
+				end
+				Moves.tpOff = nil
+				log("ACT retry seaTravel via=teleport")
+			end
+			return if v == "Glide" then v else "Teleport"
 		end
 		local function moveSpeed(mode)
 			if mode == "Glide" then
@@ -33373,7 +33384,41 @@ end
 					end
 				end
 			end
-			return travelTo(target, opts)
+			local origin = root.Position
+			local startAt = os.clock()
+			local arrived = travelTo(target, opts)
+			Moves.actN = (Moves.actN or 0) + 1
+			if mode == "Teleport" and arrived and (target - origin).Magnitude > 25 then
+				-- snapback = 0.35 s later we are back near the ORIGIN (a bad landing is not a snapback)
+				task.delay(0.35, function()
+					local r = rootPart()
+					if not r or (Log.teleportAt and Log.teleportAt >= startAt) then
+						return
+					end
+					if (r.Position - origin).Magnitude < 10 then
+						Moves.tpRej = Moves.tpRej or {}
+						table.insert(Moves.tpRej, os.clock())
+						local recent = {}
+						for _, t in ipairs(Moves.tpRej) do
+							if os.clock() - t <= 60 then
+								table.insert(recent, t)
+							end
+						end
+						Moves.tpRej = recent
+						log("ACT seaTravel via=teleport rejected reason=snapback", brief(origin), "->", brief(target))
+						if #recent >= 2 then
+							Moves.tpRej = {}
+							Moves.tpOff = os.clock() + 600
+							log("ACT fallback seaTravel teleport -> glide")
+						end
+					elseif Moves.actN <= 3 or Moves.actN % 25 == 0 then
+						log("ACT seaTravel via=teleport ok")
+					end
+				end)
+			elseif arrived and mode == "Glide" and (Moves.actN <= 3 or Moves.actN % 25 == 0) then
+				log("ACT seaTravel via=glide ok")
+			end
+			return arrived
 		end
 		local function partDelay(i)
 			if type(Game.WaveConfig) == "table" and type(Game.WaveConfig.GetPartDelay) == "function" then
