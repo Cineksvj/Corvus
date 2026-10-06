@@ -32390,14 +32390,14 @@ do
 		return false, "timeout"
 	end
 	function N.lobbyMode()
-		return optionText("MoveMode", "Walk (Legit)")
+		return optionText("MoveMode", "Walk")
 	end
 	function N.goTo(pos, near)
 		near = near or 4
 		if N.dist(pos) <= near + 1 then
 			return true
 		end
-		if N.lobbyMode() == "Teleport (Fast)" then
+		if N.lobbyMode() == "Teleport" then
 			N.tp(pos)
 			task.wait(0.2)
 			return N.dist(pos) <= near + 3
@@ -32594,7 +32594,7 @@ end
 -- Treadmills stand in one row (Z about -562, boards behind at -572). Walking goes out to the front of the row first,
 -- along it 12 studs in front, then straight in: never across a neighbour's belt (a locked one is a gamepass treadmill).
 function N.rowWalk(spot)
-	if N.lobbyMode() ~= "Teleport (Fast)" and N.dist(spot) > 8 then
+	if N.lobbyMode() ~= "Teleport" and N.dist(spot) > 8 then
 		local root = N.root()
 		if root and root.Position.Z < spot.Z + 8 then
 			N.goTo(Vector3.new(root.Position.X, spot.Y, spot.Z + 12), 3)
@@ -32996,9 +32996,9 @@ function N.tongueBeatsTraining()
 	-- only against a measured treadmill rate: a fresh start trains first
 	return P.state == "accepted" and N.Train.rate60 > 0 and P.perSec > N.Train.rate60 or false
 end
--- Wins pads at the end of every stage (Map.GiveWins.OneWin/TwoWin.Button1..15, WinAmount 1..8000). Walk (Legit) walks
--- toward the next pad and stops where the path ends; Touch (Probe) stays on the treadmill and touches every pad by
--- firetouchinterest (N1, no movement, training never stops); Teleport (Probe) hops pad to pad (the game itself moves the
+-- Wins pads at the end of every stage (Map.GiveWins.OneWin/TwoWin.Button1..15, WinAmount 1..8000). Walk walks
+-- toward the next pad and stops where the path ends; Touch stays on the treadmill and touches every pad by
+-- firetouchinterest (N1, no movement, training never stops); Teleport hops pad to pad (the game itself moves the
 -- character by CFrame on sticks). Both probes check every Wins change and are remembered per game version.
 N.Pads = { state = "new", touch = "new", nextAt = 0, backoff = 60, lastPass = 0, last = "-", walkFails = 0, walkBest = 0, say = "-", resetNext = false, afterReset = false }
 function N.winPads()
@@ -33033,10 +33033,10 @@ function N.padSpot(pad)
 	return Vector3.new(pivot.X, pivot.Y + 3.5, pivot.Z)
 end
 function N.winsRoute()
-	return optionText("WinsRoute", "Walk (Legit)")
+	return optionText("WinsRoute", "Walk")
 end
 function N.teleportAllowed()
-	return N.winsRoute() == "Teleport (Probe)" and on("AllowTeleport")
+	return N.Pads.state ~= "rejected"
 end
 local function backToLobby()
 	local target = N.trainTarget()
@@ -33212,22 +33212,18 @@ function N.touchProbe()
 	log("PROBE touchpad", "result=" .. P.touch, "gain=" .. formatNumber(total), "reached=" .. reached)
 	return total, reached
 end
--- The route a pad run uses: the dropdown, except that the Smart Planner moves a Walk dropdown to a route its probe
--- already accepted on this game version (Touch first: no movement; Teleport only with Allow Teleport Probe on), and a
--- rejected Touch probe (or an executor without firetouchinterest) falls back to Walk.
+-- The route a pad run uses: the dropdown (default Touch). A route the server did not pay (or an executor without
+-- firetouchinterest) drops to the next one: Touch, then Teleport, then Walk.
 function N.activeRoute()
 	local route = N.winsRoute()
 	local P = N.Pads
-	if route == "Walk (Legit)" and N.planner() then
-		if P.touch == "accepted" and N.touchSupported() then
-			return "Touch (Probe)"
-		end
-		if P.state == "accepted" and on("AllowTeleport") then
-			return "Teleport (Probe)"
-		end
+	local touchOk = P.touch ~= "rejected" and N.touchSupported()
+	local teleOk = P.state ~= "rejected"
+	if route == "Touch" and not touchOk then
+		return if teleOk then "Teleport" else "Walk"
 	end
-	if route == "Touch (Probe)" and (P.touch == "rejected" or not N.touchSupported()) then
-		return "Walk (Legit)"
+	if route == "Teleport" and not teleOk then
+		return "Walk"
 	end
 	return route
 end
@@ -33307,13 +33303,13 @@ local function retouchFirstPad(route)
 	if not pad then
 		return 0
 	end
-	if route == "Teleport (Probe)" then
+	if route == "Teleport" then
 		N.tp(N.padSpot(pad))
 		task.wait(0.4)
 	end
 	local delta = N.touchPadFromHere(pad, 2)
 	N.restoreFocus()
-	if route == "Teleport (Probe)" then
+	if route == "Teleport" then
 		backToLobby()
 	end
 	return delta
@@ -33356,15 +33352,10 @@ function N.padsStep()
 	local chosen = N.winsRoute()
 	local route = N.activeRoute()
 	local note = nil
-	if chosen == "Touch (Probe)" and route ~= chosen then
-		note = if N.touchSupported() then "The server did not pay pad touches from the treadmill on this game version: walking instead" else "Your executor has no firetouchinterest: walking instead"
+	if chosen == "Touch" and route ~= chosen then
+		note = if N.touchSupported() then "The server did not pay pad touches from the treadmill on this game version: the " .. (if route == "Teleport" then "Teleport" else "Walk") .. " route takes over" else "Your executor has no firetouchinterest: the " .. (if route == "Teleport" then "Teleport" else "Walk") .. " route takes over"
 	end
-	if route == "Teleport (Probe)" and not on("AllowTeleport") then
-		P.say = "Teleport route is off until you allow the probe (test it on an alt first)"
-		P.nextAt = os.clock() + 30
-		return false
-	end
-	if route == "Teleport (Probe)" and P.state == "rejected" then
+	if route == "Teleport" and P.state == "rejected" then
 		P.say = "The server did not pay teleport pad touches on this game version"
 		P.nextAt = os.clock() + 3600
 		return false
@@ -33377,19 +33368,19 @@ function N.padsStep()
 		end
 	end
 	-- Touch keeps the character on the treadmill: training never stops
-	if route ~= "Touch (Probe)" then
+	if route ~= "Touch" then
 		N.leaveTreadmill()
 	end
 	setStatus("Running the wins pads (" .. route .. ")")
 	local before = N.wins()
 	local total, reached
-	if route == "Touch (Probe)" then
+	if route == "Touch" then
 		if P.touch == "new" then
 			total, reached = N.touchProbe()
 		else
 			total, reached = N.padTouchPass()
 		end
-	elseif route == "Teleport (Probe)" then
+	elseif route == "Teleport" then
 		total, reached = N.padTeleportPass()
 	else
 		total, reached = N.padWalkPass()
@@ -33398,10 +33389,10 @@ function N.padsStep()
 	Session.padWins += total
 	local delta = N.wins() - before
 	P.last = string.format("+%s wins, reached pad %d", formatNumber(math.max(delta, total)), reached or 0)
-	if route ~= "Walk (Legit)" then
-		local key = if route == "Touch (Probe)" then "touch" else "state"
+	if route ~= "Walk" then
+		local key = if route == "Touch" then "touch" else "state"
 		local result = if total > 0 then "accepted" elseif P[key] == "accepted" then "cooldown" else "rejected"
-		if route == "Teleport (Probe)" then
+		if route == "Teleport" then
 			log("PROBE winpads", "result=" .. result, "gain=" .. formatNumber(total), "reached=" .. tostring(reached))
 		end
 		if result == "accepted" then
@@ -33415,7 +33406,7 @@ function N.padsStep()
 		N.probeSet(if key == "touch" then "touchpad" else "winpads", P[key])
 		P.nextAt = os.clock() + P.backoff
 		local name = if key == "touch" then "Pad touches from the treadmill" else "Teleport pads"
-		P.say = if P[key] == "accepted" then name .. " pay. Next run in " .. N.longTime(P.backoff) elseif key == "touch" then name .. " were not paid on this game version: walking instead" else name .. " were not paid"
+		P.say = if P[key] == "accepted" then name .. " pay. Next run in " .. N.longTime(P.backoff) elseif key == "touch" then name .. " were not paid on this game version: the next route takes over" else name .. " were not paid"
 		-- a pass right after a life reset that pays nothing twice means the reset stopped working
 		if P.afterReset then
 			P.afterReset = false
@@ -33456,7 +33447,7 @@ function N.padsStep()
 				log("WINPAD walk cannot reach the pads on foot; the Touch or Teleport route needs a test")
 			end
 		end
-		P.say = if P.walkFails >= 3 then "Walking cannot reach the stage pads (the stages need the tongue). Touch (Probe) or Teleport (Probe) are the fast routes" else P.last
+		P.say = if P.walkFails >= 3 then "Walking cannot reach the stage pads (the stages need the tongue). Touch or Teleport are the fast routes" else P.last
 	end
 	if note then
 		P.say = note
@@ -34499,9 +34490,9 @@ do
 		})
 		TrainBox:AddDropdown("MoveMode", {
 			Text = "Lobby Movement",
-			Values = { "Walk (Legit)", "Teleport (Fast)" },
-			Default = "Walk (Legit)",
-			Tooltip = "How Corvus moves inside the lobby (treadmills, upgrade pads). Walk looks like a player",
+			Values = { "Teleport", "Walk" },
+			Default = "Teleport",
+			Tooltip = "How Corvus moves inside the lobby (treadmills, upgrade pads). Teleport is instant, Walk moves like a player (used automatically if the server pulls you back)",
 		})
 		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
 		local TongueBox = Tabs.Farm:AddRightGroupbox("Auto Tongue", "zap")
@@ -34533,17 +34524,12 @@ do
 		})
 		WinsBox:AddDropdown("WinsRoute", {
 			Text = "Route",
-			Values = { "Walk (Legit)", "Touch (Probe)", "Teleport (Probe)" },
-			Default = "Walk (Legit)",
-			Tooltip = "Walk follows the floor and stops where the stage needs the tongue. Touch stays on the treadmill and touches every pad from there (tested once per game version, back to Walk if the server does not pay). Teleport hops pad to pad and checks every pad's pay",
-		})
-		WinsBox:AddToggle("AllowTeleport", {
-			Text = "Allow Teleport Probe",
-			Default = false,
-			Tooltip = "Needed for the Teleport route and peppers. Untested on this game: try it on an alt first",
+			Values = { "Touch", "Teleport", "Walk" },
+			Default = "Touch",
+			Tooltip = "Touch stays on the treadmill and touches every pad from there. Teleport hops pad to pad. Walk follows the floor and stops where the stage needs the tongue. If the server does not pay a route, Corvus drops to the next one by itself",
 		})
 		WinsBox:AddToggle("LifeResets", {
-			Text = "Life Reset Probe",
+			Text = "New Life After Pad Runs",
 			Default = false,
 			Tooltip = "When the pads stop paying on the Touch or Teleport route, tests once per game version whether a new life (the game's own death report, then a respawn) makes them pay again, and keeps using what works while Wins still buy something. Never during the Spice Festival",
 		})
@@ -34552,7 +34538,7 @@ do
 		PepperBox:AddToggle("AutoPeppers", {
 			Text = "Collect Peppers",
 			Default = false,
-			Tooltip = "During the Spice Festival (25 min every 4 h) picks up the peppers in the stages (Teleport route only)",
+			Tooltip = "During the Spice Festival (25 min every 4 h) picks up the peppers in the stages (needs the Teleport route, used by itself)",
 		})
 		Labels.Peppers = PepperBox:AddLabel({ Text = "-", DoesWrap = true })
 		N.QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "zap")
