@@ -32183,8 +32183,90 @@ do
 	end
 	-- Walks with the humanoid straight to the point. When the straight line is blocked (counters, walls: owner
 	-- 2026-10-05 "it does not avoid obstacles") it switches to N.pathWalk (pathfinding, doors, short hops).
-	function N.walkTo(pos, near, timeout, straightOnly)
+	-- ACTION SPEED LADDER (SPEED_PLAN.md section 3, Bloxburg row). The server takes job interactions from
+	-- MAX_INTERACTION_DISTANCE = 30 studs (InteractionData 262945), so inside a shift the hub parks ONCE and acts
+	-- from there: rung "remote" (reach 26, no walking between stations that are in reach), degrade one rung to "walk"
+	-- (the old exact approach) after 2 rejects in 120 s, retry the fast rung after 10 min. Memory = this session
+	-- (a new server is a new PlaceVersion check). Logs: `ACT <job> via=remote ok parked`, `ACT <job> via=remote
+	-- rejected reason=`, `ACT fallback <job> remote -> walk`, `ACT retry <job> remote`.
+	N.ActMem = {}
+	local ACT_REACH = 26
+	local NoPark = { CaveMiner = true, HutFisherman = true, LumberWoodcutter = true, TaxiJob = true, PizzaPlanetDelivery = true }
+	local function actState(job)
+		local m = N.ActMem[job]
+		if not m then
+			m = { rung = "remote", rejects = {}, retryAt = 0, okLogAt = -1e9, okN = 0 }
+			N.ActMem[job] = m
+		end
+		return m
+	end
+	function N.actRung(job)
+		local m = actState(job)
+		if m.rung == "walk" and m.retryAt > 0 and os.clock() >= m.retryAt then
+			m.rung, m.retryAt, m.rejects = "remote", 0, {}
+			log("ACT retry", job, "remote")
+		end
+		return m.rung
+	end
+	-- a real server reject of an action done from the parked spot (wrong/rejected tasks, refused claims)
+	function N.actReject(job, reason)
+		if not job or job == "" then
+			return
+		end
+		local m = actState(job)
+		if m.rung ~= "remote" then
+			return
+		end
+		local now = os.clock()
+		log("ACT", job, "via=remote", "rejected reason=" .. tostring(reason))
+		table.insert(m.rejects, now)
+		for i = #m.rejects, 1, -1 do
+			if now - m.rejects[i] > 120 then
+				table.remove(m.rejects, i)
+			end
+		end
+		if #m.rejects >= 2 then
+			m.rung, m.retryAt, m.rejects = "walk", now + 600, {}
+			log("ACT fallback", job, "remote -> walk")
+		end
+	end
+	-- (state, nearForTheWalk): "here" = already in reach, act now; "walk" = walk only to ACT_REACH-4; nil = old behaviour
+	function N.actPark(pos, near)
+		local job = N.currentJob()
+		if job == "" or NoPark[job] or typeof(pos) ~= "Vector3" then
+			return nil
+		end
+		if (N.Cap and N.Cap.active) or (N.Needs and N.Needs.active) or (N.Garden and N.Garden.running) then
+			return nil
+		end
+		if N.actRung(job) ~= "remote" then
+			return nil
+		end
+		local root = N.root()
+		if not root then
+			return nil
+		end
+		local m = actState(job)
+		if (root.Position - pos).Magnitude <= ACT_REACH then
+			m.okN += 1
+			if os.clock() - m.okLogAt > 20 then
+				m.okLogAt = os.clock()
+				log("ACT", job, "via=remote", "ok parked", "n=" .. m.okN)
+			end
+			return "here"
+		end
+		return "walk", math.max(near, ACT_REACH - 4)
+	end
+	function N.walkTo(pos, near, timeout, straightOnly, noPark)
 		near = near or 3
+		if not straightOnly and not noPark then
+			local state, wider = N.actPark(pos, near)
+			if state == "here" then
+				return true
+			elseif state == "walk" then
+				near = wider
+			end
+		end
 		-- a long trip (pizza address, far tree): the game's own FastTravel / server move first (p05_travel), the
 		-- walk below does the last meters
 		if not straightOnly and N.travelNear then
@@ -37260,7 +37342,7 @@ do
 		local spot = (attach and attach.WorldPosition) or N.posOf(origin) or N.posOf(st.model)
 		setStatus("Line Cook: going to " .. st.name)
 		if spot then
-			N.walkTo(spot, 4, 14)
+			N.walkTo(spot, 4, 14, nil, true)
 		end
 		task.wait(N.actionDelay())
 		local ok, result = N.jobInvoke({ Type = "RequestStationRole", StationName = role, StationIndexName = st.name })
@@ -37578,6 +37660,9 @@ do
 		M.win.done += dd
 		M.win.wrong += dw
 		if M.win.done >= 6 and M.win.wrong >= 4 and M.win.wrong / M.win.done > 0.35 then
+			if N.actReject then
+				N.actReject(N.currentJob(), string.format("%d of %d tasks wrong", M.win.wrong, M.win.done))
+			end
 			N.modeSignal(job, string.format("rejected tasks %d of %d wrong", M.win.wrong, M.win.done))
 			return
 		end
@@ -39808,6 +39893,60 @@ do
 		end
 		return ok
 	end
+	-- Hop ladder (opt-in alt probe, toggle HopTrips, default OFF; SPEED_PLAN.md section 5: Bloxburg has had anti-teleport
+	-- before, the dump shows no position check). Rung 3 = CFrame hops of 30 studs; after every hop the ORIGIN TEST
+	-- (0.35 s later we are within 10 studs of where we came from = snapback). 2 snapbacks = rejected for the session
+	-- (the caller walks / takes the bus). Logs: `PROBE hop_30 result=accepted|rejected gain=<studs>`, `MOVE fallback travel hop -> walk`.
+	T.hopOff = false
+	local function hopTrip(pos, why)
+		local root = N.root()
+		if not root then
+			return false
+		end
+		T.movedAt = os.clock()
+		N.detach()
+		local start = root.Position
+		local snaps = 0
+		local goal = Vector3.new(pos.X, math.max(pos.Y, start.Y - 6) + 3, pos.Z)
+		for _ = 1, 80 do
+			root = N.root()
+			if not root then
+				return false
+			end
+			local here = root.Position
+			if flat(here, goal) < 20 then
+				break
+			end
+			local step = (goal - here)
+			local p = if step.Magnitude > 30 then here + step.Unit * 30 else goal
+			root.CFrame = CFrame.new(p) * (root.CFrame - root.CFrame.Position)
+			pcall(function()
+				root.AssemblyLinearVelocity = Vector3.zero
+			end)
+			task.wait(0.35)
+			root = N.root()
+			if not root then
+				return false
+			end
+			if (root.Position - here).Magnitude < 10 then
+				snaps += 1
+				log("MOVE snapback", "hop", "dist", math.floor((p - here).Magnitude), "n=" .. snaps)
+				if snaps >= 2 then
+					T.hopOff = true
+					log("PROBE", "hop_30", "result=rejected", "gain=0")
+					log("MOVE fallback", "travel", "hop -> walk", "reason=2 snapbacks", "why=" .. tostring(why))
+					return false
+				end
+			end
+		end
+		root = N.root()
+		local ok = root ~= nil and flat(root.Position, goal) < 25
+		if ok then
+			log("PROBE", "hop_30", "result=accepted", "gain=" .. math.floor(flat(start, goal)))
+			T.trips += 1
+		end
+		return ok
+	end
 	-- Moves you close to pos when that is clearly faster than walking. True when you were moved.
 	function N.travelNear(pos, why)
 		if T.busy or typeof(pos) ~= "Vector3" then
@@ -39826,6 +39965,11 @@ do
 		local ok, moved = pcall(function()
 			if on("ServerTeleport") and not T.yieldOff and os.clock() - T.yieldAt >= 30 and d / speed >= 6 then
 				if yieldTo(pos, why) then
+					return true
+				end
+			end
+			if on("HopTrips") and not T.hopOff and NoArea[N.currentJob()] and d / speed >= 6 then
+				if hopTrip(pos, why) then
 					return true
 				end
 			end
@@ -40051,6 +40195,12 @@ do
 		Text = "Server teleport",
 		Default = false,
 		Tooltip = "Asks the server to move you straight to the goal (the game's faint recovery move). Faster than the bus, at most every 30 s. Turns itself off for the session if the server does not move you",
+	})
+
+	TravelBox:AddToggle("HopTrips", {
+		Text = "Hop trips (alt probe)",
+		Default = false,
+		Tooltip = "Between shifts: crosses long distances in 30 stud CFrame hops instead of the bus or walking. Checks after every hop that the server did not pull you back; 2 pull-backs switch it off for the session. Meant to be tried on an alt first",
 	})
 
 	local GardenBox = Tabs.Jobs:AddRightGroupbox("Garden & Skills", "sprout")
@@ -41041,7 +41191,7 @@ do
 	end)
 	-- Every change of the main toggles is logged with the others' state, so a silent stop has a visible reason.
 	task.spawn(function()
-		local names = { "SmartPlanner", "AutoJob", "BestPay", "AutoNeeds", "Objectives", "AutoGarden", "SkillBreaks", "ServerTeleport" }
+		local names = { "SmartPlanner", "AutoJob", "BestPay", "AutoNeeds", "Objectives", "AutoGarden", "SkillBreaks", "ServerTeleport", "HopTrips" }
 		local last = {}
 		while alive() do
 			for _, name in ipairs(names) do
