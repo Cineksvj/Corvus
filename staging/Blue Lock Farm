@@ -32050,7 +32050,7 @@ do
 	-- Every feature is its own toggle (owner decision 2026-10-05: no master toggle). A job runs when the player switched
 	-- its toggle on. SMART PLANNER = AUTOPILOT (owner rule 2026-10-07): with the Smart Planner on, the planner runs every
 	-- farming job itself through the same functions, even with all those toggles off. It never flips them; only the
-	-- opt-in Tutorial Hold, Walk Speed and the option toggles stay the player's own choice.
+	-- opt-in Tutorial Hold and the option toggles stay the player's own choice.
 	N.PlannerOwns = {
 		AutoConveyor = true,
 		AutoLockers = true,
@@ -32091,9 +32091,9 @@ do
 	function N.planner()
 		return on("SmartPlanner")
 	end
-	-- Movement: Teleport (default; the audit found no position check, the game pivots players itself) or Walk.
+	-- Movement: one mode, teleport (the audit found no position check). Walking only as the auto-degrade after snapbacks.
 	function N.safeMove()
-		return optionText("MoveMode", "Teleport (Fast)") ~= "Teleport (Fast)" or (N.Move and os.clock() < (N.Move.walkUntil or 0))
+		return N.Move ~= nil and os.clock() < (N.Move.walkUntil or 0)
 	end
 	Status = "Idle"
 	local StatusSeen, StatusSeenCount = {}, 0
@@ -32647,9 +32647,6 @@ function N.rollPart()
 	return N.plotPart("Systems.RollStation.ConveyorPart")
 end
 function N.rollGap()
-	if optionText("RollSpeed", "Max (server cooldown)") == "Legit (3 s)" then
-		return 3
-	end
 	return 1.05
 end
 -- The buy rule for a rolled locker. Smart Planner: payback against the 24 h horizon and the other purchases. Plain:
@@ -34350,21 +34347,9 @@ do
 			Default = false,
 			Tooltip = "Rolls the conveyor at the server cooldown and buys the lockers worth it (the AutoConveyor gamepass loop, done with the normal roll and buy remotes)",
 		})
-		ConvBox:AddDropdown("RollSpeed", {
-			Text = "Roll Speed",
-			Values = { "Max (server cooldown)", "Legit (3 s)" },
-			Default = "Max (server cooldown)",
-			Tooltip = "Max rolls again the moment the server cooldown (1 s) ends. Legit waits 3 s like a player pressing the button",
-		})
 		ConvBox:AddDropdown("BuyLockers", { Text = "Buy lockers (none = all)", Values = lockerNames, Default = {}, Multi = true, AllowNull = true, Tooltip = "Without Smart Planner: only these lockers are bought. Smart Planner buys by payback instead" })
 		ConvBox:AddDropdown("BuyVariants", { Text = "Buy variants (none = all)", Values = variantNames, Default = {}, Multi = true, AllowNull = true })
 		ConvBox:AddSlider("BuyCashShare", { Text = "Spend up to", Default = 50, Min = 5, Max = 100, Rounding = 0, Suffix = "% of cash", Tooltip = "Without Smart Planner: a locker or ball skin costs at most this share of your cash" })
-		ConvBox:AddDropdown("MoveMode", {
-			Text = "Movement",
-			Values = { "Teleport (Fast)", "Walk" },
-			Default = "Teleport (Fast)",
-			Tooltip = "Teleport moves you to the conveyor, droppers, crates and the sell NPC instantly (default). Walk walks there",
-		})
 		Labels.Conveyor = ConvBox:AddLabel({ Text = "-", DoesWrap = true })
 		local LockBox = Tabs.Farm:AddRightGroupbox("Lockers", "box")
 		LockBox:AddToggle("AutoLockers", { Text = "Auto Lockers", Default = false, Tooltip = "Places bought lockers on free droppers, opens them when ready and equips your best units" })
@@ -34397,7 +34382,7 @@ do
 		UpBox:AddToggle("AutoUpgrades", { Text = "Auto Upgrades", Default = false, Tooltip = "Buys the cheapest picked upgrade you can afford. With Smart Planner on, the planner buys by payback" })
 		UpBox:AddDropdown("UpgradePicks", {
 			Text = "Upgrades",
-			Values = { "Base Expansion", "Crate Cash Boost", "Conveyor Luck", "Open Time Boost", "Luck Boost", "Walk Speed", "Crate Polisher", "Polisher Speed" },
+			Values = { "Base Expansion", "Crate Cash Boost", "Conveyor Luck", "Open Time Boost", "Luck Boost", "Crate Polisher", "Polisher Speed" },
 			Default = { "Base Expansion", "Crate Cash Boost", "Conveyor Luck", "Open Time Boost" },
 			Multi = true,
 			AllowNull = true,
@@ -34615,7 +34600,7 @@ do
 	function Debug.perfText()
 		local last = Perf.last
 		if not last then
-			return "still measuring"
+			return "collecting numbers"
 		end
 		return string.format(
 			"fps %d, worst frame %dms, hitches %d, freezes %d, Corvus used %dms in %ds (%.2f%%), ping %sms, memory %sMB",
@@ -34694,7 +34679,7 @@ do
 	end
 	Log.header = Debug.header
 end
-N.AllAutoToggles = { "SpeedHack" }
+N.AllAutoToggles = {}
 for _, row in ipairs(N.FarmToggles) do
 	table.insert(N.AllAutoToggles, row[1])
 end
@@ -34974,10 +34959,8 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 	pcall(function()
 		local holder = Tabs.Misc or Tabs.Main
 		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
-		Labels.Perf = PerfBox:AddLabel({ Text = "Measuring...", DoesWrap = true })
+		Labels.Perf = PerfBox:AddLabel({ Text = "Collecting numbers...", DoesWrap = true })
 		local UtilBox = holder:AddRightGroupbox("Utility", "wrench")
-		UtilBox:AddToggle("SpeedHack", { Text = "Walk Speed", Default = false })
-		UtilBox:AddSlider("WalkSpeed", { Text = "Speed", Default = 50, Min = 16, Max = 200, Rounding = 0 })
 		UtilBox:AddToggle("AfkGuard", {
 			Text = "Stop AFK Rejoin",
 			Default = true,
@@ -35584,12 +35567,6 @@ do
 				vim:SendMouseMoveEvent(size.X / 2, size.Y / 2, game)
 			end)
 		end
-		if on("SpeedHack") then
-			local hum = N.humanoid()
-			if hum and hum.WalkSpeed ~= optionNumber("WalkSpeed", 50) then
-				hum.WalkSpeed = optionNumber("WalkSpeed", 50)
-			end
-		end
 		task.wait(1)
 	end)
 	-- Smart Planner: decides and logs PLAN only while its toggle is on.
@@ -35637,7 +35614,7 @@ do
 				local cp = N.collectPart()
 				I.crates = string.format("%s balls waiting (%s)\nSold %d crates for %s\n%s%s", tostring(cp and cp:GetAttribute("PendingBallCount") or 0), tostring(cp and cp:GetAttribute("PendingCashDisplay") or "0"), Session.sold, formatNumber(Session.soldCash), N.Crate.last, if N.polisherUnlocked() then "\nCrate Polisher unlocked" else "")
 				I.planner = if N.planner()
-					then string.format("<b>On</b>\n%s\nNext: %s", if N.Plan.say ~= "" then N.Plan.say else "Measuring...", if N.Plan.spendText ~= "" then N.Plan.spendText else "-")
+					then string.format("<b>On</b>\n%s\nNext: %s", if N.Plan.say ~= "" then N.Plan.say else "Planning...", if N.Plan.spendText ~= "" then N.Plan.spendText else "-")
 					else "Off. Turn it on to spend every coin by payback (levels, expansions, boosts, ball skins) and buy only lockers that pay back. Your other toggles stay as they are"
 				local levels, cheapest = 0, nil
 				for _, d in ipairs(N.placed()) do
