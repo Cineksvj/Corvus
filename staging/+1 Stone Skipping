@@ -33825,7 +33825,7 @@ function N.worldProbeStep()
 	end
 	local cfg = N.worldCfg()
 	local nextId = cfg and cfg.NextWorldId
-	local base = N.Rate.throwWins
+	local base = N.throwWinsNow()
 	if not nextId or Z.worldDone[nextId] or N.worldUnlocked(nextId) or not base or base <= 0 then
 		return false
 	end
@@ -35106,6 +35106,25 @@ do
 		return 1 + math.max(tonumber(bonus) or 0, 0)
 	end
 	-- Skill per second training now (in the best open zone), and from throwing now. Same unit: skill per second.
+	-- Wins per second from throwing at today's trail (the measured rate is stored per unit of trail multiplier, so a rate
+	-- measured before buying a trail is not undervalued afterwards).
+	function N.throwWinsNow()
+		return if R.throwWins then R.throwWins * math.max(N.trailMult(), 1) else nil
+	end
+	-- Ratio of the average Wins rate over the 24 h horizon when the skill GAIN per second is multiplied by k (a stone, a
+	-- pet): only new skill is multiplied, today's skill stays. Skill averaged over the horizon = S + g H / 2, Wins ~
+	-- skill^alpha (alpha from the game's tables). With no skill income yet it is plainly k^alpha.
+	function N.skillGainRatio(k, alpha)
+		alpha = alpha or P.alpha or 1
+		if k <= 1 then
+			return 1
+		end
+		local S, g = math.max(N.skill(), 0), N.skillIncome()
+		if not g or g <= 0 then
+			return k ^ alpha
+		end
+		return ((S + k * g * H / 2) / (S + g * H / 2)) ^ alpha
+	end
 	function N.trainRateNow()
 		if R.trainNorm then
 			local zone = N.bestZone()
@@ -35123,7 +35142,7 @@ do
 		local skill, wins, mode = N.skill(), N.wins(), N.Mode
 		local last = R.last
 		local scale = N.skillScale()
-		R.last = { t = now, skill = skill, wins = wins, mode = mode, rebirths = N.rebirths(), scale = scale, act = N.activity() }
+		R.last = { t = now, skill = skill, wins = wins, mode = mode, rebirths = N.rebirths(), scale = scale, act = N.activity(), trail = math.max(N.trailMult(), 1) }
 		if last and last.mode == mode and (mode == "train" or mode == "throw") and now - last.t < 5 and last.rebirths == R.last.rebirths then
 			local acc = R.acc[mode] or { skill = 0, wins = 0, secs = 0 }
 			R.acc[mode] = acc
@@ -35131,7 +35150,7 @@ do
 			-- Training counts only while the game says Practice (walking to the stand is not training time).
 			if mode ~= "train" or last.act == "Practice" then
 				acc.skill += math.max(skill - last.skill, 0) / unit
-				acc.wins += math.max(wins - last.wins, 0)
+				acc.wins += math.max(wins - last.wins, 0) / last.trail
 				acc.secs += now - last.t
 			end
 			if mode == "train" then
@@ -35419,7 +35438,7 @@ do
 	-- first for the Wins it costs can open the next world sooner than training alone. Returns the best such stone.
 	-- tTrain = seconds of training to the unlock now, T / s = training / throwing skill per second.
 	function N.stoneFirst(tTrain, T, s, need)
-		if not N.planner() or not (R.throwWins and R.throwWins > 0) or not need then
+		if not N.planner() or not (N.throwWinsNow() and N.throwWinsNow() > 0) or not need then
 			return nil
 		end
 		local wins = N.wins()
@@ -35431,7 +35450,7 @@ do
 			local mult, price = tonumber(stone.Multiplier) or 0, tonumber(stone.Price) or 0
 			if not owned[stone.Id] and mult > best and price > 0 and (N.Shop.refused[stone.Id] or 0) <= os.clock() then
 				local short = math.max(price - wins, 0)
-				local tThrow = short / R.throwWins
+				local tThrow = short / N.throwWinsNow()
 				local left = math.max(need - skill - (s or 0) * tThrow, 0)
 				local t = tThrow + left / (T * mult / best)
 				if t < tTrain * 0.95 and (not pick or t < pick.t) then
@@ -35529,8 +35548,9 @@ do
 	-- Wins per second the whole loop makes (measured, else the model).
 	function N.winsIncome(f)
 		f = f or P.f
-		if R.throwWins and R.throwWins > 0 then
-			return R.throwWins * f
+		local measured = N.throwWinsNow()
+		if measured and measured > 0 then
+			return measured * f
 		end
 		local per = N.baseWins(N.skill()) * N.trailMult()
 		return per / (R.secPerThrow or 6) * f
@@ -35783,7 +35803,21 @@ do
 				return true, gain, lost
 			end
 		end
-		local worth = gain > lost or r <= 0
+		-- Wins over the horizon (Wins ~ skill^alpha, alpha from the game's tables, at least 0.5 because skill also opens
+		-- zones and worlds): staying = skill S + r t, rebirth = reset then r (1 + boost) t. Integral of skill^alpha:
+		-- ((S + r H)^(a+1) - S^(a+1)) / r  against  (r' H)^(a+1) / r'.
+		local worth
+		if r <= 0 or boost <= 0 then
+			worth = r <= 0 or not resets
+		elseif not resets then
+			worth = true
+		else
+			local a1 = math.max(P.alpha or 1, 0.5) + 1
+			local S0, r2 = math.max(N.skill(), 0), r * (1 + boost)
+			local stay = ((S0 + r * H) ^ a1 - S0 ^ a1) / r
+			local reb = (r2 * H) ^ a1 / r2
+			worth = reb > stay
+		end
 		P.rebirthSay = string.format(
 			"%s: x%s -> x%s skill brings %s skill in 24 h, the reset costs %s",
 			if worth then "Rebirth when ready" else "No rebirth yet",
@@ -35845,7 +35879,7 @@ do
 			for _, stone in ipairs(N.worldStones()) do
 				local mult, price = tonumber(stone.Multiplier) or 0, tonumber(stone.Price) or 0
 				if not owned[stone.Id] and mult > best and price > 0 and (N.Shop.refused[stone.Id] or 0) <= os.clock() then
-					table.insert(list, { key = "stone:" .. stone.Id, kind = "stone", item = stone, cost = price, gain = (mult / best - 1) * alpha * W })
+					table.insert(list, { key = "stone:" .. stone.Id, kind = "stone", item = stone, cost = price, gain = (N.skillGainRatio(mult / best, alpha) - 1) * W })
 				end
 			end
 		end
@@ -35866,7 +35900,7 @@ do
 				if allows(Options.HatchEggs, egg.id) then
 					local e, total = N.eggGain(egg.id)
 					if e > 0 then
-						table.insert(list, { key = "egg:" .. egg.id, kind = "egg", item = egg, cost = egg.price * count, gain = alpha * e / total * count * W, count = count })
+						table.insert(list, { key = "egg:" .. egg.id, kind = "egg", item = egg, cost = egg.price * count, gain = (N.skillGainRatio(1 + e * count / total, alpha) - 1) * W, count = count })
 					end
 				end
 			end
