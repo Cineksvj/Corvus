@@ -33410,6 +33410,63 @@ do
 		end
 		Fo.last = text
 	end
+	-- Act ladder (SPEED_PLAN): rung 1 = fire the remote from where we stand; when refused, rung 3 = teleport onto the
+	-- table's prompt side, wait 0.3 s + ping, retry. Two refusals in 60 s on a rung = remembered for 10 min.
+	local Acts = {}
+	local function pingSeconds()
+		local ms = 0
+		pcall(function()
+			ms = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+		return math.clamp((tonumber(ms) or 0) / 1000, 0, 1)
+	end
+	function N.Act(action, fire)
+		local mem = Acts[action]
+		if not mem then
+			mem = { rung = "remote", rejects = {}, retryAt = 0 }
+			Acts[action] = mem
+		end
+		if mem.retryAt > 0 and os.clock() >= mem.retryAt then
+			mem.rung, mem.retryAt = "remote", 0
+		end
+		local ok, result
+		local rung = mem.rung
+		if rung == "teleport" then
+			local part = N.forgeTable()
+			if part then
+				local land = CFrame.new(part.Position + Vector3.new(0, 3, 5), part.Position)
+				N.tp(land)
+				task.wait(0.3 + 1.5 * pingSeconds())
+			end
+		end
+		ok, result = fire()
+		if not (ok and result) and rung == "remote" then
+			local part = N.forgeTable()
+			if part then
+				rung = "teleport"
+				N.tp(CFrame.new(part.Position + Vector3.new(0, 3, 5), part.Position))
+				task.wait(0.3 + 1.5 * pingSeconds())
+				ok, result = fire()
+			end
+		end
+		if ok and result then
+			mem.rejects = {}
+			if rung == "teleport" and mem.rung == "remote" then
+				mem.rung, mem.retryAt = "teleport", os.clock() + 600
+			end
+			log("ACT", action, "via=" .. rung, "ok")
+			return ok, result
+		end
+		local now = os.clock()
+		table.insert(mem.rejects, now)
+		for i = #mem.rejects, 1, -1 do
+			if now - mem.rejects[i] > 60 then
+				table.remove(mem.rejects, i)
+			end
+		end
+		log("ACT", action, "via=" .. rung, "rejected reason=" .. brief(result))
+		return ok, result
+	end
 	-- Forges while there are enough ores. Walks to the forge table first, like a player would.
 	function N.forgeStep(maxForges)
 		if N.fightMode() ~= nil then
@@ -33433,14 +33490,10 @@ do
 				N.Plan.forge.at = -1e9
 				break
 			end
-			local table_ = N.forgeTable()
-			if table_ and N.myPos() and (N.myPos() - table_.Position).Magnitude > 12 then
-				setStatus("Going to the forge table")
-				N.tp(CFrame.new(table_.Position + Vector3.new(0, 3, 5), table_.Position))
-				task.wait(0.4)
-			end
 			setStatus(string.format("Forging a %s from %d ores (avg power %s)", kind, total, formatNumber(avg)))
-			local ok, result = invoke(N.R.forge, 15, { ConfigType = kind, UUIDList = plan })
+			local ok, result = N.Act("forge", function()
+				return invoke(N.R.forge, 15, { ConfigType = kind, UUIDList = plan })
+			end)
 			if not ok or not result then
 				logProblem("Forge refused: " .. brief(result))
 				break
