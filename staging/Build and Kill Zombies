@@ -32203,54 +32203,94 @@ do
 		car = car or N.myCar()
 		return car and (car.PrimaryPart or car:FindFirstChildWhichIsA("BasePart", true))
 	end
-	-- Walking like a player (the server checks foot speed: FootSpeedMultiplier 1.5): Humanoid:MoveTo, re-sent every 2 s,
-	-- a jump when stuck. No teleport, no speed change.
+	-- Foot movement = a tween (server foot check: 1.5 x WalkSpeed, strikes end the run): the root slides along the floor at
+	-- min(1.4 x WalkSpeed, WalkSpeed + 5). No teleport, no WalkSpeed edit.
 	N.Walk = { fails = 0 }
-	function N.walkTo(target, near, timeout)
+	N.ActLogAt = {}
+	function N.actLog(action, rung, ok, reason)
+		local key = action .. tostring(ok)
+		if os.clock() - (N.ActLogAt[key] or -1e9) >= 30 then
+			N.ActLogAt[key] = os.clock()
+			log("ACT", action, "via=" .. rung, if ok then "ok" else "rejected reason=" .. tostring(reason))
+		end
+	end
+	function N.footSpeed()
+		local hum = N.humanoid()
+		local ws = hum and tonumber(hum.WalkSpeed) or 16
+		return math.min(1.4 * ws, ws + 5)
+	end
+	function N.pingSeconds()
+		local ok, v = pcall(function()
+			return LocalPlayer:GetNetworkPing()
+		end)
+		return if ok and tonumber(v) then math.min(v, 1) else 0.1
+	end
+	function N.footTo(target, near, timeout)
 		near = near or 6
 		timeout = timeout or 20
-		local hum = N.humanoid()
-		if not (hum and N.root()) then
-			return false
-		end
 		local function flat()
 			local p = N.myPos() or target
 			return Vector3.new(p.X - target.X, 0, p.Z - target.Z).Magnitude
 		end
+		if not N.root() then
+			return false
+		end
 		if flat() <= near then
 			return true
 		end
-		local started, sentAt, lastDist, lastAt = os.clock(), -1e9, flat(), os.clock()
+		local started, last = os.clock(), os.clock()
+		local speed = N.footSpeed()
 		while os.clock() - started < timeout and alive() do
-			if os.clock() - sentAt >= 2 then
-				sentAt = os.clock()
-				pcall(function()
-					hum:MoveTo(target)
-				end)
+			local now = os.clock()
+			local dt = math.min(now - last, 0.1)
+			last = now
+			local root = N.root()
+			if not root then
+				break
 			end
-			local d = flat()
+			local p = root.Position
+			local dx, dz = target.X - p.X, target.Z - p.Z
+			local d = math.sqrt(dx * dx + dz * dz)
 			if d <= near then
 				N.Walk.fails = 0
 				return true
 			end
-			if lastDist - d > 1 then
-				lastDist, lastAt = d, os.clock()
-			elseif os.clock() - lastAt > 1.5 then
-				lastAt = os.clock()
-				pcall(function()
-					hum.Jump = true
-				end)
-			end
-			task.wait(0.1)
+			local step = math.min(speed * dt, d - near + 0.3)
+			local dir = Vector3.new(dx / d, 0, dz / d)
+			local np = Vector3.new(p.X + dir.X * step, p.Y, p.Z + dir.Z * step)
+			pcall(function()
+				root.CFrame = CFrame.new(np, np + dir)
+				root.AssemblyLinearVelocity = Vector3.zero
+			end)
+			task.wait()
 		end
 		N.Walk.fails += 1
-		if N.Walk.fails >= 3 then
-			logProblem(string.format("Walk did not reach the spot (%.0f studs left)", flat()))
-			N.Walk.fails = 0
-		else
-			log("WALK failed", string.format("%.0f studs left", flat()))
-		end
+		log("MOVE foot tween incomplete", string.format("%.0f studs left", flat()))
 		return false
+	end
+	N.walkTo = N.footTo
+	-- ACT ladder for a ProximityPrompt (rung 2): tween inside MaxActivationDistance - 2, wait 0.25 s + 1.5 x ping so the
+	-- server sees us there, then the caller fires the prompt. Returns true when in range.
+	function N.reachPrompt(prompt, action)
+		local pos = N.promptPos(prompt)
+		if not pos then
+			return false
+		end
+		local range = math.max((tonumber(prompt.MaxActivationDistance) or 10) - 2, 3)
+		local function far()
+			local me = N.myPos()
+			return me ~= nil and Vector3.new(pos.X - me.X, 0, pos.Z - me.Z).Magnitude > range
+		end
+		if not far() then
+			return true
+		end
+		local ok = N.footTo(pos, math.max(range - 1.5, 1.5), 15)
+		if not ok then
+			N.actLog(action, "foot", false, "did not reach")
+			return false
+		end
+		task.wait(0.25 + 1.5 * N.pingSeconds())
+		return not far()
 	end
 	-- A ProximityPrompt the way the player triggers it: fireproximityprompt when the executor has it, else the prompt's
 	-- own hold input. Only in range (the server checks the distance).
@@ -32575,7 +32615,7 @@ do
 			cache = {}
 			CellCache[b] = cache
 		end
-		local kind = if support then "support" else "part"
+		local kind = if support then "support" elseif N.classOf(N.partDef(id)) == "Wheel" then "wheel" else "part"
 		if cache[kind] == nil then
 			cache[kind] = N.findFreeCell(b, id) or false
 		end
@@ -32605,12 +32645,15 @@ do
 		end
 		cx, cz = cx / math.max(n, 1), cz / math.max(n, 1)
 		local best, bestScore
+		local wheel = N.classOf(N.partDef(id)) == "Wheel"
 		for k in pairs(set) do
 			local x, y, z = N.parseKey(k)
 			for _, f in ipairs(Faces) do
 				local nx, ny, nz = x + f[1], y + f[2], z + f[3]
-				if ny > low and not (nx == sx and nz == sz and ny > sy) and N.canPlace(b, id, nx, ny, nz, counts) then
-					local score = ny * 100 + math.abs(nx - cx) + math.abs(nz - cz)
+				-- a wheel (bootstrap, the car has none) goes on the lowest layer or below it, never under another part
+				local wheelOk = wheel and ny <= low and ny >= 0 and not b[N.cellKey(nx, ny - 1, nz)]
+				if (wheelOk or (not wheel and ny > low)) and not (nx == sx and nz == sz and ny > sy) and N.canPlace(b, id, nx, ny, nz, counts) then
+					local score = (if wheel then -ny else ny) * 100 + math.abs(nx - cx) + math.abs(nz - cz)
 					if not bestScore or score < bestScore then
 						best, bestScore = { key = N.cellKey(nx, ny, nz), x = nx, y = ny, z = nz }, score
 					end
@@ -32703,7 +32746,14 @@ function N.gainPerSec(a, b)
 	elseif newIndex > 0 then
 		distGain = 1
 	else
-		distGain = 0
+		-- bootstrap: a car that cannot run yet. Each missing piece (seat, engine, fuel, wheels) that this change
+		-- supplies is worth a quarter of the first working car.
+		local function missing(x)
+			local g = N.aggregates(x)
+			return (if g.HasSeat then 0 else 1) + (if g.EnginePower > 0 then 0 else 1) + (if g.FuelTime > 0 then 0 else 1) + (if g.Wheels > 0 then 0 else 1)
+		end
+		local delta = missing(a) - missing(b)
+		return if delta > 0 then math.max(rate, 1) * 0.25 * delta else 0
 	end
 	local weaponGain = (nw - ow) / math.max(ow, 40)
 	return rate * ((1 - killShare) * distGain + killShare * weaponGain)
@@ -32730,7 +32780,7 @@ function N.bestUse(id, b)
 			end
 		end
 	end
-	if class ~= "Wheel" then
+	if class ~= "Wheel" or N.aggregates(b).Wheels == 0 then
 		local cell = N.freeCell(b, id)
 		if cell then
 			local nb = table.clone(b)
@@ -33475,12 +33525,9 @@ function N.rollStep()
 			send("SetRollCategories", want)
 		end
 	end
-	local pos = N.promptPos(roll)
-	local range = math.max((tonumber(roll.MaxActivationDistance) or 10) - 2, 3)
-	local me = N.myPos()
-	if pos and me and (Vector3.new(pos.X - me.X, 0, pos.Z - me.Z)).Magnitude > range then
-		setStatus("Walking to the " .. (if station == "RollBlocks" then "blocks" else "weapons") .. " roll station")
-		N.walkTo(pos, range - 1, 15)
+	setStatus("Moving to the " .. (if station == "RollBlocks" then "blocks" else "weapons") .. " roll station")
+	if not N.reachPrompt(roll, "roll") then
+		task.wait(0.5)
 		return true
 	end
 	local shown = R.shown[station]
@@ -33491,17 +33538,14 @@ function N.rollStep()
 		R.last = string.format("%s (%s): %s", tostring(def.Name or shown.id), tostring(def.Rarity or "?"), if yes then "bought, " .. why else "skipped, " .. why)
 		log("ROLL", station, shown.id, tostring(def.Rarity), "cost " .. formatNumber(def.Cost), "->", if yes then "buy" else "skip", why)
 		if yes and buy then
-			local bpos = N.promptPos(buy)
-			me = N.myPos()
-			if bpos and me and (bpos - me).Magnitude > (tonumber(buy.MaxActivationDistance) or 10) - 1 then
-				N.walkTo(bpos, (tonumber(buy.MaxActivationDistance) or 10) - 3, 8)
-			end
+			N.reachPrompt(buy, "buy")
 			local before = N.Inv[shown.id] or 0
 			local cashBefore = N.cash()
 			N.firePrompt(buy)
 			local ok = waitFor(function()
 				return (N.Inv[shown.id] or 0) > before or N.cash() < cashBefore or (R.boughtAt or 0) > shown.at
 			end, 4)
+			N.actLog("buy", "prompt", ok, "no answer")
 			if ok then
 				if R.stat and R.stat[station] then
 					R.stat[station].buys += 1
@@ -33541,6 +33585,7 @@ function N.rollStep()
 	local got = waitFor(function()
 		return (R.resultAt[station] or -1e9) >= R.at
 	end, 7)
+	N.actLog("roll", "prompt", got, "no result")
 	if not got then
 		R.noResult += 1
 		log("ROLL no result", station, "n=" .. R.noResult)
@@ -34458,16 +34503,16 @@ function N.planTick()
 		price = math.max(price, sum / #P.buyGains * 0.5)
 	end
 	local cash = N.cash() - optionNumber("KeepCash", 0)
-	local rolls = 10
+	local rolls = 4
 	-- A roll is worth: chance of a part worth buying x its income gain x about an hour (better rolls replace it later).
 	-- It costs the driving it replaces: income per second x ~5.5 s per roll (3 s cooldown + spin + walk).
 	local rollValue = pGood * N.avgGain(rate) * 3600
 	local rollCost = rate * 5.5
-	-- 10 rolls between runs, 20 when a roll is worth more than the driving it replaces, 30 when 3x more
+	-- 4 rolls between runs (more runs per minute), 8 when a roll is worth more than the driving it replaces, 12 when 3x more
 	if rollValue > rollCost * 3 then
-		rolls = 30
+		rolls = 12
 	elseif rollValue > rollCost then
-		rolls = 20
+		rolls = 8
 	end
 	local mode, say
 	local _, runStuds = N.carScore(N.aggregates(N.readBuild()))
