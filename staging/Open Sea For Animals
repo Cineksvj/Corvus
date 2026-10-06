@@ -32950,13 +32950,6 @@ end
 			Session.lost += amount
 			Saved.lost += amount
 			SaveDirty = true
-			feedPush({
-				Title = "Lost " .. amount .. " item" .. (if amount == 1 then "" else "s"),
-				Sub = "The sea closed before they were banked",
-				Right = "lost",
-				Image = "circle-x",
-				Color = "#f05a5a",
-			})
 		end
 		function Track.sold(total, items)
 			Session.earned += total
@@ -32985,7 +32978,7 @@ end
 		end
 		function Track.event(kind, title, sub, icon, color)
 			Metrics.event(kind, title, color)
-			feedPush({ Title = title, Sub = sub or "", Right = kind, Image = icon or "sparkles", Color = color or "#7dd3fc" })
+			-- Live Catches lists catches only (owner 2026-10-06): upgrades, dumbbells, hatches and rewards stay out of the feed
 		end
 	end
 	local hrpOffset, standSpot, Moves, travelTo, seaTravel, openDuration, Sea, isWaveActive, carriedModels, tripLimit, chargeValue, trainingController
@@ -34019,6 +34012,7 @@ end
 					string.format("closes %+.2fs", closeAt - os.clock())
 				)
 				if emptied then
+					Sea.shoreFails = 0
 					local grew = waitFor(function()
 						return inventoryCount() > before
 						end, 2.5)
@@ -34066,6 +34060,25 @@ end
 				table.insert(names, model.Name .. "(" .. model.ClassName .. " " .. table.concat(tags, "/") .. ")")
 			end
 			logProblem("The shore did not take " .. table.concat(names, ", "))
+			Sea.shoreFails = (Sea.shoreFails or 0) + 1
+			if Sea.shoreFails >= 3 then
+				-- Stuck: a stale carried model the shore will never take. Drop it through the game's own PickupController,
+				-- destroy what is left client side, then let the loop continue (catch -> bank -> sell).
+				local carriedBefore = #carriedModels()
+				local pc = controller("PickupController")
+				if pc and type(pc.DropAll) == "function" then
+					pcall(pc.DropAll, pc)
+				end
+				task.wait(0.4)
+				for _, model in ipairs(carriedModels()) do
+					pcall(function()
+						model:Destroy()
+					end)
+				end
+				task.wait(0.2)
+				log("RECOVER stuck carried item", names[1] or "?", "carried", carriedBefore, "->", #carriedModels(), "after 3 refusals, dropped via PickupController")
+				Sea.shoreFails = 0
+			end
 			return 0, 0
 		end
 		Sea.instant = { gap = 0.25, fails = 0, ok = 0, refused = 0, off = false }
