@@ -35753,8 +35753,13 @@ if N.Shop.travel then
 local spot = stallSpot(item.category)
 if spot then
 N.dismount()
-setStatus("Walking to the shop")
-N.travelTo(spot)
+local rung = N.moveMode()
+if #N.basketItems() > 0 then
+rung = "Safe"
+end
+setStatus("Going to the shop (" .. rung .. ")")
+local arrived = N.travelTo(spot, { mode = rung })
+log("ACT shop_travel via=" .. rung .. " " .. (arrived and "ok" or "rejected"))
 end
 end
 while alive() and bought < 30 do
@@ -35768,6 +35773,7 @@ fire("Game/BuyWithCash", item.category, item.name)
 local ok = waitFor(function()
 return N.cash() < before
 end, 2)
+log("ACT shop_buy via=" .. (if N.Shop.travel then "teleport" else "remote") .. " " .. (ok and "ok" or "rejected"))
 if not ok then
 N.Shop.failures += 1
 log("SHOP buy did not go through", item.name)
