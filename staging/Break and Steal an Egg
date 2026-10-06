@@ -27506,6 +27506,7 @@ end
                     "CorvusConfigList",
                     "CorvusShareCode",
                     "CorvusAutoSave",
+                    "CorvusNoRender",
                 })
                 SaveManager:SetFolder(Folder)
                 if Info.SubFolder then
@@ -31961,6 +31962,7 @@ do
 	N.G.TreadmillUnlock = N.tableOr(safeRequire("Shared.TreadmillUnlockConfig"))
 	N.G.Satchel = N.tableOr(safeRequire("Shared.SatchelConfig"))
 	N.G.Rewards = N.tableOr(safeRequire("Shared.EggRewards"))
+N.G.BackpackSell = N.tableOr(safeRequire("Shared.BackpackSellConfig"))
 	N.G.Shop = N.tableOr(safeRequire("Shared.RobuxShopConfig"))
 end
 local formatNumber, clockText, character, rootPart, humanoid, allows, selected, on, optionNumber, optionText, count
@@ -34646,6 +34648,15 @@ do
 		return out
 	end
 	-- Expected income added by one animal when the weakest placed one earns `worst` (0 while the plot has room).
+	-- Backpack sale: an animal sells for PetIncomeSeconds (60) x its income/s (BackpackSellConfig.PetValue). Every animal that does
+	-- not end up on the plot is sold, so the surplus earns 60 x min(its income, the weakest placed one's) in cash.
+	function P.sellGain(dist, worst)
+		local g = 0
+		for _, row in ipairs(dist) do
+			g += row.p * math.min(row.v, worst)
+		end
+		return g * (tonumber(N.G.BackpackSell.PetIncomeSeconds) or 60)
+	end
 	function P.gain(dist, worst)
 		local g = 0
 		for _, row in ipairs(dist) do
@@ -34742,6 +34753,13 @@ do
 		local data = N.Cat.zones[zone]
 		return if data then data.power * margin else math.huge
 	end
+	-- Capacity of the next satchel tier from SatchelConfig (one more animal when the table has no number).
+	function P.satchelCapacityAfter(tier, current)
+		local tiers = N.G.Satchel.Tiers
+		local data = type(tiers) == "table" and tiers[tier + 1]
+		local cap = data and tonumber(data.Capacity)
+		return if cap and cap > current then cap else current + 1
+	end
 	function P.copy(state, changes)
 		local out = table.clone(state)
 		for k, v in pairs(changes) do
@@ -34788,6 +34806,7 @@ do
 			canFarm = on("AutoFarm"),
 			walkBoost = P.wsRatio,
 			teleport = N.moveMode() == "Teleport",
+			canSell = on("AutoSellSurplus") or on("AutoSell"),
 		}
 	end
 	-- Best schedule over t seconds: for every target power (now, each locked zone, one decade more for walk speed)
@@ -34830,6 +34849,9 @@ do
 						local F = rate * P.gain(dist, worst)
 						local cap = P.topIncome(dist, rate * left, state.placed, state.slots) - placedSum
 						local value = P.farmValue(F, cap, left)
+						if worst > 0 and state.canSell then
+							value += rate * P.sellGain(dist, worst) * left
+						end
 						if value > best.value then
 							best = { value = value, zone = zone, target = target, train = trainTime, F = F, rate = rate }
 						end
@@ -34922,7 +34944,7 @@ do
 			local tier = tonumber(LocalPlayer:GetAttribute("SatchelTier")) or 1
 			local price = N.satchelPrice(tier)
 			if price and N.satchelStation() then
-				add("satchel", "Satchel tier " .. (tier + 1), price, P.copy(state, { capacity = state.capacity + 1 }), 0, N.buySatchel)
+				add("satchel", "Satchel tier " .. (tier + 1), price, P.copy(state, { capacity = P.satchelCapacityAfter(tier, state.capacity) }), 0, N.buySatchel)
 			end
 		end
 		return list
@@ -34941,8 +34963,12 @@ do
 				end
 			end
 		end
+		-- An option bought after waiting `eta` earns only for the rest of the horizon: rank by the discounted gain per dollar.
+		for _, option in ipairs(valid) do
+			option.score = option.ratio * math.max(horizon - option.eta, 0) / horizon
+		end
 		table.sort(valid, function(a, b)
-			return a.ratio > b.ratio
+			return a.score > b.score
 		end)
 		local best = valid[1]
 		if not best then
