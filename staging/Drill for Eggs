@@ -32389,19 +32389,22 @@ do
 	-- check seen, not proven either). Mode: "Tween (walk speed)" default, "Fast tween (x2)", "Teleport". A snapback
 	-- (the character pulled back while moving) counts; 2 snapbacks in 60 s step the mode down (MOVE fallback) and the
 	-- faster mode is tried again after 10 minutes. A move never waits forever.
-	N.MoveModes = { "Tween (walk speed)", "Fast tween (x2)", "Teleport" }
-	N.Move = { snaps = {}, degradeTo = nil, degradeAt = -1e9, moves = 0, studs = 0, last = "" }
-	function N.moveMode()
-		local wanted = optionText("MoveMode", N.MoveModes[1])
-		local w = table.find(N.MoveModes, wanted) or 1
+	-- One movement mode: tween at the Movement Speed (default 89 = the game's top walk speed). Two snapbacks (the
+	-- character pulled back) within 60 s slow the moves to 60 % for 10 minutes (MOVE fallback), then full speed again.
+	N.Move = { snaps = {}, slowAt = -1e9, moves = 0, studs = 0, last = "" }
+	function N.moveFactor()
 		local M = N.Move
-		if M.degradeTo and os.clock() - M.degradeAt < 600 then
-			return N.MoveModes[math.min(w, M.degradeTo)]
-		elseif M.degradeTo then
-			log("MOVE retry", wanted)
-			M.degradeTo = nil
+		if os.clock() - M.slowAt < 600 then
+			return 0.6
 		end
-		return N.MoveModes[w]
+		if M.slowAt > -1e8 then
+			M.slowAt = -1e9
+			log("MOVE retry full speed")
+		end
+		return 1
+	end
+	function N.moveMode()
+		return if N.moveFactor() < 1 then "tween (slowed)" else "tween"
 	end
 	local function snapback()
 		local M = N.Move
@@ -32410,14 +32413,10 @@ do
 		while #M.snaps > 0 and now - M.snaps[1] > 60 do
 			table.remove(M.snaps, 1)
 		end
-		if #M.snaps >= 2 then
-			local cur = table.find(N.MoveModes, N.moveMode()) or 1
-			if cur > 1 then
-				M.degradeTo = cur - 1
-				M.degradeAt = now
-				table.clear(M.snaps)
-				log("MOVE fallback", N.MoveModes[cur], "->", N.MoveModes[cur - 1])
-			end
+		if #M.snaps >= 2 and N.moveFactor() >= 1 then
+			M.slowAt = now
+			table.clear(M.snaps)
+			log("MOVE fallback", "tween -> slowed tween")
 		end
 	end
 	local function setRoot(pos)
@@ -32437,18 +32436,12 @@ do
 	-- for its own moves (default 89 = the game's own top speed: 24 + 40 tiers + 25 carrying).
 	function N.moveSpeed()
 		local hum = N.humanoid()
-		return math.max(hum and tonumber(hum.WalkSpeed) or 16, optionNumber("RunSpeed", 89), 16)
+		return math.max(hum and tonumber(hum.WalkSpeed) or 16, optionNumber("RunSpeed", 89), 16) * N.moveFactor()
 	end
 	local function segment(target, speedMul, deadline)
 		local root = N.root()
 		if not root then
 			return false
-		end
-		if N.moveMode() == "Teleport" then
-			setRoot(target)
-			task.wait(0.15)
-			local p = N.myPos()
-			return p ~= nil and (p - target).Magnitude <= 6
 		end
 		local last = root.Position
 		local dt = 0
@@ -32493,8 +32486,8 @@ do
 		end
 		N.streamAround(target)
 		N.Move.moves += 1
-		local mul = if N.moveMode() == "Fast tween (x2)" then 2 else 1
-		local speed = N.moveSpeed() * mul
+		local mul = 1
+		local speed = N.moveSpeed()
 		local dist = (pos - target).Magnitude
 		local deadline = os.clock() + math.min(timeout or (dist / speed * 1.6 + 6), 240)
 		local mid = if target.Y > pos.Y then Vector3.new(pos.X, target.Y, pos.Z) else Vector3.new(target.X, pos.Y, target.Z)
@@ -32740,7 +32733,7 @@ do
 		return zone and Vector3.new(zone.Position.X, zone.Position.Y + 3, zone.Position.Z)
 	end
 	-- ===== Training: stand in the own plot's Auto Train zone; the game's client fires Activate Dumbell("auto") every
-	-- 0.1 s there (x1.1^AutoTrainTier). Fast Train adds calls up to the client's own 1/14 s click limit (gainPower). =====
+	-- 0.1 s there (x1.1^AutoTrainTier). Training adds calls up to the client's own 1/14 s click limit (gainPower). =====
 	N.Train = { since = nil, rate = 0, samples = {}, fast = false, extra = 0, probe = nil, say = "" }
 	function N.trainStep()
 		local spot = N.zoneSpot()
@@ -32757,10 +32750,7 @@ do
 		setStatus(string.format("Training in the zone (%s Power/s, x%s ore)", formatNumber(N.Train.rate), formatNumber(N.autoTierMult())))
 		task.wait(0.5)
 	end
-	function N.trainSpeed()
-		return optionText("TrainSpeed", "Fast (ladder)")
-	end
-	-- Power/s sampled every second while in the zone (the rate the planner and the train ladder use).
+	-- Power/s sampled every second while in the zone (the rate the planner uses).
 	function N.sampleTrain()
 		local T = N.Train
 		local now, power = os.clock(), N.power()
@@ -32777,69 +32767,18 @@ do
 			T.rate = (s[#s].p - s[1].p) / (s[#s].t - s[1].t)
 		end
 	end
-	-- Train cadence ladder (blatant.md second pass 11): the zone tick is client-sent ("auto"), the game sends 10 a second.
-	-- The hub adds calls for a total of 14, 20 and 30 a second, 30 s each, and keeps the highest total whose Power gain
-	-- the server really paid (+10% over the step below). Remembered per PlaceVersion (train_14/20/30).
-	N.Ladder = { 14, 20, 30 }
+	-- One train mode: the zone tick is client-sent ("auto", the game sends 10 a second); the hub adds calls up to the
+	-- client's own click limit of 14 a second (gainPower 1/0.0714 s), the same cadence a player's clicking reaches.
+	N.TrainRate = 14
 	function N.trainRate()
-		local best = 10
-		for _, r in ipairs(N.Ladder) do
-			if N.probeGet("train_" .. r) == "accepted" then
-				best = r
-			else
-				break
-			end
-		end
-		return best
+		return N.TrainRate
 	end
 	function N.fastTrainTick()
 		local T = N.Train
-		local want = (on("AutoTrain") or N.planner()) and N.trainSpeed() == "Fast (ladder)" and N.inTrainingZone() and N.alive()
-		if not want or LocalPlayer:GetAttribute("holdingFriend") then
-			T.fast, T.extra = false, 0
-			T.probe = nil
-			return
-		end
-		local P = T.probe
-		local nextRate
-		for _, r in ipairs(N.Ladder) do
-			local res = N.probeGet("train_" .. r)
-			if res == nil then
-				nextRate = r
-				break
-			elseif res == "rejected" then
-				break
-			end
-		end
-		if not nextRate then
-			local rate = N.trainRate()
-			T.extra = rate - 10
-			T.fast = T.extra > 0
-			T.say = if T.fast then "Train ladder: " .. rate .. " ticks a second (server checked)" else "The server pays only the game's 10 ticks a second"
-			return
-		end
-		if not P then
-			T.probe = { phase = "base", rate = N.trainRate(), at = os.clock(), p0 = N.power() }
-			T.extra = N.trainRate() - 10
-			T.fast = T.extra > 0
-			T.say = "Measuring " .. N.trainRate() .. " ticks a second (30 s)"
-			return
-		end
-		if os.clock() - P.at < 30 then
-			return
-		end
-		local rate = (N.power() - P.p0) / (os.clock() - P.at)
-		if P.phase == "base" then
-			P.baseRate = rate
-			P.phase, P.at, P.p0 = "step", os.clock(), N.power()
-			T.extra = nextRate - 10
-			T.fast = true
-			T.say = "Measuring " .. nextRate .. " ticks a second (30 s)"
-		else
-			local ratio = if (P.baseRate or 0) > 0 then rate / P.baseRate else 0
-			N.probeSet("train_" .. nextRate, if ratio >= 1.15 then "accepted" else "rejected", string.format("x%.2f", ratio))
-			T.probe = nil
-		end
+		local want = (on("AutoTrain") or N.planner()) and N.inTrainingZone() and N.alive() and not LocalPlayer:GetAttribute("holdingFriend")
+		T.extra = if want then N.TrainRate - 10 else 0
+		T.fast = T.extra > 0
+		T.say = if T.fast then N.TrainRate .. " ticks a second (the game's own click limit)" else ""
 	end
 	-- ===== Egg runs =====
 	N.Run = { zone = nil, phase = "", last = "", lastAt = -1e9, why = "" }
@@ -33767,14 +33706,14 @@ do
 	local function horizon()
 		return optionNumber("PaybackHours", 24) * 3600
 	end
-	-- Travel estimate for a run: base -> gate column -> zone and back, at walk speed (x2 on Fast tween).
+	-- Travel estimate for a run: base -> gate column -> zone and back, at walk speed.
 	local function travelSeconds(zone)
 		local base = N.base()
 		local f = N.floor(zone)
 		if not (base and f) then
 			return 30
 		end
-		local speed = N.moveSpeed() * (if N.moveMode() == "Fast tween (x2)" then 2 else 1)
+		local speed = N.moveSpeed()
 		local d = N.flat(base.Position, f.Position) + math.abs(base.Position.Y - f.Position.Y)
 		return 2 * d / speed + 4
 	end
@@ -34168,13 +34107,7 @@ do
 	N.Rarities = { "Common", "Rare", "Epic", "Legendary", "Mythic", "Secret", "Brainrot god", "OG", "Divine", "Transcendent", "Ancient", "Elemental", "Exclusive", "Celestial", "Cosmic", "Atlantian", "Sci Fi" }
 	do
 		local TrainBox = Tabs.Farm:AddLeftGroupbox("Train", "dumbbell")
-		TrainBox:AddToggle("AutoTrain", { Text = "Auto Train", Default = false, Tooltip = "Stands in your plot's Auto Train zone: the game adds Power 10 times a second (x1.1 per ore tier)" })
-		TrainBox:AddDropdown("TrainSpeed", {
-			Text = "Train Speed",
-			Values = { "Legit (game pace)", "Fast (ladder)" },
-			Default = "Fast (ladder)",
-			Tooltip = "Fast: the zone tick is sent by your client. Corvus tries 14, 20 and 30 ticks a second (30 s each) and keeps the highest one the server really pays Power for"
-		})
+		TrainBox:AddToggle("AutoTrain", { Text = "Auto Train", Default = false, Tooltip = "Stands in your plot's Auto Train zone and adds Power at the game's own click limit, 14 times a second (x1.1 per ore tier)" })
 		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
 		local RunBox = Tabs.Farm:AddRightGroupbox("Egg Runs", "egg")
 		RunBox:AddToggle("AutoEggRun", { Text = "Auto Egg Run", Default = false, Tooltip = "Drills down the gates, takes the best eggs up to your carry limit and brings them to your farm" })
@@ -34185,18 +34118,12 @@ do
 		RunBox:AddDropdown("RunZone", { Text = "Run Zone", Values = zones, Default = "Deepest in time limit", Tooltip = "Smart Planner picks the zone by income per second of run instead" })
 		RunBox:AddSlider("MaxDrill", { Text = "Max drilling per run", Default = 60, Min = 5, Max = 300, Rounding = 0, Suffix = " s", Tooltip = "Deepest in time limit: every gate takes HP / Power hits, one hit every 0.15 s" })
 		RunBox:AddSlider("RunEvery", { Text = "Run every", Default = 3, Min = 1, Max = 15, Rounding = 0, Suffix = " min", Tooltip = "With Auto Train on too and a full farm: minutes of training between runs (a free farm slot starts a run right away)" })
-		RunBox:AddDropdown("MoveMode", {
-			Text = "Movement",
-			Values = N.MoveModes,
-			Default = "Tween (walk speed)",
-			Tooltip = "Tween moves at your walk speed (default). Fast tween x2 and Teleport are quicker; a pull-back from the server steps the movement down by itself",
-		})
-		RunBox:AddSlider("RunSpeed", { Text = "Movement Speed", Default = 89, Min = 16, Max = 150, Rounding = 0, Tooltip = "Studs per second for Corvus' own moves. 89 = the game's top walk speed (24 + 40 speed tiers + 25 carrying)" })
-		RunBox:AddToggle("FastReturn", { Text = "Fast Return", Default = true, Tooltip = "Tries the free Teleport To Spawn with eggs in hand once; keeps using it only when the eggs stay with you" })
+		RunBox:AddSlider("RunSpeed", { Text = "Movement Speed", Default = 89, Min = 16, Max = 150, Rounding = 0, Tooltip = "Studs per second for Corvus' own moves. 89 = the game's top walk speed. A pull-back from the server slows it down by itself" })
+		RunBox:AddToggle("FastReturn", { Text = "Fast Return", Default = true, Tooltip = "Brings the eggs home with the free Teleport To Spawn instead of the climb; walks when the eggs would drop" })
 		RunBox:AddToggle("WallProbe", {
-			Text = "Wall Skip Probe",
+			Text = "Skip Gate Drilling",
 			Default = false,
-			Tooltip = "Test on an alt account first. Tells the server a gate broke without drilling it (the game's client does this when its own HP count hits 0). Used only when the server accepts it, else normal drilling",
+			Tooltip = "Alt account first. Tells the server a gate broke without drilling it. Used only while the server accepts it, else normal drilling",
 		})
 		Labels.Run = RunBox:AddLabel({ Text = "-", DoesWrap = true })
 		local PlanBox = Tabs.Farm:AddLeftGroupbox("Smart Planner", "brain")
@@ -34216,7 +34143,7 @@ do
 	do
 		local EggBox = Tabs.Plot:AddLeftGroupbox("Eggs", "egg")
 		EggBox:AddToggle("AutoHatch", { Text = "Auto Place And Open Eggs", Default = false, Tooltip = "Places eggs from your bag on the farm grass and opens every ready egg (from anywhere, like the game's Growing Eggs list)" })
-		EggBox:AddToggle("EggOpenProbe", { Text = "Early Open Probe", Default = false, Tooltip = "Test on an alt account first. Tries to open a growing egg before its timer once (and the free Skip Incubation call the game sends before its Robux prompt). Used only when the server hatches it" })
+		EggBox:AddToggle("EggOpenProbe", { Text = "Open Eggs Early", Default = false, Tooltip = "Alt account first. Opens a growing egg before its timer. Used only while the server hatches it" })
 		Labels.Eggs = EggBox:AddLabel({ Text = "-", DoesWrap = true })
 		local CashBox = Tabs.Plot:AddRightGroupbox("Cash Pads", "coins")
 		CashBox:AddToggle("AutoCollect", { Text = "Auto Collect", Default = false, Tooltip = "Collects every animal's cash pad. Tries it from where you are once, else steps on the pads" })
@@ -34402,7 +34329,7 @@ do
 	function Debug.perfText()
 		local last = Perf.last
 		if not last then
-			return "still measuring"
+			return "waiting for the first sample"
 		end
 		return string.format(
 			"fps %d, worst frame %dms, hitches %d, freezes %d, Corvus used %dms in %ds (%.2f%%), ping %sms, memory %sMB",
@@ -34768,7 +34695,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 	pcall(function()
 		local holder = Tabs.Misc or Tabs.Main
 		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
-		Labels.Perf = PerfBox:AddLabel({ Text = "Measuring...", DoesWrap = true })
+		Labels.Perf = PerfBox:AddLabel({ Text = "Waiting for the first sample...", DoesWrap = true })
 		local UtilBox = holder:AddRightGroupbox("Utility", "wrench")
 		UtilBox:AddToggle("AfkGuard", {
 			Text = "Anti-AFK",
@@ -35428,7 +35355,7 @@ do
 					tostring(d.AutoTrainTier or 0),
 					N.drillCap(),
 					formatNumber(N.autoTierMult()),
-					if N.Train.say ~= "" then N.Train.say else "Train Speed " .. N.trainSpeed(),
+					if N.Train.say ~= "" then N.Train.say else "Not training right now",
 					N.longTime(Session.trainSeconds)
 				)
 				local zone, why = N.pickZone()
@@ -35437,7 +35364,7 @@ do
 					table.insert(broken, name)
 				end
 				I.run = string.format(
-					"Next: <b>%s</b> (%s)\nCarry %d  \u{00B7}  movement %s\nLast: %s\nRuns %d (%d empty), eggs %d, lost %d, gates %d\nProbes: wall skip %s, fast return %s",
+					"Next: <b>%s</b> (%s)\nCarry %d  \u{00B7}  movement %s\nLast: %s\nRuns %d (%d empty), eggs %d, lost %d, gates %d",
 					zone or "-",
 					why or "-",
 					N.carryCap(),
@@ -35447,15 +35374,13 @@ do
 					Session.runsFailed,
 					Session.eggsStolen,
 					Session.eggsLost,
-					Session.walls,
-					if on("WallProbe") then N.probeGet("wall_skip") or "untested" else "off",
-					if on("FastReturn") then N.probeGet("spawn_return") or "untested" else "off"
+					Session.walls
 				)
 				I.planner = if N.planner()
-					then string.format("<b>On</b>\n%s\n%s\n%s", if N.Plan.text ~= "" then N.Plan.text else "Measuring...", if N.Plan.spendText ~= "" then N.Plan.spendText else "-", if N.Plan.rebirthSay ~= "" then N.Plan.rebirthSay else "-")
+					then string.format("<b>On</b>\n%s\n%s\n%s", if N.Plan.text ~= "" then N.Plan.text else "Starting...", if N.Plan.spendText ~= "" then N.Plan.spendText else "-", if N.Plan.rebirthSay ~= "" then N.Plan.rebirthSay else "-")
 					else "Off. Turn it on and Corvus plays the whole loop by itself (training, egg runs, eggs, cash, purchases by payback, rebirths, rewards), even with every other toggle off"
 				I.eggs = string.format("%d growing, %d in the bag\nPlaced %d, hatched %d%s", #eggs, #N.inventoryEggs(), Session.placed, Session.hatched, if N.Place.last ~= "" then "\n" .. N.Place.last else "")
-				I.collect = string.format("Farm income <b>$%s/s</b>\nCollected $%s this session%s\nRemote collect: %s", formatNumber(N.plotIncome()), formatNumber(Session.collected), if N.Collect.last ~= "" then "\n" .. N.Collect.last else "", N.probeGet("collect_remote") or "untested")
+				I.collect = string.format("Farm income <b>$%s/s</b>\nCollected $%s this session%s", formatNumber(N.plotIncome()), formatNumber(Session.collected), if N.Collect.last ~= "" then "\n" .. N.Collect.last else "")
 				local up = N.upgradeOptions()[1]
 				I.animals = string.format(
 					"Animals <b>%d</b> + %d eggs / %d slots (farm level %s)\nBest upgrade: %s\nUpgraded %d",
