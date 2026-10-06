@@ -33002,6 +33002,22 @@ do
 				end
 			end
 		end
+		-- Nothing beats the pen: with Smart Sell on and a measured sale ratio, an egg is still worth a run when its
+		-- sale cash per second of the run beats half of the pen income (the animal is sold as a spare).
+		if not best and N.does("SmartSell") and N.Sell.ratio and N.Sell.ratio > 0 then
+			local need = math.max(N.income() * 0.5, 0)
+			local bestRate
+			for _, egg in ipairs(N.bedEggs()) do
+				if N.canSteal(egg) then
+					local t = N.runTime(egg.pos)
+					local rate = N.Sell.ratio * N.estimate(egg.model) / t
+					if rate > need and (not bestRate or rate > bestRate) then
+						best, bestRate = egg, rate
+						bestInfo = { gain = 0, value = N.estimate(egg.model), newIndex = false, time = t, floor = floor, free = free, sale = rate }
+					end
+				end
+			end
+		end
 		return best, bestInfo
 	end
 	N.onEvent("EggRemotes.Claimed", function(zone, _, creature)
@@ -33398,7 +33414,7 @@ do
 	end
 
 	-- ===== Sell (Smart Sell): spare pets that earn less than the pen floor, never protected ones =====
-	N.Sell = { last = "", walk = false }
+	N.Sell = { last = "", walk = false, ratio = nil }
 	function N.protected(creature)
 		local entry = N.rosterOf(creature)
 		if entry and entry.forbidden and on("KeepForbidden") then
@@ -33459,11 +33475,20 @@ do
 			end
 		end
 		local uids, total = {}, 0
+		local ratios = {}
 		for _, s in ipairs(list) do
 			if price[s.uid] ~= nil then
 				table.insert(uids, s.uid)
 				total += price[s.uid]
+				if s.v > 0 and price[s.uid] > 0 then
+					table.insert(ratios, price[s.uid] / s.v)
+				end
 			end
+		end
+		if #ratios > 0 then
+			-- Measured sale value: shop cash per $/s of the animal's EarnRate (prices a steal-for-sale run).
+			table.sort(ratios)
+			N.Sell.ratio = ratios[math.ceil(#ratios / 2)]
 		end
 		if #uids == 0 then
 			log("SELL nothing matched the shop list", #list)
@@ -34942,7 +34967,7 @@ do
 			local egg, info = N.wantSteal()
 			local mode, coarse
 			if egg then
-				mode = "steal " .. tostring(egg.label) .. " zone " .. egg.zone.n .. (if info.newIndex then " (new index animal)" elseif egg.big then " (big egg " .. tostring(egg.tier) .. ")" else " (+" .. formatNumber(info.gain) .. "/s over the pen floor)")
+				mode = "steal " .. tostring(egg.label) .. " zone " .. egg.zone.n .. (if info.newIndex then " (new index animal)" elseif egg.big then " (big egg " .. tostring(egg.tier) .. ")" elseif info.sale then " (for sale, +$" .. formatNumber(info.sale) .. "/s)" else " (+" .. formatNumber(info.gain) .. "/s over the pen floor)")
 				coarse = "steal from zone " .. egg.zone.n .. (if info.newIndex then " (new index animals first)" elseif egg.big then " (big egg)" else " (eggs beat the pen floor)")
 			elseif N.wantEat() then
 				mode = "eat (" .. tostring(info) .. ")"
