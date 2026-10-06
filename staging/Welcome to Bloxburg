@@ -32183,28 +32183,43 @@ do
 	end
 	-- Walks with the humanoid straight to the point. When the straight line is blocked (counters, walls: owner
 	-- 2026-10-05 "it does not avoid obstacles") it switches to N.pathWalk (pathfinding, doors, short hops).
-	-- ACTION SPEED LADDER (SPEED_PLAN.md section 3, Bloxburg row). The server takes job interactions from
-	-- MAX_INTERACTION_DISTANCE = 30 studs (InteractionData 262945), so inside a shift the hub parks ONCE and acts
-	-- from there: rung "remote" (reach 26, no walking between stations that are in reach), degrade one rung to "walk"
-	-- (the old exact approach) after 2 rejects in 120 s, retry the fast rung after 10 min. Memory = this session
-	-- (a new server is a new PlaceVersion check). Logs: `ACT <job> via=remote ok parked`, `ACT <job> via=remote
-	-- rejected reason=`, `ACT fallback <job> remote -> walk`, `ACT retry <job> remote`.
+	-- ACTION SPEED LADDER (SPEED_PLAN.md section 3, Bloxburg row): remote > prompt/click > teleport/FastTravel > tween > walk.
+	-- Two parts, both with memory per job (this session; a new server = new PlaceVersion check):
+	--  (1) ACTION rung: the server takes job interactions from MAX_INTERACTION_DISTANCE = 30 studs (InteractionData
+	--      262945), so inside a shift the hub parks ONCE and acts from there: "remote" (reach 26, no steps between
+	--      stations in reach) -> "exact" (act from the old close approach `near`) after 2 rejects in 120 s; back to remote
+	--      after 10 min. Walking does not fix a rejected task, so a reject never degrades the MOVEMENT.
+	--  (2) MOVE rung (how the hub gets to the spot): "teleport" (CFrame jump, only while JobSpeed is Blatant, origin test
+	--      0.35 s later) -> "tween" (CFrame steps at m.speed studs/s, JobSpeed Fast or after a snapback) -> "walk" (only the
+	--      exceptions below). A SNAPBACK (the server put us back) degrades teleport -> tween and halves the tween speed
+	--      (min 22), NEVER straight to walk; teleport is tried again after 10 min. Legit speed = walk.
+	--  WALK-ONLY EXCEPTIONS (NoPark): CaveMiner, HutFisherman, LumberWoodcutter (the targets are world nodes found by
+	--  the character: a Touched/swing range and moving fish/trees, so the hub must stand at the node, evidence p05_jobs4
+	--  / p05_jobs3 target loops), TaxiJob and PizzaPlanetDelivery (long drives/trips: N.travelNear = bus / server move
+	--  / hop ladder handles the distance, the last meters are walked at the customer). Needs, Garden and Cap sessions
+	--  use their own movement and skip the ladder.
+	-- Logs: `ACT <job> via=remote ok parked`, `ACT <job> via=remote rejected reason=`, `ACT fallback <job> remote -> exact`,
+	-- `ACT retry <job> remote`, `ACT move <job> teleport|tween ok`, `MOVE snapback <job> teleport -> tween`.
 	N.ActMem = {}
 	local ACT_REACH = 26
 	local NoPark = { CaveMiner = true, HutFisherman = true, LumberWoodcutter = true, TaxiJob = true, PizzaPlanetDelivery = true }
 	local function actState(job)
 		local m = N.ActMem[job]
 		if not m then
-			m = { rung = "remote", rejects = {}, retryAt = 0, okLogAt = -1e9, okN = 0 }
+			m = { rung = "remote", rejects = {}, retryAt = 0, okLogAt = -1e9, okN = 0, move = "teleport", moveRetryAt = 0, speed = 90, moveLogAt = -1e9, moves = 0 }
 			N.ActMem[job] = m
 		end
 		return m
 	end
 	function N.actRung(job)
 		local m = actState(job)
-		if m.rung == "walk" and m.retryAt > 0 and os.clock() >= m.retryAt then
+		if m.rung == "exact" and m.retryAt > 0 and os.clock() >= m.retryAt then
 			m.rung, m.retryAt, m.rejects = "remote", 0, {}
 			log("ACT retry", job, "remote")
+		end
+		if m.move == "tween" and m.moveRetryAt > 0 and os.clock() >= m.moveRetryAt then
+			m.move, m.moveRetryAt, m.speed = "teleport", 0, 90
+			log("ACT retry", job, "move teleport")
 		end
 		return m.rung
 	end
@@ -32226,11 +32241,132 @@ do
 			end
 		end
 		if #m.rejects >= 2 then
-			m.rung, m.retryAt, m.rejects = "walk", now + 600, {}
-			log("ACT fallback", job, "remote -> walk")
+			m.rung, m.retryAt, m.rejects = "exact", now + 600, {}
+			log("ACT fallback", job, "remote -> exact")
 		end
 	end
-	-- (state, nearForTheWalk): "here" = already in reach, act now; "walk" = walk only to ACT_REACH-4; nil = old behaviour
+	-- the server put us back after our own move: teleport -> tween (slower), tween -> halve the speed; never walk
+	function N.actSnapback(job, how)
+		if not job or job == "" then
+			return
+		end
+		local m = actState(job)
+		if m.move == "teleport" then
+			m.move, m.moveRetryAt, m.speed = "tween", os.clock() + 600, 60
+			log("MOVE snapback", job, "teleport -> tween", "reason=" .. tostring(how))
+		else
+			m.speed = math.max(m.speed / 2, 22)
+			log("MOVE snapback", job, "tween speed", math.floor(m.speed), "reason=" .. tostring(how))
+		end
+	end
+	-- the movement rung allowed now: JobSpeed Blatant = teleport, Fast = tween, Legit = walk (then the memory caps it)
+	local function moveRung(job)
+		local mode = N.jobSpeed and N.jobSpeed() or "Blatant"
+		if mode == "Legit" then
+			return "walk"
+		end
+		local m = actState(job)
+		if mode == "Fast" or m.move == "tween" then
+			return "tween"
+		end
+		return "teleport"
+	end
+	-- teleport / tween to within `near` studs of pos (flat). True when there.
+	local function actMove(job, pos, near, rung)
+		local root = N.root()
+		if not root then
+			return false
+		end
+		local m = actState(job)
+		local T = N.Travel
+		local function flatTo(a)
+			return Vector3.new(pos.X - a.X, 0, pos.Z - a.Z).Magnitude
+		end
+		local function standAt(from)
+			local dir = Vector3.new(pos.X - from.X, 0, pos.Z - from.Z)
+			local back = math.max(near - 1, 1)
+			local flatP = if dir.Magnitude > back then Vector3.new(pos.X, 0, pos.Z) - dir.Unit * back else Vector3.new(from.X, 0, from.Z)
+			return Vector3.new(flatP.X, math.max(pos.Y, from.Y - 6) + 3, flatP.Z)
+		end
+		if flatTo(root.Position) <= near then
+			return true
+		end
+		if T then
+			T.movedAt = os.clock()
+		end
+		pcall(N.detach)
+		local start = root.Position
+		local cf = root.CFrame - root.CFrame.Position
+		if rung == "teleport" then
+			local goal = standAt(start)
+			root.CFrame = CFrame.new(goal) * cf
+			pcall(function()
+				root.AssemblyLinearVelocity = Vector3.zero
+			end)
+			task.wait(0.35)
+			root = N.root()
+			if not root then
+				return false
+			end
+			if (root.Position - start).Magnitude < 8 and (goal - start).Magnitude > 15 then
+				N.actSnapback(job, "teleport " .. math.floor((goal - start).Magnitude) .. " studs")
+				rung = "tween"
+			else
+				m.moves += 1
+				if os.clock() - m.moveLogAt > 20 then
+					m.moveLogAt = os.clock()
+					log("ACT move", job, "teleport ok", "n=" .. m.moves)
+				end
+				return flatTo(root.Position) <= near + 6
+			end
+		end
+		-- tween: CFrame steps at m.speed studs/s, origin test every 0.5 s
+		local last, lastAt = os.clock(), os.clock()
+		local deadline = os.clock() + 12
+		while alive() and os.clock() < deadline do
+			root = N.root()
+			if not root then
+				return false
+			end
+			if flatTo(root.Position) <= near then
+				m.moves += 1
+				if os.clock() - m.moveLogAt > 20 then
+					m.moveLogAt = os.clock()
+					log("ACT move", job, "tween ok", "speed=" .. math.floor(m.speed), "n=" .. m.moves)
+				end
+				return true
+			end
+			local now = os.clock()
+			local step = math.min(m.speed * (now - last), 40)
+			last = now
+			local here = root.Position
+			local goal = standAt(here)
+			local d = goal - here
+			local p = if d.Magnitude > step then here + d.Unit * step else goal
+			root.CFrame = CFrame.new(p) * (root.CFrame - root.CFrame.Position)
+			pcall(function()
+				root.AssemblyLinearVelocity = Vector3.zero
+			end)
+			if now - lastAt >= 0.5 then
+				lastAt = now
+				if T then
+					T.movedAt = now
+				end
+				local expect = p
+				task.wait()
+				root = N.root()
+				if root and (root.Position - expect).Magnitude > 12 then
+					N.actSnapback(job, "tween pulled back")
+					return false
+				end
+			else
+				task.wait()
+			end
+		end
+		return false
+	end
+	-- (state, near | rung): "here" = already in reach, act now; "move" = go there by the movement rung (teleport/tween)
+	-- with the returned near; nil = old behaviour (walk)
 	function N.actPark(pos, near)
 		local job = N.currentJob()
 		if job == "" or NoPark[job] or typeof(pos) ~= "Vector3" then
@@ -32239,32 +32375,43 @@ do
 		if (N.Cap and N.Cap.active) or (N.Needs and N.Needs.active) or (N.Garden and N.Garden.running) then
 			return nil
 		end
-		if N.actRung(job) ~= "remote" then
-			return nil
-		end
+		local rung = N.actRung(job)
 		local root = N.root()
 		if not root then
 			return nil
 		end
 		local m = actState(job)
-		if (root.Position - pos).Magnitude <= ACT_REACH then
-			m.okN += 1
-			if os.clock() - m.okLogAt > 20 then
-				m.okLogAt = os.clock()
-				log("ACT", job, "via=remote", "ok parked", "n=" .. m.okN)
+		local reach = if rung == "remote" then ACT_REACH else near
+		if (root.Position - pos).Magnitude <= reach then
+			if rung == "remote" then
+				m.okN += 1
+				if os.clock() - m.okLogAt > 20 then
+					m.okLogAt = os.clock()
+					log("ACT", job, "via=remote", "ok parked", "n=" .. m.okN)
+				end
 			end
 			return "here"
 		end
-		return "walk", math.max(near, ACT_REACH - 4)
+		local mv = moveRung(job)
+		if mv == "walk" then
+			return if rung == "remote" then "walk" else nil, math.max(near, ACT_REACH - 4)
+		end
+		return "move", mv, if rung == "remote" then ACT_REACH - 4 else near
 	end
 	function N.walkTo(pos, near, timeout, straightOnly, noPark)
 		near = near or 3
 		if not straightOnly and not noPark then
-			local state, wider = N.actPark(pos, near)
+			local state, a, b = N.actPark(pos, near)
 			if state == "here" then
 				return true
+			elseif state == "move" then
+				-- ladder: teleport / tween to the spot; a failed move falls through to the walk below
+				if actMove(N.currentJob(), pos, b, a) then
+					return true
+				end
+				near = b
 			elseif state == "walk" then
-				near = wider
+				near = b or near
 			end
 		end
 		-- a long trip (pizza address, far tree): the game's own FastTravel / server move first (p05_travel), the
@@ -33972,6 +34119,10 @@ do
 		TaxiJob = 6.0,
 	}
 	-- $/h of a fast human on a job at a level and efficiency, from the seeds above
+	-- seeded job XP per second of a fast human: 1 XP per task (assumption, replaced by the live XP sample within 60 s)
+	function N.seedXpRate(key)
+		return (TasksPerHour[key] or 300) / 3600
+	end
 	function N.seedHuman(key, level, eff)
 		local tph = TasksPerHour[key] or 300
 		return tph * (PayFactor[key] or 0.8) * (10 + 3.3 * (level or 0)) * (eff or 1)
@@ -36718,6 +36869,17 @@ do
 			return if ok then value else nil
 		end))
 	end
+	-- JobData:GetJobMaxLevel (dump 73525): the reward ladder above is for 10 levels, a job with fewer stops earlier
+	local function maxLevelOf(key)
+		local jh = N.jobHandler()
+		local v = jh and tonumber(isolated(function()
+			local ok, r = pcall(function()
+				return jh.Shared.JobData:GetJobMaxLevel(key)
+			end)
+			return if ok then r else nil
+		end))
+		return math.clamp(if v and v >= 1 then math.floor(v) else 10, 1, 10)
+	end
 	local function realSeconds(gameMinutes, school)
 		local jh = N.jobHandler()
 		local value = jh and isolated(function()
@@ -36810,9 +36972,9 @@ do
 	end
 
 	-- level rewards and pay growth reached within h seconds when working only this job
-	local function promotion(level, xp, xpRate, rate, growth, h)
+	local function promotion(level, xp, xpRate, rate, growth, h, maxLevel)
 		local t, l, value = 0, level, 0
-		while xpRate > 0 and l < 10 do
+		while xpRate > 0 and l < (maxLevel or 10) and LevelMoney[l + 1] do
 			local dt = math.max(reqXP(l) - xp, 0) / xpRate
 			if t + dt > h then
 				break
@@ -36884,6 +37046,7 @@ do
 				xpSum += c.xpRate
 				xpN += 1
 			end
+			c.maxLevel = maxLevelOf(key)
 			c.growth = growthOf(entry, c.level)
 			if c.growth then
 				gSum += c.growth
@@ -36897,11 +37060,14 @@ do
 		local pooledXp = if xpN > 0 then xpSum / xpN else 0
 		local pooledG = if gN > 0 then gSum / gN else 0
 		for _, c in ipairs(list) do
-			local promo, toLevel, at = promotion(c.level, c.xp, c.xpRate or pooledXp, c.rate, c.growth or pooledG, h)
+			-- no XP sample yet anywhere: the seeded rate (1 XP per task) so the first pick already counts level rewards
+			local xpRate = c.xpRate or (if pooledXp > 0 then pooledXp else N.seedXpRate(c.key) * BLATANT_GAIN)
+			c.xpUsed = xpRate
+			local promo, toLevel, at = promotion(c.level, c.xp, xpRate, c.rate, c.growth or pooledG, h, c.maxLevel)
 			c.R = c.rate
 			c.promo, c.toLevel, c.levelAt = promo, toLevel, at
 			c.E = if c.failed then 0 else c.rate + promo / (h / 3600)
-			c.nextLevel = if (c.xpRate or pooledXp) > 0 and c.level < 10 then math.max(reqXP(c.level) - c.xp, 0) / (c.xpRate or pooledXp) else nil
+			c.nextLevel = if xpRate > 0 and c.level < c.maxLevel then math.max(reqXP(c.level) - c.xp, 0) / xpRate else nil
 		end
 		return list, known
 	end
@@ -37700,7 +37866,10 @@ do
 					local pos = root.Position
 					local T = N.Travel
 					if lastPos and (pos - lastPos).Magnitude > 80 and not own and not T.busy and now - (T.movedAt or -1e9) > 15 then
-						N.modeSignal(job, string.format("position snapback %d studs in 1 s", math.floor((pos - lastPos).Magnitude)))
+						if N.actSnapback then
+								N.actSnapback(job, string.format("position %d studs in 1 s", math.floor((pos - lastPos).Magnitude)))
+							end
+							N.modeSignal(job, string.format("position snapback %d studs in 1 s", math.floor((pos - lastPos).Magnitude)))
 					end
 					lastPos = pos
 				else
