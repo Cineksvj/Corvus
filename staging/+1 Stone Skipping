@@ -32510,6 +32510,91 @@ N.Direct = { seq = 100000 + math.random(0, 899) * 1000, mine = {}, byId = {}, re
 -- Per-account memory of what the server answered (Corvus/STONE_probe_<UserId>.txt, key=value lines): zone/world probe
 -- refusals with the requirement the server named, spending from the training stand, the measured secret odds.
 N.ProbeMem = { file = "Corvus/STONE_probe_" .. tostring(LocalPlayer.UserId) .. ".txt", data = {}, loaded = false }
+-- ACT ladder (owner 2026-10-06, SPEED_PLAN): lands ON the spot (teleport, 3 re-aims of 2 studs), waits 0.25 s + 1.5 x ping
+-- for the server's copy of the character, then reports. A bad landing is re-aimed, only a return to the origin is a
+-- snapback; 2 real rejects in 60 s degrade teleport -> tween (retry the teleport after 10 min). Logs ACT <action> via=<rung>.
+N.ActMem = {}
+local function pingSeconds()
+	local ok, v = pcall(function()
+		return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+	end)
+	return (ok and tonumber(v) or 80) / 1000
+end
+function N.Act(action, cf, near)
+	near = near or 4
+	local mem = N.ActMem[action]
+	if not mem then
+		mem = { rung = "teleport", rejects = {}, retryAt = 0 }
+		N.ActMem[action] = mem
+	end
+	if mem.rung ~= "teleport" and mem.retryAt > 0 and os.clock() >= mem.retryAt then
+		mem.rung, mem.retryAt = "teleport", 0
+		log("ACT retry", action, "via=teleport")
+	end
+	local root = N.root()
+	if not root then
+		return false
+	end
+	local target = cf.Position
+	local flat = function()
+		local r = N.root()
+		local p = r and r.Position or Vector3.new(1e6, 0, 1e6)
+		return Vector3.new(p.X - target.X, 0, p.Z - target.Z).Magnitude
+	end
+	local ok, reason = flat() <= near, "none"
+	local origin = root.Position
+	if not ok and mem.rung == "teleport" then
+		local aims = { Vector3.zero, Vector3.new(2, 0, 0), Vector3.new(0, 0, 2), Vector3.new(-2, 0, 0), Vector3.new(0, 0, -2) }
+		for _, off in ipairs(aims) do
+			N.tp(cf + off)
+			task.wait(0.35)
+			if flat() <= near then
+				ok = true
+				break
+			end
+			local r = N.root()
+			if r and (r.Position - origin).Magnitude <= 10 and (origin - target).Magnitude > 20 then
+				reason = "snapback"
+				break
+			end
+			reason = string.format("landed %.0f studs off", flat())
+		end
+	elseif not ok then
+		local r = N.root()
+		if r then
+			local dist = (r.Position - target).Magnitude
+			local tween = game:GetService("TweenService"):Create(r, TweenInfo.new(math.max(dist / 60, 0.1), Enum.EasingStyle.Linear), { CFrame = cf })
+			pcall(function()
+				tween:Play()
+			end)
+			local started = os.clock()
+			while os.clock() - started < dist / 60 + 1 and flat() > near do
+				task.wait(0.05)
+			end
+			ok = flat() <= near
+			reason = if ok then "none" else string.format("tween %.0f studs off", flat())
+		end
+	end
+	if ok then
+		task.wait(0.25 + 1.5 * pingSeconds())
+		mem.rejects = {}
+		log("ACT", action, "via=" .. mem.rung, "ok")
+		return true
+	end
+	log("ACT", action, "via=" .. mem.rung, "rejected reason=" .. reason)
+	local now = os.clock()
+	table.insert(mem.rejects, now)
+	for i = #mem.rejects, 1, -1 do
+		if now - mem.rejects[i] > 60 then
+			table.remove(mem.rejects, i)
+		end
+	end
+	if #mem.rejects >= 2 and mem.rung == "teleport" and reason == "snapback" then
+		mem.rung, mem.retryAt, mem.rejects = "tween", now + 600, {}
+		log("MOVE fallback", action, "teleport -> tween")
+	end
+	return false
+end
 function N.probeGet(key)
 	local M = N.ProbeMem
 	if not M.loaded then
@@ -33319,7 +33404,7 @@ function N.throwStep()
 			return false
 		end
 		setStatus("Going to the launch zone")
-		if not N.goTo(zone.CFrame + Vector3.new(0, zone.Size.Y / 2 + 3, 0), 6) then
+		if not N.Act("launch", zone.CFrame + Vector3.new(0, zone.Size.Y / 2 + 3, 0), 6) then
 			return false
 		end
 		task.wait(0.4)
@@ -33658,7 +33743,7 @@ function N.zoneProbeStep()
 	end, 3)
 	local cf = N.zoneStand(zone)
 	if cf then
-		N.goTo(cf, 3)
+		N.Act("train", cf, 3)
 	end
 	local started = cf ~= nil and waitFor(function()
 		return N.activity() == "Practice"
@@ -33839,7 +33924,7 @@ function N.trainStep()
 		return false
 	end
 	setStatus("Going to " .. zone.name)
-	N.goTo(cf, 3)
+	N.Act("train", cf, 3)
 	local started = waitFor(function()
 		return N.activity() == "Practice"
 	end, 6)
@@ -34246,8 +34331,7 @@ function N.hatch(egg, stay)
 			return egg.display:GetPivot()
 		end)
 		if ok then
-			N.goTo(pivot + Vector3.new(0, 3, 5), 6)
-			task.wait(0.3)
+			N.Act("hatch", pivot + Vector3.new(0, 3, 5), 6)
 		end
 	end
 	local count = N.hatchCount()
