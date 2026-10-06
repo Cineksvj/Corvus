@@ -33135,6 +33135,10 @@ end
 			end
 			-- a danger signal; soft ones need 3 within 60 s, hard ones (refused instant catch, kick) act at once
 			function Auto.signal(reason, hard)
+					local lowReason = string.lower(tostring(reason))
+					if not hard and (string.find(lowReason, "equip", 1, true) or string.find(lowReason, "please wait", 1, true) or string.find(lowReason, "cooldown", 1, true)) then
+						return
+					end
 				if not Auto.isOn() or Auto.pending then
 					return
 				end
@@ -33162,6 +33166,9 @@ end
 				return "Walk"
 			end
 			function Auto.fallback(reason, weight)
+					if string.find(string.lower(tostring(reason)), "please wait", 1, true) or string.find(string.lower(tostring(reason)), "before equipping", 1, true) then
+						return
+					end
 				local from = Auto.mode
 				Auto.falls[from] = (Auto.falls[from] or 0) + (weight or 1)
 				local to = Auto.lower(from)
