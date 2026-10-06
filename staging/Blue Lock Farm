@@ -31973,7 +31973,7 @@ do
 		N.Lib[name] = N.tableOr(safeRequire("Shared.Core.Storage.Game." .. name))
 	end
 	N.Svc = {}
-	for _, name in ipairs({ "CurrencyService", "DailyLoginService", "IndexRewardsService", "ObbyBonusService", "PlaytimeRewardsService", "PotionService", "ItemService", "TokensService", "BallSkinService", "WeatherService" }) do
+	for _, name in ipairs({ "CurrencyService", "DailyLoginService", "IndexRewardsService", "ObbyBonusService", "PlaytimeRewardsService", "PotionService", "ItemService", "TokensService", "BallSkinService", "WeatherService", "LuckService" }) do
 		N.Svc[name] = safeRequire("Shared.Services." .. name)
 	end
 	N.DataManager = safeRequire("Client.Data.ClientDataManager")
@@ -33905,23 +33905,93 @@ local function avgPlacedIncome()
 	end
 	return sum / #placed
 end
--- Average CashPerDrop of a conveyor roll at a ConveyorLuck tier (BoxService.GetBoxChanceTable 78861).
-function N.rollEV(tier)
+-- ProbabilityUtils.ChanceRandom (dump 88533): luck L -> p = min(8, 1 + (L-1)^0.6); the rank-ordered weights become
+-- chance * p^(gain*(rank-1)), so rarer entries gain weight. Boxes: rank = BoxesLibrary Index, gain 0.2; variants: rank =
+-- chance descending, gain MUTATION_GAIN 0.12 (88833).
+function N.luckNow()
+	local l = N.svc("LuckService", "GetLuck", LocalPlayer)
+	if type(l) == "number" and l >= 1 then
+		return l
+	end
+	return 1 + N.upgradeAmount("Luck", N.upgradeLevel("Luck"))
+end
+local function shapedOdds(entries, luck, gain)
+	local p = if luck <= 1 then 1 else math.min(8, 1 + (luck - 1) ^ 0.6)
+	local total = 0
+	for rank, e in ipairs(entries) do
+		e.w = e.chance * p ^ (gain * (rank - 1))
+		total += e.w
+	end
+	return total
+end
+-- Expected variant multiplier of one roll at this luck (VariantService 83517, VariantsLibrary chances).
+function N.variantEV(luck)
+	local entries = {}
+	for name, v in pairs(N.Lib.VariantsLibrary) do
+		if type(v) == "table" and (tonumber(v.Chance) or 0) > 0 then
+			table.insert(entries, { name = name, chance = tonumber(v.Chance), mult = tonumber(v.Multiplier) or 1 })
+		end
+	end
+	table.sort(entries, function(a, b)
+		if a.chance == b.chance then
+			return a.name < b.name
+		end
+		return a.chance > b.chance
+	end)
+	local total = shapedOdds(entries, luck, 0.12)
+	if total <= 0 then
+		return 1
+	end
+	local sum = 0
+	for _, e in ipairs(entries) do
+		sum += e.w / total * e.mult
+	end
+	return sum
+end
+-- Average CashPerDrop of a conveyor roll at a ConveyorLuck tier and luck (BoxService.GetBoxChanceTable 78861 x
+-- RollRandomBox luck 78876 x variant roll).
+function N.rollEV(tier, luck)
+	luck = luck or 1
 	local def = N.upgradeDef("ConveyorLuck")
 	local cfg = def and def.TierConfig
 	if type(cfg) ~= "table" or #cfg == 0 then
 		return 0
 	end
 	local mults = cfg[math.clamp(tier, 1, #cfg)].Multipliers or {}
-	local sum, weight = 0, 0
+	local entries = {}
 	for name, box in pairs(N.Lib.BoxesLibrary) do
 		if type(box) == "table" and not box.Unrollable then
 			local w = (tonumber(box.Weight) or 0) * (tonumber(mults[name]) or 0)
-			sum += w * N.boxEV(name, "Normal")
-			weight += w
+			if w > 0 then
+				table.insert(entries, { name = name, chance = w, index = tonumber(box.Index) or 0 })
+			end
 		end
 	end
-	return if weight > 0 then sum / weight else 0
+	table.sort(entries, function(a, b)
+		return a.index < b.index
+	end)
+	local total = shapedOdds(entries, luck, 0.2)
+	if total <= 0 then
+		return 0
+	end
+	local sum = 0
+	for _, e in ipairs(entries) do
+		sum += e.w / total * N.boxEV(e.name, "Normal")
+	end
+	return sum * N.variantEV(luck)
+end
+-- Average open time (s, before OpenTimeBoost) of the lockers the placed units came from.
+local function avgOpenTime()
+	local sum, n = 0, 0
+	for _, d in ipairs(N.placed()) do
+		local def = N.unitIndex()[d.unit.name or ""]
+		local box = def and N.boxDef(def.box)
+		if box then
+			sum += (tonumber(box.TimeToOpen) or 60) * N.varTime(d.unit.variant)
+			n += 1
+		end
+	end
+	return if n > 0 then sum / n else 120
 end
 function N.upgradeGain(name)
 	local level = N.upgradeLevel(name)
@@ -33934,6 +34004,18 @@ function N.upgradeGain(name)
 				spare = math.max(spare, N.unitIncome(u))
 			end
 		end
+		-- A free dropper that nothing fills yet (no spare unit, no waiting locker) makes another slot worthless for now.
+		local _, free, boxes = N.slots()
+		local _, waiting = N.invBoxes()
+		local spares = 0
+		for _, u in ipairs(N.allUnits()) do
+			if not u.equipped then
+				spares += 1
+			end
+		end
+		if free - boxes - waiting - spares > 0 then
+			return 0
+		end
 		return math.max(spare, avgPlacedIncome())
 	elseif name == "CrateCashBoost" then
 		local now, nxt = N.upgradeAmount(name, level), N.upgradeAmount(name, level + 1)
@@ -33941,18 +34023,26 @@ function N.upgradeGain(name)
 	elseif name == "OpenTimeBoost" then
 		local elapsed = math.max(os.clock() - Session.started, 600)
 		local rate = Session.opened / elapsed
-		local saved = (N.upgradeAmount(name, level + 1) - N.upgradeAmount(name, level)) * 120
+		local saved = (N.upgradeAmount(name, level + 1) - N.upgradeAmount(name, level)) * avgOpenTime()
 		return rate * saved * avgPlacedIncome()
 	elseif name == "ConveyorLuck" then
-		local a, b = N.rollEV(level + 1), N.rollEV(level + 2)
+		local luck = N.luckNow()
+		local a, b = N.rollEV(level + 1, luck), N.rollEV(level + 2, luck)
 		if a <= 0 then
 			return 0
 		end
 		-- Only new lockers profit from the better odds: a quarter of the income as the estimate.
 		return income * math.max(b / a - 1, 0) * 0.25
 	elseif name == "Luck" then
-		-- Luck shifts the roll toward rarer lockers and variants (ProbabilityUtils luck); estimate +1.5% income per step.
-		return income * 0.015
+		-- Exact odds: luck reshapes the locker and variant rolls (N.rollEV); only new lockers profit (a quarter of income).
+		local luck = N.luckNow()
+		local tier = N.upgradeLevel("ConveyorLuck") + 1
+		local nextLuck = luck * (1 + N.upgradeAmount(name, level + 1)) / (1 + N.upgradeAmount(name, level))
+		local a, b = N.rollEV(tier, luck), N.rollEV(tier, nextLuck)
+		if a <= 0 then
+			return 0
+		end
+		return income * math.max(b / a - 1, 0) * 0.25
 	elseif name == "CratePolisherUnlock" then
 		local def = N.upgradeDef("CratePolisher")
 		local rate = def and type(def.GetCashPerSec) == "function" and def.GetCashPerSec(0) or 5e9
