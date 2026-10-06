@@ -33089,12 +33089,12 @@ end
 			Moves.last = { pos = position, at = os.clock() }
 			return true
 		end
-		-- Movement "Auto (best measured)": measures each allowed mode, keeps the most profitable one without danger signals
+		-- Movement "Auto (best measured)" = always the fastest mode that works (Blatant); steps down only on a real danger signal, retries after 10 min
 		do
 			local AutoName = "Auto (best measured)"
 			local Steps = { "Blatant", "Teleport", "Glide", "Walk" }
 			local Auto = {
-				mode = "Blatant", falls = {}, off = {}, rate = {}, phase = "wait", why = "waiting for Auto Open Sea",
+				mode = "Blatant", falls = {}, off = {}, rate = {}, phase = "hold", why = "fastest that works",
 				sigs = {}, active = 0, holdUntil = 0, queue = {}, results = {},
 				file = "Corvus/OSFA_Auto.json", day = os.date("%Y-%m-%d"),
 			}
@@ -33170,10 +33170,6 @@ end
 			function Auto.fallback(reason, weight)
 				local from = Auto.mode
 				Auto.falls[from] = (Auto.falls[from] or 0) + (weight or 1)
-				if Auto.falls[from] >= 3 and from ~= "Walk" and not Auto.off[from] then
-					Auto.off[from] = true
-					log("MODE off for today", from, "falls", Auto.falls[from])
-				end
 				local to = Auto.lower(from)
 				if to ~= from then
 					Auto.mode = to
@@ -33187,111 +33183,27 @@ end
 					Auto.fallback("kick or disconnect: " .. string.sub(tostring(message), 1, 80), 3)
 				end
 			end
-			function Auto.beginSample()
-				while #Auto.queue > 0 do
-					local mode = table.remove(Auto.queue, 1)
-					if not Auto.off[mode] then
-						Auto.mode = mode
-						Auto.sample = { mode = mode, t = 0, value = 0 }
-						Auto.phase = "measure"
-						return
-					end
-				end
-				Auto.sample = nil
-				Auto.finish()
-			end
-			function Auto.finish()
-				local best, bestRate = nil, 0
-				for _, mode in ipairs(Steps) do
-					local r = Auto.results[mode]
-					if r and r > bestRate then
-						best, bestRate = mode, r
-					end
-				end
-				if best then
-					-- the safer mode wins when it is within 5 percent of the best
-					for i = #Steps, 1, -1 do
-						local r = Auto.results[Steps[i]]
-						if r and r >= bestRate * 0.95 then
-							best = Steps[i]
-							break
-						end
-					end
-				else
-					best = if Auto.off.Teleport then "Walk" else "Teleport"
-				end
-				local parts = {}
-				for _, mode in ipairs(Steps) do
-					if Auto.results[mode] then
-						table.insert(parts, mode .. "=" .. formatNumber(Auto.results[mode]) .. "/min")
-					end
-				end
-				Auto.mode = best
-				Auto.phase = "hold"
-				Auto.holdUntil = Auto.active + 3600
-				Auto.why = string.format("best measured: %s (%s)", best, table.concat(parts, ", "))
-				log("MODE measure " .. table.concat(parts, " ") .. " keep=" .. best)
-				Auto.save()
-			end
-			function Auto.startMeasure()
-				Auto.results, Auto.queue = {}, {}
-				local top = 0
-				for _, mode in ipairs(Steps) do
-					top = math.max(top, tonumber(Auto.rate[mode]) or 0)
-				end
-				for _, mode in ipairs(Steps) do
-					local prior = tonumber(Auto.rate[mode])
-					if not Auto.off[mode] and (prior == nil or prior >= top * 0.5) then
-						table.insert(Auto.queue, mode)
-					end
-				end
-				Auto.beginSample()
-			end
 			function Auto.tick()
 				if not Auto.isOn() then
-					Auto.phase, Auto.sample = "wait", nil
-					return
-				end
-				if not on("AutoSea") then
-					Auto.why = "waiting for Auto Open Sea"
 					return
 				end
 				Auto.active += 1
 				if Auto.pending then
 					local reason = Auto.pending
 					Auto.pending = nil
-					if Auto.phase == "measure" and Auto.sample then
-						Auto.fallback(reason)
-						Auto.results[Auto.sample.mode] = nil
-						Auto.rate[Auto.sample.mode] = 0
-						Auto.beginSample()
-					else
-						Auto.fallback(reason)
-						Auto.holdUntil = Auto.active + 3600
-					end
+					Auto.fallback(reason)
+					Auto.holdUntil = Auto.active + 600
 					return
 				end
-				if Auto.phase == "wait" then
-					Auto.startMeasure()
-				elseif Auto.phase == "measure" and Auto.sample then
-					local sample = Auto.sample
-					sample.t += 1
-					if sample.t >= 180 and (sample.value > 0 or sample.t >= 300) then
-						local rate = sample.value / sample.t * 60
-						Auto.results[sample.mode] = rate
-						Auto.rate[sample.mode] = rate
-						Auto.beginSample()
-					end
-				elseif Auto.phase == "hold" and Auto.active >= Auto.holdUntil then
-					Auto.phase = "wait"
+				-- degraded only after a real danger signal; the fastest mode is retried after 10 minutes
+				if Auto.mode ~= "Blatant" and Auto.active >= Auto.holdUntil then
+					Auto.mode, Auto.why = "Blatant", "fastest that works"
+					log("MODE retry Blatant")
 				end
 			end
 			function Auto.text()
 				if not Auto.isOn() then
 					return nil
-				end
-				if Auto.phase == "measure" and Auto.sample then
-					return string.format("Movement: measuring %s, %ds left", Auto.sample.mode, math.max(180 - Auto.sample.t, 0))
 				end
 				return "Movement: " .. Auto.mode .. " (" .. Auto.why .. ")"
 			end
@@ -35841,16 +35753,29 @@ end
 				local keepEggs = if on("AutoPlaceEggs") then eggCap() * 2 else 0
 				local keepAnimals = 5
 				list = {}
+				local keptItems = {}
 				for _, item in ipairs(smart) do
 					if item.kind == "Egg" and keepEggs > 0 then
 						keepEggs -= 1
 						why.kept += 1
+						table.insert(keptItems, item)
 					elseif item.kind ~= "Egg" and keepAnimals > 0 then
 						keepAnimals -= 1
 						why.kept += 1
+						table.insert(keptItems, item)
 					else
 						table.insert(list, 1, item)
 					end
+				end
+				-- full backpack and nothing else to sell: the planner frees room with the lowest-value kept items (never protected, locked or special ones)
+				if #list == 0 and #keptItems > 0 and Game.plannerOn() and inventoryCount() >= inventoryLimit() then
+					table.sort(keptItems, function(a, b)
+						return a.info.value < b.info.value
+					end)
+					for i = 1, math.max(math.ceil(#keptItems / 2), 1) do
+						table.insert(list, keptItems[i])
+					end
+					log("PLAN full backpack, selling lowest value kept items", #list)
 				end
 			end
 			return list, why
@@ -35865,12 +35790,15 @@ end
 			return "nothing matches of " .. why.total .. " items: " .. (if #parts > 0 then table.concat(parts, ", ") else "inventory empty")
 		end
 		function Game.sellMode()
-			if Game.drivenBy("AutoSell") then
+			if Game.drivenBy("AutoSell") or Game.plannerOn() then
 				return "Smart"
 			end
 			return Options.SellMode and Options.SellMode.Value or "Filtered"
 		end
 		Sea.fullHint = function()
+			if Game.plannerOn() then
+				return ", the planner is selling the lowest value items"
+			end
 			if not on("AutoSell") then
 				return ", turn on Auto Sell or sell some items"
 			end
