@@ -32583,8 +32583,16 @@ do
 		local el = now - L.t0
 		if L.phase == "measureBlatant" and el >= 180 then
 			L.blat = (worthNow() - L.w0) / (el / 60)
-			L.phase, L.mode, L.t0, L.w0 = "measureSafe", "safe", now, worthNow()
-		elseif L.phase == "measureSafe" and el >= 180 then
+			if L.safe then
+				-- Safe was measured once this session: Blatant is re-measured hourly, Safe is not (it is the slow baseline).
+				L.keep = if L.blat > L.safe then "blatant" else "safe"
+				L.ratio = if L.safe > 0 then L.blat / L.safe else nil
+				L.phase, L.mode, L.t0 = "keep", L.keep, now
+				log("MODE measure", "safe=" .. formatNumber(L.safe) .. "/min (kept)", "blatant=" .. formatNumber(L.blat) .. "/min", "keep=" .. L.keep)
+			else
+				L.phase, L.mode, L.t0, L.w0 = "measureSafe", "safe", now, worthNow()
+			end
+		elseif L.phase == "measureSafe" and el >= 90 then
 			L.safe = (worthNow() - L.w0) / (el / 60)
 			L.keep = if L.blat > (L.safe or 0) then "blatant" else "safe"
 			L.ratio = if (L.safe or 0) > 0 then L.blat / L.safe else nil
@@ -32608,7 +32616,7 @@ do
 			return "Mode " .. m .. " (picked by you)"
 		end
 		if L.phase == "measureSafe" or L.phase == "measureBlatant" then
-			return "Mode " .. m .. ": measuring " .. m .. " (3 min)"
+			return "Mode " .. m .. ": measuring " .. m .. (if m == "Safe" then " (90 s)" else " (3 min)")
 		end
 		if L.keep == "blatant" then
 			return "Mode Blatant: " .. (if L.ratio then string.format("%.1fx Safe", L.ratio) else "faster than Safe") .. " (measured)"
