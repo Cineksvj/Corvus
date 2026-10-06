@@ -33868,6 +33868,32 @@ do
 		TaxiJob = 30,
 	}
 	local LINE_COOK = 120
+	-- Seeded pay per task relative to the Hairdresser tier (10 + 3.3 x level per task), so every job has a $/h value from
+	-- the first second: no job is ever test-worked to find out what it pays. The server's pay table is not in the client
+	-- dump (only the level rewards and the XP curve are), so the factors are estimates from the public tier lists
+	-- (Hairdresser $10 -> $43 a task) and the task durations in the job code (Delivery and Mechanic: few, big jobs;
+	-- Janitor, Miner, Fisherman: many small ones). Live pay (ShiftEarnings per task) refines them silently.
+	local PayFactor = {
+		StylezHairdresser = 1.0,
+		SupermarketCashier = 0.9,
+		BensIceCreamSeller = 0.8,
+		BloxBurgersEmployee = 1.0,
+		PizzaPlanetBaker = 1.1,
+		MikesMechanic = 2.0,
+		SupermarketStocker = 0.9,
+		SchoolJanitor = 0.35,
+		CaveMiner = 0.3,
+		LumberWoodcutter = 1.3,
+		HutFisherman = 0.4,
+		PizzaPlanetDelivery = 4.0,
+		HighSchoolTeacher = 0.9,
+		TaxiJob = 6.0,
+	}
+	-- $/h of a fast human on a job at a level and efficiency, from the seeds above
+	function N.seedHuman(key, level, eff)
+		local tph = TasksPerHour[key] or 300
+		return tph * (PayFactor[key] or 0.8) * (10 + 3.3 * (level or 0)) * (eff or 1)
+	end
 	local function money(n)
 		return "$" .. formatNumber(math.floor(math.max(n or 0, 0) + 0.5))
 	end
@@ -33932,8 +33958,8 @@ do
 			human = e.m / e.n * tph
 			src = string.format("%s/task x %d/h", money(e.m / e.n), tph)
 		else
-			human = 360 * (10 + 3.3 * level) * eff
-			src = string.format("tier lv%d eff %.2f", level, eff)
+			human = N.seedHuman(key, level, eff)
+			src = string.format("seed lv%d eff %.2f", level, eff)
 		end
 		if human > hard then
 			human, src = hard, src .. ", hard " .. money(hard)
@@ -34056,7 +34082,7 @@ do
 			return "-", "off (Skill breaks is off)", string.format("%d, %s", C.breaks, N.longTime(C.breakSeconds))
 		end
 		local rate = N.capRate()
-		local cap = if C.limit then string.format("%s/h (%d%% of %s/h)", money(C.limit), math.floor(pct() * 100), money(C.human)) else "measuring"
+		local cap = if C.limit then string.format("%s/h (%d%% of %s/h)", money(C.limit), math.floor(pct() * 100), money(C.human)) else "-"
 		return money(rate) .. "/h", cap, string.format("%d, %s%s", C.breaks, N.longTime(C.breakSeconds), if C.active then " (on one now)" else "")
 	end
 end
@@ -36563,14 +36589,13 @@ do
 	end
 end
 -- Best Pay (toggle) on the profit engine v2 (CLAUDE.md.txt 8.00): time is the currency, so every job is a value per
--- hour over the rest of a 24 h horizon, with its uncertainty, and the hub explores a job only while the expected gain
--- of knowing it beats the money lost measuring it.
---   E(job) = measured $/h + (job level rewards + pay growth from level ups reached within the horizon) / horizon
---   measured $/h: lifetime money / shift seconds (N.Pay), uncertainty from 60 s pay windows (Welford sums)
+-- hour over the rest of a 24 h horizon. INSTANT (owner 2026-10-07): the best job is picked in the first second from
+-- seeded $/h (pay per task x tasks per hour at the job's level, p05_cap N.seedHuman), live pay only refines it silently;
+-- there is no test shift and no measuring text.
+--   E(job) = rate + (job level rewards + pay growth from level ups reached within the horizon) / horizon
+--   rate = (seed x 300 s + live money) / (300 s + shift seconds), capped by the Earnings cap
 --   level rewards: JobData (reaching level 1..10 pays $100 .. $21000), XP to the next level (level+1)^2.218812493,
---   XP per second measured live from ClientStats Job/Jobs/<job>/XP
---   explore: knowledge gradient (expected improvement over the best known job after m more windows) times the time
---   left, minus the money lost while measuring (and walking there); a job that earns $0 for two windows drops out.
+--   XP per second measured live from ClientStats Job/Jobs/<job>/XP (promotion counts once it is known)
 -- School (SchoolData): the seniority bonus multiplies the pay of every job. The hub cannot attend classes (four
 -- different minigames, graded on the server), so it only computes whether school would pay back within the horizon
 -- and logs it (PLAN school ...); it also measures real class results when you attend one yourself.
@@ -36628,23 +36653,6 @@ do
 	end
 	local function money(n)
 		return (if n < 0 then "-$" else "$") .. formatNumber(math.floor(math.abs(n)))
-	end
-	-- standard normal pdf / cdf (Abramowitz-Stegun 26.2.17)
-	local function pdf(z)
-		return 0.3989422804014327 * math.exp(-z * z / 2)
-	end
-	local function cdf(z)
-		local t = 1 / (1 + 0.2316419 * math.abs(z))
-		local p = pdf(z) * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
-		return if z > 0 then 1 - p else p
-	end
-	-- expected improvement E[max(X - best, 0)], X ~ N(mu, s)
-	local function improvement(mu, s, best)
-		if s <= 0 then
-			return math.max(mu - best, 0)
-		end
-		local z = (mu - best) / s
-		return s * pdf(z) + (mu - best) * cdf(z)
 	end
 	local function startup()
 		local n, sum = 0, 0
@@ -36745,9 +36753,19 @@ do
 		return nil
 	end
 
+	-- Value of every job from the first second, no test shifts: the seeded $/h (p05_cap N.seedHuman: pay per task x tasks
+	-- per hour at the job's level, x2 for Blatant speed) is blended with the live pay (lifetime money / shift seconds)
+	-- weighted by the shift seconds seen (a 300 s prior). Jobs never seen paying get a reliability discount (beta farms
+	-- more), a job that earned $0 for two windows drops out. The Earnings cap bounds every value.
+	local PRIOR_SEC = 300
+	local BLATANT_GAIN = 2
+	local Beta = { Fisherman = true, Woodcutter = true }
+	local function seedRate(key, name, level)
+		return N.seedHuman(key, level, 1) * BLATANT_GAIN
+	end
 	local function estimates(h)
 		local list, known = {}, {}
-		local sdSum, sdN, xpSum, xpN, gSum, gN = 0, 0, 0, 0, 0, 0
+		local xpSum, xpN, gSum, gN = 0, 0, 0, 0
 		for _, name in ipairs(Explore) do
 			local key = N.JobKeys[name]
 			local entry = N.Pay.jobs[key]
@@ -36763,21 +36781,22 @@ do
 			c.level = (N.Levels and N.Levels[key]) or N.jobLevel(key)
 			c.xp = stat("Job/Jobs/" .. key .. "/XP") or 0
 			c.failed = (entry ~= nil and entry.fail == TAG) or P.skip[name] == true
-			local w = entry and entry.w
-			c.n = if w then w.n elseif entry then math.floor((entry.seconds or 0) / WINDOW) else 0
-			if entry and (entry.seconds or 0) > 0 and c.n >= 1 then
-				c.rate = entry.money / entry.seconds * 3600
-				-- Earnings cap: a job is never worth more than the pay the hub lets itself earn there
-				local capped = N.capLimit and N.capLimit(key, name)
-				if capped and c.rate > capped then
-					c.rate = capped
-				end
-				if w and w.n >= 2 then
-					c.sdw = math.sqrt(math.max(w.sxx - w.sx * w.sx / w.n, 0) / (w.n - 1))
-					sdSum += c.sdw
-					sdN += 1
-				end
+			local sec = entry and entry.seconds or 0
+			c.n = math.floor(sec / WINDOW)
+			local seed = seedRate(key, name, c.level)
+			local rate = seed
+			local proven = entry ~= nil and (entry.money or 0) > 0 and sec >= 60
+			if proven then
+				rate = (seed * PRIOR_SEC + entry.money / sec * 3600 * sec) / (PRIOR_SEC + sec)
+			else
+				rate = seed * (if Beta[name] or string.find(name, "beta", 1, true) then 0.5 else 0.85)
 			end
+			-- Earnings cap: a job is never worth more than the pay the hub lets itself earn there
+			local capped = N.capLimit and N.capLimit(key, name)
+			if capped and rate > capped then
+				rate = capped
+			end
+			c.rate = rate
 			if entry and (entry.xpSec or 0) >= 60 then
 				c.xpRate = entry.xp / entry.xpSec
 				xpSum += c.xpRate
@@ -36789,42 +36808,17 @@ do
 				gN += 1
 			end
 			table.insert(list, c)
-			if c.rate and c.n >= 2 and not c.failed then
+			if not c.failed then
 				table.insert(known, c)
 			end
 		end
-		local pooledSd = if sdN > 0 then sdSum / sdN else nil
 		local pooledXp = if xpN > 0 then xpSum / xpN else 0
 		local pooledG = if gN > 0 then gSum / gN else 0
-		-- prior for an unmeasured job: mean and spread of the measured jobs
-		local mean, spread = nil, nil
-		if #known > 0 then
-			local s, ss = 0, 0
-			for _, c in ipairs(known) do
-				s += c.rate
-				ss += c.rate * c.rate
-			end
-			mean = s / #known
-			if #known >= 2 then
-				spread = math.sqrt(math.max(ss - s * s / #known, 0) / (#known - 1))
-			end
-		end
 		for _, c in ipairs(list) do
-			c.sdw = c.sdw or pooledSd or (if mean then mean * 0.5 else 0)
-			local rate = c.rate or mean or 0
-			if c.failed then
-				c.sigma = 0
-			elseif c.rate and c.n >= 2 then
-				c.sigma = c.sdw / math.sqrt(c.n)
-			elseif c.rate then
-				c.sigma = c.sdw
-			else
-				c.sigma = spread or c.sdw
-			end
-			local promo, toLevel, at = promotion(c.level, c.xp, c.xpRate or pooledXp, rate, c.growth or pooledG, h)
-			c.R = rate
+			local promo, toLevel, at = promotion(c.level, c.xp, c.xpRate or pooledXp, c.rate, c.growth or pooledG, h)
+			c.R = c.rate
 			c.promo, c.toLevel, c.levelAt = promo, toLevel, at
-			c.E = if c.failed then 0 else rate + promo / (h / 3600)
+			c.E = if c.failed then 0 else c.rate + promo / (h / 3600)
 			c.nextLevel = if (c.xpRate or pooledXp) > 0 and c.level < 10 then math.max(reqXP(c.level) - c.xp, 0) / (c.xpRate or pooledXp) else nil
 		end
 		return list, known
@@ -36953,97 +36947,60 @@ do
 		end
 	end
 
+	-- The best job right now, at once: highest 24 h value; stays on the current job unless the switch (walk, new shift)
+	-- pays back within the horizon. Never idles: with every job dropped it keeps the current one.
 	local function choose(now)
 		local h = horizon()
 		local list, known = estimates(h)
 		local cur = P.current
-		local curC
-		for _, c in ipairs(list) do
-			if c.name == cur then
-				curC = c
-			end
-		end
 		local up = startup()
-		local pick, mode, eta, why
+		local pick, why
 		if #known == 0 then
-			-- nothing measured yet: keep measuring the current job, else the first one not dropped
-			if curC and not curC.failed then
-				pick, mode, why = cur, "explore", "no job measured yet"
-			else
-				for _, c in ipairs(list) do
-					if not c.failed then
-						pick, mode, why = c.name, "explore", "no job measured yet"
-						break
-					end
-				end
-			end
-			eta = 2 * WINDOW
+			pick = cur or "Hairdresser"
+			why = "every job dropped, staying on " .. tostring(pick)
 		else
 			table.sort(known, function(a, b)
 				return a.E > b.E
 			end)
 			local best = known[1]
-			local Estar = best.E
-			-- knowledge gradient over m more windows, minus what measuring costs
-			local bestNet, bestC, bestT = 0, nil, 0
+			pick = best.name
+			local curC
 			for _, c in ipairs(list) do
-				if not c.failed and c.sigma > 0 and c ~= best then
-					local isCur = c.name == cur
-					for _, m in ipairs({ 1, 2, 4, 8 }) do
-						local s = c.sigma * c.sigma / math.sqrt(c.sigma * c.sigma + c.sdw * c.sdw / m)
-						local walk = if isCur then 0 else up
-						local te = m * WINDOW + walk
-						local pBetter = 1 - cdf((Estar - c.E) / math.max(s, 1e-9))
-						local value = improvement(c.E, s, Estar) * math.max(h - te, 0) / 3600
-						local loss = (Estar - c.E) * m * WINDOW / 3600 + Estar * walk * (2 - pBetter) / 3600
-						if value - loss > bestNet then
-							bestNet, bestC, bestT = value - loss, c, te
-						end
-					end
+				if c.name == cur then
+					curC = c
 				end
 			end
-			if bestC then
-				pick, mode, eta = bestC.name, "explore", bestT
-				why = string.format("value of measuring %s > cost", money(bestNet))
-			else
-				pick, mode = best.name, "exploit"
-				-- stay on the current job when the switch (walk, new shift) costs more than the gain
-				if curC and curC ~= best and not curC.failed and curC.rate and curC.n >= 2 then
-					local gainSwitch = (best.E - curC.E) * math.max(h - up, 0) / 3600 - curC.E * up / 3600
-					if gainSwitch <= 0 then
-						pick = cur
-					end
-				end
-				for _, c in ipairs(list) do
-					if c.name == pick then
-						eta = c.nextLevel
-						why = string.format("rate %s/h level %d promo %s by lvl %d", money(c.R), c.level, money(c.promo), c.toLevel)
-					end
+			if curC and curC ~= best and not curC.failed then
+				local gainSwitch = (best.E - curC.E) * math.max(h - up, 0) / 3600 - curC.E * up / 3600
+				if gainSwitch <= 0 then
+					pick = cur
 				end
 			end
 		end
-		-- alternatives for the log: the next best values
 		table.sort(list, function(a, b)
 			return a.E > b.E
 		end)
-		local alt, shown = {}, 0
-		for _, c in ipairs(list) do
-			if c.name ~= pick and shown < 2 and not c.failed then
-				shown += 1
-				table.insert(alt, string.format("%s:%s/h%s", c.name, money(c.E), if c.n >= 2 then "" else "?"))
-			end
-		end
 		local pickC
 		for _, c in ipairs(list) do
 			if c.name == pick then
 				pickC = c
 			end
 		end
-		if now - P.schoolAt > 600 and #known > 0 then
-			P.schoolAt = now
-			schoolLog(known[1].R, h)
+		if pickC then
+			why = string.format("rate %s/h level %d promo %s by lvl %d", money(pickC.R), pickC.level, money(pickC.promo), pickC.toLevel)
 		end
-		local line = string.format("PLAN best=%s gain/h=%s eta=%s alt=%s mode=%s why=%s h=%.1fh", tostring(pick), pickC and money(pickC.E) or "?", if eta then tostring(math.floor(eta)) .. "s" else "-", table.concat(alt, ","), tostring(mode), tostring(why), h / 3600)
+		local alt, shown = {}, 0
+		for _, c in ipairs(list) do
+			if c.name ~= pick and shown < 2 and not c.failed then
+				shown += 1
+				table.insert(alt, string.format("%s:%s/h", c.name, money(c.E)))
+			end
+		end
+		if now - P.schoolAt > 600 and pickC then
+			P.schoolAt = now
+			schoolLog(pickC.R, h)
+		end
+		local line = string.format("PLAN best=%s gain/h=%s alt=%s why=%s h=%.1fh", tostring(pick), pickC and money(pickC.E) or "?", table.concat(alt, ","), tostring(why), h / 3600)
 		local school = P.school
 		if school and school.net then
 			line ..= " school=" .. money(school.net)
@@ -37054,7 +37011,7 @@ do
 		end
 		P.lastPick = pick
 		P.pickRate = pickC and pickC.E or nil
-		P.text = string.format("Plan: <b>%s</b> %s/h%s", tostring(pick), pickC and money(pickC.E) or "?", if mode == "explore" then " (measuring)" else "") .. (if school then "\nSchool: " .. school.text else "")
+		P.text = string.format("Plan: <b>%s</b> %s/h", tostring(pick), pickC and money(pickC.E) or "?") .. (if school then "\nSchool: " .. school.text else "")
 		return pick
 	end
 
@@ -37550,31 +37507,20 @@ do
 		task.wait(if worked then N.actionDelay() else 0.25)
 	end
 end
--- Job speed "Auto (best measured)" (default of the Speed dropdown; owner rule: modes are chosen by measured profit).
--- Per job the engine measures every mode (Blatant, Fast; Legit only when both are out) for ~4 min of shift time: $/h
--- and tasks/h from the ShiftEarnings samples (N.paySample -> N.modeRecord), keeps the best mode and re-measures after
--- 1 h of shift time. Score = min(measured $/h, Earnings cap limit) (no limit when Skill breaks is off); a safer mode
--- within 5 % of the best score wins. Danger signals (notes.md Anticheat: no client guard, the server judges answers, staff
--- read money logs): (1) tasks rejected, wrong answers > 35 % of the last tasks (>= 4 wrong, >= 6 tasks); (2) the
--- shift ended by the server (job gone, no own end shift / needs / garden / cap break / death); (3) money log plausibility:
--- measured $/h above 2x the human maximum (N.capHuman); (4) position snapback, > 80 studs in 1 s without our own
--- travel. Any signal = one step safer (`MODE fallback`); 3 fallbacks of one mode = that mode is off for the day.
--- A mode picked by hand in the dropdown is used as is. Long trips "Auto" = bus with the same measure/fallback (below in
--- p05_travel). Logs: `MODE measure <job> <mode> ...`, `MODE measure <job> keep=<mode> ...`, `MODE fallback ...`.
-N.Mode = { jobs = {}, last = "Blatant", ownEndAt = -1e9 }
+-- Job speed: ONE mode rule (owner 2026-10-07). The Speed dropdown defaults to Blatant (every action as fast as the game
+-- takes it); there is no measuring phase and no Safe default. The only automatic change is a degrade: a danger signal
+-- (notes.md Anticheat: no client guard, the server judges answers, staff read money logs) steps one mode slower for
+-- 10 minutes (`MODE fallback`), then the chosen mode is tried again (`MODE retry`). Signals: (1) tasks rejected, wrong
+-- answers > 35 % of the last tasks (>= 4 wrong, >= 6 tasks); (2) the shift ended by the server (job gone, no own end
+-- shift / needs / garden / cap break / death); (3) position snapback, > 80 studs in 1 s without our own travel.
+-- The pay itself is bounded by the Earnings cap (p05_cap), not by a slower mode. A mode picked by hand is the ceiling:
+-- Fast never degrades to Blatant, Legit never degrades.
+-- Logs: `MODE fallback <job> <from> -> <to> reason= count=`, `MODE retry <job> <mode>`.
+N.Mode = { last = "Blatant", ownEndAt = -1e9, step = 0, untilAt = 0, count = 0, sigAt = -1e9, win = { done = 0, wrong = 0 }, why = "" }
 do
 	local M = N.Mode
-	local AUTO = "Auto (best measured)"
 	local ORDER = { "Blatant", "Fast", "Legit" }
-	local MEASURE_SEC, MEASURE_MIN_TASKS, MEASURE_MAX = 240, 4, 480
-	local WARM = 15
-	local KEEP_SEC = 3600
-	local function today()
-		return math.floor(os.time() / 86400)
-	end
-	local function isAuto()
-		return optionText("JobSpeed", AUTO) == AUTO
-	end
+	local HOLD = 600
 	local function indexOf(mode)
 		for i, m in ipairs(ORDER) do
 			if m == mode then
@@ -37583,217 +37529,78 @@ do
 		end
 		return 1
 	end
-	local function banned(s, mode)
-		return s.ban[mode] == today()
+	-- the mode the player chose (an old saved "Auto (best measured)" counts as Blatant)
+	local function chosen()
+		local pick = optionText("JobSpeed", "Blatant")
+		return ORDER[indexOf(pick)]
 	end
-	local function setMode(s, mode, phase)
-		s.cur, s.phase, s.warm = mode, phase, WARM
-		s.win = { done = 0, wrong = 0 }
-		M.last = mode
-	end
-	local function newState()
-		return { stats = {}, bad = {}, ban = {}, fb = {}, phase = "measure", cur = "Blatant", warm = WARM, win = { done = 0, wrong = 0 }, keepSec = 0, keepM = 0, queue = {}, qi = 1, why = "measuring", fallbackFrom = nil }
-	end
-	local function startMeasure(s, job)
-		local queue = {}
-		for _, mode in ipairs({ "Blatant", "Fast" }) do
-			if not banned(s, mode) and not (s.bad[mode] and os.clock() - s.bad[mode] < KEEP_SEC) then
-				table.insert(queue, mode)
-			end
-		end
-		if #queue == 0 then
-			setMode(s, "Legit", "keep")
-			s.keepSec, s.keepM, s.why = 0, 0, "faster modes are off (signals or 3 fallbacks today)"
-			log("MODE measure", job, "keep=Legit", "reason=Blatant and Fast are off for now")
-			return
-		end
-		s.queue, s.qi, s.stats = queue, 1, {}
-		setMode(s, queue[1], "measure")
-		s.why = "measuring " .. queue[1]
-		log("MODE measure start", job, "modes=" .. table.concat(queue, ","), "each ~" .. MEASURE_SEC .. "s of shift")
-	end
-	local function state(job)
-		local s = M.jobs[job]
-		if not s then
-			s = newState()
-			M.jobs[job] = s
-			startMeasure(s, job)
-		end
-		return s
-	end
-	-- the speed every job action uses (replaces optionText("JobSpeed")); a hand-picked mode wins
+	-- the speed every job action uses: the chosen mode, stepped slower while a degrade is active
 	function N.jobSpeed()
-		local pick = optionText("JobSpeed", AUTO)
-		if pick ~= AUTO then
-			return pick
+		local base = indexOf(chosen())
+		if M.step > 0 and os.clock() >= M.untilAt then
+			M.step = 0
+			M.win = { done = 0, wrong = 0 }
+			log("MODE retry", chosen(), "after " .. HOLD .. "s")
 		end
-		local job = N.currentJob()
-		local s = job ~= "" and M.jobs[job] or nil
-		return if s then s.cur else M.last
+		local mode = ORDER[math.min(base + M.step, #ORDER)]
+		M.last = mode
+		return mode
 	end
 	function N.modeOwnEnd()
 		M.ownEndAt = os.clock()
 	end
-	-- one step safer, a mode off for the day after 3 fallbacks; debounced 30 s
+	-- one step slower for HOLD seconds; debounced 30 s
 	function N.modeSignal(job, reason)
-		local s = M.jobs[job]
-		if not s or not isAuto() then
-			return
-		end
 		local now = os.clock()
-		if now - (s.sigAt or -1e9) < 30 then
+		if now - M.sigAt < 30 then
 			return
 		end
-		s.sigAt = now
-		local from = s.cur
-		if from == "Legit" then
-			log("MODE signal", job, "Legit reason=" .. reason, "(no safer mode)")
+		M.sigAt = now
+		local base = indexOf(chosen())
+		local from = ORDER[math.min(base + M.step, #ORDER)]
+		if base + M.step >= #ORDER then
+			log("MODE signal", job, from .. " reason=" .. reason, "(no slower mode)")
 			return
 		end
-		s.bad[from] = now
-		s.fb[from] = (s.fb[from] or 0) + 1
-		if s.fb[from] >= 3 then
-			s.ban[from] = today()
-			log("MODE disabled", job, from, "for today", "3 fallbacks")
-		end
-		local to = "Legit"
-		for i = indexOf(from) + 1, #ORDER do
-			if not banned(s, ORDER[i]) then
-				to = ORDER[i]
-				break
-			end
-		end
-		setMode(s, to, "keep")
-		s.keepSec, s.keepM = 0, 0
-		s.why = string.format("fell back from %s (%s)", from, reason)
-		log("MODE fallback", job, from .. " -> " .. to, "reason=" .. reason, "count=" .. s.fb[from])
+		M.step += 1
+		M.count += 1
+		M.untilAt = now + HOLD
+		M.win = { done = 0, wrong = 0 }
+		M.why = string.format("%s (slower after: %s)", ORDER[base + M.step], reason)
+		log("MODE fallback", job, from .. " -> " .. ORDER[base + M.step], "reason=" .. reason, "count=" .. M.count)
 	end
-	local function rate(st)
-		return if st.sec > 0 then st.m / st.sec * 3600 else 0, if st.sec > 0 then st.n / st.sec * 3600 else 0
-	end
-	-- end of a measure sweep: best score, a safer mode within 5 % wins
-	local function decide(s, job)
-		local limit = N.capLimit(job, N.workPickName)
-		local rows = {}
-		for _, mode in ipairs(s.queue) do
-			local st = s.stats[mode]
-			if st and st.sec > 0 then
-				local r = rate(st)
-				table.insert(rows, { mode = mode, rate = r, score = math.min(r, limit or 1e12), i = indexOf(mode) })
-			end
-		end
-		local best
-		for _, row in ipairs(rows) do
-			if not best or row.score > best.score then
-				best = row
-			end
-		end
-		local keep, why
-		if not best or best.score <= 0 then
-			keep, why = "Fast", "no pay measured yet, Fast until the next measure"
-		else
-			keep = best
-			for _, row in ipairs(rows) do
-				if row.i > keep.i and row.score >= best.score * 0.95 then
-					keep = row
-				end
-			end
-			local parts = {}
-			for _, row in ipairs(rows) do
-				table.insert(parts, string.format("%s $%s/h", row.mode, formatNumber(math.floor(row.rate))))
-			end
-			why = "best measured: " .. table.concat(parts, ", ") .. (if limit then string.format(", capped at $%s/h", formatNumber(math.floor(limit))) else "")
-			keep = keep.mode
-		end
-		setMode(s, keep, "keep")
-		s.keepSec, s.keepM, s.why = 0, 0, why
-		log("MODE measure", job, "keep=" .. keep, why, "next measure in " .. N.longTime(KEEP_SEC))
-	end
-	-- one second of shift pay (called from N.paySample)
+	-- one second of shift pay (called from N.paySample): only the rejected-tasks signal needs it
 	function N.modeRecord(job, gained, seconds)
-		if not isAuto() then
-			return
-		end
-		local s = state(job)
 		local done, wrong = Session.done, Session.wrong
-		if M.sampleJob ~= job then
-			s.lastDone, s.lastWrong, s.warm = nil, nil, WARM
-		end
-		M.sampleJob = job
-		local dd = if s.lastDone and done >= s.lastDone then done - s.lastDone else 0
-		local dw = if s.lastWrong and wrong >= s.lastWrong then wrong - s.lastWrong else 0
-		s.lastDone, s.lastWrong = done, wrong
-		if s.warm > 0 then
-			s.warm -= seconds
-			return
-		end
-		s.win.done += dd
-		s.win.wrong += dw
-		-- signal: the server rejects tasks
-		if s.cur ~= "Legit" and s.win.done >= 6 and s.win.wrong >= 4 and s.win.wrong / s.win.done > 0.35 then
-			N.modeSignal(job, string.format("rejected tasks %d of %d wrong", s.win.wrong, s.win.done))
+		local dd = if M.lastDone and done >= M.lastDone then done - M.lastDone else 0
+		local dw = if M.lastWrong and wrong >= M.lastWrong then wrong - M.lastWrong else 0
+		M.lastDone, M.lastWrong = done, wrong
+		M.win.done += dd
+		M.win.wrong += dw
+		if M.win.done >= 6 and M.win.wrong >= 4 and M.win.wrong / M.win.done > 0.35 then
+			N.modeSignal(job, string.format("rejected tasks %d of %d wrong", M.win.wrong, M.win.done))
 			return
 		end
 		-- rolling window: halve the counts after 40 tasks so old tasks fade out
-		if s.win.done >= 40 then
-			s.win.done, s.win.wrong = s.win.done // 2, s.win.wrong // 2
-		end
-		if s.phase == "keep" then
-			s.keepSec += seconds
-			s.keepM += gained
-			if s.keepSec >= KEEP_SEC then
-				startMeasure(s, job)
-			end
-			return
-		end
-		local st = s.stats[s.cur]
-		if not st then
-			st = { m = 0, n = 0, sec = 0 }
-			s.stats[s.cur] = st
-		end
-		st.m += gained
-		st.n += dd
-		st.sec += seconds
-		if (st.sec >= MEASURE_SEC and st.n >= MEASURE_MIN_TASKS) or st.sec >= MEASURE_MAX then
-			local r, tph = rate(st)
-			log("MODE measure", job, s.cur, string.format("$%d/h tasks %d/h n=%d in %ds", math.floor(r), math.floor(tph), st.n, math.floor(st.sec)))
-			-- signal: money log plausibility (more than twice what a human can earn here)
-			local okH, human = pcall(N.capHuman, job, N.workPickName)
-			if okH and human and human > 0 and s.cur ~= "Legit" and r > 2 * human then
-				N.modeSignal(job, string.format("money log implausible $%d/h vs human $%d/h", math.floor(r), math.floor(human)))
-				return
-			end
-			s.qi += 1
-			if s.queue[s.qi] then
-				setMode(s, s.queue[s.qi], "measure")
-				s.why = "measuring " .. s.cur
-			else
-				decide(s, job)
-			end
+		if M.win.done >= 40 then
+			M.win.done, M.win.wrong = M.win.done // 2, M.win.wrong // 2
 		end
 	end
 	-- status line for Up next
 	function N.modeText()
-		local job = N.currentJob()
-		if not isAuto() then
-			return "Speed: " .. optionText("JobSpeed", AUTO) .. " (your choice)"
+		local mode = N.jobSpeed()
+		if M.step > 0 then
+			return string.format("Speed: %s, slower for %s (%s)", mode, N.longTime(math.max(M.untilAt - os.clock(), 0)), M.why)
 		end
-		local s = job ~= "" and M.jobs[job] or nil
-		if not s then
-			return "Speed: Auto, measures Blatant and Fast per job while you work"
-		end
-		if s.phase == "measure" then
-			return string.format("Speed: measuring %s (%d of %d modes), keeps the best", s.cur, s.qi, #s.queue)
-		end
-		return string.format("Speed: %s (auto, %s), re-measure in %s", s.cur, s.why, N.longTime(math.max(KEEP_SEC - s.keepSec, 0)))
+		return "Speed: " .. mode
 	end
-	-- watcher: shift ended by the server, position snapback (only while a job runs in Auto)
+	-- watcher: shift ended by the server, position snapback (only while a job runs)
 	task.spawn(function()
 		local prevJob, lastPos = "", nil
 		while alive() do
 			task.wait(1)
 			local ok, err = pcall(function()
-				if not (isAuto() and N.workOn()) then
+				if not N.workOn() then
 					prevJob, lastPos = "", nil
 					return
 				end
@@ -39785,14 +39592,13 @@ do
 			return
 		end
 		if P.lastPick and P.pickRate then
-			local measuring = P.text and string.find(P.text, "measuring", 1, true) ~= nil
-			parts.job = string.format("Work %s, %s/h over 24 h%s", P.lastPick, money(P.pickRate), if measuring then " (measuring)" else "")
-			decide("job", P.lastPick .. tostring(measuring), string.format("work %s: worth %s/h over the next 24 h incl. level rewards%s", P.lastPick, money(P.pickRate), if measuring then ", still measuring which job pays best" else ""))
+			parts.job = string.format("Work %s, %s/h over 24 h", P.lastPick, money(P.pickRate))
+			decide("job", P.lastPick, string.format("work %s: worth %s/h over the next 24 h incl. level rewards", P.lastPick, money(P.pickRate)))
 		elseif P.lastPick then
-			parts.job = "Work " .. P.lastPick .. " (measuring)"
-			decide("job", "measure " .. P.lastPick, "work " .. P.lastPick .. ": no job measured yet, measuring its pay first")
+			parts.job = "Work " .. P.lastPick
+			decide("job", P.lastPick, "work " .. P.lastPick .. ": best job by seeded pay")
 		else
-			parts.job = "Choosing the first job"
+			parts.job = "Work the best paying job"
 		end
 	end
 
@@ -39887,10 +39693,11 @@ do
 	local function flat(a, b)
 		return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
 	end
-	-- "Auto (best measured)": the bus is measured by the trip time; a fall = walking for 1 h, 3 falls = off for the day
-	local AUTO = "Auto (best measured)"
+	-- "Bus, walk if slow" (default): the bus is used at once; a trip slower than walking = walking for 1 h, 3 falls = off for the day
+	local AUTO = "Bus, walk if slow"
 	local function autoTrips()
-		return optionText("LongTrips", AUTO) == AUTO
+		local v = optionText("LongTrips", AUTO)
+		return v == AUTO or v == "Auto (best measured)"
 	end
 	local function today()
 		return math.floor(os.time() / 86400)
@@ -40023,6 +39830,9 @@ do
 				end
 			end
 			local trips = optionText("LongTrips", AUTO)
+			if trips == "Auto (best measured)" then
+				trips = AUTO
+			end
 			if not NoArea[N.currentJob()] or trips == "Walk" or os.clock() < T.offUntil or (trips == AUTO and T.dayOff == today()) then
 				return false
 			end
@@ -40163,7 +39973,7 @@ do
 	end
 	mirror("QS_SmartPlanner", "SmartPlanner", "Smart Planner", "One switch that runs everything by the numbers: the job worth the most over 24 h, needs trips at the cheapest moment, daily objectives, furniture upgrades that pay back in 24 h")
 	mirror("QS_AutoJob", "AutoJob", "Auto Work", "Goes to work and does the job picked in the Jobs tab")
-	mirror("QS_BestPay", "BestPay", "Best Pay", "Switches to the job that pays you the most over the next 24 h (measured, not guessed)")
+	mirror("QS_BestPay", "BestPay", "Best Pay", "Switches to the job that pays the most over the next 24 h, picked at once from the game's pay and level rewards")
 	mirror("QS_AutoNeeds", "AutoNeeds", "Auto Needs", "Sleeps, eats, showers and watches TV at home so low moods never cut your pay. Buys quick meals and missing furniture")
 	mirror("QS_Objectives", "Objectives", "Daily Objectives", "Does the daily job task and the daily quick meal for the $5,000+ daily reward")
 	mirror("QS_AutoGarden", "AutoGarden", "Auto Garden", "Plants, grows and harvests in your planters for Gardening level rewards ($60,600 to level 10)")
@@ -40190,7 +40000,7 @@ do
 	SmartBox:AddToggle("SmartPlanner", {
 		Text = "Smart Planner",
 		Default = false,
-		Tooltip = "Works, eats, sleeps, does daily objectives and buys furniture upgrades by profit math, without touching the other switches. Uses Speed, Money reserve, Never below, Restore before efficiency and Work session max from this tab",
+		Tooltip = "Works, eats, sleeps, does daily objectives and buys furniture upgrades by profit math, without touching the other switches. Uses Speed, Money reserve, Mood floor, Efficiency floor and Work session max from this tab",
 	})
 	Labels.Smart = SmartBox:AddLabel({ Text = "Smart Planner is off", DoesWrap = true })
 	local JobBox = Tabs.Jobs:AddLeftGroupbox("Job Farm", "briefcase")
@@ -40203,18 +40013,18 @@ do
 	JobBox:AddToggle("BestPay", {
 		Text = "Best Pay",
 		Default = false,
-		Tooltip = "Measures every job's real pay and level rewards and with Job on Auto (best pay) switches to the one worth the most over the next 24 h. A job you pick above always wins",
+		Tooltip = "With Job on Auto (best pay) works the job worth the most over the next 24 h (pay per task, tasks per hour, level rewards), picked at once and refined by what you really earn. A job you pick above always wins",
 	})
 	JobBox:AddDropdown("JobSpeed", {
 		Text = "Speed",
-		Values = { "Auto (best measured)", "Blatant", "Fast", "Legit" },
-		Default = "Auto (best measured)",
-		Tooltip = "Auto = measures Blatant and Fast on every job for a few minutes ($/h, tasks/h), keeps the most profitable one without danger signs (tasks rejected, shift ended by the server, pay far above a human, position snapback), never above the Earnings cap, and measures again every hour. A danger sign steps one mode safer; 3 of them switch that mode off for the day. Blatant does each action as fast as the game takes it, Fast waits like a quick player, Legit like a careful one. A mode you pick yourself is used as is.",
+		Values = { "Blatant", "Fast", "Legit" },
+		Default = "Blatant",
+		Tooltip = "Blatant does each action as fast as the game takes it, Fast waits like a quick player, Legit like a careful one. If the server rejects tasks, ends the shift or snaps you back, the hub works one step slower for 10 minutes and then tries your mode again. Pay stays under the Earnings cap",
 	})
 	JobBox:AddToggle("AutoJob", {
 		Text = "Auto Work",
 		Default = false,
-		Tooltip = "Works the job above (or the Best Pay job) all day",
+		Tooltip = "Goes to work and does the job above (or the Best Pay job) all day",
 	})
 	JobBox:AddButton({
 		Text = "End Shift",
@@ -40233,18 +40043,14 @@ do
 	local TravelBox = Tabs.Jobs:AddLeftGroupbox("Travel", "bus")
 	TravelBox:AddDropdown("LongTrips", {
 		Text = "Long trips",
-		Values = { "Auto (best measured)", "Bus (FastTravel)", "Walk" },
-		Default = "Auto (best measured)",
-		Tooltip = "Auto = the bus, but measured: a bus trip slower than walking twice (or 2 trips that did not move you) means walking for an hour, 3 such falls switch the bus off for the day. Bus = the game's free fast travel to the bus stop nearest the goal when that saves 15 s or more (pizza addresses, the way home), then walking the last meters. Never during a shift with a work area",
+		Values = { "Bus, walk if slow", "Bus (FastTravel)", "Walk" },
+		Default = "Bus, walk if slow",
+		Tooltip = "Bus, walk if slow = the bus, but a bus trip slower than walking twice (or 2 trips that did not move you) means walking for an hour, 3 such falls switch the bus off for the day. Bus = the game's free fast travel to the bus stop nearest the goal when that saves 15 s or more (pizza addresses, the way home), then walking the last meters. Never during a shift with a work area",
 	})
 	TravelBox:AddToggle("ServerTeleport", {
 		Text = "Server teleport",
 		Default = false,
 		Tooltip = "Asks the server to move you straight to the goal (the game's faint recovery move). Faster than the bus, at most every 30 s. Turns itself off for the session if the server does not move you",
-	})
-	TravelBox:AddLabel({
-		Text = '<font transparency="0.35">Server teleport moves you the way the game does after fainting. It is off by default because staff could notice many such moves.</font>',
-		DoesWrap = true,
 	})
 
 	local GardenBox = Tabs.Jobs:AddRightGroupbox("Garden & Skills", "sprout")
@@ -40265,7 +40071,7 @@ do
 		Tooltip = "During long shifts: a short garden session every few minutes of work. Also keeps your job pay under the Earnings cap: above it, Corvus goes home for needs, gardening or a short break instead of earning faster than a human could",
 	})
 	GardenBox:AddSlider("EarningsCap", {
-		Text = "Earnings cap (% of human max)",
+		Text = "Earnings cap",
 		Default = 90,
 		Min = 50,
 		Max = 150,
@@ -40296,8 +40102,8 @@ do
 		Text = '<font transparency="0.35">Missing furniture is bought once: Standard Single Bed $200, Icebox Fridge $500, Hygienic Shower $340, Old Television $220. A quick meal costs a few dollars.</font>',
 		DoesWrap = true,
 	})
-	NeedsBox:AddSlider("NeedFloor", { Text = "Never below", Default = 25, Min = 5, Max = 60, Rounding = 0, Suffix = "%", Tooltip = "Safety floor: a mood at or under this starts a trip home right away" })
-	NeedsBox:AddSlider("EffFloor", { Text = "Restore before efficiency", Default = 70, Min = 30, Max = 95, Rounding = 0, Suffix = "%", Tooltip = "Safety floor: shift efficiency under this (with a mood under 60%) starts a trip home" })
+	NeedsBox:AddSlider("NeedFloor", { Text = "Mood floor", Default = 25, Min = 5, Max = 60, Rounding = 0, Suffix = "%", Tooltip = "Safety floor: a mood at or under this starts a trip home right away" })
+	NeedsBox:AddSlider("EffFloor", { Text = "Efficiency floor", Default = 70, Min = 30, Max = 95, Rounding = 0, Suffix = "%", Tooltip = "Safety floor: shift efficiency under this (with a mood under 60%) starts a trip home" })
 	NeedsBox:AddSlider("WorkSessionMax", { Text = "Work session max", Default = 210, Min = 0, Max = 600, Rounding = 0, Suffix = " min", Tooltip = "After this much work Auto Needs takes a break at home. 0 = no breaks" })
 	NeedsBox:AddSlider("BreakMinutes", { Text = "Break", Default = 20, Min = 5, Max = 60, Rounding = 0, Suffix = " min" })
 	NeedsBox:AddButton({
@@ -40442,7 +40248,7 @@ do
 	function Debug.perfText()
 		local last = Perf.last
 		if not last then
-			return "still measuring"
+			return "no sample yet"
 		end
 		return string.format(
 			"fps %d, worst frame %dms, hitches %d, freezes %d, Corvus used %dms in %ds (%.2f%%), ping %sms, memory %sMB",
@@ -41363,7 +41169,7 @@ do
 				if P.lastPick and P.pickRate and P.pickRate > 0 then
 					table.insert(lines, string.format("Work %s (best pay $%s/h)", P.lastPick, formatNumber(math.floor(P.pickRate))))
 				else
-					table.insert(lines, "Work: measuring which job pays best")
+					table.insert(lines, "Work: picking the best paying job")
 				end
 			else
 				table.insert(lines, "Work " .. optionText("JobPick", "Hairdresser"))
