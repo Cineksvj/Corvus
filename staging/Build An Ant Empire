@@ -26194,12 +26194,24 @@ end)
             local SupportedGames = Info.SupportedGames or {
                 { Name = "+1 Stone Skipping", PlaceId = 111543903102439 },
                 { Name = "Anime Dice", PlaceId = 113290951185459 },
+                { Name = "Ball VS Ball", PlaceId = 96510596525082 },
+                { Name = "Blue Lock Farm", PlaceId = 132767904294856 },
                 { Name = "Break and Steal an Egg", PlaceId = 114326934417838 },
+                { Name = "Build A Boat For Treasure", PlaceId = 537413528 },
+                { Name = "Build An Ant Empire", PlaceId = 78490532994307 },
+                { Name = "Build and Kill Zombies", PlaceId = 105011592530400 },
+                { Name = "Deep Fishing", PlaceId = 132239307080610 },
+                { Name = "Drill for Eggs", PlaceId = 120656419209274 },
+                { Name = "Huss Valley", PlaceId = 107535308163741 },
                 { Name = "Loot To Forge", PlaceId = 118805555015549 },
                 { Name = "Open The Sea For Animals", PlaceId = 88047783411976 },
                 { Name = "Pets Universe", PlaceId = 74629631798007 },
                 { Name = "Ride A Pet", PlaceId = 124216119978534 },
+                { Name = "Steal A Car", PlaceId = 87740422849523 },
+                { Name = "Steal ASMR", PlaceId = 82081400078378 },
+                { Name = "Steal Animal Egg", PlaceId = 99679692310083 },
                 { Name = "Steal From The Rich", PlaceId = 120475074479690 },
+                { Name = "Tongue Escape", PlaceId = 122245938604556 },
                 { Name = "Welcome to Bloxburg", PlaceId = 185655149 },
             }
             local GamesLoader = Info.Loader or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
@@ -31643,6 +31655,15 @@ do
 	function alive()
 		return not INSTANCE.stop and Env.AntEmpireInstance == INSTANCE and not Library.Unloaded
 	end
+	-- A thread resumed by a game call (web calls, yields) can come back with the game's rights and then cannot touch the
+	-- hub UI ("lacking capability Plugin"): every UI writer calls this first.
+	local setIdentity = setthreadidentity or set_thread_identity or setidentity or (syn and syn.set_thread_identity)
+	function N.fixIdentity()
+		if setIdentity then
+			pcall(setIdentity, 8)
+		end
+	end
+	N.fixIdentity()
 	UIQueue = { list = {} }
 	function UIQueue.push(fn)
 		if #UIQueue.list < 200 then
@@ -31812,6 +31833,7 @@ do
 		["/功能商人/解锁堆肥机?购买"] = true,
 		["/功能商人/骑乘单位进度奖励领取?购买"] = true,
 		["/背包系统/背包装备最佳单位?购买"] = true,
+		["/背包系统/背包装备单位?购买"] = true,
 		["/标记/新手标记位?属性设为指定值"] = true,
 	}
 	N.Sent = { count = 0, byName = {} }
@@ -31985,6 +32007,8 @@ do
 	N.G.Tags = N.tableOr(N.safeRequire("_genConfigs.battle_tbtag"))
 	N.G.Items = N.tableOr(N.safeRequire("_genConfigs.ui_tbbackpackitem"))
 	N.G.Backpack = N.safeRequire("UI.Backpack.Model.BackpackModel")
+	N.G.Store = N.safeRequire("WuKongHooks.BackPackStore")
+	N.G.Helper = N.safeRequire("WuKong.WuKongHelper")
 	N.G.FoodStore = N.safeRequire("WuKongHooks.AntFoodStore")
 end
 local formatNumber, allows, selected, on, optionNumber, optionText, Status, setStatus, picked
@@ -32168,55 +32192,224 @@ do
 	function N.foodOf(attack, m)
 		return math.ceil((tonumber(attack) or 0) * (m or N.M()))
 	end
-	N.Bp = { at = -1e9, data = nil }
-	function N.backpack(force)
-		local model = N.G.Backpack
-		if not model then
+	-- Player backpack (ants in the nest, ants in the bag, unlocked slots, items, pet eggs): the data the game's Backpack UI
+	-- shows. The server keeps it as the JSON plugin value "玩家背包" of the WuKong container "/背包系统" and pushes every
+	-- change to the client; the game's BackpackModel caches it (BackPackData) through a container observer. Sources, freshest
+	-- first: the hub's own observer (same registration as the game's), the model's cache (GetData), BackPackStore.Load
+	-- (TryGetPluginValue of the same value), the plugin value read directly. BackpackModel:Load(LocalPlayer) is never
+	-- called: when its store read fails it replaces the model's cache with EmptyData (owner's log 2026-10-06: ants 0/1
+	-- with ants in the game, 16 bought ants never placed).
+	N.Bp = { at = -1e9, data = nil, src = "-", pushed = nil, pushedAt = -1e9, piles = nil, pilesAt = -1e9, observed = false, observeAt = -1e9, lastLine = "", lineAt = -1e9, emptyAt = -1e9, errAt = -1e9 }
+	local function tableOf(v)
+		return if type(v) == "table" then v else {}
+	end
+	function N.bpDecode(raw)
+		if type(raw) == "string" then
+			local ok, data = pcall(function()
+				return HttpService:JSONDecode(raw)
+			end)
+			raw = if ok then data else nil
+		end
+		if type(raw) ~= "table" then
 			return nil
 		end
-		if force or os.clock() - N.Bp.at > 0.5 or not N.Bp.data then
-			N.Bp.at = os.clock()
-			local ok, data = pcall(function()
-				return model:Load(LocalPlayer)
-			end)
-			if not (ok and type(data) == "table") and os.clock() - (N.Bp.errAt or -1e9) > 60 then
-				N.Bp.errAt = os.clock()
-				log("BACKPACK load failed", tostring(ok), typeof(data), tostring(data))
+		return {
+			Stacks = tableOf(raw.Stacks),
+			EquippedBySlot = tableOf(raw.EquippedBySlot),
+			UnlockedAntSlots = tableOf(raw.UnlockedAntSlots),
+			ItemStacks = tableOf(raw.ItemStacks),
+			PetEggStacks = tableOf(raw.PetEggStacks),
+			Favorites = tableOf(raw.Favorites),
+		}
+	end
+	function N.bpCounts(d)
+		local eq, st, slots = 0, 0, 0
+		if d then
+			for _ in pairs(d.EquippedBySlot) do
+				eq += 1
 			end
-			N.Bp.data = if ok and type(data) == "table" then data else N.Bp.data
+			for _ in pairs(d.Stacks) do
+				st += 1
+			end
+			for _, yes in pairs(d.UnlockedAntSlots) do
+				if yes then
+					slots += 1
+				end
+			end
 		end
-		return N.Bp.data
+		return eq, st, slots
+	end
+	local function bpHas(d)
+		local eq, st, slots = N.bpCounts(d)
+		return eq > 0 or st > 0 or slots > 1
+	end
+	local function onPush(_, key, value)
+		if key == "玩家背包" then
+			local d = N.bpDecode(value)
+			if d then
+				N.Bp.pushed, N.Bp.pushedAt = d, os.clock()
+			end
+		elseif key == "AntFood" then
+			if type(value) == "string" then
+				local ok, data = pcall(function()
+					return HttpService:JSONDecode(value)
+				end)
+				value = if ok then data else nil
+			end
+			if type(value) == "table" and type(value.Slots) == "table" then
+				N.Bp.piles, N.Bp.pilesAt = value.Slots, os.clock()
+			end
+		end
+	end
+	-- The observer the game's model registers (RegisterContainerPluginDataObserver "/背包系统"), plus the model's own
+	-- BindUpdated event. Retried every 10 s until the container exists on the client.
+	function N.bpObserve()
+		local B = N.Bp
+		B.observeAt = os.clock()
+		local wk = N.wuKong()
+		if not wk then
+			return false
+		end
+		local ok, err = pcall(function()
+			wk:RegisterContainerPluginDataObserver("/背包系统", onPush)
+		end)
+		log("BACKPACK observer", if ok then "registered" else "failed " .. tostring(err))
+		if not ok then
+			return false
+		end
+		B.observed = true
+		local model = N.G.Backpack
+		if model and type(model.BindUpdated) == "function" then
+			pcall(function()
+				model:BindUpdated(function(data)
+					onPush(nil, "玩家背包", data)
+				end)
+			end)
+		end
+		return true
+	end
+	function N.backpack(force)
+		local B = N.Bp
+		if not (force or os.clock() - B.at > 0.5 or not B.data) then
+			return B.data
+		end
+		B.at = os.clock()
+		if not B.observed and os.clock() - B.observeAt > 10 then
+			N.bpObserve()
+		end
+		local best, src = nil, "-"
+		if B.pushed then
+			best, src = B.pushed, "observer"
+		end
+		if not (best and bpHas(best)) then
+			local model = N.G.Backpack
+			if model and type(model.GetData) == "function" then
+				local ok, d = pcall(function()
+					return model:GetData()
+				end)
+				d = if ok then N.bpDecode(d) else nil
+				if d and (bpHas(d) or not best) then
+					best, src = d, "model"
+				end
+			end
+		end
+		if not (best and bpHas(best)) then
+			local store = N.G.Store
+			if store and type(store.Load) == "function" then
+				local ok, okRead, _, d = pcall(function()
+					return store.Load(LocalPlayer.UserId)
+				end)
+				if ok and okRead then
+					d = N.bpDecode(d)
+					if d and (bpHas(d) or not best) then
+						best, src = d, "store"
+					end
+				elseif os.clock() - B.errAt > 300 then
+					B.errAt = os.clock()
+					log("BACKPACK store read failed", tostring(okRead), if ok then "" else "(error)")
+				end
+			end
+		end
+		if not (best and bpHas(best)) then
+			local wk, helper = N.wuKong(), N.G.Helper
+			if wk and helper and type(helper.TryGetPluginValue) == "function" then
+				local ok, found, value = pcall(function()
+					local container = wk:GetContainer()._containers["背包系统"]
+					return helper.TryGetPluginValue(container, "玩家背包")
+				end)
+				if ok and found then
+					local d = N.bpDecode(value)
+					if d and (bpHas(d) or not best) then
+						best, src = d, "plugin"
+					end
+				end
+			end
+		end
+		if best then
+			B.data, B.src = best, src
+		end
+		local eq, st, slots = N.bpCounts(B.data)
+		local line = string.format("source=%s equipped=%d backpack=%d slots=%d", B.src, eq, st, slots)
+		if line ~= B.lastLine and os.clock() - B.lineAt > 5 then
+			B.lastLine, B.lineAt = line, os.clock()
+			log("BACKPACK", line)
+		end
+		if B.data == nil and os.clock() - B.emptyAt > 300 then
+			B.emptyAt = os.clock()
+			log("BACKPACK unavailable", "observer/model/store/plugin gave nothing yet")
+		end
+		return B.data
+	end
+	-- Backpack value: ((unit - 1) * 64 + tag) * 512 + exp + 1 (BackpackModel.DecodeBackpackValue).
+	function N.decodeV(v)
+		v = tonumber(v)
+		if not v or v < 1 then
+			return nil
+		end
+		local x = math.floor(v) - 1
+		local hi = math.floor(x / 512)
+		return math.floor(hi / 64) + 1, hi % 64, x % 512
+	end
+	local function antEntry(v, m)
+		local unit, tag, exp = N.decodeV(v)
+		if not unit then
+			return nil
+		end
+		local unitId = "Unit" .. unit
+		local cfg = N.unitCfg(unitId)
+		if not cfg then
+			return nil
+		end
+		local attack = N.attackOf(unitId, tag, exp)
+		return {
+			V = math.floor(tonumber(v)),
+			UnitId = unitId,
+			TagId = tag,
+			Exp = exp,
+			Level = exp + 1,
+			Count = 1,
+			Attack = attack,
+			Rarity = cfg.Rarity or "?",
+			Price = tonumber(cfg.Price) or 0,
+			Favorite = false,
+			food = N.foodOf(attack, m),
+		}
 	end
 	-- Equipped ants by slot: {SlotIndex, UnitId, Exp, Level, TagId, Attack, Rarity, V, Price, food}.
 	function N.equipped()
-		local model = N.G.Backpack
+		local d = N.backpack()
 		local out = {}
-		if not model or not N.backpack() then
-			return out
-		end
-		local ok, entries = pcall(function()
-			return model:BuildEquippedEntries()
-		end)
-		if not ok or type(entries) ~= "table" then
+		if not d then
 			return out
 		end
 		local m = N.M()
-		for slot, e in pairs(entries) do
-			if type(e) == "table" and e.UnitId then
-				local cfg = N.unitCfg(e.UnitId) or {}
-				local attack = tonumber(e.Attack) or N.attackOf(e.UnitId, e.TagId, e.Exp)
-				table.insert(out, {
-					SlotIndex = tonumber(e.SlotIndex) or tonumber(slot),
-					UnitId = e.UnitId,
-					Exp = tonumber(e.Exp) or 0,
-					Level = tonumber(e.Level) or ((tonumber(e.Exp) or 0) + 1),
-					TagId = tonumber(e.TagId) or 0,
-					Attack = attack,
-					Rarity = e.Rarity or cfg.Rarity or "?",
-					V = e.V,
-					Price = tonumber(cfg.Price) or 0,
-					food = N.foodOf(attack, m),
-				})
+		for slot, e in pairs(d.EquippedBySlot) do
+			local idx = tonumber(slot)
+			local entry = antEntry(if type(e) == "table" then e.V else e, m)
+			if entry and idx and idx >= 1 then
+				entry.SlotIndex = math.floor(idx)
+				entry.Favorite = type(e) == "table" and e.Favorite == true
+				table.insert(out, entry)
 			end
 		end
 		table.sort(out, function(a, b)
@@ -32225,68 +32418,85 @@ do
 		return out
 	end
 	function N.unlockedSlots()
-		local model = N.G.Backpack
-		if model and N.backpack() then
-			local ok, list = pcall(function()
-				return model:GetUnlockedSlotList()
-			end)
-			if ok and type(list) == "table" and #list > 0 then
-				return list
+		local d = N.backpack()
+		local list = {}
+		if d then
+			for key, yes in pairs(d.UnlockedAntSlots) do
+				local i = tonumber(key)
+				if yes and i and i >= 1 then
+					table.insert(list, math.floor(i))
+				end
 			end
 		end
-		local n = math.max(math.floor(tonumber(LocalPlayer:GetAttribute("MaxAntSlots")) or 1), 1)
-		local list = {}
-		for i = 1, n do
-			list[i] = i
+		if #list == 0 then
+			local n = math.max(math.floor(tonumber(LocalPlayer:GetAttribute("MaxAntSlots")) or 1), 1)
+			for i = 1, n do
+				list[i] = i
+			end
 		end
+		table.sort(list)
 		return list
+	end
+	function N.freeSlots()
+		local used = {}
+		for _, e in ipairs(N.equipped()) do
+			used[e.SlotIndex] = true
+		end
+		local free = {}
+		for _, i in ipairs(N.unlockedSlots()) do
+			if not used[i] then
+				table.insert(free, i)
+			end
+		end
+		return free
 	end
 	-- Backpack ants (not equipped): {V, UnitId, TagId, Exp, Count, Attack, Rarity, Favorite, food}.
 	function N.stacks()
-		local model = N.G.Backpack
+		local d = N.backpack()
 		local out = {}
-		if not model or not N.backpack() then
-			return out
-		end
-		local ok, entries = pcall(function()
-			return model:BuildBackPackEntries()
-		end)
-		if not ok or type(entries) ~= "table" then
+		if not d then
 			return out
 		end
 		local m = N.M()
-		for _, e in ipairs(entries) do
-			if type(e) == "table" and e.UnitId then
-				local attack = tonumber(e.Attack) or N.attackOf(e.UnitId, e.TagId, e.Exp)
-				table.insert(out, {
-					V = e.V,
-					UnitId = e.UnitId,
-					TagId = tonumber(e.TagId) or 0,
-					Exp = tonumber(e.Exp) or 0,
-					Count = tonumber(e.Count) or 1,
-					Attack = attack,
-					Rarity = e.Rarity or "?",
-					Favorite = e.Favorite == true,
-					food = N.foodOf(attack, m),
-				})
+		for key, count in pairs(d.Stacks) do
+			local entry = antEntry(key, m)
+			if entry then
+				local n = tonumber(count) or (type(count) == "table" and tonumber(count.Count)) or 1
+				entry.Count = math.max(math.floor(n), 1)
+				entry.Favorite = d.Favorites["Ant:" .. entry.V] == true
+				table.insert(out, entry)
 			end
 		end
+		table.sort(out, function(a, b)
+			return a.food > b.food
+		end)
 		return out
 	end
 	function N.items()
-		local data = N.backpack()
-		return data and type(data.ItemStacks) == "table" and data.ItemStacks or {}
+		local d = N.backpack()
+		return d and d.ItemStacks or {}
 	end
-	-- Piles of food each ant left at the nest (AntFoodStore, the worker ant carries them home).
+	function N.petEggs()
+		local d = N.backpack()
+		return d and d.PetEggStacks or {}
+	end
+	-- Piles of food each ant left at the nest (AntFoodStore, the worker ant carries them home): the store's own read
+	-- first (live value), the observer's last push as the fallback.
 	function N.piles()
 		local store = N.G.FoodStore
-		if not store then
-			return {}
+		if store then
+			local ok, okRead, slots = pcall(function()
+				return store.GetSlots(LocalPlayer)
+			end)
+			if ok and okRead and type(slots) == "table" then
+				return slots
+			end
 		end
-		local ok, okRead, slots = pcall(function()
-			return store.GetSlots(LocalPlayer)
-		end)
-		return if ok and okRead and type(slots) == "table" then slots else {}
+		local B = N.Bp
+		if B.piles and os.clock() - B.pilesAt < 30 then
+			return B.piles
+		end
+		return {}
 	end
 	function N.roomIndex()
 		return tonumber(LocalPlayer:GetAttribute("RoomIndex")) or tonumber(LocalPlayer:GetAttribute("PlayerRoomId")) or 1
@@ -32459,13 +32669,13 @@ N.Manual = { running = false }
 N.Price = { base = nil, gpf = nil, mult = 1, at = -1e9, reqAt = -1e9, remaining = 0 }
 function N.goldPerFood()
 	local thr = math.clamp(optionNumber("SellPrice", 1.8), 0.5, 2)
-	local mean = if on("SmartSell") then (thr + 2) / 2 else 1.25
+	local mean = if on("SmartSell") or N.planner() then (thr + 2) / 2 else 1.25
 	return mean * math.max(N.Price.mult or 1, 0.01)
 end
 -- Seconds between two claims of one ant: Fast Harvest pace, else the game's own walk (about 12 s per trip).
 N.Harvest = { at = -1e9, interval = 3.1, gained = 0, expected = 0, windowAt = os.clock(), lowWindows = 0, lastPile = nil, say = "", fallbacks = 0 }
 function N.claimPace()
-	if on("FastHarvest") then
+	if on("FastHarvest") or N.planner() then
 		return if optionText("HarvestSpeed", "Blatant (3 s)") == "Fast (5 s)" then 5 else N.Harvest.interval
 	end
 	return 12
@@ -32509,15 +32719,25 @@ function N.harvestStep()
 		return false
 	end
 	local list = N.equipped()
-	if #list == 0 then
-		return false
-	end
 	H.at = os.clock()
 	local idx, food = {}, 0
 	for _, e in ipairs(list) do
 		if #idx < 64 then
 			table.insert(idx, e.SlotIndex)
 			food += e.food
+		end
+	end
+	if #idx == 0 then
+		-- No ant in the backpack data: every slot of the nest is claimed anyway (the server skips an empty slot silently,
+		-- ClaimAntRewardSystem tryClaim), so ants the data does not show are still harvested.
+		local layer = N.nestLayer()
+		local n = math.clamp(math.floor(layer * (layer + 1) / 2), 1, 64)
+		for i = 1, n do
+			idx[i] = i
+		end
+		if os.clock() - (H.blindLogAt or -1e9) >= 600 then
+			H.blindLogAt = os.clock()
+			log("HARVEST blind", "slots 1-" .. n, "(no ants in the backpack data, source " .. tostring(N.Bp.src) .. ")")
 		end
 	end
 	cmd("ClaimAntReward", { AntIndices = idx })
@@ -32539,9 +32759,9 @@ function N.harvestMeasure(total)
 	end
 	local ratio = if H.expected > 0 then H.gained / H.expected else 0
 	H.say = string.format("%s food/min (%d%% of the claims)", formatNumber(H.gained / span * 60), math.floor(ratio * 100))
-	if on("FastHarvest") then
+	if on("FastHarvest") or N.planner() then
 		log("HARVEST", "ants", #N.equipped(), "every", string.format("%.1fs", N.claimPace()), "food/min", formatNumber(H.gained / span * 60), "expected/min", formatNumber(H.expected / span * 60), string.format("ratio %.2f", ratio))
-		if on("AutoCollect") and H.expected > 0 and ratio < 0.5 and optionText("HarvestSpeed", "Blatant (3 s)") ~= "Fast (5 s)" then
+		if (on("AutoCollect") or N.planner()) and H.expected > 0 and ratio < 0.5 and optionText("HarvestSpeed", "Blatant (3 s)") ~= "Fast (5 s)" then
 			H.lowWindows += 1
 			if H.lowWindows >= 2 and H.interval < 6 then
 				H.interval = math.min(H.interval + 0.4, 6)
@@ -32572,7 +32792,7 @@ function N.collectStep()
 		end
 	end
 	N.harvestMeasure(total)
-	if #claims == 0 or not on("AutoCollect") then
+	if #claims == 0 or not (on("AutoCollect") or N.planner()) then
 		return false
 	end
 	table.sort(claims, function(a, b)
@@ -32725,10 +32945,10 @@ function N.sellStep()
 	end
 	local nextId, countdown = N.nextActivity()
 	-- Holding pays +32% (2.5 against the ~1.9 Smart Sell mean) but delays the gold about 5 min: while the planner still
-	-- has buys that pay back in under 20 min, reinvesting now earns more, so it sells instead.
+	-- has a buy it cannot afford yet that pays back in under 20 min, reinvesting now earns more, so it sells instead.
 	local plan = N.Plan and N.Plan.best
-	local urgent = (N.planner() or on("AutoUpgrades")) and plan ~= nil and plan.payback < 1200
-	local holding = on("SellBlackMarket") and on("HoldForMarket") and not urgent and (nextId == "BlackMarket" or N.activity() == "BlackMarket")
+	local urgent = (N.planner() or on("AutoUpgrades")) and plan ~= nil and plan.payback < 1200 and plan.cost > N.gold() - N.recentSpend()
+	local holding = on("SellBlackMarket") and on("HoldForMarket") and not urgent and not S.bootstrap and (nextId == "BlackMarket" or N.activity() == "BlackMarket")
 	if holding then
 		S.holdSince = S.holdSince or os.clock()
 		if os.clock() - S.holdSince < 900 then
@@ -32744,9 +32964,22 @@ function N.sellStep()
 		return false
 	end
 	local thr = math.clamp(optionNumber("SellPrice", 1.8), 0.5, 2)
-	-- Safety: never hold food longer than 20 minutes (the price is random, 13% of windows reach 1.8).
+	-- Safety: never hold food longer than 20 minutes (the price is random, 13% of windows reach 1.8). Bootstrap (autopilot
+	-- without an ant in the nest): the first ant is worth more than any price window, the food goes at the current price.
 	local waitedLong = os.clock() - (S.lastAt or Session.started) > 1200
-	if P.base >= thr or (waitedLong and P.base >= 1) then
+	-- Autopilot: reinvesting beats waiting for a high price while the best buy pays back fast. A window at or above the
+	-- threshold takes about 20 s / P(price >= threshold) (uniform 0.5-2.0) to come; the planned item earns wait/payback
+	-- of its price in that time, so selling now wins when that beats the relative price gain of waiting (never under 0.9).
+	local invest = false
+	if N.planner() and plan and plan.cost > N.gold() - N.recentSpend() and P.base >= 0.9 and P.base < thr then
+		local wait = 20 / math.max((2 - thr) / 1.5, 0.05)
+		local gainWait = (thr + 2) / 2 / P.base - 1
+		invest = wait / math.max(plan.payback, 1) > gainWait
+		S.investText = if invest then string.format("selling at %.2f now: %s pays back in %s, a %.2f+ window takes ~%s", P.base, plan.name, N.longTime(plan.payback), thr, N.longTime(wait)) else nil
+	else
+		S.investText = nil
+	end
+	if P.base >= thr or (waitedLong and P.base >= 1) or (S.bootstrap and P.base > 0) or invest then
 		setStatus(string.format("Selling %s food at %.2f", formatNumber(food), P.base))
 		sendSell(food, P.base, "PlayerFoodPrompt", P.gpf or P.base)
 		return true
@@ -32819,7 +33052,8 @@ function N.antGain(f)
 	return N.topK(pool, k) - before
 end
 function N.rollVerdict(r, spent)
-	local mode = optionText("RollBuy", "Smart (payback)")
+	-- The autopilot always buys by payback; the Buy Rolled Ants dropdown rules Auto Roll on its own.
+	local mode = if N.planner() then "Smart (payback)" else optionText("RollBuy", "Smart (payback)")
 	local cost = math.max(tonumber(r.Cost) or 0, 0)
 	local gold = N.gold() - (spent or 0) - N.recentSpend()
 	if mode == "Never (roll only)" then
@@ -32834,23 +33068,51 @@ function N.rollVerdict(r, spent)
 		return true, "always buy " .. tostring(r.Rarity), 0, f
 	end
 	local gain = N.antGain(f)
+	local why = ""
 	if gain <= 0 then
-		return false, "not better than the team", nil, f
+		-- A fresh ant loses to a leveled team at level 1 but a higher tier wins once leveled: it is valued at the
+		-- weakest team ant's level, with the level costs (price x 0.05 x 1.35^(L-1) each) added to its price.
+		local weakest, level = math.huge, 1
+		for _, e in ipairs(N.equipped()) do
+			if e.food < weakest then
+				weakest, level = e.food, e.Level
+			end
+		end
+		local cfg = N.unitCfg(r.UnitId)
+		local price = math.max(tonumber(cfg and cfg.Price) or 0, 0)
+		if level > 1 and price > 0 then
+			local fl = N.foodOf(N.attackOf(r.UnitId, r.TagId, level - 1))
+			gain = N.antGain(fl)
+			if gain > 0 then
+				cost += price * 0.05 * (1.35 ^ (level - 1) - 1) / 0.35
+				why = "once leveled to " .. level .. ", "
+			end
+		end
+		if gain <= 0 then
+			return false, "not better than the team", nil, f
+		end
 	end
 	local dG = gain * N.goldPerFood() / N.claimPace()
 	local payback = cost / math.max(dG, 1e-9)
 	if mode == "Better than my worst" then
-		return true, "beats the team", payback, f
+		return true, why .. "beats the team", payback, f
 	end
 	local horizon = optionNumber("PaybackHours", 24) * 3600
 	if payback > horizon then
-		return false, "payback " .. N.longTime(payback), payback, f
+		return false, why .. "payback " .. N.longTime(payback), payback, f
 	end
+	-- A rolled ant expires in 3 s, the planned item waits. The ant is bought while saving when it pays itself back before
+	-- the planned item is affordable anyway (payback <= the plan's ETA): then it costs nothing by the time the plan is
+	-- bought. It is skipped only when the plan pays back faster AND would be affordable sooner than the ant pays back.
 	local plan = N.Plan and N.Plan.best
 	if N.planner() and plan and plan.payback < payback and gold - cost < plan.cost then
-		return false, "planner saves for " .. plan.name, payback, f
+		local G = N.income()
+		local eta = if G > 0 then math.max(plan.cost - gold, 0) / G else math.huge
+		if payback > eta then
+			return false, "planner saves for " .. plan.name, payback, f
+		end
 	end
-	return true, "payback " .. N.longTime(payback), payback, f
+	return true, why .. "payback " .. N.longTime(payback), payback, f
 end
 function N.onRoll(d)
 	local R = N.Roll
@@ -32895,11 +33157,11 @@ function N.onRoll(d)
 	end
 end
 N.onEvent("RollAntResult", function(d)
-	if on("AutoRoll") then
+	if on("AutoRoll") or N.planner() then
 		task.spawn(N.onRoll, d)
 	end
 end)
-N.Equip = { want = false, at = -1e9, last = "-" }
+N.Equip = { want = false, at = -1e9, last = "-", sentAt = -1e9, mode = "best", bestFails = 0, directFails = 0, expect = nil, equips = 0 }
 N.onEvent("ClaimRolledAntResult", function(d)
 	if type(d) ~= "table" then
 		return
@@ -32932,17 +33194,26 @@ N.onEvent("ClaimRolledAntResult", function(d)
 		log("BUY failed", tostring(d.Reason), p.name or tostring(p.r.ItemId))
 	end
 end)
--- Equip Best: the game's own Equip Best (BackpackModel:EquipBest, WK /背包系统/背包装备最佳单位), only when the backpack
--- holds an ant that beats the team or a slot is empty.
+-- Equip: bought ants go into the nest at once. The game's own Equip Best (BackpackModel:EquipBest, WK
+-- /背包系统/背包装备最佳单位: the server fills every unlocked slot with the strongest ants) is the first choice; when two
+-- sends in a row change nothing, free slots are filled one by one with the game's slot equip (WK /背包系统/背包装备单位,
+-- payload {Count, V, Section="Stacks", SlotIndex} like BackpackModel.EquipEntry). Every send is verified against the
+-- backpack data 3 s later.
+local function teamKey(eq)
+	local sum = 0
+	for _, e in ipairs(eq) do
+		sum += e.V
+	end
+	return #eq .. ":" .. sum
+end
 function N.equipNeeded()
 	local eq = N.equipped()
-	local k = #N.unlockedSlots()
 	local stacks = N.stacks()
 	if #stacks == 0 then
-		return false
+		return false, false
 	end
-	if #eq < k then
-		return true
+	if #eq < #N.unlockedSlots() then
+		return true, false
 	end
 	local weakest = math.huge
 	for _, e in ipairs(eq) do
@@ -32950,31 +33221,121 @@ function N.equipNeeded()
 	end
 	for _, s in ipairs(stacks) do
 		if s.food > weakest then
-			return true
+			return false, true
 		end
 	end
-	return false
+	return false, false
+end
+-- Free slots paired with the strongest backpack ants (one ant of a stack per slot).
+function N.equipTargets()
+	local out = {}
+	local stacks = N.stacks()
+	local si, left = 1, stacks[1] and stacks[1].Count or 0
+	for _, slot in ipairs(N.freeSlots()) do
+		while stacks[si] and left <= 0 do
+			si += 1
+			left = stacks[si] and stacks[si].Count or 0
+		end
+		if not stacks[si] then
+			break
+		end
+		table.insert(out, { slot = slot, ant = stacks[si] })
+		left -= 1
+	end
+	return out
+end
+function N.equipVerify()
+	local E = N.Equip
+	if not E.expect or os.clock() - E.sentAt < 3 then
+		return
+	end
+	local expect = E.expect
+	E.expect = nil
+	if teamKey(N.equipped()) ~= expect.before then
+		E.equips += 1
+		E.bestFails, E.directFails = 0, 0
+		return
+	end
+	if expect.mode == "best" then
+		E.bestFails += 1
+		log("EQUIP best not taken", E.bestFails)
+		if E.bestFails >= 2 and E.mode ~= "direct" then
+			E.mode = "direct"
+			log("EQUIP fallback", "slot equip (/背包系统/背包装备单位)")
+		end
+	else
+		E.directFails += 1
+		log("EQUIP slot not taken", E.directFails)
+		if E.directFails >= 2 then
+			E.mode = "best"
+			E.bestFails = 0
+			log("EQUIP fallback", "Equip Best")
+		end
+	end
 end
 function N.equipStep(force)
 	local E = N.Equip
-	if os.clock() - E.at < 3 then
+	N.equipVerify()
+	if os.clock() - E.at < 3 or E.expect then
 		return false
 	end
-	if not (force or E.want or (on("AutoEquipBest") and N.choreDue and N.choreDue("equip", 20))) then
+	if not (force or E.want or ((on("AutoEquipBest") or N.planner()) and N.choreDue and N.choreDue("equip", 20))) then
 		return false
 	end
 	E.want = false
-	if not N.equipNeeded() then
+	local fill, swap = N.equipNeeded()
+	if not (fill or swap) then
 		return false
 	end
 	E.at = os.clock()
-	local model = N.G.Backpack
-	local ok = model and pcall(function()
-		return model:EquipBest()
+	local before = teamKey(N.equipped())
+	if fill and E.mode == "direct" then
+		local sent, names = 0, {}
+		for _, t in ipairs(N.equipTargets()) do
+			if sent >= 8 then
+				break
+			end
+			local payload = HttpService:JSONEncode({ Count = 1, V = t.ant.V, Section = "Stacks", SlotIndex = t.slot })
+			if N.wk("/背包系统/背包装备单位?购买", "__null__", "__null__", { payload }) then
+				sent += 1
+				local name = tostring((N.unitCfg(t.ant.UnitId) or {}).DisplayName or t.ant.UnitId)
+				table.insert(names, name .. " -> slot " .. t.slot)
+				log("EQUIP slot", t.slot, name, tostring(t.ant.Rarity), "food", formatNumber(t.ant.food))
+			end
+		end
+		if sent == 0 then
+			return false
+		end
+		E.last = "placed " .. table.concat(names, ", ")
+		E.expect = { before = before, mode = "direct" }
+	else
+		local model = N.G.Backpack
+		local ok, accepted = false, false
+		if model and type(model.EquipBest) == "function" then
+			ok, accepted = pcall(function()
+				return model:EquipBest()
+			end)
+		end
+		accepted = ok and accepted == true
+		if not accepted then
+			accepted = N.wk("/背包系统/背包装备最佳单位?购买", "__null__", "__null__", { "{}" }) == true
+		end
+		log("EQUIP best", if accepted then "sent" else "refused", if fill then "(free slots)" else "(backpack ant beats the team)")
+		if not accepted then
+			E.bestFails += 1
+			if E.bestFails >= 2 then
+				E.mode = "direct"
+				log("EQUIP fallback", "slot equip (/背包系统/背包装备单位)")
+			end
+			return false
+		end
+		E.last = "Equip Best sent"
+		E.expect = { before = before, mode = "best" }
+	end
+	E.sentAt = os.clock()
+	task.delay(0.6, function()
+		N.backpack(true)
 	end)
-	E.last = if ok then "equipped the best ants" else "Equip Best unavailable"
-	log("EQUIP best", if ok then "sent" else "unavailable")
-	N.backpack(true)
 	return true
 end
 -- 5. Events: Strawberry King coins (teleport + the coin's own prompt), Travel Snail clicks (0.5 s, the game's own
@@ -33439,8 +33800,7 @@ function N.petStep()
 			return true
 		end
 	end
-	local data = N.backpack()
-	local eggs = data and data.PetEggStacks or {}
+	local eggs = N.petEggs()
 	if #placed < 3 and P.placeFails < 3 and os.clock() - P.placeAt >= 15 then
 		for eggId, count in pairs(eggs) do
 			if (tonumber(count) or 0) >= 1 then
@@ -33645,26 +34005,28 @@ function N.rideStep()
 	end
 	return false
 end
+-- Every reward runs for its own toggle or for the Smart Planner autopilot.
 function N.rewardStep()
-	if on("AutoOnline") and due("online", 30) then
+	local auto = N.planner()
+	if (auto or on("AutoOnline")) and due("online", 30) then
 		N.onlineStep()
 	end
-	if on("AutoSevenDay") and due("seven", 120) then
+	if (auto or on("AutoSevenDay")) and due("seven", 120) then
 		N.sevenDayStep()
 	end
-	if on("AutoCheckIn") and due("checkin", 300) then
+	if (auto or on("AutoCheckIn")) and due("checkin", 300) then
 		N.checkInStep()
 	end
-	if on("AutoGroupReward") and due("group", 600) then
+	if (auto or on("AutoGroupReward")) and due("group", 600) then
 		N.groupStep()
 	end
-	if on("AutoIndex") and due("index", 60) then
+	if (auto or on("AutoIndex")) and due("index", 60) then
 		N.indexStep()
 	end
-	if on("AutoMail") and due("mail", 300) then
+	if (auto or on("AutoMail")) and due("mail", 300) then
 		N.mailStep()
 	end
-	if on("AutoRide") and due("ride", 120) then
+	if (auto or on("AutoRide")) and due("ride", 120) then
 		N.rideStep()
 	end
 end
@@ -33814,7 +34176,7 @@ function N.codeStep()
 		return false
 	end
 	local code = table.remove(C.queue, 1)
-	if not code and on("AutoCodes") then
+	if not code and (on("AutoCodes") or N.planner()) then
 		if os.clock() - C.fetchedAt > 1800 then
 			N.codesFetch()
 		end
@@ -33859,12 +34221,16 @@ function N.codeStep()
 	end
 	return true
 end
--- Profit engine. Every gold purchase is valued as extra gold per second (dG) from the server formulas (notes.md "Profit
--- model"): food per claim = ceil(Attack x 1.1^(lvl-1) x mutation) x (1 + Ant Attack) x (1 + tree), claims every 3 s with
--- Fast Harvest, gold per food = the expected sell price. Payback = price / dG. The cheapest payback inside the horizon
--- (default 24 h) is bought first; roll upgrades (luck, queen, rolls per roll) have no direct income and are bought when
--- they cost less than a few minutes of income (Luck Budget). Move speed, speed jellies and the Spider pet are never
--- bought: under Fast Harvest the reward does not depend on the walk.
+-- Profit engine + Smart Planner autopilot. Every gold purchase is valued as extra gold per second (dG) from the server
+-- formulas (notes.md "Profit model"): food per claim = ceil(Attack x 1.1^(lvl-1) x mutation) x (1 + Ant Attack) x (1 + tree),
+-- claims every 3 s with Fast Harvest, gold per food = the expected sell price. Payback = price / dG. The cheapest payback
+-- inside the horizon (default 24 h) is bought first; roll upgrades (luck, queen, rolls per roll) have no direct income and
+-- are bought when they cost less than a few minutes of income (Luck Budget). Move speed, speed jellies and the Spider
+-- pet are never bought: under Fast Harvest the reward does not depend on the walk.
+-- Smart Planner ON = autopilot (CLAUDE.md "SMART PLANNER = AUTOPILOT"): it runs the whole loop itself through the same
+-- functions the toggles use (harvest, collect, sell, roll + buy, equip, upgrades, compost, potions, pets, dungeon, events,
+-- rewards, codes) with every other toggle off, bootstraps from zero (sell food -> roll -> buy -> place -> harvest) and
+-- never flips another toggle. Status and "Up next" name the current action; `PLAN idle reason=` only for real reasons.
 N.Spent = { list = {} }
 function N.recentSpend()
 	local sum, keep = 0, {}
@@ -33886,7 +34252,14 @@ function N.canPay(price)
 	price = tonumber(price) or math.huge
 	return price >= 0 and N.gold() - N.recentSpend() >= price
 end
-N.Plan = { text = "", logAt = -1e9, best = nil, list = {}, say = "", spendText = "", blocked = {}, lastBuy = "-", queenNeeded = false }
+N.Plan = { text = "", logAt = -1e9, best = nil, list = {}, all = {}, say = "", spendText = "", blocked = {}, lastBuy = "-", queenNeeded = false }
+N.Auto = { action = "starting", stage = "-", since = os.clock() }
+function N.autoSay(action, stage)
+	if N.Auto.action ~= action then
+		N.Auto.action, N.Auto.since = action, os.clock()
+	end
+	N.Auto.stage = stage or N.Auto.stage
+end
 N.UpgradeKinds = { "Slots", "Nest Layers", "Ant Levels", "Ant Attack", "Trees", "Luck & Rolls", "Mutation Potions" }
 function N.kindOn(kind)
 	if N.planner() then
@@ -33910,6 +34283,17 @@ function N.queenForLuck(level)
 		end
 	end
 	return need
+end
+-- The cheapest ant a roll can give (the first ant of the bootstrap): the lowest Common price in the unit table.
+function N.cheapestAnt()
+	local best
+	for _, cfg in pairs(N.G.Units) do
+		local price = tonumber(cfg.Price)
+		if price and price > 0 and (cfg.Rarity == "Common" or best == nil) and (best == nil or price < best) then
+			best = price
+		end
+	end
+	return best or 45
 end
 N.Shop = { stock = {}, at = -1e9, reqAt = -1e9 }
 N.onEvent("GearShopSnapshot", function(d)
@@ -33946,6 +34330,8 @@ local function attrCandidate(list, kind, attr, label, value)
 		end,
 	})
 end
+-- Candidates inside the horizon sorted by payback, the income, the food per round and every candidate (sorted) for the
+-- idle reason.
 function N.planCandidates()
 	local list = {}
 	local eq = N.equipped()
@@ -34099,68 +34485,145 @@ function N.planCandidates()
 	end
 	local horizon = optionNumber("PaybackHours", 24) * 3600
 	local budget = optionNumber("LuckBudget", 10) * 60
-	local out = {}
+	-- Income candidates (real payback) are the plan; luck/queen/rolls per roll (no direct income) are a separate budget
+	-- list: bought as fillers while saving, never the thing the planner saves for.
+	local out, all, budgetList = {}, {}, {}
 	for _, c in ipairs(list) do
 		if not blocked(c.key) then
 			if c.budget then
 				-- Pseudo payback: seconds of income the price takes.
 				c.payback = if G > 0 then c.cost / G else math.huge
-				c.ok = c.payback <= budget
+				if c.payback <= budget then
+					table.insert(budgetList, c)
+				end
 			else
 				c.payback = if c.dG > 0 then (c.total or c.cost) / c.dG else math.huge
-				c.ok = c.payback <= horizon
-			end
-			if c.ok then
-				table.insert(out, c)
+				table.insert(all, c)
+				if c.payback <= horizon then
+					table.insert(out, c)
+				end
 			end
 		end
 	end
-	table.sort(out, function(a, b)
+	local function byPayback(a, b)
 		return a.payback < b.payback
-	end)
-	return out, G, foodSum
+	end
+	table.sort(out, byPayback)
+	table.sort(all, byPayback)
+	table.sort(budgetList, byPayback)
+	return out, G, foodSum, all, budgetList
 end
 function N.planText(c)
 	return string.format("%s for %s (%s %s)", c.name, formatNumber(c.cost), if c.budget then "budget" else "payback", N.longTime(c.payback))
 end
+local function antName(e)
+	return tostring((N.unitCfg(e.UnitId) or {}).DisplayName or e.UnitId)
+end
 -- One purchase per step: the best payback when affordable, else a cheap filler (under 10% of the best's price) so small
--- buys never wait behind a big one.
+-- buys never wait behind a big one. The autopilot adds the bootstrap: no ant in the nest = no income, so the bag is
+-- placed first, else a roll buys the first ant, funded by selling the food at any price.
 function N.planStep()
 	local P = N.Plan
-	local list, G = N.planCandidates()
-	P.list = list
-	P.best = list[1]
+	local auto = N.planner()
+	local eq = N.equipped()
+	local slots = N.unlockedSlots()
+	local stacks = N.stacks()
+	local list, G, _, all, budgetList = N.planCandidates()
+	P.list, P.best, P.all = list, list[1], all
 	local gold = N.gold() - N.recentSpend()
 	local pick, why
 	if P.best then
 		if P.best.cost <= gold then
 			pick, why = P.best, "best payback"
 		else
+			-- Saving never idles the gold: a cheaper item that pays itself back before the best one is affordable (its
+			-- payback <= the best's ETA) costs nothing by the time the best is bought, so it is bought now.
+			local eta = if G > 0 then math.max(P.best.cost - gold, 0) / G else math.huge
 			for i = 2, #list do
 				local c = list[i]
-				if c.cost <= gold and c.cost <= P.best.cost * 0.1 then
-					pick, why = c, "small buy while saving"
+				if c.cost <= gold and (c.payback <= eta or c.cost <= P.best.cost * 0.1) then
+					pick, why = c, if c.payback <= eta then "pays back before the best is affordable" else "small buy while saving"
 					break
 				end
 			end
+			if not pick then
+				for _, c in ipairs(budgetList) do
+					if c.cost <= gold and c.cost <= P.best.cost * 0.1 then
+						pick, why = c, "luck budget while saving"
+						break
+					end
+				end
+			end
+		end
+	else
+		for _, c in ipairs(budgetList) do
+			if c.cost <= gold then
+				pick, why = c, "luck budget"
+				break
+			end
 		end
 	end
-	local text
-	if P.best then
-		local eta = if G > 0 then math.max(P.best.cost - gold, 0) / G else math.huge
-		text = "next " .. N.planText(P.best) .. (if P.best.cost > gold then ", ready in " .. N.longTime(eta) else "")
+	local text, uiText
+	N.Sell.bootstrap = false
+	if auto and N.Bp.data == nil then
+		pick = nil
+		text = "idle reason=waiting for the backpack data (observer/model/store/plugin)"
+		N.autoSay("waiting for the backpack data", "bootstrap")
+	elseif auto and #eq == 0 then
+		-- Bootstrap: nothing in the nest. An upgrade without an ant earns nothing, so nothing else is bought first.
+		pick = nil
+		local price = N.cheapestAnt()
+		if #stacks > 0 then
+			N.Equip.want = true
+			text = "bootstrap: placing " .. antName(stacks[1]) .. " into the nest"
+			N.autoSay("placing the first ant", "bootstrap")
+		elseif gold >= price then
+			text = "bootstrap: rolling for the first ant (a Common costs " .. formatNumber(price) .. ")"
+			N.autoSay("rolling for the first ant", "bootstrap")
+		elseif N.food() >= 1 then
+			N.Sell.bootstrap = true
+			text = "bootstrap: selling food for the first ant (" .. formatNumber(gold) .. " of " .. formatNumber(price) .. " gold)"
+			N.autoSay("selling food for the first ant", "bootstrap")
+		else
+			text = "idle reason=no gold for the first ant (" .. formatNumber(price) .. "), claiming rewards and codes"
+			N.autoSay("waiting for reward gold for the first ant", "bootstrap")
+		end
 	else
-		text = "nothing pays back inside " .. optionNumber("PaybackHours", 24) .. " h"
+		if auto and #eq < #slots and #stacks > 0 then
+			N.Equip.want = true
+		end
+		if P.best then
+			local eta = if G > 0 then math.max(P.best.cost - gold, 0) / G else math.huge
+			if pick then
+				text = "next " .. N.planText(pick) .. " (" .. why .. ")"
+				N.autoSay("buying " .. pick.name, "grow")
+			else
+				text = "saving for " .. N.planText(P.best) .. ", harvesting " .. #eq .. " ants meanwhile"
+				uiText = "saving for " .. N.planText(P.best) .. ", ready in " .. N.longTime(eta) .. ", harvesting " .. #eq .. " ants meanwhile"
+				N.autoSay("saving for " .. P.best.name, "grow")
+			end
+		elseif G > 0 then
+			local closest = all[1]
+			text = "idle reason=no upgrade pays back inside " .. optionNumber("PaybackHours", 24) .. " h at " .. formatNumber(G) .. "/s" .. (if closest then " (closest: " .. closest.name .. " " .. N.longTime(closest.payback) .. ")" else "") .. ", harvesting and rolling"
+			N.autoSay("harvesting " .. #eq .. " ants and rolling (no upgrade pays back inside " .. optionNumber("PaybackHours", 24) .. " h)", "grow")
+		else
+			text = "idle reason=income 0/s with " .. #eq .. " ants in the nest, waiting for the sell price"
+			N.autoSay("waiting for the sell price", "grow")
+		end
 	end
-	P.spendText = text
+	P.spendText = uiText or text
 	-- Mutation crystals multiply every claim (TagMul), speed jellies only speed the walk Fast Harvest skips: never bought.
 	local mutKey = if P.best and P.best.kind == "Mutation Potions" then P.best.key .. ":" .. tostring(P.best.slot) else nil
 	if mutKey and mutKey ~= P.mutLogged then
 		P.mutLogged = mutKey
 		log("PLAN mutation", "item=" .. tostring(P.best.item), "ant=" .. tostring(P.best.slot), "payback=" .. string.format("%.0f", P.best.payback) .. "s")
 	end
-	P.say = string.format("Income %s gold/s from %d ants", formatNumber(G), #N.equipped())
-	if (N.planner() or on("AutoUpgrades")) and (text ~= P.text or os.clock() - P.logAt >= 60) then
+	P.say = string.format("Income %s gold/s from %d ants in %d slots", formatNumber(G), #eq, #slots)
+	-- One PLAN line per change of plan (what is bought or saved for, by kind) and at least one a minute; every purchase
+	-- has its own SPEND line with price, gain and payback.
+	local logKey = if P.best then (if pick then "buy:" else "save:") .. P.best.kind else text
+	if (auto or on("AutoUpgrades")) and (logKey ~= P.logKey or os.clock() - P.logAt >= 60) then
+		P.logKey = logKey
 		P.text = text
 		P.logAt = os.clock()
 		log("PLAN", text, "| income", formatNumber(G) .. "/s", "| gold", formatNumber(math.max(gold, 0)))
@@ -34177,6 +34640,8 @@ function N.planStep()
 		Session.upgrades += 1
 		Session.upgradeGold += pick.cost
 		P.lastBuy = N.planText(pick)
+		-- The same item is not sent again until the server's data (new level, new price) reached the client.
+		P.blocked[pick.key] = os.clock() + 1
 		log("SPEND", pick.kind, pick.name, "price", formatNumber(pick.cost), "gain", formatNumber(pick.dG) .. "/s", "payback", N.longTime(pick.payback), "(" .. why .. ")")
 		if pick.kind == "Mutation Potions" then
 			task.delay(1.5, function()
@@ -34214,41 +34679,68 @@ N.onEvent("UpgradePlayerAttributeResult", function(d)
 	N.Plan.blocked[tostring(r.AttributeName)] = os.clock() + 60
 	log("SPEND refused", tostring(r.AttributeName), reason)
 end)
--- Main "Up next": what the enabled toggles do, in plain words.
+-- The autopilot's status line: the current action plus the loops it keeps running (no counters that change every second,
+-- so the STATUS log line changes only with the state).
+function N.autoStatus()
+	local parts = { N.Auto.action }
+	local eq = #N.equipped()
+	if eq > 0 then
+		table.insert(parts, "harvesting " .. eq .. " ants every " .. string.format("%.1f", N.claimPace()) .. " s")
+	end
+	if N.Sell.holdText then
+		table.insert(parts, "holding food for the Black Market")
+	elseif N.bmOpen() then
+		table.insert(parts, "selling at the Black Market")
+	else
+		table.insert(parts, string.format("selling at %.2f+", math.clamp(optionNumber("SellPrice", 1.8), 0.5, 2)))
+	end
+	local st = N.Dungeon.state
+	if st and st.status and st.status ~= "ended" and os.clock() - N.Dungeon.stateAt < 60 then
+		table.insert(parts, "dungeon " .. tostring(st.status))
+	end
+	local act = N.activity()
+	if act then
+		table.insert(parts, "event " .. act)
+	end
+	return "Autopilot: " .. table.concat(parts, ", ")
+end
+-- Main "Up next": what the enabled toggles (or the autopilot) do, in plain words.
 function N.upNext()
 	local lines = {}
-	if on("FastHarvest") then
+	local auto = N.planner()
+	if auto then
+		table.insert(lines, "Autopilot: " .. N.Auto.action)
+	end
+	if on("FastHarvest") or auto then
 		table.insert(lines, string.format("Harvest: claiming %d ants every %.1f s", #N.equipped(), N.claimPace()))
 	end
-	if on("AutoCollect") then
+	if on("AutoCollect") or auto then
 		table.insert(lines, "Collect: piles to your food every 2 s")
 	end
-	if on("SmartSell") then
+	if on("SmartSell") or auto then
 		local P = N.Price
 		table.insert(lines, if N.Sell.holdText then "Sell: " .. N.Sell.holdText elseif P.base then string.format("Sell: price %.2f, selling at %.2f+", P.base, optionNumber("SellPrice", 1.8)) else "Sell: waiting for the price")
 	end
-	if on("AutoRoll") then
+	if on("AutoRoll") or auto then
 		table.insert(lines, "Roll: " .. N.Roll.last)
 	end
-	if N.planner() or on("AutoUpgrades") then
+	if auto or on("AutoUpgrades") then
 		table.insert(lines, "Planner: " .. (if N.Plan.spendText ~= "" then N.Plan.spendText else "measuring"))
 	end
-	if on("AutoEvents") then
+	if on("AutoEvents") or auto then
 		table.insert(lines, "Events: " .. (N.activity() or "none now") .. (if N.Event.last ~= "-" then ", " .. N.Event.last else ""))
 	end
-	if on("AutoDungeon") then
+	if on("AutoDungeon") or auto then
 		table.insert(lines, "Dungeon: " .. N.Dungeon.last)
+	end
+	if auto then
+		table.insert(lines, "Rewards and codes: " .. (N.Reward.log[1] or ("claimed " .. Session.rewards .. ", codes " .. Session.codes)))
 	end
 	return lines
 end
 local Window, Tabs, Labels
 do
-	do
-		local setIdentity = setthreadidentity or set_thread_identity or setidentity or (syn and syn.set_thread_identity)
-		if setIdentity then
-			pcall(setIdentity, 8)
-		end
-	end
+	N.fixIdentity()
 	Window = Library:CreateWindow({
 		Title = "Corvus",
 		Author = "Cinek",
@@ -34416,7 +34908,7 @@ do
 		PlanBox:AddToggle("SmartPlanner", {
 			Text = "Smart Planner",
 			Default = false,
-			Tooltip = "Spends gold by profit math on everything: slots, nest layers, ant levels, Ant Attack, trees, luck and rolls, mutation potions, and lets rolled ants compete with them. Other toggles stay as you set them",
+			Tooltip = "Autopilot: plays the whole game by itself, even with every other toggle off. Harvests every ant every 3 s, collects, sells by the price rule and at the Black Market, rolls and buys ants by payback, places them, buys slots, nest layers, levels, Ant Attack, trees, luck and potions by payback, composts junk, runs events, the dungeon, rewards and codes. The options below (price, protect lists, payback limit) are its rules",
 		})
 		Labels.Planner = PlanBox:AddLabel({ Text = "-", DoesWrap = true })
 		local EventBox = Tabs.Farm:AddLeftGroupbox("Events", "sparkles")
@@ -34644,7 +35136,7 @@ do
 		mirror("AutoCollect", "Auto Collect Food", "Same as Farm > Auto Collect Food")
 		mirror("SmartSell", "Smart Sell", "Same as Farm > Smart Sell: best price and the Black Market")
 		mirror("AutoRoll", "Auto Roll", "Same as Farm > Auto Roll: rolls every 3 s and buys ants by payback")
-		mirror("SmartPlanner", "Smart Planner", "Same as Farm > Smart Planner: every gold purchase by profit math")
+		mirror("SmartPlanner", "Smart Planner", "Same as Farm > Smart Planner: the autopilot plays the whole game by profit math")
 		mirror("AutoEvents", "Auto Events", "Same as Farm > Auto Events")
 		QuickBox:AddButton({
 			Text = "Stop Everything",
@@ -34699,31 +35191,38 @@ do
 	N.StatRows.Events = statRow(OtherStats, "sparkles", "Coins / snail / dungeons", 22)
 	N.StatRows.Items = statRow(OtherStats, "flask-conical", "Mutations / composted / eggs", 22)
 	N.StatRows.Rewards = statRow(OtherStats, "gift", "Rewards / codes", 22)
-	-- Every friend in the same server gives +10% sell price (GetPlayerFoodSellPriceState, uncapped). Only counted, no alt automation.
+	-- Every friend in the same server gives +10% sell price (GetPlayerFoodSellPriceState, uncapped). Only counted, no alt
+	-- automation. IsFriendsWith yields (web call): counted in its own thread every 20 s, the UI thread only reads the cache
+	-- (a yield inside the UI thread cost it the hub's rights: "lacking capability Plugin" in drawStats, owner's log).
 	local friendsLogged = -1
-	local friendCache, friendAt = {}, -1e9
+	local friendCache, friendAt, friendBusy = {}, -1e9, false
 	function N.friendsOnline()
-		if os.clock() - friendAt < 20 then
-			return friendCache.n or 0
-		end
-		friendAt = os.clock()
-		local n = 0
-		for _, p in ipairs(game:GetService("Players"):GetPlayers()) do
-			if p ~= LocalPlayer then
-				local ok, yes = pcall(function()
-					return LocalPlayer:IsFriendsWith(p.UserId)
+		if os.clock() - friendAt >= 20 and not friendBusy then
+			friendAt = os.clock()
+			friendBusy = true
+			task.spawn(function()
+				local n = 0
+				pcall(function()
+					for _, p in ipairs(game:GetService("Players"):GetPlayers()) do
+						if p ~= LocalPlayer then
+							local ok, yes = pcall(function()
+								return LocalPlayer:IsFriendsWith(p.UserId)
+							end)
+							if ok and yes then
+								n += 1
+							end
+						end
+					end
 				end)
-				if ok and yes then
-					n += 1
+				friendCache.n = n
+				friendBusy = false
+				if n ~= friendsLogged then
+					friendsLogged = n
+					log("FRIENDS", "n=" .. n, "bonus=" .. n * 10 .. "%")
 				end
-			end
+			end)
 		end
-		friendCache.n = n
-		if n ~= friendsLogged then
-			friendsLogged = n
-			log("FRIENDS", "n=" .. n, "bonus=" .. n * 10 .. "%")
-		end
-		return n
+		return friendCache.n or 0
 	end
 	function N.drawStats()
 		local elapsed = math.max(os.clock() - Session.started, 1)
@@ -34818,7 +35317,11 @@ do
 				tostring(N.roomIndex())
 			),
 			"Perf: " .. Debug.perfText(),
-			"Plan: " .. (if N.Plan.spendText ~= "" then N.Plan.spendText else "-"),
+			"Plan: " .. (if N.Plan.spendText ~= "" then N.Plan.spendText else "-") .. (if N.planner() then "  |  Autopilot: " .. tostring(N.Auto.action) .. " (" .. tostring(N.Auto.stage) .. ")" else ""),
+			(function()
+				local eq, st, slots = N.bpCounts(N.Bp.data)
+				return string.format("Backpack: source %s, equipped %d, in the bag %d, slots %d, equip mode %s (ok %d, best fails %d, slot fails %d)", tostring(N.Bp.src), eq, st, slots, tostring(N.Equip.mode), N.Equip.equips, N.Equip.bestFails, N.Equip.directFails)
+			end)(),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
 			string.rep("-", 70),
 		}
@@ -35550,6 +36053,8 @@ do
 		end)
 	end
 	-- The farm loop owns the character: harvest, collect, roll, sell (Black Market walk), dungeon and event coins never overlap.
+	-- Smart Planner ON = autopilot: every step below runs for it as if its toggle were on (the toggles themselves stay as
+	-- the player left them).
 	loop("farm", function()
 		if N.Manual.running then
 			task.wait(0.3)
@@ -35560,31 +36065,36 @@ do
 			task.wait(0.5)
 			return
 		end
+		local auto = N.planner()
 		N.guideStep()
-		if on("FastHarvest") then
+		if auto and N.Plan.logAt < 0 then
+			-- The first PLAN line (bootstrap: what the autopilot does first) precedes the first roll and purchase.
+			N.planStep()
+		end
+		if on("FastHarvest") or auto then
 			N.harvestStep()
 		end
-		if on("FastHarvest") or on("AutoCollect") then
+		if on("FastHarvest") or on("AutoCollect") or auto then
 			N.collectStep()
 		end
-		if on("AutoRoll") then
+		if on("AutoRoll") or auto then
 			N.rollStep()
 		end
-		if on("SmartSell") and N.alive() then
+		if (on("SmartSell") or auto) and N.alive() then
 			N.sellStep()
 		end
 		local busy = false
-		if on("AutoDungeon") and N.alive() then
+		if (on("AutoDungeon") or auto) and N.alive() then
 			busy = N.dungeonStep()
 		end
-		if on("AutoEvents") and not busy and N.alive() then
+		if (on("AutoEvents") or auto) and not busy and N.alive() then
 			N.eventStep()
 		end
-		if on("AutoEquipBest") or N.Equip.want then
+		if on("AutoEquipBest") or auto or N.Equip.want then
 			N.equipStep()
 		end
 		if not busy then
-			setStatus("Running: " .. table.concat(Debug.running(), ", "))
+			setStatus(if auto then N.autoStatus() else "Running: " .. table.concat(Debug.running(), ", "))
 		end
 		task.wait(0.2)
 	end)
@@ -35594,19 +36104,26 @@ do
 			task.wait(0.3)
 			return
 		end
-		if (N.planner() or on("AutoMutate")) and choreDue("shopSnap", 300) then
+		local auto = N.planner()
+		if (auto or on("AutoMutate")) and choreDue("shopSnap", 300) then
 			N.eb("GearShopRequest", { Action = "Snapshot" })
 		end
-		if N.planner() or on("AutoUpgrades") then
-			N.planStep()
+		if auto or on("AutoUpgrades") then
+			-- Up to 8 purchases per tick: with a fast-growing income one buy per 1.5 s leaves gold idle (the planner-only
+			-- soak fell behind "every toggle" for that alone). Each step re-reads gold and the backpack.
+			for _ = 1, 8 do
+				if not N.planStep() then
+					break
+				end
+			end
 		end
-		if on("AutoCompost") then
+		if on("AutoCompost") or auto then
 			N.compostStep()
 		end
-		if on("AutoMutate") then
+		if on("AutoMutate") or auto then
 			N.mutateStep()
 		end
-		if on("AutoPets") then
+		if on("AutoPets") or auto then
 			N.petStep()
 		end
 		task.wait(1.5)
@@ -35673,8 +36190,8 @@ do
 				)
 				I.roll = string.format("Rolls <b>%s</b>, bought <b>%d</b>\nLast roll: %s\nLast buy: %s", formatNumber(Session.rolls), Session.bought, N.Roll.last, N.Roll.lastBuy)
 				I.planner = if N.planner()
-					then string.format("<b>On</b>\n%s\n%s\nLast: %s", N.Plan.say, if N.Plan.spendText ~= "" then N.Plan.spendText else "-", N.Plan.lastBuy)
-					else "Off. Turn it on to let Corvus spend gold on slots, nest layers, ant levels, Ant Attack, trees, luck and potions by payback. Your other toggles stay as they are"
+					then string.format("<b>Autopilot: %s</b>\n%s\n%s\nLast buy: %s", N.Auto.action, N.Plan.say, if N.Plan.spendText ~= "" then N.Plan.spendText else "-", N.Plan.lastBuy)
+					else "Off. Turn it on and Corvus plays the whole game by itself: harvest, collect, sell, roll and buy ants, place them, every upgrade by payback, compost, potions, dungeon, events, rewards and codes. Your other toggles stay as they are"
 				I.events = string.format("Now: %s  \u{00B7}  next: %s\n%s\nCoins %d, snail %d", N.activity() or "none", tostring((N.nextActivity())), N.Event.last, Session.coins, Session.snail)
 				I.dungeon = string.format("%s\nBosses %d, clicks %s", N.Dungeon.last, Session.dungeons, formatNumber(Session.clicks))
 				I.upgrades = string.format("Bought %d (%s gold)\n%s", Session.upgrades, formatNumber(Session.upgradeGold), if N.Plan.spendText ~= "" then N.Plan.spendText else "-")
@@ -35705,11 +36222,40 @@ do
 		end
 		return Library.ActiveTab == nil or Library.ActiveTab == tab
 	end
+	-- UI writes that fail for missing rights ("lacking capability": the draw thread came back from a game yield with the
+	-- game's rights) are re-run on the frame thread, connected here with the hub's rights (owner's log 2026-10-06: drawStats).
+	local UiLater, uiMoved = {}, false
+	pcall(function()
+		Library:GiveSignal(RunService.Heartbeat:Connect(function()
+			if #UiLater == 0 then
+				return
+			end
+			local queue = UiLater
+			UiLater = {}
+			for _, fn in ipairs(queue) do
+				pcall(fn)
+			end
+		end))
+	end)
 	task.spawn(function()
 		local uiErrorAt = -1e9
 		local function group(fn)
+			N.fixIdentity()
 			local ok, err = xpcall(fn, debug.traceback)
-			if not ok and os.clock() - uiErrorAt > 30 then
+			if ok then
+				return
+			end
+			if string.find(tostring(err), "lacking capability", 1, true) then
+				if #UiLater < 20 then
+					table.insert(UiLater, fn)
+				end
+				if not uiMoved then
+					uiMoved = true
+					log("UI thread lost its rights, UI updates now run on the frame thread")
+				end
+				return
+			end
+			if os.clock() - uiErrorAt > 30 then
 				uiErrorAt = os.clock()
 				log("ERROR", "ui", string.sub(tostring(err), 1, 300))
 			end
