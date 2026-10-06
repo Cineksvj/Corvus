@@ -34590,6 +34590,19 @@ else
 table.insert(items, tool)
 end
 end
+local hold = Plan.holdSpare and Plan.holdSpare(items)
+if hold then
+for i, tool in ipairs(items) do
+if tool == hold then
+table.remove(items, i)
+break
+end
+end
+pending += 1
+if Plan.planning() then
+logEvery("sellhold", 120, "PLAN", "keeping the best spare item to fill the slot I am about to buy")
+end
+end
 local crateList = {}
 for _, tool in ipairs(toolsWith("CrateUid")) do
 if isFavorite(tool) then
@@ -36020,7 +36033,7 @@ trip = V.trip(V.raw(dist, dist, "STANDARD", level))
 else
 return nil, nil
 end
-return value * (1 - Plan.guardLoss(id)) / math.max(trip, 0.5), income
+return value * (1 - Plan.guardLoss(id)) / math.max(trip, 0.5), income, math.max(trip, 0.5)
 end
 function Plan.zoneWanted(id)
 if not (Options.StealZones and type(Options.StealZones.Value) == "table") then
@@ -36201,6 +36214,47 @@ before += V.item(income, 0)
 end
 return V.item(fused, 0) - before
 end
+-- Selling timing: do not sell the best spare item when a slot/plot purchase the planner approves is affordable without it:
+-- the item is worth income * (H - eta) in the new slot against income * SellSeconds on the shelf.
+Plan.hold = { uid = nil, since = 0 }
+function Plan.holdSpare(items)
+if not (Plan.smart() and Plan.ready) or #items == 0 then
+return nil
+end
+local opt
+for _, o in ipairs(Plan.list) do
+if (o.kind == "slot" or o.kind == "plot") and o.gain > o.cost then
+opt = o
+break
+end
+end
+if not (opt and Plan.check(opt.cost, opt.gain, opt.income)) then
+return nil
+end
+local top, topIncome, rest = nil, 0, 0
+local mult = if Admin.left("Money") > 0 then Admin.get("Money") else 1
+for _, tool in ipairs(items) do
+local income = tonumber(tool:GetAttribute("ItemIncome")) or 0
+if income > topIncome then
+if top then
+rest += topIncome * SellSeconds * mult
+end
+top, topIncome = tool, income
+else
+rest += income * SellSeconds * mult
+end
+end
+if not top or money() + rest < opt.cost then
+return nil
+end
+local uid = top:GetAttribute("ItemUid")
+if Plan.hold.uid ~= uid then
+Plan.hold.uid, Plan.hold.since = uid, os.clock()
+elseif os.clock() - Plan.hold.since > 300 then
+return nil
+end
+return top
+end
 function Plan.plotPrice(floor)
 local board = floor and signOf(floor, "UpgradeSignBoard")
 if not board then
@@ -36276,15 +36330,15 @@ G = math.max(G, 1e-6)
 local spent = Sched.trainTime + Sched.otherTime
 local cashRate = if spent >= 30 then (Sched.trainMoney + Sched.otherMoney) / spent else tonumber(LocalPlayer:GetAttribute("IncomePerSecond")) or 0
 cashRate = math.max(cashRate, 1e-6)
-local nowRate, nowArea, nowIncome = 0, nil, 0
+local nowRate, nowArea, nowIncome, nowTrip = 0, nil, 0, nil
 for _, area in ipairs(Areas) do
 V.logRare(area)
 end
 for _, area in ipairs(Areas) do
 if Plan.zoneWanted(area.Id) and (area.RecommendedSpeed or 0) <= level then
-local rate, income = V.zoneRate(area, level)
+local rate, income, trip = V.zoneRate(area, level)
 if rate and rate > nowRate then
-nowRate, nowArea, nowIncome = rate, area, income
+nowRate, nowArea, nowIncome, nowTrip = rate, area, income, trip
 end
 end
 end
@@ -36347,18 +36401,30 @@ local spare = 0
 for _, tool in ipairs(toolsWith("ItemUid")) do
 spare = math.max(spare, tonumber(tool:GetAttribute("ItemIncome")) or 0)
 end
-local slotIncome = if V.plot.free > 0 then 0 else math.max(spare, math.min(nowIncome, V.plot.min))
+-- A new slot is worth the item it keeps instead of selling: income * (time left after the slot exists - sell value given up).
+-- With free slots on the plot it only starts to matter once the plot is full (free * one steal trip), so the gain is delayed, not zero.
+local slotIncome
+local fillTime = 0
+if V.plot.free > 0 then
+slotIncome = if V.plot.used > 0 and V.plot.min > 0 then math.min(nowIncome, V.plot.min) else nowIncome
+fillTime = V.plot.free * (nowTrip or 300)
+else
+slotIncome = math.max(spare, math.min(nowIncome, V.plot.min))
+end
+local function slotGain(price)
+return slotIncome * math.max(H - math.max(etaOf(price), fillTime) - SellSeconds, 0)
+end
 if Plan.on("AutoBuySlot") and type(SlotPrices) == "table" then
 local index = (tonumber(LocalPlayer:GetAttribute("AddedSlots")) or 0) + 1
 local price = tonumber(SlotPrices[index])
 if price then
-add({ kind = "slot", name = "slot " .. index, cost = price, income = slotIncome, gain = slotIncome * math.max(H - etaOf(price), 0) })
+add({ kind = "slot", name = "slot " .. index, cost = price, income = slotIncome, gain = slotGain(price) })
 end
 end
 if Plan.on("AutoUpgradePlot") then
 local price = Plan.plotPrice(myFloor())
 if price then
-add({ kind = "plot", name = "plot upgrade", cost = price, income = slotIncome, gain = slotIncome * math.max(H - etaOf(price), 0) })
+add({ kind = "plot", name = "plot upgrade", cost = price, income = slotIncome, gain = slotGain(price) })
 end
 end
 table.sort(options, function(a, b)
