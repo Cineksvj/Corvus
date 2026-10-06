@@ -33278,9 +33278,116 @@ end))
 N.Snap = { times = {}, level = 0, at = -1e9 }
 local MoveRank = { Safe = 1, Fast = 2, Blatant = 3 }
 local MoveByRank = { "Safe", "Fast", "Blatant" }
+-- Auto (best measured): measures Safe, Fast and Blatant for MeasureSeconds each (eggs delivered per hour while the farm
+-- runs), drops any mode that showed a danger signal (snapback fallback, pushed while flying, refused delivery), keeps the
+-- most profitable clean one (a riskier mode must beat the safer one by 5%), re-measures hourly, and switches a mode off
+-- for the day after 3 fallbacks. Safe is the baseline and is never disqualified.
+N.Auto = { order = { "Safe", "Fast", "Blatant" }, rates = {}, sigs = {}, falls = {}, off = {}, phase = "idle", idx = 0, cur = "Safe", keep = nil, secs = 0, d0 = 0, holdAt = 0, MeasureSeconds = 240 }
+function N.autoSelected()
+local v = optionText("MoveMode", "Auto (best measured)")
+return v ~= "Fast" and v ~= "Safe" and v ~= "Blatant"
+end
+function N.autoSignal(mode, reason)
+local A = N.Auto
+if mode == "Safe" or not N.autoSelected() then
+return
+end
+if A.phase == "measure" and A.cur == mode then
+A.sigs[mode] = (A.sigs[mode] or 0) + 1
+end
+A.falls[mode] = (A.falls[mode] or 0) + 1
+if A.falls[mode] >= 3 and not A.off[mode] then
+A.off[mode] = os.time() + 86400
+log("MODE disabled", mode, "for the day after 3 fallbacks, reason=" .. tostring(reason))
+end
+if A.keep == mode then
+A.keep = "Safe"
+end
+end
+function N.autoNext()
+local A = N.Auto
+local now = os.time()
+repeat
+A.idx += 1
+until A.idx > #A.order or not (A.off[A.order[A.idx]] and A.off[A.order[A.idx]] > now)
+if A.idx > #A.order then
+local best, bestRate, parts = "Safe", A.rates.Safe or 0, {}
+for _, m in ipairs(A.order) do
+table.insert(parts, m .. "=" .. string.format("%.0f", A.rates[m] or 0) .. (if (A.sigs[m] or 0) > 0 then "(signals " .. A.sigs[m] .. ")" else ""))
+if m ~= "Safe" and A.rates[m] and (A.sigs[m] or 0) == 0 and not (A.off[m] and A.off[m] > now) and A.rates[m] > bestRate * 1.05 then
+best, bestRate = m, A.rates[m]
+end
+end
+A.keep, A.cur, A.phase, A.holdAt = best, best, "hold", os.clock()
+log("MODE measure done eggs/h " .. table.concat(parts, " ") .. " keep=" .. best)
+else
+A.cur, A.phase, A.secs, A.d0 = A.order[A.idx], "measure", 0, Session.delivered
+A.sigs[A.cur] = 0
+log("MODE measure start", A.cur, "for", A.MeasureSeconds, "s")
+end
+end
+function N.autoText()
+local A = N.Auto
+if not N.autoSelected() then
+return ""
+end
+if A.phase == "measure" then
+return "Auto: measuring " .. A.cur .. " (" .. A.idx .. "/" .. #A.order .. ")"
+end
+local r = {}
+for _, m in ipairs(A.order) do
+if A.rates[m] then
+table.insert(r, m .. " " .. string.format("%.0f", A.rates[m]) .. "/h")
+end
+end
+return "Auto: " .. tostring(A.keep or A.cur) .. " is the best measured" .. (if #r > 0 then " (" .. table.concat(r, ", ") .. ")" else "")
+end
+task.spawn(function()
+while alive() do
+task.wait(5)
+local ok, err = pcall(function()
+local A = N.Auto
+if not N.autoSelected() then
+A.phase = "idle"
+return
+end
+local active = N.farmOn() and Farm and Farm.idleReason == nil
+if A.phase == "idle" then
+if active then
+A.idx = 0
+N.autoNext()
+end
+elseif A.phase == "measure" then
+if active then
+A.secs += 5
+end
+if A.secs >= A.MeasureSeconds or (A.sigs[A.cur] or 0) > 0 and A.cur ~= "Safe" then
+A.rates[A.cur] = (Session.delivered - A.d0) / math.max(A.secs, 1) * 3600
+log("MODE measure", A.cur, string.format("eggs/h=%.0f signals=%d", A.rates[A.cur], A.sigs[A.cur] or 0))
+N.autoNext()
+end
+elseif A.phase == "hold" and os.clock() - A.holdAt >= 3600 then
+A.idx = 0
+log("MODE re-measure (hourly)")
+N.autoNext()
+end
+end)
+if not ok then
+log("ERROR", "mode auto", tostring(err))
+end
+end
+end)
 function N.chosenMoveMode()
-local v = optionText("MoveMode", "Blatant")
-return if v == "Fast" or v == "Safe" then v else "Blatant"
+local v = optionText("MoveMode", "Auto (best measured)")
+if v == "Fast" or v == "Safe" or v == "Blatant" then
+return v
+end
+local A = N.Auto
+local m = if A.phase == "measure" then A.cur else (A.keep or A.cur)
+if A.off[m] and A.off[m] > os.time() then
+m = "Safe"
+end
+return m
 end
 function N.moveMode()
 local base = N.chosenMoveMode()
@@ -33311,7 +33418,8 @@ local count = #S.times
 table.clear(S.times)
 S.level += 1
 S.at = now
-log("MOVE fallback", from, "->", N.moveMode(), "(snapbacks " .. count .. ", " .. tostring(kind) .. ")")
+log("MOVE fallback", from, "->", N.moveMode(), "(snapbacks " .. count .. ", " .. tostring(kind) .. ") reason=" .. tostring(kind))
+N.autoSignal(from, kind)
 end
 end
 function N.safeSpeed()
@@ -33670,6 +33778,7 @@ end)
 if ok and type(text) == "string" and string.find(text, "Delivery Failed", 1, true) and os.clock() - seenAt > 2 then
 seenAt = os.clock()
 N.Moves.deliveryFails = (N.Moves.deliveryFails or 0) + 1
+N.autoSignal(N.moveMode(), "refused")
 logProblem("Game refused an egg delivery: " .. string.sub(text, 1, 80) .. " (mode " .. N.moveMode() .. ")")
 end
 end)
@@ -36791,9 +36900,9 @@ end,
 local MoveBox = Tabs.Player:AddLeftGroupbox("Movement", "wind")
 MoveBox:AddDropdown("MoveMode", {
 Text = "Mode",
-Values = { "Safe", "Fast", "Blatant" },
-Default = "Blatant",
-Tooltip = "Blatant teleports to each egg and straight back. Fast flies at the speed below. Safe flies at your pet's own riding speed. If the server snaps you back twice within a minute, Corvus drops one step by itself and retries after 10 minutes.",
+Values = { "Auto (best measured)", "Safe", "Fast", "Blatant" },
+Default = "Auto (best measured)",
+Tooltip = "Auto measures Safe, Fast and Blatant for a few minutes each (eggs delivered per hour), drops any mode that triggers snapbacks or refused deliveries, keeps the most profitable clean one and re-measures every hour. Blatant teleports to each egg and straight back. Fast flies at the speed below. Safe flies at your pet's own riding speed. If the server snaps you back twice within a minute, Corvus drops one step by itself and retries after 10 minutes.",
 })
 MoveBox:AddSlider("SafePercent", {
 Text = "Safe Speed",
@@ -38162,14 +38271,14 @@ end,
 Library:AddCommand({
 Name = "mode",
 Aliases = { "move" },
-Args = "<safe/fast/blatant>",
+Args = "<auto/safe/fast/blatant>",
 Description = "Sets how Corvus travels",
 Source = GameName,
 Callback = function(args)
 local word = string.lower(tostring(args[1] or ""))
-local pick = ({ safe = "Safe", fast = "Fast", blatant = "Blatant", tp = "Blatant", teleport = "Blatant" })[word]
+local pick = ({ auto = "Auto (best measured)", safe = "Safe", fast = "Fast", blatant = "Blatant", tp = "Blatant", teleport = "Blatant" })[word]
 if not pick then
-return "Mode is " .. N.moveMode() .. ". Use: mode safe, mode fast or mode blatant"
+return "Mode is " .. N.moveMode() .. ". Use: mode auto, mode safe, mode fast or mode blatant"
 end
 Options.MoveMode:SetValue(pick)
 return "Mode set to " .. pick
@@ -39819,8 +39928,9 @@ local model = N.mountModel()
 local riding = N.isRiding() and model
 local lines = {
 string.format(
-"Mode <b>%s</b>  \u{00B7}  %s",
+"Mode <b>%s</b>%s  \u{00B7}  %s",
 N.moveMode(),
+if N.autoSelected() then "  (" .. N.autoText() .. ")" else "",
 if N.moveMode() == "Blatant"
 then "teleport"
 elseif N.moveMode() == "Fast" then formatNumber(N.modeSpeed("Fast")) .. " studs/s"
