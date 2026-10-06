@@ -31939,6 +31939,12 @@ do
 	function N.planner()
 		return on("SmartPlanner")
 	end
+	-- The Smart Planner is the autopilot: with its toggle on it runs these jobs itself through the same functions the
+	-- toggles use (the toggles stay as the player set them, nothing is flipped). Chests are never its job (payback never).
+	N.PlannerOwns = { AutoFarm = true, AutoClaim = true, AutoCodes = true, AutoQuests = true, AutoDiscoverHop = true }
+	function N.wants(name)
+		return on(name) or (N.PlannerOwns[name] == true and on("SmartPlanner"))
+	end
 	Status = "Idle"
 	local StatusSeen, StatusSeenCount = {}, 0
 	function setStatus(text)
@@ -31985,17 +31991,21 @@ do
 		local m = N.multiplier()
 		return m == 1.25 or m == 2.25
 	end
-	-- Credited stages of the current (or last unclaimed) run: non-empty Stage values, and whether End is set.
+	-- Credited stages of the current (or last unclaimed) run: n = non-empty Stage0..9 values, whether End is set, how
+	-- many are first discoveries (UPPERCASE) and how many pay (Stage1..9: the GUI pays 8 per Stage1..9, Stage0 nothing).
 	function N.credited()
 		local other = LocalPlayer:FindFirstChild("OtherData")
-		local n, ended, first = 0, false, 0
+		local n, ended, first, paying = 0, false, 0, 0
 		if not other then
-			return 0, false, 0
+			return 0, false, 0, 0
 		end
 		for _, key in ipairs(N.StageKeys) do
 			local v = other:FindFirstChild(key)
 			if v and type(v.Value) == "string" and v.Value ~= "" then
 				n += 1
+				if key ~= "Stage0" then
+					paying += 1
+				end
 				if v.Value == string.upper(v.Value) then
 					first += 1
 				end
@@ -32003,11 +32013,19 @@ do
 		end
 		local e = other:FindFirstChild("End")
 		ended = e ~= nil and type(e.Value) == "string" and e.Value ~= ""
-		return n, ended, first
+		return n, ended, first, paying
 	end
-	-- RiverResultsGui payout formula (8 start + 8 per stage + 25 at the end) x Multiplier, rounded up.
-	function N.payout(stages, ended, mult)
-		return math.ceil((8 + 8 * stages + (if ended then 25 else 0)) * (mult or N.multiplier()))
+	function N.stagesEmpty()
+		local n, ended = N.credited()
+		return n == 0 and not ended
+	end
+	-- RiverResultsGui payout formula (8 start + 8 per Stage1..9 + 25 at the end) x Multiplier, rounded up; nothing pays
+	-- when no stage and no End were credited.
+	function N.payout(paying, ended, mult)
+		if paying <= 0 and not ended then
+			return 0
+		end
+		return math.ceil((8 + 8 * math.min(paying, 9) + (if ended then 25 else 0)) * (mult or N.multiplier()))
 	end
 	function N.resultsShown()
 		local gui = LocalPlayer:FindFirstChild("PlayerGui")
@@ -32103,12 +32121,14 @@ do
 		return N.Route
 	end
 end
--- Session counters (the Stats tab, the log header, the webhook).
+-- Session counters (the Stats tab, the log header, the webhook). `started` = runs started, `runs` = runs settled.
 local Session = {
-	started = os.clock(),
+	startedAt = os.clock(),
+	started = 0,
 	runs = 0,
 	fullRuns = 0,
-	failedRuns = 0,
+	partialRuns = 0,
+	unpaidRuns = 0,
 	stages = 0,
 	runGold = 0,
 	runSeconds = 0,
@@ -32131,13 +32151,17 @@ local Session = {
 N.Events = {}
 N.Manual = { running = false }
 -- Auto Farm Gold: the river route without a boat. The character flies (CFrame steps, no physics) through every
--- CaveStage DarknessPart (the server writes OtherData.Stage* on touch), then down to TheEnd.GoldenChest.Trigger, waits
--- for the chest prize and the respawn, and claims the results like the RiverResultsGui Collect button
--- (ClaimRiverResultsGold:FireServer()). Payout = (8 + 8 x stages + 25 end) x Multiplier plus the chest prize.
--- The client has no anticheat (notes.md "Anticheat"); the only unknown is a server-side minimum time per stage, so the
--- movement ladder auto-degrades: when a run is not credited twice in a row the next slower mode is used
--- (MOVE fallback) and the faster one is tried again after 10 minutes. Instant stage hops are a probe (PROBE
--- instant_route), remembered per PlaceVersion.
+-- CaveStage DarknessPart and stays inside each one until the server writes the next OtherData.Stage* value (stepping out
+-- and back in every 0.5 s so the touch is fresh): the server credits about one stage per 2-3 s (owner's log 2026-10-06:
+-- Instant hops credited 1-2 of 10, Blatant 450 credited 8 of 10), so this credit gate makes every run 10/10 in every
+-- movement mode. Then down to TheEnd.GoldenChest.Trigger: the touch starts the treasure sequence (the server clones
+-- TreasureEndEffectsLS: fog to 100 studs, chest light, gold bars), writes OtherData.End about 11 s later and respawns the
+-- character. That "respawn by the game after 11 s" is the normal end of a run, not a kill zone. The results are claimed
+-- like the RiverResultsGui Collect button (ClaimRiverResultsGold:FireServer()) and the gold stat is polled for up to 15 s
+-- because the credit lands late: a run is settled from the measured gold, never from a timer.
+-- Payout = 8 + 8 x Stage1..9 + 25 (End), x Multiplier (RiverResultsGui 10457-10797). No anticheat on the client
+-- (notes.md "Anticheat"); when the server refuses a movement (under half the stages twice) the ladder steps down
+-- (MOVE fallback, tried again after 10 min) and Instant hops are a probe (PROBE instant_route) remembered per PlaceVersion.
 N.Modes = {
 	{ id = "Instant", speed = math.huge, hold = 0.4, text = "Instant stage hops" },
 	{ id = "Blatant", speed = 450, hold = 0.3, text = "Blatant flight 450 studs/s" },
@@ -32146,8 +32170,11 @@ N.Modes = {
 }
 N.ModeChoices = { "Auto (fastest that pays)", "Blatant", "Fast", "Safe" }
 N.CruiseY = 60
-N.Move = { level = nil, fails = 0, retryAt = nil, stats = {}, probes = {}, probesLoaded = false, flying = false }
-N.Run = { current = nil, respawnAt = nil, last = "-", history = {}, offset = 0 }
+N.StageWait = 5 -- seconds inside a stage for the server's credit (8 when the server turned out slower)
+N.EndWait = 13 -- seconds at the chest for OtherData.End (the server writes it about 11 s after the touch)
+N.GoldWait = 15 -- seconds the gold stat is polled after a claim (the credit lands late)
+N.Move = { level = nil, fails = 0, failMode = nil, refusedUntil = {}, stats = {}, probes = {}, probesLoaded = false, flying = false }
+N.Run = { current = nil, pending = nil, respawnAt = nil, last = "-", history = {}, offset = 0, bestStages = 0, stageMiss = {}, stageSkip = {}, endSeconds = nil, creditSeconds = nil }
 N.Claim = { charClaimed = nil, last = "-" }
 do
 	local M = N.Move
@@ -32191,48 +32218,82 @@ do
 		N.probesLoad()
 		return M.probes[name]
 	end
-	-- The fastest mode the player allows: Auto starts at Instant (unless the probe was rejected on this PlaceVersion).
-	function N.topLevel()
+	-- The player's own choice from the Movement dropdown (nil = Auto).
+	function N.fixedLevel()
 		local choice = optionText("RouteMode", N.ModeChoices[1])
 		for i, m in ipairs(N.Modes) do
 			if m.id == choice then
 				return i
 			end
 		end
-		return if N.probe("instant_route") == "rejected" then 2 else 1
+		return nil
 	end
+	-- A mode the server did not refuse (two runs under half the stages block it for 10 minutes; a rejected Instant probe for good).
+	function N.modeAllowed(i)
+		if i == 1 and N.probe("instant_route") == "rejected" then
+			return false
+		end
+		local until_ = M.refusedUntil[N.Modes[i].id]
+		return until_ == nil or os.clock() >= until_
+	end
+	-- The fastest mode the player allows: Auto starts at Instant (unless the probe was rejected on this PlaceVersion).
+	function N.topLevel()
+		return N.fixedLevel() or (if N.probe("instant_route") == "rejected" then 2 else 1)
+	end
+	-- The mode of the next run: the player's fixed choice, else the Smart Planner's pick (measured gold per hour, p05),
+	-- else the fastest allowed level of the ladder (a refused mode is tried again after 10 minutes: MOVE retry).
 	function N.currentMode()
-		local top = N.topLevel()
-		if M.level == nil or M.level < top then
-			M.level = top
+		local fixed = N.fixedLevel()
+		local level
+		if fixed then
+			level = fixed
+		elseif N.planner() and N.Plan.level then
+			level = N.Plan.level
+		else
+			level = N.topLevel()
+			while level < #N.Modes and not N.modeAllowed(level) do
+				level += 1
+			end
+			if M.level and level < M.level then
+				log("MOVE retry", N.Modes[M.level].id, "->", N.Modes[level].id, "(10 minutes passed)")
+			end
 		end
-		-- Planner: among the modes measured as paying, the one with the best gold per hour.
-		if N.planner() and N.Plan.bestLevel and N.Plan.bestLevel >= top and N.Plan.bestLevel ~= M.level and not M.retryAt then
-			M.level = N.Plan.bestLevel
-		end
-		if M.retryAt and os.clock() >= M.retryAt and M.level > top then
-			local from = N.Modes[M.level].id
-			M.level -= 1
-			M.fails = 0
-			M.retryAt = nil
-			log("MOVE retry", from, "->", N.Modes[M.level].id, "(10 minutes passed)")
-		end
-		return N.Modes[M.level], M.level
+		M.level = level
+		return N.Modes[level], level
 	end
 	function N.modeStats(id)
 		local s = M.stats[id]
 		if not s then
-			s = { runs = 0, ok = 0, gold = 0, seconds = 0 }
+			s = { runs = 0, full = 0, paid = 0, gold = 0, seconds = 0, window = {} }
 			M.stats[id] = s
 		end
 		return s
 	end
+	-- Gold per hour of a mode from its last 4 settled runs (what the planner compares); 0 before the first settled run.
 	function N.modeRate(id)
 		local s = M.stats[id]
-		if not s or s.seconds <= 0 or s.ok == 0 then
+		if not s or #s.window == 0 then
 			return 0
 		end
-		return s.gold / s.seconds * 3600
+		local gold, seconds = 0, 0
+		for _, w in ipairs(s.window) do
+			gold += w.gold
+			seconds += w.seconds
+		end
+		return if seconds > 0 then gold / seconds * 3600 else 0
+	end
+	function N.modeMeasured(id)
+		local s = M.stats[id]
+		return if s then #s.window else 0
+	end
+	function N.modeFull(id)
+		local s, full = M.stats[id], 0
+		for _, w in ipairs(s and s.window or {}) do
+			if w.full then
+				full += 1
+			end
+		end
+		return full
 	end
 	local function noclip(char)
 		for _, part in ipairs(char:GetDescendants()) do
@@ -32255,7 +32316,7 @@ do
 		return true
 	end
 	local function keepGoing()
-		return alive() and on("AutoFarm") and N.alive()
+		return alive() and N.wants("AutoFarm") and N.alive()
 	end
 	-- Moves the character to target at speed studs/s (math.huge = one hop). Yields; false when stopped or dead.
 	function N.flyTo(target, speed)
@@ -32280,7 +32341,7 @@ do
 			dt = task.wait()
 		end
 	end
-	-- Stays on target for seconds (inside a DarknessPart the server sees the touch). Optional stop(): true ends early.
+	-- Stays on target for seconds. Optional stop(): true ends early. False when stopped or dead.
 	function N.hold(target, seconds, stop)
 		local started = os.clock()
 		while os.clock() - started < seconds do
@@ -32295,15 +32356,72 @@ do
 		end
 		return true
 	end
+	-- Stays inside a part until stop() is true or seconds pass, stepping out of it (nudge) for two frames every 0.5 s so
+	-- the server sees a fresh touch (Touched fires on entry; a position poll sees the character inside most of the time).
+	-- True when stop() was satisfied, false on a timeout or when the farm was stopped.
+	function N.touchHold(target, seconds, stop, nudge)
+		local started, lastNudge = os.clock(), os.clock()
+		while os.clock() - started < seconds do
+			if not keepGoing() then
+				return false
+			end
+			if stop() then
+				return true
+			end
+			if os.clock() - lastNudge >= 0.5 then
+				lastNudge = os.clock()
+				N.place(target + nudge)
+				task.wait()
+				N.place(target + nudge)
+				task.wait()
+			end
+			N.place(target)
+			task.wait()
+		end
+		return stop() == true
+	end
+	-- The treasure sequence started: the server cloned TreasureEndEffectsLS to us (Lighting.FogEnd tweens to 100 studs,
+	-- CleanTreasureEndEffectsLS puts 100000 back on the next character), or End is already written, or the character is gone.
+	function N.endStarted(char)
+		local ok, fog = pcall(function()
+			return game:GetService("Lighting").FogEnd
+		end)
+		if ok and tonumber(fog) and tonumber(fog) <= 150 then
+			return true
+		end
+		local _, ended = N.credited()
+		return ended or N.char() ~= char or not N.alive()
+	end
+	function N.resetChar(why)
+		local hum = N.humanoid()
+		if hum and N.alive() then
+			hum.Health = 0
+			Session.resets += 1
+			log("RUN reset", why)
+		end
+	end
 	-- One full run from the spawn to the chest and back to a fresh character.
 	function N.runOnce()
 		local R = N.readRoute()
 		local mode, level = N.currentMode()
 		local char = N.char()
-		local run = { start = os.clock(), gold0 = N.gold(), offset0 = N.Run.offset, mode = mode.id, level = level, flown = 0, credited = 0, ended = false, first = 0, quest = N.Quest and N.Quest.active }
+		-- The server resets the stage values when it pays the last claim; touches before that would not count.
+		if not N.stagesEmpty() then
+			setStatus("Waiting for the server to reset the river results")
+			if not waitFor(function()
+				return N.stagesEmpty() or not keepGoing()
+			end, 5) then
+				log("RUN start with old stage values", "(the server did not reset them in 5 s)")
+			end
+			if not keepGoing() then
+				return
+			end
+		end
+		Session.started += 1
+		local run = { id = Session.started, start = os.clock(), gold0 = N.gold(), offset0 = N.Run.offset, mode = mode.id, level = level, flown = 0, credited = 0, ended = false, first = 0, misses = 0, quest = N.Quest and N.Quest.active }
 		N.Run.current = run
 		M.flying = true
-		log("RUN start", "#" .. (Session.runs + 1), "mode", mode.id, "gold", N.gold(), "x" .. N.multiplier())
+		log("RUN start", "#" .. run.id, "mode", mode.id, "gold", N.gold(), "x" .. N.multiplier(), if N.planner() and not on("AutoFarm") then "(planner)" else "")
 		noclip(char)
 		local pos = N.myPos()
 		local okRoute = N.flyTo(Vector3.new(pos.X, N.CruiseY, pos.Z), mode.speed)
@@ -32313,9 +32431,44 @@ do
 			end
 			local target = Vector3.new(stage.X, N.CruiseY, stage.Z)
 			setStatus(string.format("Flying: stage %d/%d (%s)", i, #R.stages, mode.id))
-			okRoute = N.flyTo(target, mode.speed) and N.hold(target, mode.hold)
+			okRoute = N.flyTo(target, mode.speed)
 			if okRoute then
-				run.flown = i
+				local before = N.credited()
+				if N.Run.stageSkip[i] and run.id % 20 ~= 0 then
+					okRoute = N.hold(target, mode.hold)
+				else
+					setStatus(string.format("Flying: stage %d/%d (%s), waiting for the server's credit", i, #R.stages, mode.id))
+					local t0 = os.clock()
+					local got = N.touchHold(target, N.StageWait, function()
+						return N.credited() > before
+					end, Vector3.new(0, 0, -16))
+					okRoute = keepGoing()
+					if got then
+						N.Run.stageMiss[i] = 0
+						if N.Run.stageSkip[i] then
+							N.Run.stageSkip[i] = nil
+							log("STAGE back", i, "(credited again)")
+						end
+						local latency = os.clock() - t0
+						N.Run.creditSeconds = if N.Run.creditSeconds then N.Run.creditSeconds * 0.8 + latency * 0.2 else latency
+					elseif okRoute then
+						run.misses += 1
+						run.missed = i
+					end
+				end
+				if okRoute then
+					run.flown = i
+				end
+			end
+		end
+		-- One stage the server never credits while every other one is (3 runs in a row): touched briefly from then on.
+		-- Runs with several misses are the movement's problem (the ladder/planner handle it), not a stage's.
+		if okRoute and run.misses == 1 then
+			local i = run.missed
+			N.Run.stageMiss[i] = (N.Run.stageMiss[i] or 0) + 1
+			if N.Run.stageMiss[i] >= 3 and not N.Run.stageSkip[i] then
+				N.Run.stageSkip[i] = true
+				log("STAGE skip", i, "(not credited in 3 runs while the others were: touched briefly from now on, tried again every 20th run)")
 			end
 		end
 		local chest = R.chest
@@ -32324,163 +32477,167 @@ do
 			okRoute = N.flyTo(Vector3.new(chest.X, N.CruiseY, chest.Z), mode.speed) and N.flyTo(chest, mode.speed)
 		end
 		if okRoute then
-			N.hold(chest, 3, function()
-				local _, ended = N.credited()
-				return ended
-			end)
+			setStatus("At the chest: touching the treasure trigger")
+			local triggered = N.touchHold(chest, 6, function()
+				return N.endStarted(char)
+			end, Vector3.new(0, 9, 0))
 			run.credited, run.ended, run.first = N.credited()
 			run.chestAt = os.clock()
-			log("RUN chest", string.format("stages=%d/%d end=%s first=%d flown in %.1fs", run.credited, #R.stages, tostring(run.ended), run.first, os.clock() - run.start))
-			-- Probe (blatant.md second pass #1): claim at the chest, before the respawn. Paid -> no wait for the respawn
-			-- screen, the run ends here.
-			local early = N.probe("claimEarly")
-			if run.ended and early ~= "rejected" then
-				local before = N.gold()
-				send("ClaimRiverResultsGold")
+			run.triggered = triggered == true
+			log("RUN chest", string.format("stages=%d/%d end=%s first=%d flown in %.1fs misses=%d trigger=%s", run.credited, #R.stages, tostring(run.ended), run.first, run.chestAt - run.start, run.misses, if run.triggered then "ok" else "no fog signal in 6 s, waiting for End anyway"))
+			do
+				-- End or the game's respawn, at most N.EndWait s after the arrival (the server respawns at ~11 s).
+				setStatus("At the chest: waiting for the treasure (End)")
 				waitFor(function()
-					return N.gold() ~= before
-				end, 1.5)
-				local delta = N.gold() - before
-				local n2, e2 = N.credited()
-				if early == nil then
-					log("PROBE claimEarly result=" .. delta, "stagesReset=" .. tostring(n2 == 0 and not e2))
-					N.probeSet("claimEarly", if delta > 0 then "accepted" else "rejected", delta)
+					local _, ended = N.credited()
+					return ended or N.char() ~= char or not N.alive() or not keepGoing()
+				end, math.max(N.EndWait - (os.clock() - run.chestAt), 8))
+				local n, ended, first = N.credited()
+				run.credited, run.ended, run.first = math.max(n, run.credited), ended or run.ended, math.max(first, run.first)
+				local sinceTouch = os.clock() - run.chestAt
+				if N.char() ~= char or not N.alive() then
+					log("RUN respawn by the game", string.format("after %.1fs end=%s (the normal end of a run)", sinceTouch, tostring(run.ended)))
+				elseif run.ended then
+					N.Run.endSeconds = if N.Run.endSeconds then N.Run.endSeconds * 0.8 + sinceTouch * 0.2 else sinceTouch
+					log("RUN end credited", string.format("after %.1fs, before the respawn", sinceTouch))
+					-- Probe (blatant.md second pass #1): claim at the chest, before the respawn. Decided from the gold by
+					-- N.settle (once per PlaceVersion the gold is awaited here so the decision is clean).
+					if N.probe("claimEarly") ~= "rejected" and keepGoing() then
+						N.claimNow(run, "chest")
+						if N.probe("claimEarly") == nil then
+							setStatus("At the chest: waiting for the gold (claim probe)")
+							waitFor(function()
+								local P = N.Run.pending
+								return P == nil or P.run ~= run or N.gold() ~= P.before or not alive()
+							end, N.GoldWait)
+							N.settleStep()
+						end
+					end
+					N.resetChar("after the End (no wait for the game's respawn)")
+				elseif keepGoing() then
+					log("RUN end not credited", string.format("in %.0fs at the chest", os.clock() - run.chestAt))
+					N.resetChar("no End")
 				end
-				if delta > 0 then
-					run.claimedEarly = true
-					Session.claims += 1
-					Session.earlyClaims += 1
-					N.Claim.last = string.format("+%s gold at the chest (%d stages)", formatNumber(delta), run.credited)
-					log("CLAIM early", "stages=" .. run.credited, "gold=+" .. delta)
-				end
-			end
-			-- The chest prize flies to the character for about 5 s (TreasureEndEffectsLS), then the character respawns.
-			-- If it does not, the character is reset like the Roblox menu's Reset button.
-			local waitSeconds = if run.claimedEarly then 2 elseif N.planner() then N.Plan.resetAfter else 12
-			setStatus("At the chest: collecting the prize")
-			waitFor(function()
-				return N.char() ~= char or not N.alive() or not alive()
-			end, waitSeconds)
-			if alive() and N.char() == char and N.alive() then
-				local hum = N.humanoid()
-				if hum then
-					hum.Health = 0
-					Session.resets += 1
-					log("RUN reset after the chest", string.format("(no respawn in %ds)", waitSeconds))
-				end
-			else
-				log("RUN respawn by the game", string.format("after %.1fs", os.clock() - run.chestAt))
 			end
 		else
 			log("RUN stopped", "flown", run.flown, if N.alive() then "toggle off" else "character died")
 		end
 		setStatus("Waiting for the respawn")
 		waitFor(function()
-			return (N.char() ~= char and N.alive()) or not alive()
+			return (N.char() ~= char and N.alive()) or not alive() or (not N.wants("AutoFarm") and N.alive())
 		end, 20)
 		M.flying = false
 		N.Run.respawnAt = os.clock()
-		if run.claimedEarly then
-			N.Claim.charClaimed = N.char()
-			N.finishRun(run, run.credited, run.ended)
-		elseif not run.chestAt then
+		if not run.chestAt then
 			N.Run.current = nil
 			if N.questDone then
 				N.questDone(run, 0)
 			end
 		end
 	end
-	-- Results of a finished run: Session numbers, per-mode stats and the auto-degrade.
-	function N.finishRun(run, credited, ended)
-		N.Run.current = nil
-		-- Gold from other sources during the run (codes in, chests out) is taken out.
-		local gold = N.gold() - run.gold0 - (N.Run.offset - run.offset0)
-		local seconds = math.max(os.clock() - run.start, 1)
-		-- Credited = the server wrote 9+ stages and End. Gold alone counts only when no stage value was readable at all
-		-- (quest rewards and discovery bonuses would fake a full run otherwise).
-		local ok = (credited >= 9 and ended) or (credited == 0 and not ended and gold >= 90 * N.multiplier() and not run.quest)
+	-- Results of a settled run: Session numbers, per-mode stats, the Instant probe and the auto-degrade.
+	function N.finishRun(run, n, ended, first, paying, gold, claimAt)
+		-- The cycle ends when the claim goes out: the next run starts right after it, the gold is settled on the side.
+		local seconds = math.max((claimAt or os.clock()) - run.start, 1)
+		local expected = N.payout(paying, ended)
+		local paid = expected > 0 and gold >= expected - 1
+		if n > N.Run.bestStages then
+			N.Run.bestStages = n
+		end
+		local full = paid and ended and n >= math.max(9, N.Run.bestStages)
+		local refused = n < 5
 		Session.runs += 1
-		Session.stages += credited
+		Session.stages += n
 		Session.runGold += gold
 		Session.runSeconds += seconds
-		Session.lastGold, Session.lastStages, Session.lastSeconds = gold, credited, seconds
-		if ok then
+		Session.lastGold, Session.lastStages, Session.lastSeconds = gold, n, seconds
+		if full then
 			Session.fullRuns += 1
+		elseif paid then
+			Session.partialRuns += 1
 		else
-			Session.failedRuns += 1
+			Session.unpaidRuns += 1
 		end
 		local s = N.modeStats(run.mode)
 		s.runs += 1
 		s.seconds += seconds
-		if ok then
-			s.ok += 1
-			s.gold += gold
+		s.gold += gold
+		if full then
+			s.full += 1
+		end
+		if paid then
+			s.paid += 1
+		end
+		table.insert(s.window, { gold = gold, seconds = seconds, full = full })
+		if #s.window > 4 then
+			table.remove(s.window, 1)
 		end
 		local rate = gold / seconds * 3600
-		N.Run.last = string.format("+%s gold, %d stages%s, %.0fs (%s)", formatNumber(gold), credited, if ended then " + end" else "", seconds, run.mode)
+		N.Run.last = string.format("+%s gold, %d stages%s, %.0fs (%s)", formatNumber(gold), n, if ended then " + end" else "", seconds, run.mode)
 		table.insert(N.Run.history, 1, N.Run.last)
 		if #N.Run.history > 5 then
 			table.remove(N.Run.history)
 		end
-		log("RUN done", "#" .. Session.runs, "mode=" .. run.mode, "stages=" .. credited, "end=" .. tostring(ended), "gold=+" .. gold, string.format("time=%.1fs rate=%s/h", seconds, formatNumber(rate)), if ok then "ok" else "NOT CREDITED")
+		log("RUN done", "#" .. run.id, "mode=" .. run.mode, string.format("stages=%d/%d", n, #N.StageKeys), "end=" .. tostring(ended), "gold=+" .. gold, string.format("time=%.1fs rate=%s/h", seconds, formatNumber(rate)), if full then "full" elseif paid then "partial" else "NOT PAID")
 		if N.Events.run then
-			pcall(N.Events.run, gold, credited, ended, seconds, run.mode)
+			pcall(N.Events.run, gold, n, ended, seconds, run.mode)
 		end
-		if (run.first or 0) > 0 then
-			Session.discoveries += run.first
-			local extra = gold - N.payout(credited, ended) - (N.Plan.prize or 0)
-			N.Plan.discoverSamples = (N.Plan.discoverSamples or 0) + run.first
+		if first > 0 then
+			Session.discoveries += first
+			local extra = gold - expected
+			N.Plan.discoverSamples = (N.Plan.discoverSamples or 0) + first
 			N.Plan.discoverGold = (N.Plan.discoverGold or 0) + math.max(extra, 0)
-			log("PROBE discover", "stages=" .. run.first, "gold=" .. gold, "extra=" .. extra)
-		elseif ok then
-			N.Plan.prizeSum = (N.Plan.prizeSum or 0) + math.max(gold - N.payout(credited, ended), 0)
+			log("PROBE discover", "stages=" .. first, "gold=" .. gold, "extra=" .. extra)
+		elseif full then
+			N.Plan.prizeSum = (N.Plan.prizeSum or 0) + math.max(gold - expected, 0)
 			N.Plan.prizeRuns = (N.Plan.prizeRuns or 0) + 1
 			N.Plan.prize = N.Plan.prizeSum / N.Plan.prizeRuns
 		end
 		if N.questDone then
 			N.questDone(run, gold)
 		end
-		-- Instant hops are a probe: the first credited (or twice refused) run decides it for this PlaceVersion.
+		if M.failMode ~= run.mode then
+			M.failMode, M.fails = run.mode, 0
+		end
+		-- Instant hops are a probe: the first full run accepts it, two refused runs reject it for this PlaceVersion.
 		if run.mode == "Instant" and N.probe("instant_route") == nil then
-			if ok then
+			if full then
 				N.probeSet("instant_route", "accepted", string.format("%.0fs per run", seconds))
-			elseif M.fails >= 1 then
+			elseif refused and M.fails >= 1 then
 				N.probeSet("instant_route", "rejected", 0)
 			end
 		end
-		if ok then
+		if refused then
+			M.fails += 1
+			if M.fails >= 2 and run.level < #N.Modes then
+				M.fails = 0
+				M.refusedUntil[run.mode] = os.clock() + 600
+				Session.fallbacks += 1
+				table.clear(N.Run.stageMiss)
+				table.clear(N.Run.stageSkip)
+				local next_ = run.level + 1
+				while next_ < #N.Modes and not N.modeAllowed(next_) do
+					next_ += 1
+				end
+				log("MOVE fallback", run.mode, "->", N.Modes[next_].id, if run.mode == "Instant" and N.probe("instant_route") == "rejected" then "(instant hops rejected on this version)" else "(2 runs under half the stages, tried again in 10 min)")
+			end
+		else
 			M.fails = 0
-			return
 		end
-		M.fails += 1
-		if M.fails >= 2 and run.level < #N.Modes and M.level == run.level then
-			local from = N.Modes[M.level].id
-			M.level += 1
-			M.fails = 0
-			M.retryAt = if from == "Instant" and N.probe("instant_route") == "rejected" then nil else os.clock() + 600
-			Session.fallbacks += 1
-			log("MOVE fallback", from, "->", N.Modes[M.level].id, "(2 runs not credited, retry in 10 min)")
+		if N.Plan.onRun then
+			N.Plan.onRun(run, gold, seconds, full, paid)
 		end
 	end
-	-- Claim like the RiverResultsGui Collect button: once per character, after the GUI shows the results (or, for the
-	-- farm, when the run's stage values wait). The GUI frame is then closed like claim() does.
-	function N.claimStep()
-		if not (on("AutoClaim") or on("AutoFarm")) or M.flying then
-			return false
+	-- The claim: ClaimRiverResultsGold:FireServer() like the Collect button, the frame closed like claim() does. The gold
+	-- lands late (the owner watched it), so the result is settled by N.settle from the gold stat, up to N.GoldWait s,
+	-- while the next run already flies.
+	function N.claimNow(run, where)
+		local n, ended, first, paying = N.credited()
+		if run then
+			n, ended, first = math.max(n, run.credited or 0), ended or run.ended, math.max(first, run.first or 0)
 		end
-		local char = N.char()
-		if not char or N.Claim.charClaimed == char or not N.alive() then
-			return false
-		end
-		local shown, frame = N.resultsShown()
-		local n, ended = N.credited()
-		local farmRun = N.Run.current ~= nil and N.Run.current.chestAt ~= nil
-		if not shown and not (farmRun and (n > 0 or ended)) then
-			return false
-		end
-		N.Claim.charClaimed = char
 		local before = N.gold()
-		local expected = N.payout(n, ended)
+		local _, frame = N.resultsShown()
 		send("ClaimRiverResultsGold")
 		Session.claims += 1
 		pcall(function()
@@ -32489,53 +32646,114 @@ do
 			end
 			game:GetService("StarterGui"):SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, true)
 		end)
-		waitFor(function()
-			return N.gold() ~= before
-		end, 3)
-		local got = N.gold() - before
-		N.Claim.last = string.format("+%s gold (%d stages%s)", formatNumber(got), n, if ended then " + end" else "")
-		log("CLAIM", "stages=" .. n, "end=" .. tostring(ended), "gold=+" .. got, "expected=" .. expected)
-		-- Probe: a second claim right after the first (blatant.md #3). Expected to be refused by the server.
-		if N.probe("double_claim") == nil and got > 0 then
-			local second = N.gold()
-			send("ClaimRiverResultsGold")
-			waitFor(function()
-				return N.gold() ~= second
-			end, 2)
-			local extra = N.gold() - second
-			N.probeSet("double_claim", if extra > 0 then "accepted" else "rejected", extra)
-		elseif N.probe("double_claim") == "accepted" and got > 0 then
-			local second = N.gold()
-			send("ClaimRiverResultsGold")
-			waitFor(function()
-				return N.gold() ~= second
-			end, 2)
-			log("CLAIM double", "gold=+" .. (N.gold() - second))
+		local P = N.Run.pending
+		if P and run and P.run == run then
+			P.claims += 1
+			P.n, P.ended, P.first, P.paying = math.max(P.n, n), P.ended or ended, math.max(P.first, first), math.max(P.paying, paying)
+		else
+			if P then
+				N.settle(P, true)
+			end
+			P = { run = run, before = before, offset0 = N.Run.offset, at = os.clock(), n = n, ended = ended, first = first, paying = paying, where = where, claims = 1 }
+			N.Run.pending = P
 		end
-		local run = N.Run.current
-		if run and run.chestAt then
-			N.finishRun(run, math.max(n, run.credited), ended or run.ended)
+		if run then
+			N.Run.current = nil
+		end
+		local expected = N.payout(paying, ended)
+		log("CLAIM sent", "stages=" .. n, "end=" .. tostring(ended), "expected=" .. expected, "(" .. where .. ")")
+		-- Probe (blatant.md #3): a second claim right after the first, once per PlaceVersion, on a run without discovery
+		-- bonuses so the gold decides cleanly at the settle.
+		if N.probe("double_claim") == nil and n > 0 and first == 0 and where ~= "chest" then
+			task.wait(0.6)
+			send("ClaimRiverResultsGold")
+			P.double = true
+		elseif N.probe("double_claim") == "accepted" and n > 0 then
+			task.wait(0.6)
+			send("ClaimRiverResultsGold")
+			log("CLAIM double sent")
+		end
+		setStatus("Waiting for the gold (+" .. expected .. " expected)")
+	end
+	-- Settles a claim from the gold stat (or after N.GoldWait s without a change; force = right now).
+	function N.settle(P, force)
+		local delta = N.gold() - P.before - (N.Run.offset - P.offset0)
+		local waited = os.clock() - P.at
+		if delta == 0 and not force and waited < N.GoldWait then
+			return false
+		end
+		N.Run.pending = nil
+		local expected = N.payout(P.paying, P.ended)
+		if delta == 0 and P.where == "chest" and P.run and P.claims == 1 then
+			-- The server did not pay at the chest: the run waits for the usual claim after the respawn.
+			log("CLAIM unpaid at the chest", "expected=" .. expected, string.format("no gold change in %.0fs, claimed again after the respawn", waited))
+			if N.probe("claimEarly") == nil then
+				N.probeSet("claimEarly", "rejected", 0)
+			end
+			N.Run.current = P.run
+			return true
+		end
+		if delta ~= 0 then
+			log("CLAIM paid", "gold=+" .. delta, "expected=" .. expected, string.format("after %.1fs", waited), "(" .. P.where .. ")")
+		else
+			log("CLAIM unpaid", "expected=" .. expected, string.format("no gold change in %.0fs", waited), "(" .. P.where .. ")")
+		end
+		N.Claim.last = string.format("+%s gold (%d stages%s)", formatNumber(delta), P.n, if P.ended then " + end" else "")
+		if P.double then
+			N.probeSet("double_claim", if expected > 0 and delta >= 2 * expected then "accepted" else "rejected", math.max(delta - expected, 0))
+		end
+		if P.where == "chest" and N.probe("claimEarly") == nil then
+			N.probeSet("claimEarly", if delta > 0 and P.claims == 1 then "accepted" else "rejected", delta)
+		end
+		if P.run then
+			N.finishRun(P.run, P.n, P.ended, P.first, P.paying, delta, P.at)
 		end
 		return true
 	end
-	-- A respawned farm character with nothing to claim (the server already paid or reset the values).
+	function N.settleStep()
+		local P = N.Run.pending
+		return P ~= nil and N.settle(P, false)
+	end
+	-- Claim like the RiverResultsGui Collect button: once per character, after the GUI shows the results (or when the
+	-- farm run's stage values wait).
+	function N.claimStep()
+		if not (N.wants("AutoClaim") or N.wants("AutoFarm")) or M.flying then
+			return false
+		end
+		local char = N.char()
+		if not char or N.Claim.charClaimed == char or not N.alive() then
+			return false
+		end
+		local shown = N.resultsShown()
+		local n, ended = N.credited()
+		if not shown and n == 0 and not ended then
+			return false
+		end
+		N.Claim.charClaimed = char
+		local run = N.Run.current
+		local target = if run and run.chestAt then run elseif N.Run.pending then N.Run.pending.run else nil
+		N.claimNow(target, "respawn")
+		return true
+	end
+	-- A respawned farm character with nothing to claim and no claim out (the server paid or reset the values itself).
 	function N.settleRun()
 		local run = N.Run.current
-		if run and run.chestAt and not M.flying and N.Run.respawnAt and os.clock() - N.Run.respawnAt > 5 then
+		if run and run.chestAt and not M.flying and not N.Run.pending and N.Run.respawnAt and os.clock() - N.Run.respawnAt > 5 then
 			log("CLAIM nothing shown", "after the respawn, run counted from the gold change")
 			N.Claim.charClaimed = N.char()
-			N.finishRun(run, run.credited, run.ended)
+			N.finishRun(run, run.credited, run.ended, run.first, math.min(run.credited, 9), N.gold() - run.gold0 - (N.Run.offset - run.offset0), os.clock())
 			return true
 		end
 		return false
 	end
-	-- One farm step (the farm loop): claim, settle or fly the next run.
+	-- One farm step (the farm loop): settle, claim or fly the next run.
 	function N.farmStep()
+		N.settleStep()
 		if N.claimStep() or N.settleRun() then
 			return
 		end
 		if N.Run.current and N.Run.current.chestAt then
-			setStatus("Waiting for the results")
+			setStatus("Waiting for the river results")
 			task.wait(0.5)
 			return
 		end
@@ -32698,7 +32916,7 @@ do
 			return false
 		end
 		local code = table.remove(C.queue, 1)
-		if not code and on("AutoCodes") then
+		if not code and N.wants("AutoCodes") then
 			if os.clock() - C.fetchedAt > 1800 then
 				N.codesFetch()
 			end
@@ -32798,6 +33016,7 @@ end
 -- blocks in front of Z 900, like checkAllClear). The quest rules only restrict block placement; the farm places no
 -- blocks and flies to the End, so each one-time quest is tried with the normal run and checked by OtherData.Q<n>.
 -- A quest that is not done after its run is cancelled (QuestMakerEvent 0) and marked rejected for this PlaceVersion.
+-- Driven by Auto Quests or by the Smart Planner (N.wants).
 N.Quest = { list = { 1, 2, 3, 4, 5, 6, 8, 9, 101 }, active = nil, refused = {}, last = "-", leaderNoted = false }
 function N.questDoneOn(n)
 	local other = LocalPlayer:FindFirstChild("OtherData")
@@ -32827,7 +33046,7 @@ local function blocksClear()
 end
 function N.questStep()
 	local Q = N.Quest
-	if not on("AutoQuests") or Q.active then
+	if not N.wants("AutoQuests") or Q.active then
 		return false
 	end
 	local zone = N.myZone()
@@ -32911,7 +33130,7 @@ function N.discoveryCounts()
 	return newHere, newAll - newHere, #all, #here
 end
 function N.discoverStep()
-	if not on("AutoDiscoverHop") or N.Move.flying or (N.Quest and N.Quest.active) then
+	if not N.wants("AutoDiscoverHop") or N.Move.flying or (N.Quest and N.Quest.active) then
 		return false
 	end
 	local newHere, newElsewhere = N.discoveryCounts()
@@ -32926,6 +33145,13 @@ function N.discoverStep()
 		N.Discover.last = "Smart Planner: a hop costs more than the discovery bonus"
 		return false
 	end
+	if N.Run.pending then
+		-- the last claim's gold lands late: settled first so the run and the mode measurement are complete
+		setStatus("Waiting for the gold before the server hop")
+		waitFor(function()
+			return N.Run.pending == nil or not alive()
+		end, N.GoldWait)
+	end
 	N.Discover.hopAt = os.clock()
 	Session.hops += 1
 	N.Discover.last = string.format("Hopping: %d stage types are new on other servers", newElsewhere)
@@ -32936,13 +33162,17 @@ function N.discoverStep()
 	end)
 	return true
 end
--- Profit engine. Gold per run is fixed by the server ((8 + 8 x stages + 25) x Multiplier plus the chest prize), so gold
--- per hour = gold per run / cycle time. The planner: (1) picks the movement mode with the best MEASURED gold/h among the
--- modes that were credited, (2) shortens the wait at the chest (the prize lands in about 5 s, TreasureEndEffectsLS),
--- (3) values spending: chests only give blocks, a flown route uses no boat, so payback = never -> keep the gold,
--- (4) shows what the free group join (x1.25) would add per hour. It never switches another toggle.
-N.Plan = { say = "", spendText = "", routeText = "", groupText = "", bestLevel = nil, resetAfter = 7, lastLogKey = "", lastLogAt = -1e9 }
+-- Smart Planner = the autopilot (CLAUDE.md "SMART PLANNER = AUTOPILOT"). With the toggle on the hub plays the gold loop
+-- by itself through the same functions as the toggles (N.wants: farm runs, claims, codes, one-time quests, discovery
+-- hops) even when every other toggle is off, and never flips a toggle. Gold per run is fixed by the server
+-- ((8 + 8 x Stage1..9 + 25) x Multiplier), so gold per hour = gold per run / cycle time: the planner measures every
+-- movement mode with full 10/10 runs (the credit gate in p03), starts with the mode that completes runs reliably
+-- (Blatant), probes Instant hops next, keeps the best measured gold per hour and re-measures the others every hour.
+-- Spending: chests give blocks only and the route is flown, so payback = never -> keep the gold. The free group join
+-- (x1.25) is shown with its value per hour; a discovery hop happens only while the measured bonus beats the time it costs.
+N.Plan = { say = "", routeText = "", spendText = "", groupText = "", discoverText = "", level = nil, phase = "", measureRuns = 2, remeasureAt = nil, lastLogKey = "", lastLogAt = -1e9, idleSince = nil, idleLogAt = -1e9 }
 do
+	local MeasureOrder = { 2, 1, 3, 4 } -- Blatant first (completes runs reliably), the Instant probe next, slower modes only when both fast ones fail
 	function N.goldPerHour()
 		local seconds = Session.runSeconds
 		if seconds < 30 then
@@ -32950,24 +33180,83 @@ do
 		end
 		return Session.runGold / seconds * 3600
 	end
-	function N.planRoute()
-		local best, bestRate = nil, 0
-		for i, m in ipairs(N.Modes) do
-			local rate = N.modeRate(m.id)
-			if rate > bestRate then
-				best, bestRate = i, rate
+	-- Blatant or Instant has a full run in its window: the slower modes cannot beat them (same credit gate, longer flight).
+	local function fastOk()
+		for _, i in ipairs({ 1, 2 }) do
+			if N.modeFull(N.Modes[i].id) > 0 then
+				return true
 			end
 		end
-		N.Plan.bestLevel = best
+		return false
+	end
+	local function candidate(i)
+		return N.modeAllowed(i) and (i <= 2 or not fastOk())
+	end
+	-- The mode of the next run: the player's fixed Movement, else a candidate still measuring (fewer than measureRuns
+	-- settled runs in its window), else the best measured gold per hour (2 % hysteresis keeps the current one).
+	function N.planMode()
+		local fixed = N.fixedLevel()
+		if fixed then
+			N.Plan.level = fixed
+			N.Plan.phase = "Movement set by you"
+			N.Plan.routeText = N.Modes[fixed].text .. string.format(" %s/h", formatNumber(N.modeRate(N.Modes[fixed].id)))
+			return fixed
+		end
+		local now = os.clock()
+		if N.Plan.remeasureAt and now >= N.Plan.remeasureAt then
+			N.Plan.remeasureAt = nil
+			local cleared = {}
+			for i, m in ipairs(N.Modes) do
+				if i ~= N.Plan.level and candidate(i) and N.modeMeasured(m.id) > 0 then
+					table.clear(N.modeStats(m.id).window)
+					table.insert(cleared, m.id)
+				end
+			end
+			if #cleared > 0 then
+				log("PLAN re-measure", table.concat(cleared, ", "), "(an hour passed, 2 runs each)")
+			end
+		end
 		local parts = {}
 		for _, m in ipairs(N.Modes) do
-			local s = N.Move.stats[m.id]
-			if s and s.runs > 0 then
-				table.insert(parts, string.format("%s %s/h (%d/%d credited)", m.id, formatNumber(N.modeRate(m.id)), s.ok, s.runs))
+			local runs = N.modeMeasured(m.id)
+			if runs > 0 then
+				table.insert(parts, string.format("%s %s/h (%d runs, %d full)", m.id, formatNumber(N.modeRate(m.id)), runs, N.modeFull(m.id)))
 			end
 		end
-		N.Plan.routeText = if #parts > 0 then table.concat(parts, ", ") else "measuring the first run"
-		return best, bestRate
+		N.Plan.routeText = if #parts > 0 then table.concat(parts, ", ") else "no run measured yet"
+		for _, i in ipairs(MeasureOrder) do
+			if candidate(i) and N.modeMeasured(N.Modes[i].id) < N.Plan.measureRuns then
+				N.Plan.level = i
+				N.Plan.phase = string.format("measuring %s, run %d/%d", N.Modes[i].id, N.modeMeasured(N.Modes[i].id) + 1, N.Plan.measureRuns)
+				return i
+			end
+		end
+		local best, bestRate = nil, 0
+		for i, m in ipairs(N.Modes) do
+			if N.modeAllowed(i) then
+				local r = N.modeRate(m.id)
+				if r > bestRate then
+					best, bestRate = i, r
+				end
+			end
+		end
+		if not best then
+			-- nothing measured pays: the ladder's fastest allowed mode
+			best = N.topLevel()
+			while best < #N.Modes and not N.modeAllowed(best) do
+				best += 1
+			end
+		end
+		local current = N.Plan.level
+		if current and current ~= best and N.modeAllowed(current) and N.modeRate(N.Modes[current].id) >= bestRate * 0.98 then
+			best = current
+		end
+		N.Plan.level = best
+		N.Plan.phase = string.format("best measured: %s %s/h", N.Modes[best].id, formatNumber(bestRate))
+		if not N.Plan.remeasureAt then
+			N.Plan.remeasureAt = now + 3600
+		end
+		return best
 	end
 	function N.planSpend()
 		N.Plan.spendText = "Keep gold: chests only give blocks and the flown route uses no boat, so no purchase raises gold per hour (payback never)"
@@ -32991,7 +33280,7 @@ do
 		local cost = N.goldPerHour() / 3600 * 45
 		if newElsewhere <= 0 then
 			N.Plan.hopWorth = false
-			N.Plan.discoverText = "Every stage type is discovered"
+			N.Plan.discoverText = "every stage type is discovered"
 		elseif bonus == nil then
 			N.Plan.hopWorth = true
 			N.Plan.discoverText = string.format("%d new types elsewhere, bonus not measured yet (hop allowed)", newElsewhere)
@@ -33001,49 +33290,81 @@ do
 		end
 		return N.Plan.hopWorth
 	end
+	-- Real reasons the autopilot is not farming right now (anything else is a bug): a manual action, no character for
+	-- more than 10 s. Logged as PLAN idle reason= once a minute while it lasts.
+	local function idleReason()
+		if N.Manual.running then
+			return "a manual action is running"
+		end
+		if not N.alive() and not N.Move.flying then
+			N.Plan.idleSince = N.Plan.idleSince or os.clock()
+			if os.clock() - N.Plan.idleSince > 10 then
+				return "no character for " .. math.floor(os.clock() - N.Plan.idleSince) .. " s, waiting for the respawn"
+			end
+			return nil
+		end
+		N.Plan.idleSince = nil
+		return nil
+	end
 	function N.planTick()
 		if not N.planner() then
+			N.Plan.level = nil
+			N.Plan.phase = ""
 			return
 		end
-		local best = N.planRoute()
+		local level = N.planMode()
 		N.planSpend()
 		N.planGroup()
 		N.planDiscovery()
-		N.Plan.resetAfter = 7
-		local bestId = best and N.Modes[best].id or "measuring"
-		N.Plan.say = string.format("Route %s, wait %ds at the chest, keep gold", bestId, N.Plan.resetAfter)
-		local key = bestId .. "|" .. tostring(N.inGroup()) .. "|" .. tostring(N.Plan.hopWorth)
-		if key ~= N.Plan.lastLogKey or os.clock() - N.Plan.lastLogAt > 60 then
+		local mode = N.Modes[level]
+		local endText = if N.Run.endSeconds then string.format("End after ~%.1fs", N.Run.endSeconds) else "End awaited up to " .. N.EndWait .. "s"
+		local creditText = if N.Run.creditSeconds then string.format("stage credit ~%.1fs", N.Run.creditSeconds) else "stage credit not measured yet"
+		N.Plan.say = string.format("Run #%d in %s (%s)", Session.started + (if N.Run.current then 0 else 1), mode.id, N.Plan.phase)
+		local now = os.clock()
+		local idle = idleReason()
+		if idle then
+			if now - N.Plan.idleLogAt > 60 then
+				N.Plan.idleLogAt = now
+				log("PLAN idle", "reason=" .. idle)
+			end
+			return
+		end
+		local key = level .. "|" .. N.Plan.phase .. "|" .. tostring(N.inGroup()) .. "|" .. tostring(N.Plan.hopWorth)
+		if key ~= N.Plan.lastLogKey or now - N.Plan.lastLogAt > 60 then
 			N.Plan.lastLogKey = key
-			N.Plan.lastLogAt = os.clock()
-			log("PLAN", "route", bestId, "|", N.Plan.routeText, "| wait", N.Plan.resetAfter .. "s at the chest", "| spend: keep gold (chests give blocks only, payback never)", "|", N.Plan.groupText, "| discovery", N.Plan.discoverText or "-")
+			N.Plan.lastLogAt = now
+			log("PLAN", N.Plan.say, "|", N.Plan.routeText, "|", creditText .. ",", endText, "| spend: keep gold (chests give blocks only, payback never) |", N.Plan.groupText, "| discovery:", N.Plan.discoverText or "-")
 		end
 	end
 	function N.upNext()
 		local list = {}
-		if on("AutoFarm") then
+		local planner = N.planner()
+		if planner then
+			local mode = N.Modes[N.Plan.level or N.topLevel()]
+			table.insert(list, string.format("Smart Planner: run #%d in %s (%s), full 10-stage route, chest, claim", Session.started + (if N.Run.current then 0 else 1), mode.id, if N.Plan.phase ~= "" then N.Plan.phase else "measuring"))
+		elseif on("AutoFarm") then
 			local mode = N.Modes[N.Move.level or N.topLevel()]
-			table.insert(list, string.format("Farm gold: fly the 10 cave stages to the chest (%s), run #%d", mode.text, Session.runs + 1))
+			table.insert(list, string.format("Farm gold: fly the 10 cave stages to the chest (%s), run #%d", mode.text, Session.started + 1))
 		end
-		if on("AutoClaim") then
+		if on("AutoClaim") and not planner then
 			table.insert(list, "Claim the river results after every run")
 		end
-		if on("AutoCodes") then
+		if N.wants("AutoCodes") then
 			local ok = N.codeCounts()
-			table.insert(list, "Codes: " .. ok .. " redeemed, trying the rest once")
+			table.insert(list, "Codes: " .. ok .. " redeemed, trying the rest once" .. (if planner and not on("AutoCodes") then " (planner)" else ""))
 		end
-		if on("AutoQuests") then
+		if N.wants("AutoQuests") then
 			local left = #N.questsLeft()
-			table.insert(list, if N.Quest.active then "Quest " .. N.Quest.active .. " rides along with this run" else left .. " quests left to try with the runs")
+			table.insert(list, (if N.Quest.active then "Quest " .. N.Quest.active .. " rides along with this run" else left .. " quests left to try with the runs") .. (if planner and not on("AutoQuests") then " (planner)" else ""))
 		end
-		if on("AutoDiscoverHop") then
-			table.insert(list, "Discovery: " .. N.Discover.last)
+		if N.wants("AutoDiscoverHop") then
+			table.insert(list, "Discovery: " .. (if planner then N.Plan.discoverText or N.Discover.last else N.Discover.last))
 		end
 		if on("AutoChests") then
 			table.insert(list, "Chests: " .. optionText("ChestChoice", "Common Chest") .. " with the gold above " .. formatNumber(optionNumber("GoldReserve", 1000)))
 		end
-		if on("SmartPlanner") then
-			table.insert(list, "Smart Planner: " .. (if N.Plan.say ~= "" then N.Plan.say else "measuring"))
+		if planner then
+			table.insert(list, N.Plan.groupText ~= "" and N.Plan.groupText or "Keep gold (chests give blocks only)")
 		end
 		return list
 	end
@@ -33167,13 +33488,13 @@ do
 		FarmBox:AddToggle("AutoFarm", {
 			Text = "Auto Farm Gold",
 			Default = false,
-			Tooltip = "Flies through all 10 cave stages to the treasure chest, takes the chest prize, respawns and claims the results. About 105 gold x your multiplier per run plus the chest",
+			Tooltip = "Flies through all 10 cave stages, waits in each one until the server credits it, touches the treasure chest and claims the results after the respawn. 105 gold x your multiplier per full run",
 		})
 		FarmBox:AddDropdown("RouteMode", {
 			Text = "Movement",
 			Values = N.ModeChoices,
 			Default = N.ModeChoices[1],
-			Tooltip = "Auto starts with instant stage hops and steps down to the fastest flight the server still credits (Blatant 450, Fast 250, Safe 120 studs/s). It tries the faster one again after 10 minutes",
+			Tooltip = "Auto starts with instant stage hops and steps down to the fastest flight the server still credits (Blatant 450, Fast 250, Safe 120 studs/s), trying the faster one again after 10 minutes. With the Smart Planner on, Auto = the mode with the best measured gold per hour",
 		})
 		FarmBox:AddToggle("AutoClaim", {
 			Text = "Auto Claim Results",
@@ -33193,7 +33514,7 @@ do
 		PlanBox:AddToggle("SmartPlanner", {
 			Text = "Smart Planner",
 			Default = false,
-			Tooltip = "Profit math: the movement with the best measured gold per hour, a shorter wait at the chest, what is worth buying (nothing: blocks do not raise gold per hour) and the group bonus. Other toggles stay as you set them",
+			Tooltip = "Autopilot: plays the gold loop by itself even with every other toggle off. Full 10-stage runs in the movement with the best measured gold per hour (re-measured every hour), claims, codes, one-time quests, discovery hops when they pay, never a wasted purchase (blocks do not raise gold per hour). Other toggles stay as you set them",
 		})
 		Labels.Planner = PlanBox:AddLabel({ Text = "-", DoesWrap = true })
 		local TpBox = Tabs.Farm:AddLeftGroupbox("Teleports", "map-pin")
@@ -33242,7 +33563,7 @@ do
 		QuestBox:AddToggle("AutoQuests", {
 			Text = "Auto Quests",
 			Default = false,
-			Tooltip = "Starts each one-time quest (gold and blocks) as team leader and rides it along with the farm run. Quests that need a build are cancelled and skipped. Needs Auto Farm Gold",
+			Tooltip = "Starts each one-time quest (gold and blocks) as team leader and rides it along with the farm run. Quests that need a build are cancelled and skipped. Needs Auto Farm Gold or the Smart Planner",
 		})
 		Labels.Quests = QuestBox:AddLabel({ Text = "-", DoesWrap = true })
 		local GroupBox = Tabs.Rewards:AddRightGroupbox("Gold Multiplier", "users")
@@ -33367,7 +33688,7 @@ do
 	N.StatRows.Time = statRow(ProgressBox, "clock", "Session", 22, "FontColor")
 	local RunStats = Tabs.Stats:AddRightGroupbox("Runs", "sailboat")
 	N.StatRows.Runs = statRow(RunStats, "flag", "Runs / per hour", 28)
-	N.StatRows.Full = statRow(RunStats, "check", "Credited / not credited", 22)
+	N.StatRows.Full = statRow(RunStats, "check", "Full / partial / unpaid", 22)
 	N.StatRows.PerRun = statRow(RunStats, "coins", "Gold per run (avg / last)", 22)
 	N.StatRows.RunTime = statRow(RunStats, "timer", "Run time (avg / last)", 22, "FontColor")
 	N.StatRows.Stages = statRow(RunStats, "layers", "Stages (avg / last)", 22)
@@ -33379,7 +33700,7 @@ do
 		return N.gold() - (Session.goldStart or N.gold())
 	end
 	function N.drawStats()
-		local elapsed = math.max(os.clock() - Session.started, 1)
+		local elapsed = math.max(os.clock() - Session.startedAt, 1)
 		local gold = N.gained()
 		local per = 3600 / elapsed
 		local runs = math.max(Session.runs, 1)
@@ -33388,7 +33709,7 @@ do
 		N.StatRows.Mult.set("x" .. tostring(N.multiplier()) .. (if N.inGroup() then " (group)" else ""))
 		N.StatRows.Time.set(string.format("%dh %02dm", elapsed // 3600, (elapsed % 3600) // 60))
 		N.StatRows.Runs.set(Session.runs .. "  \u{00B7}  " .. string.format("%.1f", Session.runs * per) .. "/h")
-		N.StatRows.Full.set(Session.fullRuns .. " / " .. Session.failedRuns)
+		N.StatRows.Full.set(Session.fullRuns .. " / " .. Session.partialRuns .. " / " .. Session.unpaidRuns)
 		N.StatRows.PerRun.set(formatNumber(math.floor(Session.runGold / runs)) .. " / " .. formatNumber(Session.lastGold))
 		N.StatRows.RunTime.set(string.format("%.0fs / %.0fs", Session.runSeconds / runs, Session.lastSeconds))
 		N.StatRows.Stages.set(string.format("%.1f / %d", Session.stages / runs, Session.lastStages))
@@ -33427,7 +33748,7 @@ do
 		return running
 	end
 	function Debug.header()
-		local elapsed = math.floor(os.clock() - Session.started)
+		local elapsed = math.floor(os.clock() - Session.startedAt)
 		local executor = "?"
 		pcall(function()
 			executor = table.concat({ identifyexecutor() }, " ")
@@ -33436,12 +33757,13 @@ do
 			"Corvus debug log  |  " .. GameName,
 			string.format("Player %s (@%s)  |  executor %s  |  place %s v%s  |  %s", LocalPlayer.DisplayName, LocalPlayer.Name, executor, tostring(game.PlaceId), N.placeVersion(), os.date("%Y-%m-%d %H:%M:%S")),
 			string.format(
-				"Session %dh %02dm  |  runs %d (credited %d, not %d)  |  gold +%d (%s/h)  |  avg %.0f gold, %.0fs per run  |  claims %d  |  codes %d  |  chests %d (spent %d)  |  resets %d  |  fallbacks %d",
+				"Session %dh %02dm  |  runs %d (full %d, partial %d, unpaid %d)  |  gold +%d (%s/h)  |  avg %.0f gold, %.0fs per run  |  claims %d  |  codes %d  |  chests %d (spent %d)  |  resets %d  |  fallbacks %d",
 				elapsed // 3600,
 				(elapsed % 3600) // 60,
 				Session.runs,
 				Session.fullRuns,
-				Session.failedRuns,
+				Session.partialRuns,
+				Session.unpaidRuns,
 				N.gained(),
 				formatNumber(N.goldPerHour()),
 				Session.runGold / math.max(Session.runs, 1),
@@ -33457,7 +33779,7 @@ do
 			"Running: " .. table.concat(Debug.running(), ", "),
 			string.format("Game: gold %s, multiplier x%s, players %d, probes instant=%s double_claim=%s claimEarly=%s, quests %d, discoveries %d, hops %d", formatNumber(N.gold()), tostring(N.multiplier()), N.playerCount(), tostring(N.probe("instant_route") or "untested"), tostring(N.probe("double_claim") or "untested"), tostring(N.probe("claimEarly") or "untested"), Session.quests, Session.discoveries, Session.hops),
 			"Perf: " .. Debug.perfText(),
-			"Plan: " .. (if N.Plan.say ~= "" then N.Plan.say else "-") .. " | " .. (if N.Plan.routeText ~= "" then N.Plan.routeText else "-"),
+			"Plan: " .. (if N.planner() and N.Plan.say ~= "" then N.Plan.say else "planner off") .. " | " .. (if N.Plan.routeText ~= "" then N.Plan.routeText else "-") .. (if N.Run.creditSeconds then string.format(" | stage credit ~%.1fs", N.Run.creditSeconds) else "") .. (if N.Run.endSeconds then string.format(" | End after ~%.1fs", N.Run.endSeconds) else ""),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
 			string.rep("-", 70),
 		}
@@ -33604,7 +33926,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		return Toggles.WebhookOn and Toggles.WebhookOn.Value
 	end
 		local function reportEmbed(title)
-			local elapsed = math.max(os.clock() - Session.started, 60)
+			local elapsed = math.max(os.clock() - Session.startedAt, 60)
 			local gold = N.gained()
 			return {
 				title = title,
@@ -33957,7 +34279,7 @@ do
 						{ Id = "farm", Title = "Farm gold", Description = "Flies the 10 cave stages to the treasure chest, run after run", Icon = "coins", Color = "#fab428" },
 						{ Id = "claim", Title = "Claim results", Description = "Collects the river results after every run", Icon = "check", Color = "#3ccf91" },
 						{ Id = "codes", Title = "Redeem codes", Description = "Every known code once on this account", Icon = "ticket", Color = "#7fd9bf" },
-						{ Id = "planner", Title = "Smart Planner", Description = "Best measured movement, shorter chest wait, no wasted gold", Icon = "brain", Color = "#5fb8ff" },
+						{ Id = "planner", Title = "Smart Planner", Description = "Autopilot: full runs in the best measured movement, claims, codes, quests, no wasted gold", Icon = "brain", Color = "#5fb8ff" },
 					},
 				},
 			},
@@ -34197,7 +34519,7 @@ do
 			end
 		end)
 	end
-	-- Farm loop: the only code that moves the character.
+	-- Farm loop: the only code that moves the character. Auto Farm Gold or the Smart Planner (the autopilot) drive it.
 	loop("farm", function()
 		if Session.goldStart == nil then
 			Session.goldStart = N.gold()
@@ -34206,7 +34528,7 @@ do
 			task.wait(0.3)
 			return
 		end
-		if on("AutoFarm") then
+		if N.wants("AutoFarm") then
 			if not N.alive() then
 				setStatus("Waiting for the character")
 				task.wait(0.5)
@@ -34214,15 +34536,30 @@ do
 			end
 			N.farmStep()
 		else
+			N.settleStep()
 			N.claimStep()
-			if anyAutoOn() then
-				setStatus(if on("AutoClaim") then "Waiting for river results to claim" else "Working on the other toggles")
-			else
-				setStatus("Idle")
+			local chores = {}
+			if on("AutoClaim") then
+				table.insert(chores, "claim the river results")
 			end
+			if on("AutoCodes") then
+				table.insert(chores, "redeem codes")
+			end
+			if on("AutoChests") then
+				table.insert(chores, "buy chests")
+			end
+			if on("AutoQuests") or on("AutoDiscoverHop") then
+				table.insert(chores, "quests and discovery hops (they need Auto Farm Gold or the Smart Planner)")
+			end
+			setStatus(if #chores > 0 then "Farm off: " .. table.concat(chores, ", ") else "Idle")
 			task.wait(0.5)
 		end
 		task.wait(0.05)
+	end)
+	-- The claim's gold lands late (up to 15 s): settled here while the next run already flies.
+	loop("settle", function()
+		N.settleStep()
+		task.wait(0.25)
 	end)
 	-- Remote-only chores: codes, chests, anti AFK. They never move the character.
 	loop("chores", function()
@@ -34245,11 +34582,10 @@ do
 		end
 		task.wait(1)
 	end)
-	-- Smart Planner: decides and logs PLAN only while its toggle is on.
+	-- Smart Planner: the autopilot's decisions (mode by measured gold per hour, PLAN lines) only while its toggle is on;
+	-- the runs themselves go through the farm loop above (N.wants).
 	loop("planner", function()
-		if N.planner() then
-			N.planTick()
-		end
+		N.planTick()
 		task.wait(1)
 	end)
 	N.InfoText = {}
@@ -34272,7 +34608,7 @@ do
 				local upNext = N.upNext()
 				I.plan = if #upNext > 0 then "<b>Up next</b>\n" .. '<font transparency="0.2">\u{2022} ' .. table.concat(upNext, "\n\u{2022} ") .. "</font>" else "Up next: nothing running"
 				I.lines = string.format(
-					"Runs <b>%d</b> (%d credited)  \u{00B7}  avg %s gold in %.0fs\nLast: %s",
+					"Runs <b>%d</b> (%d full)  \u{00B7}  avg %s gold in %.0fs\nLast: %s",
 					Session.runs,
 					Session.fullRuns,
 					formatNumber(math.floor(Session.runGold / math.max(Session.runs, 1))),
@@ -34288,8 +34624,8 @@ do
 					if #N.Run.history > 0 then table.concat(N.Run.history, "\n") else "No run yet"
 				)
 				I.planner = if N.planner()
-					then string.format("<b>On</b>\n%s\n%s\n%s", if N.Plan.say ~= "" then N.Plan.say else "Measuring...", if N.Plan.routeText ~= "" then N.Plan.routeText else "-", if N.Plan.groupText ~= "" then N.Plan.groupText else "-")
-					else "Off. Turn it on to let Corvus pick the movement with the best measured gold per hour and shorten the chest wait. Your other toggles stay as they are"
+					then string.format("<b>On: autopilot</b>\n%s\n%s\n%s", if N.Plan.say ~= "" then N.Plan.say else "Measuring the first run...", if N.Plan.routeText ~= "" then N.Plan.routeText else "-", if N.Plan.groupText ~= "" then N.Plan.groupText else "-")
+					else "Off. Turn it on and Corvus plays the gold loop by itself: full 10-stage runs in the movement with the best measured gold per hour (re-measured every hour), claims, codes, one-time quests and discovery hops when they pay. Your other toggles stay as they are"
 				local okCodes, doneCodes = N.codeCounts()
 				I.codes = string.format("Redeemed <b>%d</b>, invalid or used %d\nLast: %s", okCodes, doneCodes, N.Codes.last)
 				I.group = string.format("Gold multiplier <b>x%s</b>%s\n%s", tostring(N.multiplier()), if N.inGroup() then " (group bonus on)" else "", if N.inGroup() then "Nothing to do" else "Join the Chillz Studios group for x1.25 gold every run. " .. N.Group.last)
