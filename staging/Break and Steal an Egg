@@ -35674,8 +35674,14 @@ do
 		return false
 	end
 	function N.rewardStep()
-		if on("AutoIndex") and due("index", 60) then
-			fire("IndexRemote", "ClaimAll", nil)
+		if on("AutoIndex") then
+			if due("index", 600) then
+				fire("IndexRemote", "ClaimAll", nil)
+				RewardAt.indexLogged = nil
+			elseif not RewardAt.indexLogged then
+				RewardAt.indexLogged = true
+				log("INDEX claim skipped reason=cooldown")
+			end
 		end
 		if on("AutoOffline") and due("offline", 300) then
 			fire("OfflineRewardRemote", "Claim")
