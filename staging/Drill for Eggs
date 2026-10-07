@@ -20183,8 +20183,8 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         Library.MinSize = Vector2.new(math.min(WindowInfo.MinContainerWidth, MaxX), Library.OriginalMinSize.Y)
     
         WindowInfo.Size = UDim2.fromOffset(
-            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, MaxX),
-            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, MaxY)
+            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, math.max(Library.MinSize.X, MaxX)),
+            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, math.max(Library.MinSize.Y, MaxY))
         )
         Library.MobileWindowSize = Vector2.new(WindowInfo.Size.X.Offset, WindowInfo.Size.Y.Offset)
         if typeof(WindowInfo.Font) == "EnumItem" then
@@ -32290,12 +32290,15 @@ do
 	end
 	-- Seconds of drilling for one gate: ceil(HP / Power) hits, one every 0.15 s (the client counts the GUI HP). With the
 	-- Wall Skip probe accepted a gate costs one call.
+	N.GateLB, N.GateFail = {}, {}
 	function N.drillSeconds(name, power)
 		if on("WallProbe") and N.probeGet and N.probeGet("wall_skip") == "accepted" and N.floor(name) then
 			return 0.2
 		end
 		power = math.max(1, math.floor(power or N.power()))
 		local hp = N.wallHP(name)
+		-- A failed drill proves the real HP is above power x hits done (N.GateLB), so the estimate never stays below it.
+		hp = math.max(hp, N.GateLB[name] or 0)
 		if hp == math.huge then
 			return math.huge
 		end
@@ -32304,13 +32307,32 @@ do
 	-- Total drilling down to a zone (every gate above it and its own gate).
 	function N.drillTimeTo(zone, power)
 		local total = 0
+		local broken = N.broken()
 		for _, name in ipairs(N.zoneOrder()) do
-			total += N.drillSeconds(name, power)
+			if not broken[name] then
+				total += N.drillSeconds(name, power)
+			end
 			if name == zone then
 				return total
 			end
 		end
 		return math.huge
+	end
+	-- A gate that stayed shut at Power P is not tried again before Power is 2x higher (training decides, not hope).
+	-- Returns the blocking gate name and its failed Power, or nil.
+	function N.zoneBlocked(zone, power)
+		power = power or N.power()
+		local broken = N.broken()
+		for _, name in ipairs(N.zoneOrder()) do
+			local fail = N.GateFail[name]
+			if fail and not broken[name] and power < fail * 2 then
+				return name, fail
+			end
+			if name == zone then
+				break
+			end
+		end
+		return nil
 	end
 	function N.broken()
 		local set = {}
@@ -32862,7 +32884,7 @@ do
 		local best
 		for _, name in ipairs(order) do
 			local f = N.floor(name)
-			if not f then
+			if not f or N.zoneBlocked(name, power) then
 				break
 			end
 			if N.drillTimeTo(name, power) <= limit then
@@ -32914,21 +32936,30 @@ do
 				end
 				N.Run.phase = "drill " .. name
 				setStatus("Drilling the " .. name .. " gate (" .. N.longTime(N.drillSeconds(name)) .. ")")
+				local waited = 0
 				if not tryWallSkip(name, spot) then
 					if not N.moveTo(spot, 3) then
 						return false
 					end
-					local deadline = os.clock() + N.drillSeconds(name) * 1.5 + 8
+					local t0 = os.clock()
+					local deadline = t0 + math.min(N.drillSeconds(name) * 1.5 + 8, 45)
 					while not N.broken()[name] and os.clock() < deadline and alive() and N.alive() do
 						N.holdAt(spot)
 						task.wait(0.15)
 					end
+					waited = os.clock() - t0
 				end
 				if not N.broken()[name] then
-					log("RUN gate not broken", name, "power", formatNumber(N.power()), "hp", formatNumber(N.wallHP(name)))
+					-- Learn from it: the gate is skipped until Power is 2x higher and its HP estimate rises.
+					local power = math.max(1, math.floor(N.power()))
+					N.GateFail[name] = power
+					N.GateLB[name] = math.max(N.GateLB[name] or 0, power * math.floor(waited / 0.15))
+					local pos, spot2 = N.myPos(), N.gateSpot(name)
+					log("RUN gate not broken", name, "power", formatNumber(power), "hp", formatNumber(N.wallHP(name)), "waited", math.floor(waited) .. "s", "dist", pos and spot2 and math.floor((pos - spot2).Magnitude) or "?", "zone", tostring(N.inTrainingZone()), "retry at power", formatNumber(power * 2))
 					return false
 				end
 				Session.walls += 1
+				N.GateFail[name] = nil
 			end
 			if name == zone then
 				return true
@@ -33432,18 +33463,31 @@ do
 	N.Buy = { last = "", npc = {} }
 	-- Buys with a fallback: from where the player is, then next to the shop NPC when the server ignored it.
 	local function shopBuy(kind, stand, npc, fire, done)
-		if N.Buy.npc[kind] then
+		-- Action ladder (SPEED_PLAN): the remote from here, then a 30-stud hop next to the shop NPC, then a tween there.
+		local function atShop(hop)
 			local spot = N.shopSpot(stand, npc)
-			if spot and not N.moveTo(spot, 6) then
+			if not spot then
 				return false
 			end
+			local reached = if hop then N.hopTo(spot, 6) else N.moveTo(spot, 6)
+			if not reached then
+				return false
+			end
+			fire()
+			return waitFor(done, 4)
 		end
-		fire()
-		local ok = waitFor(done, 3)
-		if not ok and not N.Buy.npc[kind] then
-			N.Buy.npc[kind] = true
-			log("BUY " .. kind .. " needs the shop, walking there next time")
-		end
+		local ok = N.Act("buy_" .. kind, {
+			{ "remote", function()
+				fire()
+				return waitFor(done, 4)
+			end },
+			{ "hop", function()
+				return atShop(true)
+			end },
+			{ "tween", function()
+				return atShop(false)
+			end },
+		})
 		return ok
 	end
 	function N.buyDrill(id, def)
@@ -33885,8 +33929,18 @@ do
 			if not N.floor(zone) then
 				break
 			end
+			local blocker, failPower = N.zoneBlocked(zone, power)
+			if blocker then
+				bestWhy = string.format("skip run %s: gate %s stayed shut at Power %s, training to %s first", zone, blocker, formatNumber(failPower), formatNumber(failPower * 2))
+				break
+			end
 			local drill = N.drillTimeTo(zone, power)
-			if drill > 300 then
+			-- Training is far faster than hitting a gate with little Power: a gate that needs more than 90 s of drilling
+			-- (gate HP / (Power x 0.15 s per hit)) is skipped, the planner trains until it opens in time.
+			if drill > 90 then
+				if not best then
+					bestWhy = string.format("skip run %s: gate hp %s > Power %s x 90 s of hits, training first", zone, formatNumber(N.wallHP(zone)), formatNumber(power))
+				end
 				break
 			end
 			local values = {}
@@ -33925,7 +33979,7 @@ do
 			local slotGain = drillSlotGain(id)
 			local slotPays = slotGain > 0 and def.Price / slotGain <= horizon()
 			if slotPays or def.Price <= income * 7200 or not bestUp or bestUp.payback > 3600 then
-				return { kind = "drill", id = id, def = def, price = def.Price, say = string.format("%s for $%s (x%.1f Power)", def.Name, formatNumber(def.Price), ratio) }
+				return { kind = "drill", id = id, def = def, price = def.Price, say = string.format("%s for $%s (x%.1f Power per training tick)", def.Name, formatNumber(def.Price), ratio) }
 			end
 		end
 		-- Carry: one more egg every run; first when it costs at most 30 min of farm income.
@@ -34023,6 +34077,10 @@ do
 		local rebirthWorth, rebirthSay = N.planRebirth()
 		N.Plan.rebirthSay = rebirthSay
 		local mode = N.planMode()
+		if not zone and string.sub(tostring(why), 1, 8) == "skip run" and why ~= N.Plan.skipLogged then
+			N.Plan.skipLogged = why
+			log("PLAN " .. why)
+		end
 		local doing
 		if mode == "run" then
 			doing = "run " .. tostring(why)
