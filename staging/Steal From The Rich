@@ -31809,11 +31809,7 @@ local parts = table.pack(...)
 for i = 1, parts.n do
 parts[i] = tostring(parts[i])
 end
-local stamp = ""
-pcall(function()
-stamp = os.date("%H:%M:%S")
-end)
-local line = string.format("[%s +%7.1fs] %s", stamp, os.clock() - Log.start, table.concat(parts, " ", 1, parts.n))
+local line = string.format("[%8.2f] %s", os.clock() - Log.start, table.concat(parts, " ", 1, parts.n))
 if parts[1] == "PROBLEM" or parts[1] == "ERROR" then
 Log.problemCount += 1
 local short = string.sub(table.concat(parts, " ", 1, parts.n), 1, 120)
@@ -33542,6 +33538,9 @@ local failures, pulls = 0, 0
 local started = os.clock()
 local root0 = rootPart()
 local hum0 = humanoid()
+if hum0 and not options.toTreadmill and not options.precise then
+arrive = math.max(arrive, math.min(hum0.WalkSpeed * 0.12, 14))
+end
 local limit = options.timeout
 or ((root0 and flat(root0.Position, target) or 200) / math.max(hum0 and hum0.WalkSpeed or 16, 10) * 3 + 25)
 while alive() and os.clock() - started < limit do
@@ -33585,6 +33584,7 @@ elseif result == "stopped" then
 return false
 elseif result == "pulled" then
 pulls += 1
+logEvery("navpulled", 10, "NAV pulled", pulls, "goal", string.format("%.0f,%.0f", target.X, target.Z))
 waitStanding(3)
 if pulls >= 6 then
 return false
@@ -33592,8 +33592,19 @@ end
 else
 failures += 1
 local here = rootPart()
+logEvery("navstuck", 5, "NAV stuck", "failures", failures, "at", here and string.format("%.0f,%.0f", here.Position.X, here.Position.Z) or "?", "goal", string.format("%.0f,%.0f", target.X, target.Z))
 if here and stuckAt then
 Nav.learn(here.Position, stuckAt)
+local h2 = humanoid()
+if h2 and not options.toTreadmill then
+local dir = Vector3.new(stuckAt.X - here.Position.X, 0, stuckAt.Z - here.Position.Z)
+if dir.Magnitude > 0.1 then
+local side = Vector3.new(-dir.Z, 0, dir.X).Unit * (if failures % 2 == 0 then 6 else -6)
+h2.Jump = true
+h2:MoveTo(here.Position + side)
+task.wait(0.35)
+end
+end
 end
 if failures >= 8 then
 return false
@@ -36629,7 +36640,7 @@ end
 end
 local best = Plan.best
 Sched.info = string.format(
-"time=%s | steal now %s $%s/s | speed +%s/s on treadmill | cash $%s/s | trip calib x%.2f | H=%dh",
+"time=%s | steal now %s value %s/trip-s | speed +%s/s on treadmill | cash $%s/s | trip calib x%.2f | H=%dh",
 why,
 Plan.time.zone,
 formatNumber(nowRate),
@@ -36644,7 +36655,7 @@ Sched.info ..= " | admin " .. adminText
 end
 local text = string.format(
 "best=%s gain/$=%s eta=%s alt=%s | %s",
-if best then best.kind .. ":" .. best.name .. " $" .. formatNumber(best.cost) else "none (save cash)",
+if best then best.kind .. ":" .. best.name .. " $" .. formatNumber(best.cost) else "none, stealing " .. tostring(Plan.time and Plan.time.zone or "?"),
 if best then string.format("%.3g", best.ratio) else "-",
 if best then math.floor(best.eta) .. "s" else "-",
 if #alt > 0 then table.concat(alt, ", ") else "none",
@@ -36661,7 +36672,7 @@ logEvery("plan", 120, "PLAN", text)
 end
 local zones = {}
 for id, zone in pairs(V.zones) do
-table.insert(zones, string.format("%s $%s/s trip %.0fs n%d loss %.0f%%", id, formatNumber((zone.rate or 0) * (1 - Plan.guardLoss(id))), zone.dist / V.walk(level), zone.n, Plan.guardLoss(id) * 100))
+table.insert(zones, string.format("%s value %s/trip-s trip %.0fs n%d loss %.0f%%", id, formatNumber((zone.rate or 0) * (1 - Plan.guardLoss(id))), zone.dist / V.walk(level), zone.n, Plan.guardLoss(id) * 100))
 end
 if #zones > 0 and Plan.planning() then
 table.sort(zones)
@@ -39186,7 +39197,7 @@ end
 return count
 end)()
 )
-add("best buy: " .. (if Plan.target then string.format("%s %s for $%s (gain/$ %.3g, eta %ds)", Plan.target.kind, Plan.target.name, formatNumber(Plan.target.cost), Plan.target.ratio, math.floor(Plan.target.eta)) else "none, saving"))
+add("best buy: " .. (if Plan.target then string.format("%s %s for $%s (gain/$ %.3g, eta %ds)", Plan.target.kind, Plan.target.name, formatNumber(Plan.target.cost), Plan.target.ratio, math.floor(Plan.target.eta)) else "none, stealing " .. tostring(Plan.time and Plan.time.zone or "?")))
 add("schedule: " .. Sched.info .. " | now " .. (if Sched.training then "training" else "stealing"))
 add("storm: " .. (if stormActive() then "ON" else "off") .. " | storm points " .. formatNumber(tonumber(LocalPlayer:GetAttribute("StormPoints")) or 0))
 add("admin: " .. (if Admin.describe() ~= "" then Admin.describe() else "none") .. " | event game " .. tostring(on("AutoEventGame")) .. " | hop " .. tostring(on("EventHop")) .. " | phrases " .. tostring(on("AutoAdminPhrases")))
