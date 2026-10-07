@@ -37924,11 +37924,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		local UtilBox = holder:AddRightGroupbox("Utility", "wrench")
 		UtilBox:AddToggle("SpeedHack", { Text = "Walk Speed", Default = false })
 		UtilBox:AddSlider("WalkSpeed", { Text = "Speed", Default = 50, Min = 16, Max = 200, Rounding = 0 })
-		UtilBox:AddToggle("AfkGuard", {
-			Text = "Stop AFK Rejoin",
-			Default = true,
-			Tooltip = "The game moves you to a new server after 19 minutes without input (AfkRejoinController). While Corvus farms, a tiny mouse nudge every 2 minutes counts as input",
-		})
 	end)
 	-- Live stats card: one Discord message (POST ?wait=true gives its id) edited in place every 2 minutes.
 	local Card = { id = nil, at = -1e9, url = nil }
@@ -38545,18 +38540,6 @@ do
 				N.openInventoryEggs()
 			end
 			N.codeStep()
-		end
-		-- AFK: the game's AfkRejoinController asks the server for a new server after 19 min without input. A mouse move
-		-- through VirtualInputManager is input for the game and for Roblox's idle timer.
-		if on("AfkGuard") and anyAutoOn() and choreDue("afk", 120) then
-			pcall(function()
-				local vim = game:GetService("VirtualInputManager")
-				local camera = workspace.CurrentCamera
-				local size = camera and camera.ViewportSize or Vector2.new(800, 600)
-				vim:SendMouseMoveEvent(size.X / 2 + 1, size.Y / 2, game)
-				task.wait(0.05)
-				vim:SendMouseMoveEvent(size.X / 2, size.Y / 2, game)
-			end)
 		end
 		if on("SpeedHack") then
 			local hum = N.humanoid()
