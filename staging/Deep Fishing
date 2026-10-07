@@ -34011,6 +34011,16 @@ do
 			N.pauseFishing("switching to Blatant")
 			F.paused = false
 		end
+		-- The game's own auto fishing (saved ON in the profile, or left on by an earlier Legit/fallback phase) casts with the
+		-- full catch animation next to ours: switch it off once, found even when the hub never patched it.
+		if not F.afOffChecked then
+			F.afOffChecked = true
+			local AF = findAutoFishing()
+			if AF and AF.On then
+				pcall(AF.SetOn, AF, false)
+				log("FISH game auto fishing was on, switched off (Blatant casts by itself, no catch animation)")
+			end
+		end
 		F.engine = "remote-blatant"
 		setStatus("Fishing: best fish of every school, instant reel")
 		N.castOnce(true)
@@ -36034,8 +36044,18 @@ do
 			Default = false,
 			Tooltip = "Autopilot: plays the whole game by itself, even with every other toggle off. Fishes (Mode and Perfect Rate from Auto Fish), sells by the Smart Sell rules and protect lists when the backpack needs it or a purchase waits, buys upgrades, rods, bait, the next world, the pond and offline net levels in the order of the fastest payback (price / extra coins per second, within 24 h); with Tutorial hold on it also decides whether holding the tutorial still beats finishing it, visits the pond, claims rewards and codes, feeds the Big Mouth, opens chests, uses potions, relics and scrolls. Saving for something = fishing meanwhile. Your other toggles stay as you set them",
 			Callback = function(v)
-				if not v and not on("AutoFish") then
-					N.fishOff()
+				-- Off must be visible at once: the loops stop at their next check, so Status / Up next say so now (a cast in
+				-- flight still finishes its claim) instead of showing the old action for up to a cast length.
+				if not v then
+					N.plannerOffAt = os.clock()
+					if N.InfoText then
+						N.InfoText.planner = "Smart Planner is off"
+						N.InfoText.plan = "Smart Planner is off"
+					end
+					setStatus(if N.Fish and N.Fish.cast then "Smart Planner off, finishing the cast in flight" else "Smart Planner off")
+					if not on("AutoFish") then
+						N.fishOff()
+					end
 				end
 			end,
 		})
