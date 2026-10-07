@@ -36432,12 +36432,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		local holder = Tabs.Misc or Tabs.Main
 		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
 		Labels.Perf = PerfBox:AddLabel({ Text = "Measuring...", DoesWrap = true })
-		local UtilBox = holder:AddRightGroupbox("Utility", "wrench")
-		UtilBox:AddToggle("AfkGuard", {
-			Text = "Stop AFK Rejoin",
-			Default = true,
-			Tooltip = "The game moves you to a new server after 15 minutes without input (AfkRejoin). While Corvus farms, a tiny mouse nudge every minute counts as input",
-		})
 	end)
 	-- Live stats card: one Discord message (POST ?wait=true gives its id) edited in place every 2 minutes.
 	local Card = { id = nil, at = -1e9, url = nil }
@@ -37006,29 +37000,7 @@ do
 			N.spendStep()
 		end
 		N.rewardStep()
-		-- AFK: the game asks the server for a rejoin after 900 s without input (AfkRejoin, InputChanged resets it).
-		if on("AfkGuard") and any and choreDue("afk", 60) then
-			pcall(function()
-				local vim = game:GetService("VirtualInputManager")
-				local camera = workspace.CurrentCamera
-				local size = camera and camera.ViewportSize or Vector2.new(800, 600)
-				vim:SendMouseMoveEvent(size.X / 2 + 1, size.Y / 2, game)
-				task.wait(0.05)
-				vim:SendMouseMoveEvent(size.X / 2, size.Y / 2, game)
-			end)
-		end
 		task.wait(1)
-	end)
-	pcall(function()
-		Library:GiveSignal(LocalPlayer.Idled:Connect(function()
-			if on("AfkGuard") and anyAutoOn() then
-				pcall(function()
-					local vu = game:GetService("VirtualUser")
-					vu:CaptureController()
-					vu:ClickButton2(Vector2.new())
-				end)
-			end
-		end))
 	end)
 	-- Smart Planner: its own loop, decides and logs PLAN only while the toggle is on.
 	loop("planner", function()
