@@ -33604,7 +33604,7 @@ do
 	end
 
 	-- ===== Eggs on the beds (Workspace.Zones.<Zone>.EggBeds.EggBed_*.<egg model> with EggPrompt) =====
-	N.Steal = { skip = {}, last = "", claimedAt = nil, toll = nil, bigEggs = {}, luck = {} }
+	N.Steal = { skip = {}, zoneBlock = {}, zoneFails = {}, commit = nil, lastTarget = nil, last = "", claimedAt = nil, toll = nil, bigEggs = {}, luck = {} }
 	function N.eggPrompt(model)
 		local prompt = model:FindFirstChild("EggPrompt", true)
 		if prompt and prompt:IsA("ProximityPrompt") and prompt.Enabled ~= false then
@@ -33687,22 +33687,62 @@ do
 		if pin and egg.zone.n ~= pin and not (egg.big and N.does("BigEggSniper")) then
 			return false
 		end
+		if (N.Steal.zoneBlock[egg.zone.n] or 0) > os.clock() then
+			return false
+		end
 		return (N.Steal.skip[egg.model] or 0) < os.clock()
+	end
+	-- A failed run (egg not carried / not reachable) blocks the whole zone for a growing time (30 s, 60 s ... 300 s), so the
+	-- hub does not hop to a sibling egg or to the other side of the map and back (ping-pong). A success resets it.
+	function N.stealFailed(egg, why)
+		local n = egg.zone.n
+		local fails = (N.Steal.zoneFails[n] or 0) + 1
+		N.Steal.zoneFails[n] = fails
+		local block = math.min(30 * 2 ^ (fails - 1), 300)
+		N.Steal.skip[egg.model] = os.clock() + block
+		N.Steal.zoneBlock[n] = os.clock() + block
+		N.Steal.commit = nil
+		log("TARGET drop zone", n, "why", why, "block", math.floor(block) .. "s", "fails", fails)
 	end
 	function N.pickTarget()
 		local floor, free = N.penFloor()
 		local found = N.foundSet()
 		local best, bestScore, bestInfo
+		local keep, keepScore, keepInfo
+		local commit = N.Steal.commit
+		if commit and (commit.at + 90 < os.clock() or not commit.model.Parent) then
+			commit = nil
+			N.Steal.commit = nil
+		end
 		for _, egg in ipairs(N.bedEggs()) do
 			if N.canSteal(egg) then
 				local score, gain, value, newIndex, t = N.eggWorth(egg, floor, found)
 				if gain > 0 or newIndex or (egg.big and N.does("BigEggSniper")) then
+					local info = { gain = gain, value = value, newIndex = newIndex, time = t, floor = floor, free = free }
+					if commit and egg.model == commit.model then
+						keep, keepScore, keepInfo = egg, score, info
+					end
 					if not bestScore or score > bestScore then
-						best, bestScore = egg, score
-						bestInfo = { gain = gain, value = value, newIndex = newIndex, time = t, floor = floor, free = free }
+						best, bestScore, bestInfo = egg, score, info
 					end
 				end
 			end
+		end
+		-- Hysteresis: stay with the committed egg unless the new best scores 1.5x higher or the old one is invalid.
+		local kept = false
+		if keep and best and best ~= keep and bestScore < keepScore * 1.5 then
+			best, bestScore, bestInfo = keep, keepScore, keepInfo
+			kept = true
+		end
+		if best then
+			local id = tostring(best.model)
+			if N.Steal.lastTarget ~= id then
+				log("TARGET " .. (if kept then "keep" else "switch"), "from", tostring(N.Steal.lastLabel or "-"), "to", tostring(best.label), "zone", best.zone.n, "why", (if bestInfo.newIndex then "new index" elseif best.big then "big egg" else "+" .. formatNumber(bestInfo.gain) .. "/s"))
+				N.Steal.lastTarget = id
+				N.Steal.lastLabel = best.label
+			end
+		else
+			N.Steal.lastTarget = nil
 		end
 		-- Nothing beats the pen: with Smart Sell on and a measured sale ratio, an egg is still worth a run when its
 		-- sale cash per second of the run beats half of the pen income (the animal is sold as a spare).
@@ -33788,6 +33828,7 @@ do
 		end
 		N.wsBegin()
 		N.Steal.outcome = nil
+		N.Steal.commit = { model = egg.model, label = egg.label, at = os.clock() }
 		local ok, result = pcall(N.stealRun, egg, info or {})
 		N.wsEnd(N.Steal.outcome)
 		N.tagEnd(N.Steal.outcome or "failed")
@@ -33807,7 +33848,7 @@ do
 		local range = tonumber(egg.prompt.MaxActivationDistance) or 10
 		local near = math.max(range - 3, 3)
 		if not N.goTo(egg.pos, near, "egg " .. tostring(egg.label), N.probeTick) then
-			N.Steal.skip[egg.model] = os.clock() + 30
+			N.stealFailed(egg, "unreachable")
 			Session.stealFails += 1
 			return false
 		end
@@ -33830,13 +33871,15 @@ do
 		N.promptReacted(took)
 		if not N.carrying() and instant() then
 			N.Steal.outcome = "claimed"
+			N.Steal.zoneFails[egg.zone.n] = nil
+			N.Steal.commit = nil
 			Session.steals += 1
 			N.Steal.last = string.format("%s (%s), claimed at once", tostring(egg.label), egg.loose and "loose egg" or "home side")
 			log("STEAL claimed", egg.label, "zone", egg.zone.n, "at once")
 			return true
 		end
 		if not N.carrying() then
-			N.Steal.skip[egg.model] = os.clock() + 30
+			N.stealFailed(egg, "no carry")
 			Session.stealFails += 1
 			log("STEAL no carry", egg.label, "zone", egg.zone.n, if N.Steal.toll then "(speed toll)" else "")
 			return false
@@ -33853,6 +33896,8 @@ do
 		Session.stealSeconds += took2
 		if claimed then
 			N.Steal.outcome = "claimed"
+			N.Steal.zoneFails[egg.zone.n] = nil
+			N.Steal.commit = nil
 			Session.steals += 1
 			N.Steal.last = string.format("%s from zone %d (%s), %ds%s", tostring(egg.label), egg.zone.n, why, math.floor(took2), if via ~= "walk" then ", " .. via else "")
 			log("STEAL claimed", egg.label, "zone", egg.zone.n, "in", math.floor(took2) .. "s", if via ~= "walk" then "via " .. via else "")
@@ -35629,7 +35674,18 @@ do
 		end
 		local egg, info = N.pickTarget()
 		if not egg then
-			return nil, "no egg beats your pen right now"
+			local left, zn = 0, nil
+			for n, untilAt in pairs(N.Steal.zoneBlock) do
+				if untilAt - os.clock() > left then
+					left, zn = untilAt - os.clock(), n
+				end
+			end
+			local why = if zn then string.format("waiting for a better egg: zone %d failed, retry in %ds", zn, math.ceil(left)) else "no egg beats your pen right now"
+			if N.Steal.lastWait ~= why and (not zn or N.Steal.lastWaitAt == nil or os.clock() - N.Steal.lastWaitAt > 30) then
+				N.Steal.lastWait, N.Steal.lastWaitAt = why, os.clock()
+				log("WAIT reason=" .. why)
+			end
+			return nil, why
 		end
 		if not N.planner() or info.newIndex or (egg.big and N.does("BigEggSniper")) then
 			return egg, info
