@@ -33232,6 +33232,14 @@ function N.roadTarget(p)
 	local here = N.roadCentre(p)
 	-- look further ahead the faster the car goes (about 0.6 s of travel, 30 to 120 studs)
 	local lead = math.clamp((N.Drive.speed or 0) * 0.6, 30, 120)
+	-- RunConfig.RoadCentre projects on the NEAREST stage zone (by X only): from the lobby launch lane it points at a zone
+	-- line 75 studs to the side (live 12:20: car turned from +X to -Z into the lobby wall, 17 studs every run). Off the
+	-- road (more than 20 studs from that centre line) the car keeps the launch lane straight along the distance axis.
+	local off = Vector3.new(here.X - p.X, 0, here.Z - p.Z).Magnitude
+	if off > 20 then
+		local ahead = p + fwd * lead
+		return Vector3.new(ahead.X, p.Y, N.Drive.laneZ or p.Z), fwd, Vector3.new(-fwd.Z, 0, fwd.X), p
+	end
 	local ahead = N.roadCentre(p + fwd * lead)
 	local dir = Vector3.new(ahead.X - here.X, 0, ahead.Z - here.Z)
 	dir = if dir.Magnitude > 1 then dir.Unit else fwd
@@ -33506,6 +33514,7 @@ function N.driveRun()
 	local reason = "?"
 	local hp = 100
 	D.car, D.active, D.abort, D.mode, D.offset = car, true, nil, "road", 0
+	D.laneZ = part.Position.Z
 	D.cap = N.speedCap(car)
 	do
 		local look = part.CFrame.LookVector
@@ -33665,9 +33674,46 @@ function N.driveRun()
 	if N.Events.run then
 		pcall(N.Events.run, studs, cash)
 	end
+	N.afterRun(studs, reason)
 	return true
 end
--- ===== Rolls and Smart Buy =====
+-- Safeguard: two runs in a row stuck under 30 studs right after a build change = the last placed part blocks the car
+-- (overlap with the ground or the lane): take it off again (a swap puts the old part back), block that part for 1 h and
+-- log BUILD revert. Three short stuck runs in a row with nothing left to revert = runs pay nothing: the planner rolls and
+-- builds for 5 min instead (N.Drive.blockedUntil).
+function N.afterRun(studs, reason)
+	local D = N.Drive
+	local S = N.BuildState
+	if reason == "stuck" and studs < 30 then
+		D.shortStuck = (D.shortStuck or 0) + 1
+	elseif studs >= 100 then
+		D.shortStuck = 0
+		S.history = {}
+	end
+	if (D.shortStuck or 0) < 2 then
+		return
+	end
+	local last = S.history and table.remove(S.history)
+	if last and not N.myCar() then
+		S.busy = true
+		send("RemovePart", last.x, last.y, last.z)
+		task.wait(0.5)
+		if last.old then
+			send("PlacePart", last.old, last.x, last.y, last.z, last.R, last.T)
+			task.wait(0.5)
+		end
+		S.busy = false
+		S.blocked[last.id] = os.clock() + 3600
+		N.invalidateBuild()
+		D.shortStuck = 0
+		log("BUILD revert " .. tostring(last.id), "at " .. tostring(last.key), "reason=stuck", if last.old then "old part " .. last.old .. " back" else "")
+		S.last = "took " .. tostring(last.id) .. " off again (runs got stuck at the start)"
+	elseif D.shortStuck >= 3 then
+		D.blockedUntil = os.clock() + 300
+		D.shortStuck = 0
+		log("DRIVE blocked 300s reason=3 runs stuck at the start, rolling and building instead")
+	end
+end-- ===== Rolls and Smart Buy =====
 N.Inv = {}
 N.Roll = { shown = {}, decision = {}, verdict = {}, at = -1e9, last = "-", total = 0, good = 0, noResult = 0, resultAt = {}, promptsLogged = {}, station = "RollBlocks", count = 0, sinceRun = 0 }
 do
@@ -34096,6 +34142,11 @@ function N.buildOnce()
 	end
 	Session.builds += 1
 	N.invalidateBuild()
+	S.history = S.history or {}
+	table.insert(S.history, { id = bestId, key = best.key, old = best.old, x = x, y = y, z = z, R = best.R or 0, T = best.T or 0 })
+	while #S.history > 10 do
+		table.remove(S.history, 1)
+	end
 	local def = N.partDef(bestId) or {}
 	S.last = string.format("%s %s at %s (+%s cash/s)", if best.kind == "swap" then "swapped in" else "added", tostring(def.Name or bestId), best.key, formatNumber(best.gain))
 	log("BUILD", best.kind, bestId, "at", best.key, if best.old then "replaced " .. best.old else "", "gain", formatNumber(best.gain) .. "/s")
@@ -34973,6 +35024,8 @@ function N.planTick()
 		else
 			mode, say = "roll", string.format("roll: the car is missing a part, rolling for it (cash %s)", formatNumber(cash))
 		end
+	elseif os.clock() < (N.Drive.blockedUntil or 0) then
+		mode, say = "roll", "roll: the last runs got stuck at the start and paid nothing, rolling and building for a few minutes"
 	elseif #N.Rate.runs == 0 then
 		mode, say = "drive", "drive: first run, measuring the income of this car"
 	elseif far and (P.farRuns == nil or P.farRuns >= Session.runs) then
