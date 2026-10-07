@@ -36138,8 +36138,11 @@ return done
 end
 end
 do
-function N.upgradeLuck()
+function N.upgradeLuck(manual)
+manual = manual == true
 if not N.luckEnabled() then
+N.LuckWhy = "luck multiplier is turned off in the game settings"
+log("UPGRADE luck refused reason=multiplier off in settings")
 return 0
 end
 local free = tonumber(N.savedValue("FreeHatchUpgrades")) or 0
@@ -36149,12 +36152,25 @@ fire("Plot/Upgrades", "MaxFree")
 waitFor(function()
 return N.luckUpgrades() > before
 end, 2)
-return N.luckUpgrades() - before
+local got = N.luckUpgrades() - before
+log(if got > 0 then "UPGRADE luck ok level=" .. N.luckUpgrades() .. " free=" .. got else "UPGRADE luck refused reason=free upgrade not applied")
+return got
 end
 local bought = 0
-while alive() and bought < 25 and N.planOn("AutoLuck") do
+while alive() and bought < 25 and (manual or N.planOn("AutoLuck")) do
 local price = N.luckPrice(N.paidLuckUpgrades())
-if not N.Plan.approve("luck", price) then
+if not manual and not N.Plan.approve("luck", price) then
+local have = N.spendable()
+local why = if have < price then "need $" .. formatNumber(price) .. ", have $" .. formatNumber(have) else "planner: Luck does not pay back yet (cheaper than nothing else, waiting)"
+if N.LuckWhy ~= why then
+N.LuckWhy = why
+log("UPGRADE luck refused reason=" .. why)
+end
+break
+end
+if manual and N.spendable() < price then
+N.LuckWhy = "need $" .. formatNumber(price) .. ", have $" .. formatNumber(N.spendable())
+log("UPGRADE luck refused reason=" .. N.LuckWhy)
 break
 end
 local before = N.luckUpgrades()
@@ -36162,9 +36178,12 @@ fire("Plot/Upgrades")
 if not waitFor(function()
 return N.luckUpgrades() > before
 end, 2) then
-log("LUCK upgrade did not go through", "price", formatNumber(price))
+N.LuckWhy = "server did not apply the upgrade"
+log("UPGRADE luck refused reason=server did not apply it price=" .. formatNumber(price))
 break
 end
+N.LuckWhy = nil
+log("UPGRADE luck ok level=" .. N.luckUpgrades() .. " price=" .. formatNumber(price))
 bought += 1
 Session.luckBought += 1
 N.Plan.spent()
@@ -36547,7 +36566,7 @@ end
 -- per drop at luck multiplier mult: expected raw $/s above the weakest placed pet (g), expected raw $/s of drops
 -- that beat it (s), the chance to beat it (p), average size factor (f) and chance per rarity
 local function dropStats(mult, w)
-local g, s, p, f, rar = 0, 0, 0, 0, {}
+local g, s, p, f, rar, a = 0, 0, 0, 0, {}, 0
 local odds = {}
 for _, e in ipairs(P.mix) do
 local list = odds[e.name]
@@ -36561,6 +36580,7 @@ local cfg = N.PetsData[entry.name]
 local inc = (if type(cfg) == "table" then tonumber(cfg.Income) or 0 else 0) * e.f
 local r = N.petRarity(entry.name)
 rar[r] = (rar[r] or 0) + entry.chance
+a += entry.chance * inc
 if inc > w then
 g += entry.chance * (inc - w)
 s += entry.chance * inc
@@ -36570,12 +36590,12 @@ end
 end
 local n = #P.mix
 if n == 0 then
-return 0, 0, 0, 1, rar
+return 0, 0, 0, 1, rar, 0
 end
 for r, c in pairs(rar) do
 rar[r] = c / n
 end
-return g / n, s / n, p / n, f / n, rar
+return g / n, s / n, p / n, f / n, rar, a / n
 end
 local function short(x)
 return string.format("%.3g", x)
@@ -36693,11 +36713,17 @@ for i = 0, k - 1 do
 C += N.luckPrice(paid + i)
 end
 local L1 = N.luckMultiplierFor(n + k)
-local g1, s1, p1 = dropStats(L1, w)
+local g1, s1, p1, _f1, _r1, a1 = dropStats(L1, w)
 local gap1 = if p1 > 0 then math.max(K * s1 / p1 - raw, 0) else 0
 local o = add({ kind = "luck", key = "", label = "Luck +" .. k .. " (x" .. formatNumber(L1) .. ")", cash = C, C = C, dI = 0 })
 local T = math.max(0, rebirthAt - o.eta)
 o.dI = math.max(accrue(r * g1, gap1, T) - accrue(r * g0, gap0, T), 0) * m / H
+if N.plannerOn() then
+-- drops that do not beat the weakest pet are sold (SellValue = income x SELL_MULT): better luck also raises that cash stream
+local a0 = select(6, dropStats(L0, w))
+local sold1, sold0 = math.max(a1 - s1, 0), math.max(a0 - s0, 0)
+o.dI += math.max(r * (sold1 - sold0) * P.SELL_MULT, 0) * T / H
+end
 o.ratio = if C > 0 then o.dI / C else math.huge
 end
 -- Nest: one more egg hatching every growth time (only when eggs wait for a nest)
@@ -36919,6 +36945,10 @@ if have < cost then
 return false
 end
 local o = P.byKey[kind .. ":" .. tostring(key or "")]
+if kind == "luck" and not on("AutoSmartPlan") and on("AutoLuck") then
+-- the player turned Auto Upgrade Luck on himself: buy whenever it is affordable, the planner's payback verdict does not veto it
+return true
+end
 if o then
 return o.ok == true
 end
@@ -37726,7 +37756,7 @@ Labels.Luck = LuckBox:AddLabel({ Text = "-", DoesWrap = true })
 LuckBox:AddButton({
 Text = "Upgrade Now",
 Func = function()
-task.spawn(N.upgradeLuck)
+task.spawn(N.upgradeLuck, true)
 end,
 })
 local RebirthBox = Tabs.Upgrades:AddLeftGroupbox("Rebirth", "refresh-cw")
@@ -41146,7 +41176,7 @@ N.luckUpgrades(),
 if free > 0 then "  \u{00B7}  " .. free .. " free" else "",
 formatNumber(N.luckPrice(paid)),
 Session.luckBought,
-"\nUp next: " .. N.Plan.nextText() .. (if N.luckEnabled()
+"\nUp next: " .. N.Plan.nextText() .. (if N.LuckWhy and (on("AutoLuck") or N.plannerOn()) then "\nWaiting: " .. N.LuckWhy else "") .. (if N.luckEnabled()
 then ""
 else '\n<font color="#fab428">The luck multiplier is turned off in the game settings</font>')
 )
