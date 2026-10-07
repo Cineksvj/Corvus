@@ -5028,7 +5028,12 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 if typeof(Entry.Target) == "string" and Library.OnUserToggle then
                 	pcall(Library.OnUserToggle, Entry.Target, Toggle.Value)
                 end
-                Library:Notify({ Title = tostring(Toggle.Text), Description = if Toggle.Value then "ON" else "OFF", Time = 1.5 })
+                local NoteKey = tostring(Toggle.Text) .. (if Toggle.Value then "1" else "0")
+                Library.QuickNoteAt = Library.QuickNoteAt or {}
+                if os.clock() - (Library.QuickNoteAt[NoteKey] or 0) > 1.5 then
+                    Library.QuickNoteAt[NoteKey] = os.clock()
+                    Library:Notify({ Title = tostring(Toggle.Text), Description = if Toggle.Value then "ON" else "OFF", Time = 1.5 })
+                end
             end
         elseif Entry.Kind == "Button" then
             local Button = Library.QuickButtons[Entry.Target]
@@ -5040,11 +5045,25 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         end
     end
     
+    local QuickKeysHeld, QuickLastRun, QuickLastNote = {}, {}, {}
+    table.insert(Library.Signals, UserInputService.InputEnded:Connect(function(Input)
+        if Input.UserInputType == Enum.UserInputType.Keyboard then
+            QuickKeysHeld[Input.KeyCode.Name] = nil
+        end
+    end))
+    table.insert(Library.Signals, UserInputService.WindowFocusReleased:Connect(function()
+        table.clear(QuickKeysHeld)
+    end))
     table.insert(Library.Signals, UserInputService.InputBegan:Connect(function(Input, Processed)
         if Library.Unloaded or Input.UserInputType ~= Enum.UserInputType.Keyboard or Input.KeyCode == Enum.KeyCode.Unknown then
             return
         end
         local KeyName = Input.KeyCode.Name
+        local HeldAt = QuickKeysHeld[KeyName]
+        if HeldAt and os.clock() - HeldAt < 10 then
+            return
+        end
+        QuickKeysHeld[KeyName] = os.clock()
         local Pending = Library.QuickBindPending
         if Pending then
             Library.QuickBindPending = nil
@@ -5067,11 +5086,12 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             Library:Notify({ Title = Pending.Label, Description = "Bound to " .. KeyName, Time = 3 })
             return
         end
-        if Processed or UserInputService:GetFocusedTextBox() then
+        if Processed ~= false or UserInputService:GetFocusedTextBox() then
             return
         end
         local Entry = Library:GetQuickBinds()[KeyName]
-        if Entry then
+        if Entry and os.clock() - (QuickLastRun[KeyName] or 0) >= 0.4 then
+            QuickLastRun[KeyName] = os.clock()
             Library:RunQuickBind(Entry)
         end
     end))
