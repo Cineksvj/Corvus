@@ -32899,7 +32899,242 @@ do
 		end
 		return false
 	end
-	-- Moves to `target`: vertical first when going up, horizontal first when going down (out of the pit and into it).
+	-- VIP doors (Workspace.Map.VIPDoors, notes.md "Movement"): touching one opens a Robux purchase prompt and the
+	-- door is solid without the pass. Their boxes (plus a margin) are non-walkable: a route goes around them, a
+	-- target inside one is refused. Noclip never lets a move touch a door.
+	N.Vip = { boxes = {}, at = -1e9, margin = 8 }
+	function N.vipBoxes()
+		local V = N.Vip
+		if os.clock() - V.at < 5 then
+			return V.boxes
+		end
+		V.at = os.clock()
+		local boxes = {}
+		pcall(function()
+			local map = workspace:FindFirstChild("Map")
+			local folder = map and map:FindFirstChild("VIPDoors")
+			if folder then
+				for _, part in ipairs(folder:GetChildren()) do
+					if part:IsA("BasePart") then
+						local s, c = part.Size, part.Position
+						table.insert(boxes, { x = c.X, y = c.Y, z = c.Z, hx = math.max(s.X, s.Z) / 2, hy = s.Y / 2 })
+					end
+				end
+			end
+		end)
+		V.boxes = boxes
+		return boxes
+	end
+	local function inVip(x, y, z, margin)
+		for _, b in ipairs(N.vipBoxes()) do
+			if math.abs(x - b.x) <= b.hx + margin and math.abs(z - b.z) <= b.hx + margin and math.abs(y - b.y) <= b.hy + 14 then
+				return true
+			end
+		end
+		return false
+	end
+	function N.vipBlocked(a, b)
+		if #N.vipBoxes() == 0 then
+			return false
+		end
+		local d = (b - a).Magnitude
+		local n = math.max(1, math.ceil(d / 2))
+		for i = 0, n do
+			local p = a + (b - a) * (i / n)
+			if inVip(p.X, p.Y, p.Z, N.Vip.margin) then
+				return true
+			end
+		end
+		return false
+	end
+	-- Waypoints from `from` to `to` that never enter a VIP box: {to} when clear, one corner detour when needed,
+	-- nil when the target itself is inside a blocked zone or no detour exists.
+	function N.safeRoute(from, to)
+		if #N.vipBoxes() == 0 then
+			return { to }
+		end
+		if inVip(to.X, to.Y, to.Z, N.Vip.margin - 2) then
+			return nil
+		end
+		if not N.vipBlocked(from, to) then
+			return { to }
+		end
+		local corners = {}
+	for _, b in ipairs(N.vipBoxes()) do
+		local r = b.hx + N.Vip.margin + 4
+		for _, sx in ipairs({ -1, 1 }) do
+			for _, sz in ipairs({ -1, 1 }) do
+				table.insert(corners, Vector3.new(b.x + sx * r, from.Y, b.z + sz * r))
+			end
+		end
+	end
+	local best, bestLen
+	for _, c in ipairs(corners) do
+		if not N.vipBlocked(from, c) and not N.vipBlocked(c, to) then
+			local len = (c - from).Magnitude + (to - c).Magnitude
+			if not bestLen or len < bestLen then
+				best, bestLen = { c, to }, len
+			end
+		end
+	end
+	if not best then
+		for _, c1 in ipairs(corners) do
+			if not N.vipBlocked(from, c1) then
+				for _, c2 in ipairs(corners) do
+					if c2 ~= c1 and not N.vipBlocked(c1, c2) and not N.vipBlocked(c2, to) then
+						local len = (c1 - from).Magnitude + (c2 - c1).Magnitude + (to - c2).Magnitude
+						if not bestLen or len < bestLen then
+							best, bestLen = { c1, c2, to }, len
+						end
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+	-- Noclip: CanCollide off on the character while a tween/teleport move runs (the hub sets the CFrame itself, so
+	-- walls only make the character bump and stall), restored when the move ends. Never used while walking.
+	N.Noclip = { on = false, saved = {}, conn = nil, n = 0 }
+	function N.noclip(state)
+		local NC = N.Noclip
+		if state == NC.on then
+			return
+		end
+		NC.on = state
+		NC.n += 1
+		if state then
+			local function apply()
+				local char = LocalPlayer.Character
+				if not char then
+					return
+				end
+				for _, part in ipairs(char:GetDescendants()) do
+					if part:IsA("BasePart") and part.CanCollide then
+						NC.saved[part] = true
+						part.CanCollide = false
+					end
+				end
+			end
+			pcall(apply)
+			NC.conn = game:GetService("RunService").Stepped:Connect(function()
+				pcall(apply)
+			end)
+		else
+			if NC.conn then
+				pcall(function()
+					NC.conn:Disconnect()
+				end)
+				NC.conn = nil
+			end
+			for part in pairs(NC.saved) do
+				pcall(function()
+					part.CanCollide = true
+				end)
+			end
+			NC.saved = {}
+		end
+		if NC.n <= 6 or NC.n % 100 == 0 then
+			log("MOVE noclip", state and "on" or "off", "n=" .. NC.n)
+		end
+	end
+	local function tweenTo(target, deadline)
+		local pos = N.myPos()
+		if not pos then
+			return false
+		end
+		local mid = if target.Y > pos.Y then Vector3.new(pos.X, target.Y, pos.Z) else Vector3.new(target.X, pos.Y, target.Z)
+		return segment(mid, 1, deadline) and segment(target, 1, deadline)
+	end
+	-- Walk rung: Humanoid:MoveTo along a PathfindingService route. Waypoint arrival radius max(3, WalkSpeed * 0.12);
+	-- no progress for 0.8 s = jump, then a sidestep, then give up; the caller re-plans from the new spot (4 times).
+	N.Walk = { fails = 0, path = "" }
+	local function followPath(hum, target, near, deadline)
+		local ok, waypoints = pcall(function()
+			local path = game:GetService("PathfindingService"):CreatePath({ AgentRadius = 2.5, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 8 })
+			path:ComputeAsync(N.root().Position, target)
+			if path.Status ~= Enum.PathStatus.Success then
+				return nil
+			end
+			return path:GetWaypoints()
+		end)
+		if not ok or type(waypoints) ~= "table" or #waypoints == 0 then
+			N.Walk.path = "unavailable"
+			return false
+		end
+		N.Walk.path = "ok " .. #waypoints
+		for i = 2, #waypoints do
+			local wp = waypoints[i]
+			if os.clock() > deadline or not alive() then
+				return false
+			end
+			-- A route point inside a VIP zone ends the plan: the caller falls back to the tween around it.
+			if inVip(wp.Position.X, wp.Position.Y, wp.Position.Z, N.Vip.margin - 2) then
+				N.Walk.path = "vip"
+				return false
+			end
+			pcall(function()
+				if wp.Action == Enum.PathWaypointAction.Jump then
+					hum.Jump = true
+				end
+				hum:MoveTo(wp.Position)
+			end)
+			local started = os.clock()
+			local lastP, lastMoveAt, tries = N.myPos(), os.clock(), 0
+			while os.clock() - started < 4 and os.clock() <= deadline do
+				local p = N.myPos()
+				if not p or N.flat(p, wp.Position) <= math.max(3, (tonumber(hum.WalkSpeed) or 16) * 0.12) then
+					break
+				end
+				if N.flat(p, target) <= near then
+					return true
+				end
+				if lastP and N.flat(p, lastP) > 0.8 then
+					lastP, lastMoveAt = p, os.clock()
+				elseif os.clock() - lastMoveAt > 0.8 then
+					lastMoveAt = os.clock()
+					tries += 1
+					if tries >= 3 then
+						N.Walk.path = "wall"
+						return false
+					end
+					pcall(function()
+						hum.Jump = true
+						local dir = wp.Position - p
+						local side = Vector3.new(-dir.Z, 0, dir.X)
+						if side.Magnitude > 0.1 then
+							hum:MoveTo(p + side.Unit * (if tries == 1 then 6 else -6))
+						end
+					end)
+					task.wait(0.35)
+					pcall(function()
+						hum:MoveTo(wp.Position)
+					end)
+				end
+				task.wait(0.1)
+			end
+		end
+		local p = N.myPos()
+		return p ~= nil and N.flat(p, target) <= near
+	end
+	local function walkTo(target, near, deadline)
+		local hum = N.humanoid()
+		if not hum then
+			return false
+		end
+		for _ = 1, 4 do
+			if followPath(hum, target, near, deadline) then
+				return true
+			end
+			if N.Walk.path ~= "wall" or os.clock() > deadline or not alive() then
+				break
+			end
+		end
+		return false
+	end
+	-- Movement dropdown (Options.MoveMode): "Fastest" = teleport hops once the hop_30 probe was accepted, else the
+	-- noclip tween; "Noclip tween"; "Walk" (pathfinding, tween around a stuck spot). Moves to `target`: vertical
+	-- first when going up, horizontal first when going down (out of the pit and into it).
 	function N.moveTo(target, near, timeout)
 		near = near or 4
 		local pos = N.myPos()
@@ -32909,14 +33144,45 @@ do
 		if (pos - target).Magnitude <= near then
 			return true
 		end
+		local route = N.safeRoute(pos, target)
+		if not route then
+			N.Move.last = "target in a blocked VIP zone"
+			log("MOVE blocked", "VIP zone", string.format("%.0f,%.0f,%.0f", target.X, target.Y, target.Z))
+			return false
+		end
 		N.streamAround(target)
 		N.Move.moves += 1
-		local mul = 1
 		local speed = N.moveSpeed()
 		local dist = (pos - target).Magnitude
 		local deadline = os.clock() + math.min(timeout or (dist / speed * 1.6 + 6), 240)
-		local mid = if target.Y > pos.Y then Vector3.new(pos.X, target.Y, pos.Z) else Vector3.new(target.X, pos.Y, target.Z)
-		local ok = segment(mid, mul, deadline) and segment(target, mul, deadline)
+		local mode = optionText("MoveMode", "Fastest")
+		local walk = mode == "Walk"
+		local hop = mode == "Fastest" and N.probeGet("hop_30") == "accepted"
+		if not walk then
+			N.noclip(true)
+		end
+		local ok = pcall(function()
+			for i, stop in ipairs(route) do
+				local nr = if i == #route then near else 3
+				local reached
+				if walk then
+					reached = walkTo(stop, nr, deadline)
+					if not reached then
+						log("MOVE walk stuck", N.Walk.path, "tween around it")
+						N.noclip(true)
+						reached = tweenTo(stop, deadline)
+					end
+				elseif hop then
+					reached = N.hopTo(stop, nr) or tweenTo(stop, deadline)
+				else
+					reached = tweenTo(stop, deadline)
+				end
+				if not reached then
+					break
+				end
+			end
+		end)
+		N.noclip(false)
 		local final = N.myPos()
 		if final and (final - target).Magnitude <= near + 2 then
 			return true
@@ -34727,6 +34993,7 @@ do
 		RunBox:AddDropdown("RunZone", { Text = "Run Zone", Values = zones, Default = "Deepest in time limit", Tooltip = "Smart Planner picks the zone by income per second of run instead" })
 		RunBox:AddSlider("MaxDrill", { Text = "Max drilling per run", Default = 60, Min = 5, Max = 300, Rounding = 0, Suffix = " s", Tooltip = "Deepest in time limit: every gate takes HP / Power hits, one hit every 0.15 s" })
 		RunBox:AddSlider("RunEvery", { Text = "Run every", Default = 3, Min = 1, Max = 15, Rounding = 0, Suffix = " min", Tooltip = "With Auto Train on too and a full farm: minutes of training between runs (a free farm slot starts a run right away)" })
+		RunBox:AddDropdown("MoveMode", { Text = "Movement", Values = { "Fastest", "Noclip tween", "Walk" }, Default = "Fastest", Tooltip = "Fastest = teleport hops once the server accepts them, else a tween through walls (noclip). Walk = path-finding on foot. VIP doors are never entered" })
 		RunBox:AddSlider("RunSpeed", { Text = "Movement Speed", Default = 89, Min = 16, Max = 150, Rounding = 0, Tooltip = "Studs per second for Corvus' own moves. 89 = the game's top walk speed. A pull-back from the server slows it down by itself" })
 		RunBox:AddToggle("FastReturn", { Text = "Fast Return", Default = true, Tooltip = "Brings the eggs home with the free Teleport To Spawn instead of the climb; walks when the eggs would drop" })
 		RunBox:AddToggle("WallProbe", {
