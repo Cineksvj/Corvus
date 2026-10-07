@@ -33125,8 +33125,8 @@ do
 			local s = if right then dir:Dot(right) else 0
 			hold(D.keySet[1], not D.coast and not back)
 			hold(D.keySet[4], back)
-			hold(D.keySet[2], if back then true else s < -0.15)
-			hold(D.keySet[3], not back and s > 0.15)
+			hold(D.keySet[2], if back then D.nudgeSide == 2 else s < -0.15)
+			hold(D.keySet[3], if back then D.nudgeSide == 3 else s > 0.15)
 			return
 		end
 		pcall(function()
@@ -33271,12 +33271,21 @@ function N.nitroTick(car)
 	D.nitroKey = key
 	local fuel = tonumber(car:GetAttribute("NitroFuel")) or 0
 	if not D.nitroHeld then
-		if fuel >= 0.95 and car:GetAttribute("NitroBlocked") ~= true and (tonumber(car:GetAttribute("Fuel")) or 0) > 0 then
+		-- only while the car already rolls forward (a turbo placed facing back or sideways forces the throttle its way)
+		if fuel >= 0.95 and D.speed >= 8 and car:GetAttribute("NitroBlocked") ~= true and (tonumber(car:GetAttribute("Fuel")) or 0) > 0 then
 			N.key(true, key)
 			D.nitroHeld = true
 			D.nitroAt = os.clock()
+			local np = N.carPart(car)
+			D.nitroX = if np then np.Position.X else 0
 			Session.nitros += 1
 		end
+	elseif D.mode == "road" and os.clock() - (D.nitroAt or 0) > 1 and N.carPart(car) and N.carPart(car).Position.X - (D.nitroX or 0) < 5 then
+		-- on nitro the car does not go forward along the road: the turbo pushes it the wrong way, nitro off for 10 min
+		N.key(false, key)
+		D.nitroHeld = false
+		D.nitroOffUntil = os.clock() + 600
+		log("NITRO off 600s: the car does not go forward on nitro (turbo direction)")
 	elseif fuel <= 0.05 or os.clock() - (D.nitroAt or 0) > 6 then
 		N.key(false, key)
 		D.nitroHeld = false
@@ -33491,14 +33500,17 @@ function N.driveRun()
 	D.keySet = D.keySets[D.input] or D.keySets.keys
 	local startX = part.Position.X
 	local maxX, lastX, lastProgressAt, emptyAt = startX, startX, os.clock(), nil
-	local slowAt, nudged = nil, false
+	local slowAt, nudges = nil, 0
 	local startedAt = os.clock()
 	local inputChecked = false
 	local reason = "?"
 	local hp = 100
 	D.car, D.active, D.abort, D.mode, D.offset = car, true, nil, "road", 0
 	D.cap = N.speedCap(car)
-	log("DRIVE start", "input=" .. D.input, "cap=" .. string.format("%.0f", D.cap), "fuel=" .. string.format("%.0fs", tonumber(car:GetAttribute("FuelTime")) or 0))
+	do
+		local look = part.CFrame.LookVector
+		log("DRIVE start", "input=" .. D.input, "cap=" .. string.format("%.0f", D.cap), "fuel=" .. string.format("%.0fs", tonumber(car:GetAttribute("FuelTime")) or 0), "accel=" .. tostring(car:GetAttribute("Accel")), "turbo=" .. tostring(car:GetAttribute("TurboMult")), string.format("pos=%.0f,%.0f,%.0f look=%.2f,%.2f,%.2f", part.Position.X, part.Position.Y, part.Position.Z, look.X, look.Y, look.Z))
+	end
 	while alive() do
 		if car.Parent == nil then
 			reason = "car gone"
@@ -33574,35 +33586,39 @@ function N.driveRun()
 		else
 			emptyAt = nil
 		end
-		-- stuck on a wall or a wreck: once the run is under way (30 studs), 2 s under 3 studs/s with fuel left -> 1 s of
-		-- reverse with the wheel turned; still stuck 6 s after the stop -> the run ends (DespawnCar) and the planner goes on
+		-- stuck (a wall, the pad's lip, a wreck): once the car has moved (input check passed), 2 s under 3 studs/s or 6 s
+		-- without +5 studs along the road with fuel left -> 1 s of reverse with the wheel turned (left, then right, then
+		-- left), forward again; after 3 nudges without progress the run ends (DespawnCar) and the planner goes on
 		local now = os.clock()
 		if p.X > lastX + 5 then
 			lastX, lastProgressAt = p.X, now
-			if nudged and not slowAt then
-				nudged = false
-			end
-		end
-		if studs >= 30 and fuel > 0 and D.speed < 3 and now >= (D.nudgeUntil or 0) then
-			slowAt = slowAt or now
-			if not nudged and now - slowAt > 2 then
-				nudged = true
-				D.nudgeUntil = now + 1
-				log("DRIVE stuck nudge", "studs=" .. math.floor(studs))
-			elseif now - slowAt > 6 then
-				reason = "stuck"
-				break
-			end
-		elseif D.speed >= 3 then
+			nudges = 0
 			slowAt = nil
 		end
-		if now - lastProgressAt > 10 and studs >= 30 then
-			-- moving but not along the road (spinning, sliding on a wall)
-			reason = "stuck"
-			break
-		elseif now - lastProgressAt > 20 then
-			reason = "stuck"
-			break
+		if inputChecked and fuel > 0 and now >= (D.nudgeUntil or 0) + 1 then
+			if D.speed < 3 then
+				slowAt = slowAt or now
+			else
+				slowAt = nil
+			end
+			if (slowAt and now - slowAt > 2) or now - lastProgressAt > 6 then
+				if nudges >= 3 then
+					reason = "stuck"
+					break
+				end
+				nudges += 1
+				D.nudgeSide = if nudges % 2 == 1 then 2 else 3
+				D.nudgeUntil = now + 1
+				slowAt = nil
+				lastProgressAt = now
+				if D.nitroHeld and D.nitroKey then
+					N.key(false, D.nitroKey)
+					D.nitroHeld = false
+				end
+				local look = part.CFrame.LookVector
+				local vel = part.AssemblyLinearVelocity or Vector3.zero
+				log("DRIVE stuck nudge " .. nudges, "studs=" .. math.floor(studs), string.format("pos=%.0f,%.0f,%.0f look=%.2f,%.2f,%.2f vel=%.0f,%.0f,%.0f", p.X, p.Y, p.Z, look.X, look.Y, look.Z, vel.X, vel.Y, vel.Z), string.format("target=%.0f,%.0f", D.target.X, D.target.Z), "turbo=" .. tostring(car:GetAttribute("TurboMult")), "accel=" .. tostring(car:GetAttribute("Accel")), "nitros=" .. Session.nitros)
+			end
 		end
 		if N.wantBoss() then
 			reason = "boss"
@@ -33697,13 +33713,22 @@ do
 		-- through this question): buy -> keep it (skip=false) and rollStep buys it next, else skip and roll on
 		local yes, why = N.judgeRoll(station, partId)
 		local skip = not yes
+		N.noteRollResult(station, partId, yes)
 		if not skip then
 			R.shown[station] = R.shown[station] or { id = partId, at = os.clock() }
 			R.shown[station].id = partId
 		end
-		R.at = os.clock()
-		R.resultAt[station] = os.clock()
-		task.spawn(send, "ConfirmRollSkip", requestId, skip)
+		-- the game's dialog (Confirmation.CooldownMode) enables "Yes, skip" only after SettingsConfig.RollCooldown: an
+		-- instant skip answer left the same Mythical on the pedestal for 50 rolls (live 11:40), so the skip waits like it
+		local delay = if skip then (tonumber(N.G.Settings.RollCooldown) or 3) + 0.3 else 0
+		R.at = os.clock() + delay
+		R.resultAt[station] = os.clock() + delay
+		task.spawn(function()
+			if delay > 0 then
+				task.wait(delay)
+			end
+			send("ConfirmRollSkip", requestId, skip)
+		end)
 		log("ROLL confirm", station, tostring(partId), "skip=" .. tostring(skip), why)
 	end)
 	N.onPacket("InventoryChanged", function(id, count)
@@ -33822,7 +33847,48 @@ function N.judgeRoll(station, id)
 	log("ROLL", station, tostring(id), tostring(def.Rarity), "cost " .. formatNumber(def.Cost), "->", if yes then "buy" else "skip", why)
 	return yes, why, use
 end
+-- Backoff: the same high-rarity part asked about (RollConfirmation) and skipped 3 times in a row = the server keeps it on
+-- the pedestal: that station pauses 10 min (log ROLL backoff); the other station or a run takes the time.
+function N.noteRollResult(station, id, yes)
+	local R = N.Roll
+	R.streak = R.streak or {}
+	R.pauseUntil = R.pauseUntil or {}
+	local s = R.streak[station] or { id = nil, same = 0 }
+	R.streak[station] = s
+	if yes then
+		s.id, s.same = nil, 0
+		return
+	end
+	s.same = if s.id == id then s.same + 1 else 1
+	s.id = id
+	if s.same >= 3 then
+		R.pauseUntil[station] = os.clock() + 600
+		log("ROLL backoff", station, tostring(id), "skipped 3x in a row, pause 10m")
+		s.id, s.same = nil, 0
+		if R.current == station then
+			R.current = nil
+		end
+	end
+end
+function N.stationPaused(station)
+	local p = N.Roll.pauseUntil
+	return p ~= nil and os.clock() < (p[station] or 0)
+end
+function N.rollsPaused()
+	return N.stationPaused("RollBlocks") and N.stationPaused("RollWeapons")
+end
 function N.pickStation()
+	local pick = N.pickStationRaw()
+	if pick and N.stationPaused(pick) then
+		if optionText("RollStation", "Both") ~= "Both" then
+			return nil
+		end
+		local other = if pick == "RollBlocks" then "RollWeapons" else "RollBlocks"
+		return if N.stationPaused(other) then nil else other
+	end
+	return pick
+end
+function N.pickStationRaw()
 	local mode = optionText("RollStation", "Both")
 	if mode == "Blocks" then
 		return "RollBlocks"
@@ -33854,6 +33920,11 @@ end
 function N.rollStep()
 	local R = N.Roll
 	local station = R.current or N.pickStation()
+	if not station then
+		setStatus("Both roll stations show only parts that are not worth buying: driving instead")
+		task.wait(1)
+		return false
+	end
 	R.current = station
 	local roll, buy = N.stationPrompts(station)
 	if not roll then
@@ -34848,7 +34919,7 @@ function N.planMode()
 		if N.planner() then
 			return N.Plan.mode or "drive"
 		end
-		return if N.Roll.sinceRun < optionNumber("RollsPerRun", 10) then "roll" else "drive"
+		return if N.Roll.sinceRun < optionNumber("RollsPerRun", 10) and not N.rollsPaused() then "roll" else "drive"
 	elseif drive then
 		return "drive"
 	elseif roll then
@@ -34913,6 +34984,8 @@ function N.planTick()
 		mode, say = "drive", string.format("drive: %s cash/s, no part pays back yet", formatNumber(rate))
 	elseif cash < price then
 		mode, say = "drive", string.format("drive: %s cash/s until %s cash buys the cheapest part that pays back", formatNumber(rate), formatNumber(price))
+	elseif N.rollsPaused() then
+		mode, say = "drive", string.format("drive: %s cash/s, both roll stations show parts that are not worth buying (paused)", formatNumber(rate))
 	elseif R.sinceRun < rolls then
 		mode, say = "roll", string.format("roll %d more: a roll is worth ~%s vs %s of driving (a good part every ~%d rolls)", rolls - R.sinceRun, formatNumber(rollValue), formatNumber(rollCost), math.ceil(1 / pGood))
 	else
