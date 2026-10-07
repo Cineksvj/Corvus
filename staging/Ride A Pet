@@ -36721,9 +36721,10 @@ o.dI = math.max(accrue(r * g1, gap1, T) - accrue(r * g0, gap0, T), 0) * m / H
 if N.plannerOn() then
 -- drops that do not beat the weakest pet are sold (SellValue = income x SELL_MULT): better luck also raises that cash stream
 local a0 = select(6, dropStats(L0, w))
-local sold1, sold0 = math.max(a1 - s1, 0), math.max(a0 - s0, 0)
-o.dI += math.max(r * (sold1 - sold0) * P.SELL_MULT, 0) * T / H
+-- every drop is worth its sale price at least: expected income per drop rises with luck (the placement gain above is the extra on top)
+o.dI += math.max(r * (a1 - a0) * P.SELL_MULT, 0) * T / H
 end
+o.label = string.format("%s gain=+$%s/s payback=%s", o.label, formatNumber(o.dI), secs(if o.dI > 0 then C / o.dI else 1e9))
 o.ratio = if C > 0 then o.dI / C else math.huge
 end
 -- Nest: one more egg hatching every growth time (only when eggs wait for a nest)
