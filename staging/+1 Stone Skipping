@@ -32199,8 +32199,9 @@ do
 		local mode = if N.throwMode then N.throwMode() else speed
 		return (if speed == "blatant" then "Blatant" elseif speed == "fast" then "Fast" else "Legit") .. (if speed ~= "legit" then " (" .. mode .. ")" else "") .. ", " .. (if N.safeMove() then "Walk" else "Teleport")
 	end
-	-- Throw Speed: "blatant" (default) and "fast" = direct Throw right after ThrowFinished (the server's own 0.82 s cooldown),
-	-- "legit" = the game's button at the game's Auto Wins pace. A saved "Auto (best measured)" or "Max (Blatant)" from older
+	-- Throw Speed: "blatant" (default) = the game's button the moment its 0.8 s cooldown ends (direct throws as the fallback),
+	-- "fast" = direct Throw right after ThrowFinished (the server's own 0.82 s cooldown), "legit" = the game's button at
+	-- the game's Auto Wins pace. A saved "Auto (best measured)" or "Max (Blatant)" from older
 	-- configs counts as Blatant.
 	function N.throwSpeed()
 		local text = optionText("ThrowSpeed", "Blatant")
@@ -32835,6 +32836,7 @@ N.onEvent("ThrowStarted", function(data)
 		T.live[data.Id or "?"] = { secret = data.Secret == true, colossus = data.Colossus == true, at = os.clock() }
 		T.pending = true
 		T.noStart = 0
+		T.stallFrom = os.clock()
 		T.secret = data.Secret == true
 		T.colossus = data.Colossus == true
 		local mine = data.RequestId ~= nil and N.Direct.mine[data.RequestId]
@@ -32876,7 +32878,8 @@ N.onEvent("ThrowRejected", function(data)
 		-- they step up by 0.05 s; the button by 0.15 s.
 		N.Throw.extraGap = math.min(1.5, N.Throw.extraGap + (if mine then 0.05 else 0.15))
 		N.Throw.okRun = 0
-		log("THROW gap=" .. string.format("%.2f", os.clock() - N.Throw.finishedAt), "accepted=false", "backoff", string.format("%.2f", N.Throw.extraGap), tostring(data.Message))
+		N.Throw.lastReject = tostring(data.Message)
+		log("THROW rejected via=" .. (if mine then "direct" else "button") .. " reason=" .. tostring(data.Message), "gap", string.format("%.2f", os.clock() - N.Throw.finishedAt), "backoff", string.format("%.2f", N.Throw.extraGap))
 			N.autoThrowRefused(data.Message)
 	end
 end)
@@ -33123,9 +33126,13 @@ function N.pressThrow()
 	if not button then
 		return nil
 	end
+	-- The method that worked last goes first; the others stay as backups (a pinned method this executor lacks used to
+	-- leave Auto Throw paused for good: "No way to press the Throw button" every 10 s).
 	local methods = { "connections", "firesignal", "click" }
-	if N.Throw.method then
-		methods = { N.Throw.method }
+	local pinned = N.Throw.method
+	if pinned and table.find(methods, pinned) then
+		table.remove(methods, table.find(methods, pinned))
+		table.insert(methods, 1, pinned)
 	end
 	for _, method in ipairs(methods) do
 		local ok = false
@@ -33210,7 +33217,8 @@ local function recentCount(list, now, window)
 	return #list
 end
 function N.autoFallback(reason)
-	if N.throwSpeed() == "legit" then
+	-- Only direct throws step back; the game's button already runs at the game's own cooldown.
+	if N.throwSpeed() == "legit" or not N.preferDirect() then
 		return
 	end
 	local A, now = N.Auto, os.clock()
@@ -33275,6 +33283,11 @@ function N.autoTick()
 		N.Direct.rejectRun = 0
 		log("MODE retry", "direct throws again after the fallback window")
 	end
+	local T = N.Throw
+	if T.buttonBack and now >= (T.buttonOffUntil or 0) then
+		T.buttonBack = false
+		log("MODE retry", "the game's Throw button again after the direct window")
+	end
 	if A.moveBack and now >= A.walkUntil then
 		A.moveBack, A.walkUntil = false, 0
 		log("MODE retry", "teleport again after the walk window")
@@ -33284,7 +33297,11 @@ end
 function N.autoSay()
 	local A, now = N.Auto, os.clock()
 	local parts = {}
-	if N.throwSpeed() ~= "legit" and now < N.Direct.offUntil then
+	local T = N.Throw
+	if N.throwSpeed() ~= "legit" and now < (T.buttonOffUntil or 0) then
+		table.insert(parts, string.format("direct throws for %s (the game's Throw button started no throw)", N.longTime(T.buttonOffUntil - now)))
+	end
+	if N.preferDirect() and now < N.Direct.offUntil then
 		table.insert(parts, string.format("the game's button for %s (%s)", N.longTime(N.Direct.offUntil - now), tostring(A.lastWhy or "refused throws")))
 	end
 	if now < A.walkUntil then
@@ -33295,9 +33312,34 @@ function N.autoSay()
 	end
 	return "Fallback: " .. table.concat(parts, ", ")
 end
--- Which throw path runs now: "direct" (the fastest) unless the server turned it down, then "button" (the game's button, no
--- pause); "legit" for the game's own pace. A second throw in flight was removed: the server refuses it ("Finish your current
--- throw first.", owner log 2026-10-05 22:53).
+-- Which throw path runs now. Blatant (default) = "button": the game's own Throw button pressed the moment its 0.8 s
+-- cooldown ends. The game's client draws that throw (stone, distance meter, +Wins), and it measured as fast as direct live
+-- (RusinaLover08 2026-10-06: button 6.3 vs direct 5.9 throws/min). Direct server throws are invisible in game (the client
+-- only draws throws whose RequestId it made itself, GameplayController 12471-12483), which looked like "Auto Throw does
+-- nothing" to the owner. Direct = Fast, Secret Reroll, and Blatant's automatic fallback when the button path starts no
+-- throw (button missing, presses ignored); "legit" for the game's own pace. A second throw in flight was removed: the
+-- server refuses it ("Finish your current throw first.", owner log 2026-10-05 22:53).
+function N.preferDirect()
+	local speed = N.throwSpeed()
+	if speed == "legit" then
+		return false
+	elseif speed == "fast" then
+		return true
+	end
+	if on("SecretReroll") and not N.Reroll.off then
+		return true
+	end
+	return os.clock() < (N.Throw.buttonOffUntil or 0)
+end
+-- The button path started no throw: direct throws for 10 minutes, then the button again (MODE retry).
+function N.buttonFallback(reason)
+	local T = N.Throw
+	T.noStart = 0
+	T.buttonOffUntil = os.clock() + 600
+	T.buttonBack = true
+	log("THROW rejected via=button reason=" .. reason)
+	log("MODE fallback", "button->direct", "reason=" .. reason)
+end
 function N.throwModeAvailable(mode)
 	if mode == "direct" then
 		local D = N.Direct
@@ -33312,7 +33354,7 @@ function N.throwMode()
 	if N.throwSpeed() == "legit" then
 		return "legit"
 	end
-	if N.throwModeAvailable("direct") then
+	if N.preferDirect() and N.throwModeAvailable("direct") then
 		return "direct"
 	end
 	return "button"
@@ -33326,12 +33368,13 @@ end
 local function directFailed(why)
 	local D = N.Direct
 	D.rejectRun += 1
-	log("THROW direct", "accepted=false", why, "run", D.rejectRun)
+	N.Throw.lastReject = why
+	log("THROW rejected via=direct reason=" .. why, "run", D.rejectRun)
 	if D.rejectRun >= 3 then
 		D.rejectRun = 0
-		D.offUntil = os.clock() + 600
 		log("THROW direct fallback", "the game's button for 10 min after 3 refusals")
 		N.autoFallback("3 direct throws refused or cancelled in a row")
+		D.offUntil = math.max(D.offUntil, os.clock() + 600)
 	end
 end
 function N.noteDirectCancel(_mine)
@@ -33468,7 +33511,7 @@ local function directStep(gap)
 		D.rejectRun = 0
 		D.logs += 1
 		if D.logs <= 5 or D.logs % 50 == 0 then
-			log("THROW direct gap=" .. (if gap then string.format("%.2f", gap) else "first"), "accepted=true", "dropped cancels", D.dropped)
+			log("THROW ok via=direct gap=" .. (if gap then string.format("%.2f", gap) else "first"), "dropped cancels", D.dropped)
 		end
 		if N.rerollActive() then
 			if N.rerollKeep(mine) then
@@ -33501,11 +33544,52 @@ local function notePace(gap, firstThrow)
 		T.pace = { at = os.clock(), n = 0, gaps = 0, blocked = 0 }
 	end
 end
+-- Watchdog: throwing is wanted but no throw of ours started for 60 s. Logs the exact reason (THROW stalled ...), a PROBLEM
+-- once per 10 min, and switches the throw path (button -> direct, direct -> button), so Auto Throw never sits silent.
+function N.throwWatchdog(mode, activity)
+	local T = N.Throw
+	local now = os.clock()
+	if not T.wantAt or now - T.wantAt > 5 then
+		T.stallFrom = now
+	end
+	T.wantAt = now
+	if liveCount() > 0 then
+		T.stallFrom = now
+		return
+	end
+	if now - (T.stallFrom or now) < 60 then
+		return
+	end
+	T.stallFrom = now
+	local button = N.throwButton()
+	local reason = N.throwBlocker()
+	log(
+		"THROW stalled 60s",
+		"mode=" .. tostring(mode),
+		"activity=" .. tostring(activity),
+		"launch=" .. tostring(N.inLaunchZone()),
+		"button=" .. (if button == nil then "missing" elseif button.Active then "active" else "off"),
+		"blocker=" .. tostring(reason),
+		"tutorial=" .. tostring(N.state().TutorialStep),
+		"last=" .. tostring(T.lastReject or "-")
+	)
+	if now - (T.stallProblemAt or -1e9) > 600 then
+		T.stallProblemAt = now
+		logProblem("Auto Throw started no throw in 60 s (" .. tostring(mode) .. ", " .. tostring(reason) .. ")")
+	end
+	if mode == "button" and N.throwSpeed() ~= "legit" and N.throwModeAvailable("direct") then
+		N.buttonFallback("no throw in 60 s")
+	elseif mode == "direct" then
+		N.autoFallback("no throw in 60 s")
+		N.Direct.offUntil = math.max(N.Direct.offUntil, now + 600)
+	end
+end
 -- One throw from the launch zone. Returns true when a throw finished (or is running).
 function N.throwStep()
 	local T = N.Throw
 	local activity = N.activity()
 	local mode = N.throwMode()
+	N.throwWatchdog(mode, activity)
 	N.rerollTick()
 	-- A throw whose ThrowFinished never came (world change, lost packet) is forgotten after 30 s, so a ghost never
 	-- counts as "in flight".
@@ -33642,6 +33726,10 @@ function N.throwStep()
 	local gap = os.clock() - T.finishedAt
 	T.pressedAt = os.clock()
 	local method = N.pressThrow()
+	if not method and N.throwSpeed() ~= "legit" and N.throwModeAvailable("direct") then
+		N.buttonFallback(if button then "no way to press the game's Throw button in this executor" else "the game's Throw button was not found")
+		return false
+	end
 	if not method then
 		T.noStart += 1
 		if T.noStart == 1 then
@@ -33655,6 +33743,12 @@ function N.throwStep()
 	end, 2.5)
 	if not started then
 		T.noStart += 1
+		T.lastReject = "press started no throw (" .. method .. ")"
+		log("THROW rejected via=button reason=no throw started 2.5 s after the press", "method", method, "tries", T.noStart)
+		if T.noStart >= 3 and N.throwSpeed() ~= "legit" and N.throwModeAvailable("direct") then
+			N.buttonFallback("3 presses started no throw (" .. method .. ")")
+			return false
+		end
 		if T.noStart >= 3 then
 			log("THROW no start", "method", method, "tries", T.noStart)
 			if T.method == method then
@@ -33670,7 +33764,7 @@ function N.throwStep()
 	local firstThrow = T.finishedAt < -1e8
 	T.gapLogs = (T.gapLogs or 0) + 1
 	if T.gapLogs <= 5 or T.gapLogs % 50 == 0 then
-		log("THROW gap=" .. (if firstThrow then "first" else string.format("%.2f", gap)), "accepted=true")
+		log("THROW ok via=" .. mode .. " gap=" .. (if firstThrow then "first" else string.format("%.2f", gap)), "method", method)
 	end
 	notePace(gap, firstThrow)
 	if not T.method then
@@ -35721,6 +35815,18 @@ do
 	-- job; with both on the time is split by the Throw Share slider in 180 s blocks.
 	local Plain = { mode = "throw", ends = 0 }
 	function N.planMode()
+		-- The game's first quest (fresh account, State.TutorialStep 1, GameBalance.Tutorial.SkillGoal 30): the tutorial
+		-- arrow points at the training stand and the launch zone only opens as the next step (TutorialController
+		-- targetFor 59255-59297), so the hub trains those few seconds first whatever toggle runs.
+		local step = tonumber(N.state().TutorialStep)
+		if step == 1 and (N.planner() or on("AutoThrow") or on("AutoTrain")) then
+			if not N.TutorialLogged then
+				N.TutorialLogged = true
+				local goal = N.G and N.G.Balance and N.G.Balance.Tutorial and N.G.Balance.Tutorial.SkillGoal or 30
+				log("TUTORIAL step 1: training to", tostring(goal), "skill first (the game's first quest), then throwing")
+			end
+			return "train"
+		end
 		if not N.planner() then
 			local throwOn, trainOn = on("AutoThrow"), on("AutoTrain")
 			if throwOn and not trainOn then
@@ -36494,7 +36600,7 @@ do
 			Text = "Throw Speed",
 			Values = { "Blatant", "Fast", "Legit (game pace)" },
 			Default = "Blatant",
-			Tooltip = "Blatant (default) and Fast: throw again 0.82 s after a throw lands (the server's own cooldown). If the server refuses throws or names a flag, Corvus uses the game's button for 10 minutes and then goes back to direct throws. Legit: the game's own button at its Auto Wins pace (about 2.4 s between throws)",
+			Tooltip = "Blatant (default): presses the game's own Throw button the moment it comes back (0.8 s after a throw lands), so every throw shows in game. If the button starts no throw, Corvus sends the throws straight to the server for 10 minutes. Fast: always sends them straight to the server at the same 0.82 s, the game does not draw those throws. Legit: the game's own button at its Auto Wins pace (about 2.4 s between throws)",
 		})
 		ThrowBox:AddDropdown("MoveMode", {
 			Text = "Movement",
