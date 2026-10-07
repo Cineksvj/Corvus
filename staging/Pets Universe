@@ -32619,7 +32619,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	webhookRarity = { Mythical = true, Secret = true },
     	webhookPets = {},
     	webhookHideName = false,
-    	eggAutoTravel = false,
+    	eggAutoTravel = true,
     	hatchStopAfter = 0,
     	hatchKeepCoins = 0,
     	fruitRefill = 1,
@@ -33687,6 +33687,13 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     local function recordHatch(list, egg)
     	if type(list) ~= "table" then return end
     	HatchState.waiting = false
+    	HatchState.noAnswer = 0
+    	HatchState.results = (HatchState.results or 0) + 1
+    	if HatchState.results <= 3 then
+    		Auto.log("HATCH", "ok", "egg=" .. tostring(egg or HatchState.lastEgg), "pets=" .. #list, "eggs=" .. tostring(Saved.eggs))
+    	elseif Auto.logEvery then
+    		Auto.logEvery("hatchok", 300, "HATCH", "ok", "egg=" .. tostring(egg or HatchState.lastEgg), "pets=" .. #list, "results=" .. HatchState.results, "eggs=" .. tostring(Saved.eggs))
+    	end
     	local batch = {}
     	for _, pet in ipairs(list) do
     		local name = type(pet) == "table" and pet.Name or (type(pet) == "string" and pet) or nil
@@ -34577,7 +34584,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	"AutoFarm", "AutoTap", "PetStrike", "FarmWorldOn", "AutoUfo", "UfoTravel", "UfoHop", "AutoBuyWorlds",
     	"AutoGift", "AutoPartyEgg", "AutoFruitMachine", "AutoGroupChest", "AutoMoonChest", "AutoKeyCraft",
     	"AutoVipChest", "AutoPartner", "AutoUniverseZone", "AutoQuests", "AutoBen", "AutoCodes", "AutoFriend",
-    	"AutoFriendSend", "AutoFriendAccept", "AutoHatch", "EggSmart", "EggAutoTravel", "AutoInvEggs", "IndexHunter",
+    	"AutoFriendSend", "AutoFriendAccept", "AutoHatch", "EggSmart", "AutoInvEggs", "IndexHunter",
     	"AutoFruits", "AutoPotions", "AutoLucky", "AutoEquipBest", "AutoGolden", "AutoDiamond", "AutoFish", "FishSmart",
     	"FishIndexHunt", "FishIndexGolden", "FishTap", "AutoWorms", "AutoHooks", "AutoSellFish", "AutoMerchantBuy",
     	"AutoSpawnUpgrades", "AutoTree", "AutoSpecial", "AutoFishTree", "AutoMoonPerm", "AutoMoonIncr",
@@ -34607,15 +34614,64 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     UI.AllBox:AddToggle("SmartPlan", {
     	Text = "Smart Planner",
     	Description = "Plans and buys everything by payback",
-    	Tooltip = "Runs the profit engine on the whole game with real odds and prices: picks and hatches the egg that adds the most income per coin, walks to it, equips the best team, farms in the best world, buys worlds (The Moon too), spawn, tree, special and Moon upgrades only when they pay back within 24 hours, times Moon rebirths, pauses fishing when farming pays more and uses admin events (luck, free eggs). Your upgrade picks and the ruby / gem reserves are respected. Auto Farm, fusing, selling and items stay on their own switches.",
+    	Tooltip = "Runs the profit engine on the whole game with real odds and prices: picks and hatches the egg that adds the most income per coin, walks to it, equips the best team, farms in the best world, buys worlds (The Moon too), spawn, tree, special and Moon upgrades only when they pay back within 24 hours, times Moon rebirths, pauses fishing when farming pays more and uses admin events (luck, free eggs). Your upgrade picks and the ruby / gem reserves are respected. It farms and opens eggs by itself, even with every other switch off. Fishing, fusing, selling and items stay on their own switches.",
     	Default = false,
     	Callback = function(v)
     		S.farmOP = v == true
     		if not S.farmOP then
     			S.worldSave = 0
     		end
+    		if Auto.drive then
+    			pcall(Auto.drive)
+    		end
     	end,
     })
+    -- log a line at most once per gap seconds for the same key (refusal reasons, travel failures)
+    function Auto.logEvery(key, gap, ...)
+    	Auto.logAt = Auto.logAt or {}
+    	local now = os.clock()
+    	if now - (Auto.logAt[key] or -1e9) < gap then
+    		return
+    	end
+    	Auto.logAt[key] = now
+    	Auto.log(...)
+    end
+    -- Smart switches own their loop (the switches themselves never flip): Smart Planner farms and hatches,
+    -- Smart Egg Pick hatches, Smart Fishing fishes and farms, Rebirth By Payback rebirths
+    function Auto.drive()
+    	local plan = S.farmOP == true
+    	local rows = {
+    		{ "AutoFarm", "autoFarm", plan or S.fishSmart == true },
+    		{ "AutoHatch", "autoHatch", plan or S.eggSmart == true },
+    		{ "AutoFish", "autoFish", S.fishSmart == true },
+    		{ "AutoRebirth", "autoRebirth", S.rebirthSmart == true },
+    	}
+    	for _, row in ipairs(rows) do
+    		local toggle = Toggles[row[1]]
+    		local user = toggle ~= nil and toggle.Value == true
+    		local value = user or row[3]
+    		if S[row[2]] ~= value then
+    			S[row[2]] = value
+    			Auto.log("DRIVE", row[2] .. "=" .. tostring(value), "by=" .. (if user then "switch" elseif value then "smart" else "off"))
+    			if row[1] == "AutoFarm" then
+    				if SetAutoBreaking then
+    					pcall(function() SetAutoBreaking:FireServer(value) end)
+    				end
+    				if not value then
+    					lockedTarget = nil
+    				end
+    			elseif row[1] == "AutoHatch" then
+    				HatchState.waiting = false
+    			end
+    		end
+    	end
+    end
+    task.spawn(function()
+    	while alive() do
+    		task.wait(1)
+    		pcall(Auto.drive)
+    	end
+    end)
     -- what changed a toggle is always in the log: the saved config at start (AUTOLOAD) or the player (CLICK)
     Library.OnAutoload = function()
     	local names = {}
@@ -35225,7 +35281,7 @@ end
     })
     EggBox:AddToggle("AutoHatch", {
     	Text = "Auto Buy Egg",
-    	Description = "Opens the egg when in range and affordable",
+    	Description = "Goes to the egg and opens it when affordable",
     	Default = false,
     	Callback = function(v)
     		S.autoHatch = v
@@ -35239,18 +35295,22 @@ end
     EggBox:AddToggle("EggSmart", {
     	Text = "Smart Egg Pick",
     	Description = "Picks the egg that pays back best",
-    	Tooltip = "Uses real egg odds, your luck and your team to pick the coin egg that adds the most income per coin within 24 hours. Your egg pick is ignored while this is on. Needs Auto Buy Egg.",
+    	Tooltip = "Uses real egg odds, your luck and your team to pick the coin egg that adds the most income per coin within 24 hours. Your egg pick is ignored while this is on. It opens the eggs and goes to them by itself, Auto Buy Egg does not need to be on.",
     	Default = false,
     	Callback = function(v)
     		S.eggSmart = v
+    		if Auto.drive then
+    			pcall(Auto.drive)
+    		end
     	end,
     })
-    EggBox:AddToggle("EggAutoTravel", {
-    	Text = "Go to egg automatically",
-    	Description = "Teleports to its world and walks to it",
+    EggBox:AddToggle("EggStayPut", {
+    	Text = "Stay where I am",
+    	Description = "Only opens the egg when you stand next to it",
+    	Tooltip = "Off: Auto Buy Egg teleports to the egg's world and walks up to it when it is too far. On: it waits until you are in range. Smart Planner always goes to its egg.",
     	Default = false,
     	Callback = function(v)
-    		S.eggAutoTravel = v
+    		S.eggAutoTravel = not v
     	end,
     })
     EggBox:AddToggle("SkipHatchAnim", {
@@ -35824,10 +35884,13 @@ end
     UI.FishBox:AddToggle("FishSmart", {
     	Text = "Smart Fishing",
     	Description = "Pauses fishing while farming pays more",
-    	Tooltip = "Measures what fishing and farming earn per second (fish tokens count as 0) and fishes only while it pays more. Fishing events always fish. Needs Auto Fish.",
+    	Tooltip = "Measures what fishing and farming earn per second (fish tokens count as 0) and fishes only while it pays more. Fishing events always fish. It fishes and farms by itself, Auto Fish and Auto Farm do not need to be on.",
     	Default = false,
     	Callback = function(v)
     		S.fishSmart = v
+    		if Auto.drive then
+    			pcall(Auto.drive)
+    		end
     	end,
     })
     UI.FishBox:AddDropdown("FishSpot", {
@@ -35851,12 +35914,75 @@ end
     UI.FishBox:AddToggle("FishIndexGolden", {
     	Text = "Count golden fish",
     	Description = "Golden fish also count as missing",
-    	Tooltip = "Golden fish only come from Golden Catch in the Fishing Tree, so they are rare. Off means the hunter only looks for normal fish.",
+    	Tooltip = "Golden fish only come from Golden Catch in the Fishing Tree or the Golden Machine, so they are rare. Same as Golden in Complete below.",
     	Default = false,
     	Callback = function(v)
     		S.fishIndexGolden = v
+    		local option = Options.FishHuntVariants
+    		if option and type(option.Value) == "table" and (option.Value.Golden == true) ~= (v == true) then
+    			local value = table.clone(option.Value)
+    			value.Golden = v == true
+    			pcall(option.SetValue, option, value)
+    		end
     	end,
     })
+    function Auto.pickSet(value)
+    	local pick = {}
+    	if type(value) == "table" then
+    		for key, on in pairs(value) do
+    			if on then
+    				pick[key] = true
+    			end
+    		end
+    	end
+    	return pick
+    end
+    UI.FishBox:AddDropdown("FishHuntRarity", {
+    	Text = "Hunt rarities",
+    	Values = Items.HuntRarities,
+    	ValueImages = UI.RarityImages,
+    	Default = table.clone(Items.HuntRarities),
+    	Multi = true,
+    	Tooltip = "Fish Index Hunter only counts missing fish of these rarities.",
+    	Callback = function(value)
+    		S.fishHuntRarity = Auto.pickSet(value)
+    	end,
+    })
+    UI.FishBox:AddDropdown("FishHuntVariants", {
+    	Text = "Complete",
+    	Values = { "Normal", "Golden", "Diamond" },
+    	Default = { "Normal" },
+    	Multi = true,
+    	Tooltip = "Which fish variants the hunter completes. Normal is caught, Golden is caught or crafted from normal ones, Diamond is crafted from golden ones at the Diamond Machine.",
+    	Callback = function(value)
+    		S.fishHuntVariants = Auto.pickSet(value)
+    		local toggle = Toggles.FishIndexGolden
+    		local golden = S.fishHuntVariants.Golden == true
+    		if toggle and toggle.Value ~= golden then
+    			pcall(toggle.SetValue, toggle, golden)
+    		end
+    	end,
+    })
+    S.fishHuntRarity = Auto.pickSet(Options.FishHuntRarity and Options.FishHuntRarity.Value)
+    S.fishHuntVariants = Auto.pickSet(Options.FishHuntVariants and Options.FishHuntVariants.Value)
+    -- the variants the fish hunter completes (Count golden fish = Golden)
+    function Auto.fishVariantOn(variant)
+    	local pick = S.fishHuntVariants or { Normal = true }
+    	if variant == "Golden" then
+    		return pick.Golden == true or S.fishIndexGolden == true
+    	end
+    	return pick[variant] == true
+    end
+    function Auto.fishRarityOn(rarity)
+    	local pick = S.fishHuntRarity
+    	if type(pick) ~= "table" or next(pick) == nil then
+    		return pick == nil
+    	end
+    	if rarity == nil or not table.find(Items.HuntRarities, rarity) then
+    		return true
+    	end
+    	return pick[rarity] == true
+    end
     UI.FishBox:AddToggle("FishTap", {
     	Text = "Auto Tap",
     	Description = "Hits every speed-up for faster catches",
@@ -35908,6 +36034,7 @@ end
     UI.FishSpotRow = UI.FishStatusBox:AddStat({ Icon = "map-pin", Text = "Spot", Value = "-", Size = 22, ValueColor = "FontColor" })
     UI.FishIndexRow = UI.FishStatusBox:AddStat({ Icon = "book-open", Text = "Fish index", Value = "...", Size = 24, Progress = 0 })
     UI.FishMissingRow = UI.FishStatusBox:AddStat({ Icon = "search", Text = "Hunting", Value = "-", Size = 22, ValueColor = "FontColor" })
+    UI.FishFilterRow = UI.FishStatusBox:AddStat({ Icon = GameIcons.Index, Text = "Missing", Value = "-", Size = 22, ValueColor = "FontColor" })
     UI.FishTimerRow = UI.FishStatusBox:AddStat({ Icon = "clock", Text = "Next catch", Value = "-", Size = 22, Progress = 0 })
     UI.FishCatchRow = UI.FishStatusBox:AddStat({ Icon = GameIcons.Auto, Text = "Catches", Value = "0", Size = 22 })
     UI.FishLastRow = UI.FishStatusBox:AddStat({ Icon = "fish", Text = "Last catch", Value = "-", Size = 26 })
@@ -36465,10 +36592,13 @@ end
     UI.RebirthBox:AddToggle("RebirthSmart", {
     	Text = "Rebirth By Payback",
     	Description = "Rebirths when the gem gain beats the rebuild",
-    	Tooltip = "Rebirths only when the extra gems over 24 hours are worth more than the income lost while the Moon Incremental shop is bought again. Replaces Wait For Permanent Max while on.",
+    	Tooltip = "Rebirths only when the extra gems over 24 hours are worth more than the income lost while the Moon Incremental shop is bought again. Replaces Wait For Permanent Max while on and rebirths by itself, Auto Rebirth does not need to be on.",
     	Default = false,
     	Callback = function(v)
     		S.rebirthSmart = v
+    		if Auto.drive then
+    			pcall(Auto.drive)
+    		end
     	end,
     })
     UI.RebirthBox:AddInput("RebirthStopAt", {
@@ -37012,9 +37142,13 @@ end
     			if not hrp then return false, "Character is not loaded" end
     			if getWorldAt(hrp.Position) == world then return true end
     			if isWorldUnlocked(world) == false then
+    				Auto.logEvery("tplocked:" .. tostring(world), 300, "TP", "fail", "world=" .. tostring(world), "reason=locked")
     				return false, prettyWorld(world) .. " is locked"
     			end
-    			if not WorldGoTo then return false, "Teleport is unavailable" end
+    			if not WorldGoTo then
+    				Auto.logEvery("tpnone", 600, "TP", "fail", "world=" .. tostring(world), "reason=no GoTo remote")
+    				return false, "Teleport is unavailable"
+    			end
     			local previous = Mover.task
     			Mover.task = "Travelling to " .. prettyWorld(world)
     			pcall(function() WorldGoTo:FireServer(world) end)
@@ -37025,8 +37159,10 @@ end
     			until waited >= 10 or not alive() or (hrp and getWorldAt(hrp.Position) == world)
     			Mover.task = previous
     			if not (hrp and getWorldAt(hrp.Position) == world) then
+    				Auto.logEvery("tpfail:" .. tostring(world), 120, "TP", "fail", "world=" .. tostring(world), "reason=not there after " .. string.format("%.1f", waited) .. "s", "at=" .. tostring(hrp and getWorldAt(hrp.Position)))
     				return false, "Could not reach " .. prettyWorld(world)
     			end
+    			Auto.log("TP", "ok", "world=" .. tostring(world), "t=" .. string.format("%.1f", waited))
     			task.wait(0.8)
     			return true
     		end
@@ -37123,6 +37259,7 @@ end
     			until waited >= 4
     			local hrp = getRoot()
     			if not (model and hrp) then
+    				Auto.logEvery("tpegg:" .. name, 120, "TP", "fail", "egg=" .. name, "reason=egg model not found in " .. tostring(world))
     				return false, "Could not find " .. name
     			end
     			local pivot = model:GetPivot().Position
@@ -37164,6 +37301,7 @@ end
     			end
     			pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
     			hrp.CFrame = CFrame.lookAt(spot, Vector3.new(pivot.X, spot.Y, pivot.Z))
+    			Auto.logEvery("tpeggok:" .. name, 60, "TP", "ok", "egg=" .. name, "world=" .. tostring(world), "dist=" .. math.floor((hrp.Position - pivot).Magnitude))
     			return true
     		end
     
@@ -38163,6 +38301,7 @@ end
     				return folder and folder:FindFirstChild("Multi")
     			end)
     		end
+    		Auto.petsMulti = petsMulti
     
     		local function craftableList(kind)
     			local reqG, reqD = craftRequirements()
@@ -38299,23 +38438,32 @@ end
 
     		-- Fishing Index Hunter: golden fish missing from the index are crafted once enough normal ones are caught.
     		Auto.FishCraft = { lastTrip = -1e9, blockedUntil = -1e9 }
-    		Auto.fishCraftList = function()
+    		Auto.fishCraftList = function(kind)
+    			kind = kind or "Golden"
     			local fish = Auto.Fish
     			local plan = fish and fish.plan
     			local list = {}
-    			if not (S.fishIndexHunt and S.fishIndexGolden and plan and type(plan.missing) == "table") then
+    			if not (S.fishIndexHunt and Auto.fishVariantOn(kind) and plan and type(plan.missing) == "table") then
     				return list
     			end
-    			local reqG = craftRequirements()
+    			local reqG, reqD = craftRequirements()
     			local multi = petsMulti()
     			for _, name in ipairs(plan.missing) do
-    				local base = string.match(name, "^Golden (.+)$")
+    				local base = string.match(name, "^" .. kind .. " (.+)$")
     				if base then
     					local info = if type(multi) == "table" then multi[base] else nil
     					local rarity = if type(info) == "table" then info[3] else nil
-    					local exists = type(multi) ~= "table" or multi["Golden " .. base] ~= nil
-    					if exists and rarity ~= "Exclusive" and rarity ~= "Secret" and petStock("NormalPetsData", base) >= reqG then
-    						table.insert(list, base)
+    					local exists = type(multi) ~= "table" or multi[kind .. " " .. base] ~= nil
+    					if exists and rarity ~= "Exclusive" and rarity ~= "Secret" then
+    						if kind == "Golden" then
+    							if petStock("NormalPetsData", base) >= reqG then
+    								table.insert(list, base)
+    							end
+    						elseif petStock("GoldenPetsData", "Golden " .. base) >= reqD then
+    							table.insert(list, "Golden " .. base)
+    						elseif petStock("GoldenPetsData", base) >= reqD then
+    							table.insert(list, base)
+    						end
     					end
     				end
     			end
@@ -38324,20 +38472,28 @@ end
     		end
     		Auto.fishCraftDue = function(now)
     			local state = Auto.FishCraft
-    			if not (S.fishIndexHunt and S.fishIndexGolden) or now - state.lastTrip < 45 or now < state.blockedUntil then
+    			if not S.fishIndexHunt or now - state.lastTrip < 45 or now < state.blockedUntil then
     				return false
     			end
-    			return #Auto.fishCraftList() > 0
+    			return #Auto.fishCraftList("Golden") > 0 or #Auto.fishCraftList("Diamond") > 0
     		end
     		Auto.doFishCraft = function()
     			local state = Auto.FishCraft
     			state.lastTrip = os.clock()
-    			local list = Auto.fishCraftList()
-    			local done = if #list > 0 then craftBulk("Golden", list) else 0
-    			if done == 0 then
+    			local total = 0
+    			for _, kind in ipairs({ "Golden", "Diamond" }) do
+    				local list = Auto.fishCraftList(kind)
+    				local done = if #list > 0 then craftBulk(kind, list) else 0
+    				if #list > 0 then
+    					Auto.log("FISHCRAFT", kind, "wanted=" .. #list, "done=" .. done)
+    				end
+    				total += done
+    				if done > 0 then
+    					queueToast("Fishing Index", string.format("Crafted %d %s fish", done, string.lower(kind)))
+    				end
+    			end
+    			if total == 0 then
     				state.blockedUntil = os.clock() + 120
-    			else
-    				queueToast("Fishing Index", string.format("Crafted %d golden fish", done))
     			end
     		end
     
@@ -43733,8 +43889,9 @@ end
     				if not loot then
     					return nil
     				end
-    				local plan = { have = 0, total = 0, missing = {}, chance = 0 }
+    				local plan = { have = 0, total = 0, missing = {}, chance = 0, groups = {}, rarity = {}, craftOnly = 0 }
     				local seen = {}
+    				local multi = if Auto.petsMulti then Auto.petsMulti() else nil
     				for _, entry in ipairs(FishWorlds) do
     					local list = loot[if entry.frame == "Spawn" then "Default" else entry.frame]
     					local total, want, names = 0, 0, {}
@@ -43743,10 +43900,18 @@ end
     						if item.Gate == nil then
     							total += weight
     						end
-    						if item.Kind == "Pet" and type(item.Name) == "string" then
-    							local variants = { { item.Name, weight } }
-    							if S.fishIndexGolden then
-    								table.insert(variants, { tostring(item.Golden or ("Golden " .. item.Name)), weight * 0.01 })
+    						local info = if type(multi) == "table" and type(item.Name) == "string" then multi[item.Name] else nil
+    						local rarity = if type(info) == "table" and type(info[3]) == "string" then info[3] else nil
+    						if item.Kind == "Pet" and type(item.Name) == "string" and Auto.fishRarityOn(rarity) then
+    							local variants = {}
+    							if Auto.fishVariantOn("Normal") then
+    								table.insert(variants, { item.Name, weight, "Normal" })
+    							end
+    							if Auto.fishVariantOn("Golden") then
+    								table.insert(variants, { tostring(item.Golden or ("Golden " .. item.Name)), weight * 0.01, "Golden" })
+    							end
+    							if Auto.fishVariantOn("Diamond") and (type(multi) ~= "table" or multi["Diamond " .. item.Name] ~= nil) then
+    								table.insert(variants, { "Diamond " .. item.Name, 0, "Diamond" })
     							end
     							for _, variant in ipairs(variants) do
     								local value = readData("IndexData", variant[1])
@@ -43754,13 +43919,22 @@ end
     								if not seen[variant[1]] then
     									seen[variant[1]] = true
     									plan.total += 1
+    									local group = plan.groups[variant[3]] or { have = 0, total = 0 }
+    									plan.groups[variant[3]] = group
+    									group.total += 1
     									if got then
     										plan.have += 1
+    										group.have += 1
     									else
     										table.insert(plan.missing, variant[1])
+    										local key = rarity or "Other"
+    										plan.rarity[key] = (plan.rarity[key] or 0) + 1
+    										if variant[2] <= 0 then
+    											plan.craftOnly += 1
+    										end
     									end
     								end
-    								if not got then
+    								if not got and variant[2] > 0 then
     									want += variant[2]
     									table.insert(names, variant[1])
     								end
@@ -44289,7 +44463,7 @@ end
     				end
     				local pets = getDataFolder("PetsData")
     				local goldenWanted = {}
-    				if S.fishIndexHunt and S.fishIndexGolden and Fish.plan and type(Fish.plan.missing) == "table" then
+    				if S.fishIndexHunt and Auto.fishVariantOn("Golden") and Fish.plan and type(Fish.plan.missing) == "table" then
     					for _, missing in ipairs(Fish.plan.missing) do
     						local wanted = string.match(missing, "^Golden (.+)$")
     						if wanted then
@@ -45533,10 +45707,11 @@ end
     		HatchState.status = reason
     		HatchState.waiting = false
     		local far = reason == "Egg not in this world" or string.find(reason, "Too far", 1, true) ~= nil
+    		Auto.logEvery("hatchwhy:" .. eggName .. ":" .. string.gsub(reason, "%d", ""), 120, "HATCH", "wait", "egg=" .. eggName, "reason=" .. reason, "travel=" .. tostring(far and (S.eggAutoTravel or S.farmOP or huntEgg ~= nil) == true))
     		if far and huntEgg then
     			Auto.Hunter.needMove = true
     			HatchState.activeAt = os.clock()
-    		elseif far and S.eggAutoTravel and Auto.EggTravel then
+    		elseif far and (S.eggAutoTravel or S.farmOP) and Auto.EggTravel then
     			if S.autoUfo and Auto.Ufo and Auto.Ufo.engaged then
     				HatchState.status = "Paused for the UFO"
     			else
@@ -45556,6 +45731,12 @@ end
     	if HatchState.waiting and now - HatchState.lastFire < 4 then
     		HatchState.status = "Hatching"
     		return
+    	end
+    	if HatchState.waiting then
+    		HatchState.noAnswer = (HatchState.noAnswer or 0) + 1
+    		if HatchState.noAnswer == 3 or HatchState.noAnswer % 30 == 0 then
+    			Auto.log("HATCH", "no answer", "egg=" .. eggName, "tries=" .. HatchState.noAnswer, "status=" .. tostring(HatchState.status))
+    		end
     	end
     	if now - HatchState.lastFire < 0.5 then return end
     	local mode, count = Auto.hatchPlan(eggName, if huntEgg then "Max" else S.hatchMode, remaining)
@@ -45579,6 +45760,13 @@ end
     	HatchState.waiting = true
     	HatchState.status = "Hatching"
     	HatchState.count = count
+    	HatchState.fired = (HatchState.fired or 0) + 1
+    	if HatchState.fired <= 3 or HatchState.lastEgg ~= eggName then
+    		Auto.log("BUY", "egg", "egg=" .. eggName, "mode=" .. tostring(mode), "count=" .. tostring(count), "by=" .. (if huntEgg then "index" elseif S.farmOP then "planner" elseif S.eggSmart then "smart" else "switch"))
+    	else
+    		Auto.logEvery("buyegg", 300, "BUY", "egg", "egg=" .. eggName, "mode=" .. tostring(mode), "count=" .. tostring(count), "fired=" .. HatchState.fired)
+    	end
+    	HatchState.lastEgg = eggName
     	pcall(function() EggHatch:FireServer(eggName, mode) end)
     end
     
@@ -47005,8 +47193,40 @@ end
     				setStat(UI.FishMissingRow, nil, faint(#index.missing .. " missing, hunter off"))
     			elseif index.key then
     				setStat(UI.FishMissingRow, nil, tostring(index.names[1] or "") .. (if #index.names > 1 then faint("  +" .. (#index.names - 1)) else "") .. faint("  1 in " .. formatNumber(math.ceil(1 / index.chance))))
+    			elseif (index.craftOnly or 0) >= #index.missing then
+    				setStat(UI.FishMissingRow, nil, paint("#ffb84d", "Crafting " .. #index.missing .. " at the machines"))
     			else
     				setStat(UI.FishMissingRow, nil, paint("#ffb84d", "Unlock more fishing worlds"))
+    			end
+    		end
+    		if UI.FishFilterRow then
+    			if not (index and index.total > 0) then
+    				setStat(UI.FishFilterRow, nil, faint("Nothing picked, choose rarities and variants"))
+    			elseif #index.missing == 0 then
+    				local parts = {}
+    				for _, variant in ipairs({ "Normal", "Golden", "Diamond" }) do
+    					local group = index.groups and index.groups[variant]
+    					if group and group.total > 0 then
+    						table.insert(parts, group.total .. " " .. string.lower(variant))
+    					end
+    				end
+    				setStat(UI.FishFilterRow, nil, paint("#5ef08a", "All done") .. faint("  \u{00B7}  " .. table.concat(parts, ", ")))
+    			else
+    				local parts = {}
+    				for _, variant in ipairs({ "Normal", "Golden", "Diamond" }) do
+    					local group = index.groups and index.groups[variant]
+    					if group and group.total > 0 then
+    						table.insert(parts, variant .. " " .. (group.total - group.have))
+    					end
+    				end
+    				local rarities = {}
+    				for _, rarity in ipairs(Items.HuntRarities) do
+    					local n = index.rarity and index.rarity[rarity]
+    					if n and n > 0 then
+    						table.insert(rarities, rarity .. " " .. n)
+    					end
+    				end
+    				setStat(UI.FishFilterRow, nil, table.concat(parts, "  ") .. (if #rarities > 0 then faint("  \u{00B7}  " .. table.concat(rarities, ", ")) else ""))
     			end
     		end
     		if fish.active and fish.left then
@@ -47198,7 +47418,7 @@ end
     	local tasks = type(values.tasks) == "table" and values.tasks or {}
     	local map = {
     		farm = { "AutoFarm" },
-    		hatch = { "AutoHatch", "EggAutoTravel" },
+    		hatch = { "AutoHatch" },
     		index = { "IndexHunter" },
     		rewards = { "AutoGift", "AutoPartyEgg", "AutoQuests", "AutoMoonChest", "AutoGroupChest", "AutoFruitMachine", "AutoCodes" },
     		upgrades = { "AutoSpawnUpgrades", "AutoTree", "AutoSpecial" },
