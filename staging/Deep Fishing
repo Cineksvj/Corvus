@@ -33208,6 +33208,40 @@ N.Fish = {
 }
 do
 	local F = N.Fish
+	-- Cast cadence (player report: "fast, then slow, then fast again"): casts per minute in 1-minute windows, the pauses
+	-- (trips) that cost time in the window, and a SLOW line with the dominant cause when a minute is under 60% of the best.
+	N.Rate = { start = os.clock(), casts = 0, tSum = 0, best = 0, causes = {}, minutes = 0 }
+	function N.rateCause(why)
+		local R = N.Rate
+		R.causes[why] = (R.causes[why] or 0) + 1
+	end
+	function N.rateCast(took)
+		local R = N.Rate
+		R.casts += 1
+		R.tSum += tonumber(took) or 0
+	end
+	function N.rateTick()
+		local R = N.Rate
+		if os.clock() - R.start < 60 then
+			return
+		end
+		local span = (os.clock() - R.start) / 60
+		local perMin = R.casts / span
+		local avgT = if R.casts > 0 then R.tSum / R.casts else 0
+		log("RATE", "casts/min=" .. string.format("%.1f", perMin), "avg cast t=" .. string.format("%.1f", avgT), "best minute=" .. string.format("%.1f", R.best))
+		if R.minutes >= 2 and R.best > 0 and perMin < 0.6 * R.best and (N.wants("AutoFish") or N.planner()) then
+			local cause, count = "longer fights (avg cast " .. string.format("%.1f", avgT) .. " s)", 0
+			for why, n in pairs(R.causes) do
+				if n > count then
+					cause, count = "pause: " .. why .. " x" .. n, n
+				end
+			end
+			log("SLOW", "cause=" .. cause, "casts/min=" .. string.format("%.1f", perMin), "best=" .. string.format("%.1f", R.best))
+		end
+		R.minutes += 1
+		R.best = math.max(R.best, perMin)
+		R.start, R.casts, R.tSum, R.causes = os.clock(), 0, 0, {}
+	end
 	-- Auto Fish mode (default "Fast (default)"): always the fastest way that works. Any danger signal while fast (refused
 	-- casts, casts without an answer or catch window, a client error/kick message) = the game's own auto fishing for 30
 	-- minutes, and 3 such fallbacks in a day switch the fast way off for the day. "Legit" pins the game's auto fishing.
@@ -33656,6 +33690,7 @@ do
 		if N.Events.cast then
 			pcall(N.Events.cast, fish[1], cast.hooked)
 		end
+		N.rateCast(took)
 		F.cast = nil
 		return true
 	end
@@ -33740,6 +33775,7 @@ do
 	-- Stops casting for a trip (sell, shop, pond): the game's auto fishing off and any cast finished first.
 	function N.pauseFishing(why)
 		F.paused = true
+		N.rateCause(tostring(why))
 		local AF = F.patched
 		if AF and AF.On then
 			pcall(AF.SetOn, AF, false)
@@ -34365,7 +34401,7 @@ do
 			return false
 		end
 		local bm = N.tab("BigMouth")
-		if (tonumber(bm.ReadyAt) or 0) > N.serverTime() or not N.due("bigMouth", 60) then
+		if (tonumber(bm.ReadyAt) or 0) > N.serverTime() or os.clock() < (N.bmBackoff or 0) or not N.due("bigMouth", 60) then
 			return false
 		end
 		local _, sellable = N.fishStats()
@@ -34404,7 +34440,10 @@ do
 		end
 		local pos = N.spot("BigMouthFish")
 		if not pos or not N.goTo(pos, 8) then
-			log("BIGMOUTH not reached")
+			-- every failed trip cost two world changes and a lost cast, repeated each minute (live log: 4 trips in 5 minutes)
+			N.BMFail = math.min((N.BMFail or 0) + 1, 6)
+			N.bmBackoff = os.clock() + 300 * 2 ^ (N.BMFail - 1)
+			log("BIGMOUTH not reached", "retry in " .. math.floor(300 * 2 ^ (N.BMFail - 1) / 60) .. " min")
 			N.resumeFishing()
 			return false
 		end
@@ -37316,6 +37355,7 @@ do
 			if not ok then
 				reportError("info", err)
 			end
+			pcall(N.rateTick)
 			Perf.work.info = (Perf.work.info or 0) + (os.clock() - started)
 			task.wait(1)
 		end
