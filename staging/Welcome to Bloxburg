@@ -31987,10 +31987,15 @@ do
 	end
 	-- The game's job framework: PlayerScripts.Modules.JobHandler is a shared module (its .net, .Modules and .Shared
 	-- are filled by the game's loader), so requiring it gives the live object the game itself uses.
-	local JobHandlerCache = nil
+	local JobHandlerCache, JobHandlerMissAt = nil, nil
 	function N.jobHandler()
 		if JobHandlerCache and type(JobHandlerCache.net) == "table" then
 			return JobHandlerCache
+		end
+		-- not loaded yet (main menu): look again at most every 3 s, not on every call (the require + getgc(true) scan ran
+		-- dozens of times a second in the menu: live log 2026-10-07 `ISOLATED error :36034` spam, hitches)
+		if JobHandlerMissAt and os.clock() - JobHandlerMissAt < 3 then
+			return nil
 		end
 		local found = isolated(function()
 			local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
@@ -32012,6 +32017,7 @@ do
 			end
 		end
 		JobHandlerCache = found
+		JobHandlerMissAt = if found then nil else os.clock()
 		return found
 	end
 	-- Only the job actions a worker sends. Never purchases, trading, admin or anything for other players.
@@ -32241,6 +32247,214 @@ do
 	Log.context = function()
 		return Status
 	end
+end
+-- Main menu pre-step (live alt 2026-10-07 10:36: the account sat on the Bloxburg main menu (PLAY, STORE, WHAT'S NEW)
+-- while the hub "worked": shift did not start x3, `HAIR claim ... inUse=nil` every 20 s, efficiency 0).
+-- Dump MainMenuUI (148476-149828): the menu is the ScreenGui "MainMenuGui", parented to PlayerGui while shown
+-- (u1.Show 149370) and back under the module on Hide (149527). PLAY = MainMenuGui.MainMenu.ButtonContainer.Play,
+-- Play.Activated (149215) -> checkJoinWithoutPlot() / showPlotSelection(): with a plot or without Premium ->
+-- showHouseSelection(): no house yet = the game buys the starter house itself (HousePurchase ID 2, 148839), else
+-- HouseSelectionUI:Show (146912): the ScreenGui "HouseSelectionGUI" in PlayerGui, one entry per house under
+-- Frame.Main.Scroll with a "Button" whose Activated sends LoadHouse (147042-147060). Premium without a plot: the
+-- ScreenGui "ChoosePlot" (148921), "RandomFrame".Button = a free random plot (SelectPlot, 149072-149105).
+-- The hub presses exactly these buttons by firing their own Activated connections (getconnections / firesignal, else a
+-- real mouse click on the button), one press per screen every 6 s, only while a farm toggle or Smart Planner is on
+-- (nothing happens by itself otherwise). Everything else waits: the main loop and the planner pause with the status
+-- "Waiting for the game menu" until the world is ready (menu gone, character in the world, the game's JobHandler).
+-- Logs: `MENU seen <screen>`, `MENU play pressed via=<how>`, `MENU house pressed <name> via=`, `MENU plot random pressed`,
+-- `MENU daily reward closed`, `WORLD ready after <s>s`.
+N.Menu = { active = false, since = nil, pressAt = {}, houseTry = 0, seen = nil }
+do
+	local M = N.Menu
+	local function playerGui()
+		return LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	end
+	local function shown(gui)
+		if not gui then
+			return false
+		end
+		local ok, enabled = pcall(function()
+			return gui.Enabled
+		end)
+		return not ok or enabled ~= false
+	end
+	-- which pre-game screen is up: "main" | "plot" | "house" | nil (in the world)
+	function N.menuScreen()
+		local pg = playerGui()
+		if not pg then
+			return nil
+		end
+		local choose = pg:FindFirstChild("ChoosePlot")
+		if shown(choose) then
+			return "plot", choose
+		end
+		local houses = pg:FindFirstChild("HouseSelectionGUI")
+		local mainGui = pg:FindFirstChild("MainMenuGui")
+		-- the house list also opens in the world (a player's own house menu); it is a pre-step only with the menu up
+		if houses and mainGui then
+			return "house", houses
+		end
+		if shown(mainGui) then
+			return "main", mainGui
+		end
+		return nil
+	end
+	function N.inMenu()
+		return M.active or N.menuScreen() ~= nil
+	end
+	-- fires the button's own Activated handlers (the same code a click runs); returns how
+	function N.pressButton(button)
+		if not button then
+			return nil
+		end
+		local how = nil
+		if type(getconnections) == "function" then
+			pcall(function()
+				for _, c in ipairs(getconnections(button.Activated)) do
+					local fn = c.Function
+					if type(fn) == "function" then
+						task.spawn(fn)
+						how = "connection"
+					elseif c.Fire then
+						task.spawn(function()
+							c:Fire()
+						end)
+						how = "connection"
+					end
+				end
+			end)
+		end
+		if not how and type(firesignal) == "function" then
+			if pcall(firesignal, button.Activated) then
+				how = "firesignal"
+			end
+		end
+		if not how then
+			pcall(function()
+				local vim = game:GetService("VirtualInputManager")
+				local inset = game:GetService("GuiService"):GetGuiInset()
+				local p = button.AbsolutePosition + button.AbsoluteSize / 2 + inset
+				vim:SendMouseButtonEvent(p.X, p.Y, 0, true, game, 0)
+				task.wait(0.05)
+				vim:SendMouseButtonEvent(p.X, p.Y, 0, false, game, 0)
+				how = "click"
+			end)
+		end
+		return how
+	end
+	local function find(parent, ...)
+		local node = parent
+		for _, name in ipairs({ ... }) do
+			node = node and node:FindFirstChild(name)
+		end
+		return node
+	end
+	local function due(key, every)
+		if os.clock() - (M.pressAt[key] or -1e9) < every then
+			return false
+		end
+		M.pressAt[key] = os.clock()
+		return true
+	end
+	-- house entries, in the game's order (last used first)
+	local function houseButtons(gui)
+		local list = {}
+		local scroll = find(gui, "Frame", "Main", "Scroll")
+		for i, entry in ipairs(scroll and scroll:GetChildren() or {}) do
+			local button = entry:FindFirstChild("Button")
+			if button then
+				local okOrder, layout = pcall(function()
+					return entry.LayoutOrder
+				end)
+				table.insert(list, { name = entry.Name, button = button, order = (if okOrder then tonumber(layout) or 0 else 0) * 10000 + i })
+			end
+		end
+		table.sort(list, function(a, b)
+			return a.order < b.order
+		end)
+		return list
+	end
+	-- one step on the current screen; true when something was pressed
+	function N.menuStep(screen, gui)
+		if screen == "main" then
+			local play = find(gui, "MainMenu", "ButtonContainer", "Play")
+			if play and due("play", 6) then
+				local how = N.pressButton(play)
+				log("MENU play pressed", "via=" .. tostring(how))
+				return how ~= nil
+			end
+		elseif screen == "plot" then
+			local random = find(gui, "RandomFrame", "Button")
+			if random and due("plot", 6) then
+				local how = N.pressButton(random)
+				log("MENU plot random pressed", "via=" .. tostring(how))
+				return how ~= nil
+			end
+		elseif screen == "house" then
+			local list = houseButtons(gui)
+			if #list > 0 and due("house", 8) then
+				-- the last used house first; if the list is still up 8 s later, the next one (the current house ignores clicks)
+				M.houseTry += 1
+				local pick = list[(M.houseTry - 1) % #list + 1]
+				local how = N.pressButton(pick.button)
+				log("MENU house pressed", pick.name, "try=" .. M.houseTry, "via=" .. tostring(how))
+				return how ~= nil
+			end
+		end
+		return false
+	end
+	-- the daily paycheck prompt the menu queues (MainMenuUI showDailyReward 148544): its Close button claims it
+	local function closeDailyReward()
+		local pg = playerGui()
+		local box = pg and pg:FindFirstChild("DailyReward", true)
+		local close = box and box:FindFirstChild("Close")
+		if close and due("daily", 10) then
+			local how = N.pressButton(close)
+			log("MENU daily reward closed", "via=" .. tostring(how))
+		end
+	end
+	local function wanted()
+		return N.workOn() or N.needsOn() or N.dailyOn() or (N.gardenOn ~= nil and N.gardenOn())
+	end
+	function N.worldReady()
+		local root = N.root and N.root()
+		return N.menuScreen() == nil and root ~= nil and N.jobHandler() ~= nil
+	end
+	task.spawn(function()
+		while alive() do
+			local ok, err = pcall(function()
+				local screen, gui = N.menuScreen()
+				if screen then
+					if not M.active then
+						M.active, M.since, M.houseTry = true, os.clock(), 0
+					end
+					if M.seen ~= screen then
+						M.seen = screen
+						log("MENU seen", screen, if wanted() then "pressing through" else "waiting (no farm toggle on)")
+					end
+					if wanted() then
+						closeDailyReward()
+						N.menuStep(screen, gui)
+					end
+				elseif M.active then
+					closeDailyReward()
+					M.goneAt = M.goneAt or os.clock()
+					if N.worldReady() then
+						log("WORLD ready after", math.floor(os.clock() - (M.since or os.clock())) .. "s")
+						M.active, M.seen, M.goneAt = false, nil, nil
+					elseif os.clock() - M.goneAt > 60 and N.root and N.root() then
+						-- menu gone for a minute, character in the world, JobHandler still missing: go on (the main loop reports it)
+						log("WORLD ready after", math.floor(os.clock() - (M.since or os.clock())) .. "s", "without the JobHandler")
+						M.active, M.seen, M.goneAt = false, nil, nil
+					end
+				end
+			end)
+			if not ok then
+				log("ERROR", "menu", tostring(err))
+			end
+			task.wait(if M.active then 1 else 3)
+		end
+	end)
 end
 -- Movement core (owner 2026-10-07: "it moves jerkily, stops and starts, like on a stick, there is no tween").
 -- Causes in the old code (log 2026-10-06 14:56): (1) the path walk insisted on every 4-stud waypoint (arrival 2 studs,
@@ -32757,6 +32971,18 @@ do
 			return if rung == "remote" then "walk" else nil, math.max(near, ACT_REACH - 4)
 		end
 		return "move", mv, if rung == "remote" then ACT_REACH - 4 else near
+	end
+	-- a move where the game needs your body there (hairdresser chair within 7.9 studs): never "parked in reach",
+	-- glide by the movement rung (teleport/tween memory per job), the walk only for Legit / NoPark jobs
+	function N.presenceMove(pos, near, timeout)
+		local job = N.currentJob()
+		if job ~= "" and not NoPark[job] and typeof(pos) == "Vector3" and not ((N.Cap and N.Cap.active) or (N.Needs and N.Needs.active) or (N.Garden and N.Garden.running)) then
+			local mv = moveRung(job)
+			if mv ~= "walk" and actMove(job, pos, near, mv) then
+				return true
+			end
+		end
+		return N.walkTo(pos, near, timeout, false, true)
 	end
 	function N.walkTo(pos, near, timeout, straightOnly, noPark)
 		near = near or 3
@@ -33393,8 +33619,11 @@ do
 				end
 			end
 			if claim then
+				-- presence needed (live log 2026-10-07: `HAIR claim ... dist 23` every 20 s, seated=0 for minutes): the
+				-- remote rung parked 23 studs away ("in reach" 26), but customers only sit when the hairdresser stands
+				-- within 7.9 studs of the chair, so this move skips the remote reach and glides to the station
 				if claimDist > 5 then
-					N.walkTo(stationPos(claim), 4, 8)
+					N.presenceMove(stationPos(claim), 4, 8)
 				end
 				local use = claim:FindFirstChild("InUse")
 				if (not use or use.Value ~= LocalPlayer) and os.clock() - (N.Hair.claimAt or -1e9) >= 20 then
@@ -41701,6 +41930,13 @@ do
 			task.wait(0.3)
 			return
 		end
+		-- pre-step: the game's main menu / house list (p02_menu presses PLAY); no job, needs or planner action before the
+		-- world is ready
+		if N.inMenu() then
+			setStatus(if N.Menu.seen then "Waiting for the game menu: " .. N.Menu.seen .. " screen" else "Waiting for the game menu")
+			task.wait(1)
+			return
+		end
 		if N.dead() then
 			N.taxiRelease()
 			setStatus("Waiting for your character")
@@ -41826,7 +42062,7 @@ do
 						log("EFF", N.currentJob(), "efficiency", eff, "reason", tostring(tip), "'" .. why .. "'", if needsRelated then "(needs)" else "", "level", N.Levels[N.currentJob()], "shift pay", N.shiftEarnings())
 					end
 				end
-				if working and N.bestOn() then
+				if working and N.bestOn() and not N.inMenu() then
 					N.planTick()
 				end
 				-- moods every 10 s: decay and efficiency model samples, the MOOD log line every 60 s (only with Auto Needs)
@@ -42017,7 +42253,13 @@ do
 	-- Smart Planner: its own loop, silent while the toggle is off
 	task.spawn(function()
 		while alive() do
-			if N.planOn() then
+			if N.planOn() and N.inMenu() then
+				-- the planner waits for the world (p02_menu presses PLAY)
+				if os.clock() - (N.Menu.planLogAt or -1e9) >= 60 then
+					N.Menu.planLogAt = os.clock()
+					log("PLAN idle", "reason=game menu, pressing PLAY first")
+				end
+			elseif N.planOn() then
 				local ok, err = xpcall(N.smartTick, debug.traceback)
 				if not ok then
 					reportError("plan", err)
