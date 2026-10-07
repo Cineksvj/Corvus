@@ -35384,12 +35384,40 @@ do
 			end
 		end)
 	end
+	-- The plot's Starter Pack pad opens a Robux purchase window when the character steps on it (LocalScript 'Plot Pads.Starter Pack Pad',
+	-- dump 85919: Top.Touched -> prompt). Tween/hop routes crossed it and left the window open over the game (owner shot 2026-10-07).
+	-- The pad is local to us: with CanTouch off it never fires.
+	local PaidPadAt = 0
+	function N.guardPaidPads()
+		if os.clock() - PaidPadAt < 5 then
+			return
+		end
+		PaidPadAt = os.clock()
+		pcall(function()
+			local plot = N.plot()
+			local pack = plot and plot:FindFirstChild("StarterPack")
+			if not pack then
+				return
+			end
+			local off = 0
+			for _, part in ipairs(pack:GetDescendants()) do
+				if part:IsA("BasePart") and part.CanTouch then
+					part.CanTouch = false
+					off += 1
+				end
+			end
+			if off > 0 then
+				log("GUARD paid pad: CanTouch off on", off, "parts of the Starter Pack pad")
+			end
+		end)
+	end
 	N.fetchData()
 	Session.cashStart = N.cash()
 	Session.powerStart = N.power()
 	log("DATA", "cash", formatNumber(N.cash()), "power", formatNumber(N.power()), "rebirth", N.rebirths(), "drill", tostring(N.d().EquippedDumbell), "carry", N.carryCap(), "slots", N.plotSlots(), "plot", N.plot() and N.plot().Name or "?")
 	-- Chores at the farm (the tier and expand pads are on the plot, eggs are placed on its grass, pads are stepped on).
 	local function baseChores()
+		N.guardPaidPads()
 		if not N.atBase(40) then
 			return false
 		end
