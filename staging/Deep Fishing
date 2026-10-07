@@ -32560,7 +32560,7 @@ do
 	function N.modeText()
 		local c = modeChoice()
 		if os.clock() < F.fallbackUntil then
-			return "Fishing with the game's auto fishing (fast way paused 30 min: " .. F.fallbackReason .. ")"
+			return "Fishing with the game's auto fishing (fast way paused " .. tostring(F.pauseText or "30 min") .. ": " .. F.fallbackReason .. ")"
 		end
 		if os.clock() < L.dayOffUntil then
 			return "Fishing with the game's auto fishing (fast way off for the day)"
@@ -32575,19 +32575,22 @@ do
 			return
 		end
 		local now = os.clock()
-		F.fallbackUntil = now + 1800
+		-- First fallback of the day: 5 minutes (the first throws right after joining often get no answer while the character settles at the pier); later ones 30 minutes.
+		local pause = if #L.falls == 0 then 300 else 1800
+		F.fallbackUntil = now + pause
 		F.fallbackReason = reason
+		F.pauseText = if pause >= 1800 then "30 min" else "5 min"
 		L.phase, L.mode, L.keep = "cooldown", "safe", "safe"
 		table.insert(L.falls, now)
 		while #L.falls > 0 and now - L.falls[1] > 86400 do
 			table.remove(L.falls, 1)
 		end
-		log("MODE fallback blatant -> safe", "reason=" .. tostring(reason), "retry in 30m", "falls today=" .. #L.falls)
+		log("MODE fallback blatant -> safe", "reason=" .. tostring(reason), "retry in " .. F.pauseText, "falls today=" .. #L.falls)
 		if #L.falls >= 3 then
 			L.dayOffUntil = now + 86400
 			log("MODE blatant off for the day", "falls=" .. #L.falls)
 		end
-		notify("Auto Fish", "Fast fishing paused for 30 minutes (" .. tostring(reason) .. "), using the game's auto fishing meanwhile", 6)
+		notify("Auto Fish", "Fast fishing paused for " .. F.pauseText .. " (" .. tostring(reason) .. "), using the game's auto fishing meanwhile", 6)
 	end
 	pcall(function()
 		game:GetService("GuiService").ErrorMessageChanged:Connect(function(msg)
