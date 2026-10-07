@@ -35283,7 +35283,7 @@ do
 end
 -- Towers are fought on the server: PlayTower starts a run with your tower team, every CompleteTowerFloor plays out
 -- one floor and the server refuses the next call until the fight animation time has passed.
-N.Tower = { running = false, name = nil, floor = 0, best = {}, lastText = "", teamAt = -1e9, autoOffAt = -1e9, rewards = {} }
+N.Tower = { running = false, name = nil, floor = 0, best = {}, lastText = "", teamAt = -1e9, autoOffAt = -1e9, rewards = {}, lastActionAt = os.clock(), loopGen = 0 }
 do
 	local T = N.Tower
 	local R = N.R
@@ -35517,12 +35517,22 @@ do
 			T.failStreak = 0
 		end
 		T.running, T.name, T.floor = true, tower.name, 0
+		T.lastActionAt = os.clock()
 		Session.towerRuns += 1
 		local rewards = {}
 		local finished, misses, endedRun = false, 0, false
+		-- Stall guard: answers without a completed floor or an end (empty or odd tables after a server hiccup) used to
+		-- keep a run "open" forever. 120 s without a new floor ends the run (CancelTower) and the loop starts a fresh one.
+		local progressAt = os.clock()
+		local stalled = false
 		-- An error in the loop must never leave T.running stuck on (the tower would never run again).
 		local loopOk, loopError = pcall(function()
 			while alive() and N.towerWanted() do
+				if os.clock() - progressAt > 120 then
+					log("WATCHDOG", "tower stalled reason=no new floor for 120 s", "tower=" .. tower.name, "floor=" .. T.floor, "- cancelling and starting again")
+					stalled = true
+					break
+				end
 				local okFloor, sequence
 				if pending then
 					okFloor, sequence, pending = true, pending, nil
@@ -35540,6 +35550,8 @@ do
 					local ended = false
 					for _, step in ipairs(sequence) do
 						if step.action == "floorCompleted" then
+							progressAt = os.clock()
+							T.lastActionAt = progressAt
 							T.floor = tonumber(step.floor) or T.floor + 1
 							Session.towerFloors += 1
 							for name, amount in pairs(type(step.rewards) == "table" and step.rewards or {}) do
@@ -35562,7 +35574,7 @@ do
 		if not loopOk then
 			log("ERROR", "tower run", tostring(loopError))
 		end
-		if (not endedRun and (not alive() or not N.towerWanted())) or not loopOk then
+		if (not endedRun and (not alive() or not N.towerWanted())) or not loopOk or stalled then
 			invoke(R.cancelTower, 5)
 		end
 		if finished then
@@ -37310,12 +37322,58 @@ do
 		end
 		task.wait(0.25)
 	end)
-	loop("tower loop", function()
-		if not N.manualRunning() and N.towerWanted() then
-			N.towerRun()
-			task.wait(1)
-		else
-			task.wait(1)
+	-- The tower loop carries a generation number: the watchdog below can start a fresh loop, the old one ends itself.
+	function N.startTowerLoop()
+		local Tw = N.Tower
+		Tw.loopGen += 1
+		local gen = Tw.loopGen
+		task.spawn(function()
+			while alive() and Tw.loopGen == gen do
+				local ok, err = xpcall(function()
+					if not N.manualRunning() and N.towerWanted() then
+						N.towerRun()
+					end
+				end, debug.traceback)
+				if not ok then
+					setStatus("Error: " .. reportError("tower loop", err))
+				end
+				task.wait(1)
+			end
+		end)
+	end
+	N.startTowerLoop()
+	-- Watchdog (player report 2026-10-07: "left it all night, the tower completed zero times"): towers wanted but no
+	-- run started and no floor completed for 10 min -> log the reason, clear the run state and start a fresh loop.
+	function N.towerWatchdog()
+		local Tw = N.Tower
+		if not N.towerWanted() then
+			Tw.lastActionAt = os.clock()
+			return false
+		end
+		if os.clock() - Tw.lastActionAt < 600 then
+			return false
+		end
+		local reason = if N.manualRunning() then "a manual action is still running"
+			elseif Tw.running then "run open without a new floor (" .. tostring(Tw.name) .. " floor " .. Tw.floor .. ")"
+			elseif Tw.lastText ~= "" then Tw.lastText
+			else "no run started"
+		log("WATCHDOG", "tower idle reason=" .. reason, "- restarting the tower loop")
+		logProblem("tower idle 10 min: " .. reason)
+		if Tw.running then
+			pcall(invoke, N.R.cancelTower, 5)
+		end
+		Tw.running, Tw.failStreak = false, 0
+		if N.Manual then
+			N.Manual.running = false
+		end
+		Tw.lastActionAt = os.clock()
+		N.startTowerLoop()
+		return true
+	end
+	task.spawn(function()
+		while alive() do
+			task.wait(30)
+			pcall(N.towerWatchdog)
 		end
 	end)
 	local function shown(tab)
