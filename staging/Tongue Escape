@@ -33680,6 +33680,29 @@ function N.tongueStep()
 	P.say = string.format("Server pays <b>+%s/s</b> at %d calls/s (%s)", formatNumber(P.perSec), P.rate, P.variant)
 	N.tongueBurst(P.rate, 3, P.variant)
 end
+-- A probe the server rejected on this PlaceVersion is hidden everywhere (no fake options); a game update resets the memory
+-- (state "new") and the controls come back. Idempotent: logs once per change.
+function N.tongueDead()
+	local P = N.Probe
+	return P.loaded == true and P.state == "rejected" and P.session.state ~= "new" and not P.session.kept
+end
+function N.lifeDead()
+	return N.Life.state == "rejected"
+end
+N.Hidden = {}
+function N.hideUi(name, objects, dead)
+	dead = dead == true
+	if (N.Hidden[name] == true) == dead then
+		return
+	end
+	N.Hidden[name] = dead
+	for _, o in ipairs(objects) do
+		if type(o) == "table" and type(o.SetVisible) == "function" then
+			pcall(o.SetVisible, o, not dead)
+		end
+	end
+	log("PROBE " .. name .. (if dead then " rejected, hidden" else " shown again"))
+end
 function N.tongueBeatsTraining()
 	local P = N.Probe
 	-- only against a measured treadmill rate: a fresh start trains first
@@ -34545,31 +34568,6 @@ function N.pepperStep()
 	Pp.last = string.format("Picked %d peppers (have %d)%s", got, N.peppers(), if Pp.commit then ", committed after " .. Pp.commit else "")
 	return got > 0
 end
--- Anti AFK: the game rejoins after 900 s without UserInputService input (AntiAfkSystem 5659-5673), Roblox kicks after
--- 20 min idle. A right-click and a VirtualUser click every 4 minutes count as real input.
-function N.afkInput()
-	local sent = false
-	pcall(function()
-		local vu = game:GetService("VirtualUser")
-		vu:CaptureController()
-		vu:ClickButton2(Vector2.new(0, 0))
-		sent = true
-	end)
-	pcall(function()
-		local vim = game:GetService("VirtualInputManager")
-		vim:SendMouseButtonEvent(0, 0, 1, true, game, 0)
-		task.wait(0.05)
-		vim:SendMouseButtonEvent(0, 0, 1, false, game, 0)
-		sent = true
-	end)
-	if sent then
-		Session.afk += 1
-		if Session.afk <= 2 or Session.afk % 15 == 0 then
-			log("AFK input", "sent " .. Session.afk)
-		end
-	end
-	return sent
-end
 -- Rewards: daily streak, playtime ladder, group reward, leave bonus and codes. Each one reads the same player attribute
 -- the game's button reads first, then sends the button's remote.
 N.Reward = { log = {}, at = {} }
@@ -35026,7 +35024,7 @@ function N.planStep()
 		else
 			table.insert(lines, "Skip pad runs: nothing left to buy with Wins")
 		end
-		do
+		if not N.tongueDead() then
 			local mode = N.tongueMode()
 			table.insert(lines, "Auto Tongue: " .. (if mode == "session" then "launch sessions off the treadmill" elseif mode then N.Probe.state .. " at " .. N.Probe.rate .. "/s " .. mode else N.Probe.state))
 		end
@@ -35042,6 +35040,24 @@ function N.planStep()
 	N.Plan.say = table.concat(lines, "\n")
 	N.Plan.spendText = lines[#lines] or ""
 end
+-- Wins pads: only probes that are not rejected are shown (a rejected one is hidden, never listed as a feature)
+function N.padProbeText()
+	local parts = {}
+	if N.Pads.touch ~= "rejected" then
+		table.insert(parts, "touch " .. N.Pads.touch)
+	end
+	if N.Pads.state ~= "rejected" then
+		table.insert(parts, "teleport " .. N.Pads.state)
+	end
+	if not N.lifeDead() then
+		table.insert(parts, "life resets " .. N.Life.state .. (if N.Life.variant then " (" .. N.Life.variant .. ")" else ""))
+	end
+	local out = if #parts > 0 then "\nProbes: " .. table.concat(parts, ", ") else ""
+	if not N.lifeDead() and N.Life.say ~= "-" then
+		out ..= "\n" .. N.Life.say
+	end
+	return out
+end
 -- Plain words for Main: what every enabled toggle does next.
 function N.upNext()
 	local out = {}
@@ -35052,7 +35068,7 @@ function N.upNext()
 	if N.want("AutoBubbles") then
 		table.insert(out, "Pop training bubbles (" .. N.Bubble.popped .. " so far)")
 	end
-	if N.want("AutoTongue") then
+	if N.want("AutoTongue") and not N.tongueDead() then
 		local mode = N.Probe.loaded and N.tongueMode()
 		table.insert(out, "Auto Tongue: " .. (if N.Probe.pending() then "test the server once" elseif mode == "session" then "launch sessions (beat training)" elseif mode then N.Probe.state .. " " .. mode else N.Probe.state))
 	end
@@ -35126,6 +35142,10 @@ do
 	end
 	Labels = {}
 	-- Every automation toggle (Stop Everything, Status, the stuck check). No master toggle (owner decision 2026-10-05).
+	function N.applyHidden()
+		N.hideUi("tongue", { N.TongueBox, Toggles.AutoTongue, N.TongueMirror, N.StatRows.Calls }, N.tongueDead())
+		N.hideUi("liferesets", { Toggles.LifeResets }, N.lifeDead())
+	end
 	N.FarmToggles = {
 		{ "SmartPlanner", "Smart Planner" },
 		{ "AutoTrain", "Train" },
@@ -35218,6 +35238,7 @@ do
 			Tooltip = "Sends the game's +1 Tongue call (one per second of tongue stretch in the real game). Tests once per game version what the server pays at 1, 2, 4 and 10 calls a second and in launch sessions (one launch, all its calls, retract), keeps what pays most next to training and stops if the server stops paying",
 		})
 		Labels.Tongue = TongueBox:AddLabel({ Text = "-", DoesWrap = true })
+		N.TongueBox = TongueBox
 		local RebirthBox = Tabs.Farm:AddLeftGroupbox("Rebirth", "refresh-cw")
 		RebirthBox:AddToggle("AutoRebirth", {
 			Text = "Auto Rebirth",
@@ -35359,7 +35380,7 @@ do
 		end
 		mirror("AutoTrain", "Auto Train", "Same as Farm > Auto Train: your best treadmill")
 		mirror("AutoBubbles", "Pop Training Bubbles", "Same as Farm > Pop Training Bubbles")
-		mirror("AutoTongue", "Auto Tongue", "Same as Farm > Auto Tongue: the +1 Tongue call at the cadence the server pays")
+		N.TongueMirror = mirror("AutoTongue", "Auto Tongue", "Same as Farm > Auto Tongue: the +1 Tongue call at the cadence the server pays")
 		mirror("AutoRebirth", "Auto Rebirth", "Same as Farm > Auto Rebirth: +0.5x tongue at every 10 levels")
 		mirror("SmartBuy", "Smart Buy", "Same as Upgrades > Smart Buy: skins and trails by tongue per win")
 		mirror("SmartPlanner", "Smart Planner", "Same as Farm > Smart Planner: plans everything by tongue math")
@@ -35389,6 +35410,9 @@ do
 					set = function(value)
 						stat:SetValue(value)
 					end,
+					SetVisible = function(_, v)
+						stat:SetVisible(v)
+					end,
 				}
 			end
 		end
@@ -35396,6 +35420,9 @@ do
 		return {
 			set = function(value)
 				label:SetText(text .. ": " .. tostring(value))
+			end,
+			SetVisible = function(_, v)
+				label:SetVisible(v)
 			end,
 		}
 	end
@@ -35486,7 +35513,7 @@ do
 				Session.rewards,
 				Session.codes
 			),
-			string.format("Status: %s  |  planner %s  |  probe tongue %s %s/s, winpads %s", tostring(Status), if N.planner() then "on" else "off", N.Probe.state, tostring(N.Probe.rate), N.Pads.state),
+			string.format("Status: %s  |  planner %s%s", tostring(Status), if N.planner() then "on" else "off", if N.tongueDead() then "" else string.format("  |  probe tongue %s %s/s, winpads %s", N.Probe.state, tostring(N.Probe.rate), N.Pads.state)),
 			"Running: " .. table.concat(Debug.running(), ", "),
 			string.format(
 				"Game: tongue %s, level %d, wins %s, rebirths %d, per point %s, trail %s, training %s on %s, peppers %d, festival %s",
@@ -35510,7 +35537,7 @@ do
 	end
 	Log.header = Debug.header
 end
-N.AllAutoToggles = { "SpeedHack", "AntiAfk" }
+N.AllAutoToggles = { "SpeedHack" }
 for _, row in ipairs(N.FarmToggles) do
 	table.insert(N.AllAutoToggles, row[1])
 end
@@ -35802,11 +35829,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		local UtilBox = holder:AddRightGroupbox("Utility", "wrench")
 		UtilBox:AddToggle("SpeedHack", { Text = "Walk Speed", Default = false })
 		UtilBox:AddSlider("WalkSpeed", { Text = "Speed", Default = 50, Min = 16, Max = 200, Rounding = 0 })
-		UtilBox:AddToggle("AntiAfk", {
-			Text = "Anti AFK",
-			Default = false,
-			Tooltip = "A click every 4 minutes counts as input, so the game's 15-minute AFK rejoin and Roblox's idle kick never trigger. Farming toggles do this on their own",
-		})
 	end)
 	if Tabs.Webhook then
 		pcall(function()
@@ -36324,9 +36346,6 @@ do
 		end
 		N.rewardStep()
 		N.codeStep()
-		if (on("AntiAfk") or anyAutoOn()) and choreDue("afk", 240) then
-			N.afkInput()
-		end
 		if on("SpeedHack") then
 			local hum = N.humanoid()
 			if hum and hum.WalkSpeed ~= optionNumber("WalkSpeed", 50) then
@@ -36364,6 +36383,7 @@ do
 					formatNumber(N.Train.rate60),
 					N.Bubble.popped
 				)
+				N.applyHidden()
 				local ses = N.Probe.session
 				I.tongue = string.format(
 					"Probe: <b>%s</b>%s\nLaunch sessions: %s%s\n%s\nCalls sent %s",
@@ -36379,16 +36399,13 @@ do
 					then string.format("<b>On</b>\n%s\nLast buy: %s", N.Plan.say, N.Plan.lastBuy)
 					else "Off. Turn it on to let Corvus rebirth, pick the treadmill and spend Wins and peppers by tongue math. Your other toggles stay as they are"
 				I.wins = string.format(
-					"Route: %s\n%s\nLast run: %s\nRuns %d, wins from pads %s\nProbes: touch %s, teleport %s, life resets %s%s",
+					"Route: %s\n%s\nLast run: %s\nRuns %d, wins from pads %s%s",
 					N.activeRoute(),
 					N.Pads.say,
 					N.Pads.last,
 					Session.padPasses,
 					formatNumber(Session.padWins),
-					N.Pads.touch,
-					N.Pads.state,
-					N.Life.state,
-					(if N.Life.variant then " (" .. N.Life.variant .. ")" else "") .. (if N.Life.say ~= "-" then "\n" .. N.Life.say else "")
+					N.padProbeText()
 				)
 				I.peppers = string.format("%s\nPeppers %d, festival %s\nCommit after: %s", N.Pepper.last, N.peppers(), if N.festival() then "<b>on</b>" else "off", N.Pepper.commit or "not measured yet")
 				local skin, skinName = N.skinPerPoint()
