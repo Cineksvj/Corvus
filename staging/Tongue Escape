@@ -32507,9 +32507,11 @@ do
 		if not hum or not N.alive() then
 			return false, "dead"
 		end
+		near = math.max(near or 4, 3, (hum.WalkSpeed or 16) * 0.12)
 		local started, sentAt = os.clock(), -1e9
 		local startY = N.root().Position.Y
 		local bestDist, bestAt = N.flatDist(pos), os.clock()
+		local replans = 0
 		while os.clock() - started < (timeout or 20) and alive() do
 			if not N.alive() then
 				return false, "died"
@@ -32521,7 +32523,23 @@ do
 			if d < bestDist - 0.5 then
 				bestDist, bestAt = d, os.clock()
 			elseif os.clock() - bestAt > (opts.stuck or 4) then
-				return false, "stuck"
+				if replans >= 4 then
+					log("MOVE stuck", string.format("%.0f studs left", d), "gave up after 4 re-plans")
+					return false, "stuck"
+				end
+				replans += 1
+				log("MOVE stuck", string.format("%.0f studs left", d), "re-plan " .. replans)
+				local root = N.root()
+				pcall(function()
+					hum.Jump = true
+					hum:MoveTo(root.Position + root.CFrame.RightVector * (if replans % 2 == 1 then 6 else -6))
+				end)
+				task.wait(0.6)
+				pcall(function()
+					hum:MoveTo(pos)
+				end)
+				sentAt = os.clock()
+				bestDist, bestAt = d + 1, os.clock()
 			end
 			if opts.fallY and N.root().Position.Y < startY - opts.fallY then
 				return false, "fell"
@@ -32554,6 +32572,8 @@ do
 			task.wait(0.2)
 			return N.dist(pos) <= near + 3
 		end
+		local hum = N.humanoid()
+		near = math.max(near, 3, (hum and hum.WalkSpeed or 16) * 0.12)
 		local ok, why = N.walkTo(pos, near, 25)
 		if ok then
 			return true
