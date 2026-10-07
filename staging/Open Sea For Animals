@@ -20179,8 +20179,8 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         Library.MinSize = Vector2.new(math.min(WindowInfo.MinContainerWidth, MaxX), Library.OriginalMinSize.Y)
     
         WindowInfo.Size = UDim2.fromOffset(
-            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, MaxX),
-            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, MaxY)
+            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, math.max(Library.MinSize.X, MaxX)),
+            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, math.max(Library.MinSize.Y, MaxY))
         )
         Library.MobileWindowSize = Vector2.new(WindowInfo.Size.X.Offset, WindowInfo.Size.Y.Offset)
         if typeof(WindowInfo.Font) == "EnumItem" then
@@ -34442,7 +34442,8 @@ end
 				if I.fails >= 3 then
 					TS.state = "no"
 					call("TrainingService", "StopTraining")
-					log("TRAIN+SEA off: the sea does not open while training")
+					TS.offAt, I.fails, I.gap = os.clock(), 0, 0.25 -- the refusals during the probe are not a danger signal (live 2026-10-07: 10 refusals in 25 s -> Teleport)
+						log("TRAIN+SEA off: the sea does not open while training")
 				elseif now - TS.at >= 20 then
 					if power() > TS.power and I.ok > TS.waves then
 						TS.state, TS.at, TS.power = "works", now, power()
@@ -34451,7 +34452,8 @@ end
 					else
 						TS.state = "no"
 						call("TrainingService", "StopTraining")
-						log("TRAIN+SEA off: power", TS.power, "->", power(), "waves", TS.waves, "->", I.ok)
+						TS.offAt, I.fails, I.gap = os.clock(), 0, 0.25
+							log("TRAIN+SEA off: power", TS.power, "->", power(), "waves", TS.waves, "->", I.ok)
 					end
 				end
 			elseif TS.state == "works" and now - TS.at >= 60 then
@@ -34505,7 +34507,7 @@ end
 				I.fails += 1
 				I.gap = math.min(I.gap * 1.5 + 0.1, 4)
 				setStatus(string.format("Blatant: the sea did not open, next try in %.1fs", I.gap))
-				if I.fails % 10 == 0 then
+				if I.fails % 10 == 0 and os.clock() - (TS.offAt or -1e9) > 25 then
 					if Game.auto then
 						Game.auto.signal("the sea refused to open " .. I.fails .. " times", true)
 					end
