@@ -26439,15 +26439,10 @@ end
                 Description = Info.Description or "Performance, AFK and connection",
             })
             Window.MiscTab = Tab
-    
-            local function Nudge()
-                pcall(function()
-                    local VirtualUser = game:GetService("VirtualUser")
-                    VirtualUser:CaptureController()
-                    VirtualUser:ClickButton2(Vector2.new())
-                end)
+            if typeof(Info.RejoinScript) == "string" then
+                Library.RejoinScript = Info.RejoinScript
             end
-    
+
             local function Humanoid()
                 local Character = LocalPlayer.Character
                 return Character and Character:FindFirstChildOfClass("Humanoid")
@@ -26469,11 +26464,15 @@ end
             AfkBox:AddToggle("CorvusAntiAFK", {
                 Text = "Anti AFK",
                 Description = "Never get kicked for being idle",
-                Tooltip = "Answers the idle check and sends a quiet input every few minutes",
+                Tooltip = "A harmless key press after a minute without input, a tiny step now and then while you stand still, and a rejoin if Roblox still kicks you",
                 Default = Afk.Enabled,
                 Callback = function(Value)
                     Afk.Enabled = Value
-                    Library:SetSetting("AntiAFK", Value)
+                    if Library.SetAntiAfk then
+                        Library:SetAntiAfk(Value)
+                    else
+                        Library:SetSetting("AntiAFK", Value)
+                    end
                 end,
             })
             AfkBox:AddToggle("CorvusAutoJump", {
@@ -26506,26 +26505,17 @@ end
                     Afk.LastMove = os.clock()
                 end,
             })
-            local AfkStat = AfkBox:AddStat({ Icon = "shield-check", Text = "Idle kicks blocked", Value = "0", Size = 22 })
+            local AfkStat = AfkBox:AddStat({ Icon = "shield-check", Text = "AFK inputs sent", Value = "0", Size = 22 })
             local PulseStat = AfkBox:AddStat({ Icon = "activity", Text = "Last activity", Value = "just now", Size = 22, ValueColor = "FontColor" })
-    
-            Library:GiveSignal(LocalPlayer.Idled:Connect(function()
-                if not Afk.Enabled or Library.Unloaded then
-                    return
-                end
-                Nudge()
-                Afk.Count += 1
-                Afk.LastPulse = os.clock()
-            end))
     
             task.spawn(function()
                 while not Library.Unloaded do
                     task.wait(1)
                     local Now = os.clock()
-                    if Afk.Enabled and Now >= Afk.NextPulse then
-                        Nudge()
-                        Afk.LastPulse = Now
-                        Afk.NextPulse = Now + 45 + math.random() * 30
+                    local Engine = Library.AntiAfk
+                    if typeof(Engine) == "table" then
+                        Afk.Count = Engine.Count or Afk.Count
+                        Afk.LastPulse = math.max(Afk.LastPulse, Engine.LastPulse or 0)
                     end
                     if Afk.Jump and Now - Afk.LastJump >= Afk.JumpEvery then
                         Afk.LastJump = Now
@@ -26600,6 +26590,7 @@ end
                 Default = false,
                 Callback = function(Value)
                     Reconnect.Enabled = Value
+                    Library.AutoReconnectOn = Value == true
                     Reconnect.Status = if Value then "Watching" else "Off"
                     if not Value then
                         Reconnect.Pending = false
@@ -27417,36 +27408,19 @@ end
 
             if not Window.MiscTab and Info.Utility ~= false then
                 local Utility = Tab:AddRightGroupbox("Utility", "wrench")
-                local AntiIdleCount = 0
-                local AntiIdleEnabled = Library:GetSetting("AntiAFK", true) ~= false
-                local AntiIdleToggle = Utility:AddToggle("CorvusAntiAFK", {
+                Utility:AddToggle("CorvusAntiAFK", {
                     Text = "Anti AFK",
                     Description = "Blocks the 20 minute idle kick",
-                    Default = AntiIdleEnabled,
+                    Default = Library:GetSetting("AntiAFK", true) ~= false,
                     Callback = function(Value)
-                        AntiIdleEnabled = Value
-                        Library:SetSetting("AntiAFK", Value)
+                        if Library.SetAntiAfk then
+                            Library:SetAntiAfk(Value)
+                        else
+                            Library:SetSetting("AntiAFK", Value)
+                        end
                     end,
                 })
-    
-                Library:GiveSignal(LocalPlayer.Idled:Connect(function()
-                    if not AntiIdleEnabled or Library.Unloaded then
-                        return
-                    end
-    
-                    local Success = pcall(function()
-                        local VirtualUser = game:GetService("VirtualUser")
-                        VirtualUser:CaptureController()
-                        VirtualUser:ClickButton2(Vector2.new())
-                    end)
-                    if Success then
-                        AntiIdleCount += 1
-                        if AntiIdleToggle and AntiIdleToggle.SetDescription then
-                            AntiIdleToggle:SetDescription(string.format("Blocks the idle kick  \u{00B7}  %d prevented", AntiIdleCount))
-                        end
-                    end
-                end))
-    
+
                 Utility:AddToggle("CorvusNoPausePopup", {
                     Text = "Hide paused popup",
                     Description = "Removes the gameplay paused overlay",
@@ -32009,6 +31983,297 @@ end
 			end)
 		end
 	end)
+	-- CORVUS-ANTIAFK (tester 2026-10-07: a Loot To Forge farm ended in a disconnect after ~20 min AFK). ONE shared anti-AFK
+	-- for every hub, default ON ("Anti AFK" in Misc/Settings, saved as the AntiAFK setting), running from library load,
+	-- independent of any tab or automation toggle. Layers:
+	--  key     after ~70 s without input: a harmless key (F13) down/up through VirtualInputManager = UserInputService
+	--          InputBegan/InputEnded. That resets Roblox's idle timer (Idled never fires, no 20 min kick) and every game AFK
+	--          timer found in the dumps (LTF AFKClient 1100 s on InputBegan only, AD 1080 s, SFTR 1140 s, BLF/TONGUE/DRILL 900 s,
+	--          BSE/STONE/BKZ/ANT/ASMR/SAEGG controllers). A mouse move alone (InputChanged) did NOT reset LTF/AD/BLF/TONGUE/SAEGG.
+	--  vu      when the key does not arrive (executor without VirtualInputManager): VirtualUser CaptureController + ClickButton2.
+	--  idled   LocalPlayer.Idled -> VirtualUser click (last line of defence).
+	--  defuse  the game's own LocalPlayer.Idled handlers (RAP TeleportBackOnAFK, WTB AFKDetection, Idled rejoin requests) are
+	--          disabled through getconnections when the executor has it; re-enabled on unload. Client-side only.
+	--  nudge   every 3-4 min while the character stands still: a 0.5-stud MoveTo step and back (games that watch MoveDirection,
+	--          e.g. SAEGG AfkAutoClient). Never while seated, moving, falling, anchored or when Library.AntiAfkBusy() says busy.
+	--  rejoin  a Roblox idle kick (error message with idle/AFK) rejoins the same server with the hub queued (queue_on_teleport);
+	--          skipped when the Misc "Auto reconnect" toggle already handles it.
+	-- Logs: AFK prevented via=<key|vu|idled|nudge> total=<n> (max once per 5 min or on a layer change),
+	--       AFK watchdog no input for <N> min -> nudge (max once per 5 min), AFK defused game idle handlers n=<n>, AFK kicked "<msg>" -> rejoin.
+	do
+		local Afk = {
+			Enabled = Library:GetSetting("AntiAFK", true) ~= false,
+			LastInput = os.clock(),
+			LastHuman = os.clock(),
+			OwnAt = -1e9,
+			LastPulse = os.clock(),
+			LastNudge = os.clock(),
+			NextNudge = 180 + math.random() * 60,
+			Every = 60 + math.random() * 20,
+			Count = 0,
+			LastVia = nil,
+			LastLog = -1e9,
+			LastWatchLog = -1e9,
+			LastDefuse = -1e9,
+			KeySeen = false,
+			KeyWorks = nil,
+			Disabled = {},
+			Rejoining = false,
+		}
+		Library.AntiAfk = Afk
+		function Library:SetAntiAfk(Value: boolean)
+			local Was = Afk.Enabled
+			Afk.Enabled = Value == true
+			Library:SetSetting("AntiAFK", Value == true)
+			if Was ~= Afk.Enabled then
+				Library:CorvusLog("AFK guard " .. (if Afk.Enabled then "on" else "off"))
+			end
+		end
+		local AfkKey = Enum.KeyCode.F13
+		local function AfkNote(Via: string)
+			Afk.Count += 1
+			Afk.LastPulse = os.clock()
+			local Now = os.clock()
+			if Via ~= Afk.LastVia or Now - Afk.LastLog >= 300 then
+				Afk.LastVia = Via
+				Afk.LastLog = Now
+				Library:CorvusLog(string.format("AFK prevented via=%s total=%d", Via, Afk.Count))
+			end
+		end
+		local function AfkVirtualUser(): boolean
+			Afk.OwnAt = os.clock()
+			return (pcall(function()
+				local VirtualUser = game:GetService("VirtualUser")
+				VirtualUser:CaptureController()
+				VirtualUser:ClickButton2(Vector2.new())
+			end))
+		end
+		local function AfkInput(Input: any)
+			local Kind = Input and Input.UserInputType
+			if Kind == Enum.UserInputType.Gyro or Kind == Enum.UserInputType.Accelerometer then
+				return
+			end
+			Afk.LastInput = os.clock()
+			if Kind == Enum.UserInputType.Keyboard and Input.KeyCode == AfkKey then
+				Afk.KeySeen = true
+			elseif os.clock() - Afk.OwnAt > 1.5 then
+				Afk.LastHuman = os.clock()
+			end
+		end
+		for _, Signal in { UserInputService.InputBegan, UserInputService.InputEnded, UserInputService.InputChanged } do
+			pcall(function()
+				Library:GiveSignal(Signal:Connect(AfkInput))
+			end)
+		end
+		local function AfkPulse()
+			Afk.KeySeen = false
+			local Sent = pcall(function()
+				local VIM = game:GetService("VirtualInputManager")
+				VIM:SendKeyEvent(true, AfkKey, false, game)
+				task.wait(0.05)
+				VIM:SendKeyEvent(false, AfkKey, false, game)
+			end)
+			task.wait(0.5)
+			if Sent and Afk.KeySeen then
+				Afk.KeyWorks = true
+				AfkNote("key")
+				return
+			end
+			if Afk.KeyWorks ~= false then
+				Afk.KeyWorks = false
+				Library:CorvusLog("AFK key input not seen (" .. (if Sent then "no InputBegan" else "no VirtualInputManager") .. "), using VirtualUser")
+			end
+			if AfkVirtualUser() then
+				Afk.LastInput = os.clock()
+				AfkNote("vu")
+			end
+		end
+		local function AfkStep(Hum: Humanoid, Target: Vector3): ()
+			local Done = false
+			local Conn = Hum.MoveToFinished:Connect(function()
+				Done = true
+			end)
+			Hum:MoveTo(Target)
+			local Deadline = os.clock() + 0.8
+			while not Done and os.clock() < Deadline do
+				task.wait(0.05)
+			end
+			Conn:Disconnect()
+		end
+		local function AfkNudge(): boolean
+			local Busy = Library.AntiAfkBusy
+			if typeof(Busy) == "function" then
+				local Ok, IsBusy = pcall(Busy)
+				if Ok and IsBusy then
+					return false
+				end
+			end
+			local Char = LocalPlayer.Character
+			local Hum = Char and Char:FindFirstChildOfClass("Humanoid")
+			local Root = Hum and Hum.RootPart
+			if not (Hum and Root) or Hum.Health <= 0 or Hum.Sit or Hum.PlatformStand or Root.Anchored then
+				return false
+			end
+			if Hum.FloorMaterial == Enum.Material.Air or Hum.MoveDirection.Magnitude > 0.05 or Root.AssemblyLinearVelocity.Magnitude > 1 then
+				return false
+			end
+			local Origin = Root.Position
+			local Look = Root.CFrame.LookVector
+			local Dir = Vector3.new(Look.X, 0, Look.Z)
+			Dir = if Dir.Magnitude > 0.1 then Dir.Unit else Vector3.new(0, 0, -1)
+			local Ok = pcall(function()
+				AfkStep(Hum, Origin + Dir * 0.5)
+				AfkStep(Hum, Vector3.new(Origin.X, Root.Position.Y, Origin.Z))
+			end)
+			return Ok
+		end
+		local function AfkIdled()
+			if not Afk.Enabled or Library.Unloaded then
+				return
+			end
+			if AfkVirtualUser() then
+				Afk.LastInput = os.clock()
+				AfkNote("idled")
+			end
+		end
+		pcall(function()
+			Library:GiveSignal(LocalPlayer.Idled:Connect(AfkIdled))
+		end)
+		local function AfkReleaseIdled()
+			for Conn in Afk.Disabled do
+				Afk.Disabled[Conn] = nil
+				pcall(function()
+					Conn:Enable()
+				end)
+			end
+		end
+		table.insert(Library.UnloadSignals, AfkReleaseIdled)
+		local function AfkDefuse()
+			if typeof(getconnections) ~= "function" then
+				return
+			end
+			local Ok, List = pcall(getconnections, LocalPlayer.Idled)
+			if not Ok or typeof(List) ~= "table" then
+				return
+			end
+			local Fresh = 0
+			for _, Conn in List do
+				local Fn = nil
+				pcall(function()
+					Fn = Conn.Function
+				end)
+				if typeof(Fn) == "function" and Fn ~= AfkIdled and not Afk.Disabled[Conn] then
+					local Source = ""
+					pcall(function()
+						Source = tostring(debug.info(Fn, "s"))
+					end)
+					local Core = string.find(Source, "CoreGui", 1, true) or string.find(Source, "CorePackages", 1, true) or string.find(Source, "RobloxGui", 1, true)
+					if not Core and pcall(function()
+						Conn:Disable()
+					end) then
+						Afk.Disabled[Conn] = true
+						Fresh += 1
+					end
+				end
+			end
+			if Fresh > 0 then
+				local Total = 0
+				for _ in Afk.Disabled do
+					Total += 1
+				end
+				Library:CorvusLog(string.format("AFK defused game idle handlers n=%d total=%d", Fresh, Total))
+			end
+		end
+		local function AfkKicked(Message: string)
+			if not Afk.Enabled or Afk.Rejoining or Library.Unloaded or Library.AutoReconnectOn then
+				return
+			end
+			local Low = string.lower(tostring(Message or ""))
+			if not (string.find(Low, "idle", 1, true) or string.find(Low, "afk", 1, true) or string.find(Low, "278", 1, true)) then
+				return
+			end
+			Afk.Rejoining = true
+			Library:CorvusLog(string.format('AFK kicked "%s" -> rejoin same server', string.sub(tostring(Message), 1, 120)))
+			task.spawn(function()
+				local Script = Library.RejoinScript
+				if typeof(Script) ~= "string" then
+					Script = 'loadstring(game:HttpGet("https://raw.githubusercontent.com/vaensigma/Corvus/refs/heads/main/Loader"))()'
+				end
+				pcall(function()
+					local Queue = queue_on_teleport or queueonteleport or (typeof(syn) == "table" and syn.queue_on_teleport)
+					if typeof(Queue) == "function" then
+						Queue("if not game:IsLoaded() then game.Loaded:Wait() end\n" .. Script)
+					end
+				end)
+				local TeleportService = game:GetService("TeleportService")
+				for Attempt = 1, 30 do
+					pcall(function()
+						if Attempt <= 3 and game.JobId ~= "" then
+							TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+						else
+							TeleportService:Teleport(game.PlaceId, LocalPlayer)
+						end
+					end)
+					task.wait(8)
+				end
+			end)
+		end
+		pcall(function()
+			Library:GiveSignal(GuiService.ErrorMessageChanged:Connect(function()
+				local Message = ""
+				pcall(function()
+					Message = GuiService:GetErrorMessage()
+				end)
+				AfkKicked(Message)
+			end))
+		end)
+		task.delay(15, function()
+			if Library.Unloaded then
+				return
+			end
+			local HasVIM = pcall(function()
+				return game:GetService("VirtualInputManager")
+			end)
+			Library:CorvusLog(string.format(
+				"AFK guard %s layers=key%s,vu,idled,nudge,rejoin%s",
+				if Afk.Enabled then "on" else "off",
+				if HasVIM then "" else "(no VIM)",
+				if typeof(getconnections) == "function" then ",defuse" else ""
+			))
+		end)
+		task.spawn(function()
+			while not Library.Unloaded do
+				task.wait(1)
+				if Afk.Enabled then
+					local Now = os.clock()
+					local Idle = Now - Afk.LastInput
+					if Idle >= Afk.Every then
+						Afk.Every = 60 + math.random() * 20
+						Afk.LastInput = Now
+						if Now - Afk.LastWatchLog >= 300 then
+							Afk.LastWatchLog = Now
+							Library:CorvusLog(string.format("AFK watchdog no input for %.1f min -> nudge", Idle / 60))
+						end
+						task.spawn(AfkPulse)
+					end
+					if Now - Afk.LastNudge >= Afk.NextNudge and Now - Afk.LastHuman >= 150 then
+						Afk.LastNudge = Now
+						Afk.NextNudge = 180 + math.random() * 60
+						task.spawn(function()
+							if AfkNudge() then
+								AfkNote("nudge")
+							end
+						end)
+					end
+					if Now - Afk.LastDefuse >= 30 then
+						Afk.LastDefuse = Now
+						pcall(AfkDefuse)
+					end
+				end
+			end
+		end)
+	end
+	-- CORVUS-ANTIAFK-END
 	getgenv().CorvusLibrary = Library
     return Library
     end)()
