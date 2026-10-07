@@ -32377,9 +32377,17 @@ do
 		end)
 		return if ok and tonumber(v) then math.min(v, 1) else 0.1
 	end
-	function N.footTo(target, near, timeout)
-		near = near or 6
-		timeout = timeout or 20
+	-- near = the arrival radius: at least max(3, WalkSpeed x 0.12) (a fast character overshoots a tight radius), at most
+	-- maxNear (a prompt's range). Timeout = the distance at foot speed x 1.5 + 3 s. Stuck (under 1 stud gained in 1.5 s,
+	-- a wall or a server pull-back): jump, then a 4-stud sidestep, then a fresh start from where the character stands;
+	-- 3 stuck rounds = give up for this target.
+	function N.footTo(target, near, timeout, maxNear)
+		local hum = N.humanoid()
+		local ws = hum and tonumber(hum.WalkSpeed) or 16
+		near = math.max(near or 0, 3, ws * 0.12)
+		if maxNear then
+			near = math.min(near, maxNear)
+		end
 		local function flat()
 			local p = N.myPos() or target
 			return Vector3.new(p.X - target.X, 0, p.Z - target.Z).Magnitude
@@ -32390,8 +32398,10 @@ do
 		if flat() <= near then
 			return true
 		end
-		local started, last = os.clock(), os.clock()
 		local speed = N.footSpeed()
+		timeout = math.max(timeout or 0, flat() / math.max(speed, 1) * 1.5 + 3)
+		local started, last = os.clock(), os.clock()
+		local checkAt, checkD, stuck, sideUntil, side = os.clock(), flat(), 0, 0, nil
 		while os.clock() - started < timeout and alive() do
 			local now = os.clock()
 			local dt = math.min(now - last, 0.1)
@@ -32407,8 +32417,30 @@ do
 				N.Walk.fails = 0
 				return true
 			end
-			local step = math.min(speed * dt, d - near + 0.3)
-			local dir = Vector3.new(dx / d, 0, dz / d)
+			if now - checkAt >= 1.5 then
+				if checkD - d < 1 then
+					stuck += 1
+					if stuck >= 3 then
+						break
+					end
+					local h = N.humanoid()
+					if stuck == 1 then
+						pcall(function()
+							h.Jump = true
+						end)
+						log("MOVE stuck jump", string.format("%.0f studs left", d))
+					else
+						side = Vector3.new(-dz / d, 0, dx / d) * (if math.random() < 0.5 then 1 else -1)
+						sideUntil = now + 4 / math.max(speed, 1)
+						log("MOVE stuck sidestep", string.format("%.0f studs left", d))
+					end
+					-- re-plan: the timeout restarts from where the character stands now
+					timeout = math.max(timeout, now - started + d / math.max(speed, 1) * 1.5 + 3)
+				end
+				checkAt, checkD = now, d
+			end
+			local dir = if now < sideUntil and side then side else Vector3.new(dx / d, 0, dz / d)
+			local step = if now < sideUntil then speed * dt else math.min(speed * dt, d - near + 0.3)
 			local np = Vector3.new(p.X + dir.X * step, p.Y, p.Z + dir.Z * step)
 			pcall(function()
 				root.CFrame = CFrame.new(np, np + dir)
@@ -32436,7 +32468,7 @@ do
 		if not far() then
 			return true
 		end
-		local ok = N.footTo(pos, math.max(range - 1.5, 1.5), 15)
+		local ok = N.footTo(pos, math.max(range - 1.5, 1.5), nil, range)
 		if not ok then
 			N.actLog(action, "foot", false, "did not reach")
 			return false
@@ -32530,7 +32562,7 @@ do
 	end
 	-- The build as the plot shows it: Plot.Parts children named "x,y,z" with PartId, R, T attributes. Read at most every
 	-- 2 s (the same table, never changed by callers, so the per-build caches below hit); a build action invalidates it.
-	N.BuildCache = { b = nil, at = -1e9, sig = "" }
+	N.BuildCache = { b = nil, at = -1e9, sig = "", last = nil }
 	function N.invalidateBuild()
 		N.BuildCache.b = nil
 	end
@@ -32544,6 +32576,14 @@ do
 			return C.b
 		end
 		local b = N.scanBuild()
+		-- while the car is out (or the plot is between states) Plot.Parts is empty: the car is still the last build seen
+		if C.last and (N.myCar() ~= nil or next(b) == nil) then
+			C.b, C.at = C.last, os.clock()
+			return C.last
+		end
+		if next(b) ~= nil then
+			C.last = b
+		end
 		local keys = {}
 		for k, v in pairs(b) do
 			table.insert(keys, k .. "=" .. v.Id)
@@ -32959,7 +32999,10 @@ N.Drive = {
 	active = false,
 	car = nil,
 	target = nil,
-	input = "move",
+	-- the W key is what moved the car in every live run (tour 1039: MoveDirection gave 17 studs in 39 s); the input that
+	-- worked is remembered per PlaceVersion
+	input = "keys",
+	inputFile = "Corvus/BKZ_input.txt",
 	speed = 0,
 	lastPos = nil,
 	cap = 0,
@@ -32976,7 +33019,25 @@ N.Drive = {
 do
 	local D = N.Drive
 	D.keyAt = {}
-	D.keySet = { "W", "A", "D" }
+	D.keySet = { "W", "A", "D", "S" }
+	D.keySets = { keys = { "W", "A", "D", "S" }, arrows = { "Up", "Left", "Right", "Down" } }
+	do
+		local version = tostring(game.PlaceVersion)
+		pcall(function()
+			local v, mode = string.match(readfile(D.inputFile), "^(%S+)=(%a+)")
+			if v == version and (mode == "keys" or mode == "arrows" or mode == "move") then
+				D.input = mode
+			end
+		end)
+		function N.saveInput()
+			pcall(function()
+				if makefolder and isfolder and not isfolder("Corvus") then
+					makefolder("Corvus")
+				end
+				writefile(D.inputFile, version .. "=" .. D.input)
+			end)
+		end
+	end
 	local function hold(name, down)
 		local now = os.clock()
 		-- a held key is re-sent every 0.5 s: the game's input can lose a key (focus change, a menu), the flag must not hide it
@@ -33016,16 +33077,19 @@ do
 			return
 		end
 		dir = dir.Unit
-		if D.input == "keys" then
+		-- stuck nudge: 1 s of reverse with the wheel turned, then forward again
+		local back = os.clock() < (D.nudgeUntil or 0)
+		if D.input ~= "move" then
 			local right = part.CFrame.RightVector
 			local s = if right then dir:Dot(right) else 0
-			hold(D.keySet[1], not D.coast)
-			hold(D.keySet[2], s < -0.15)
-			hold(D.keySet[3], s > 0.15)
+			hold(D.keySet[1], not D.coast and not back)
+			hold(D.keySet[4], back)
+			hold(D.keySet[2], if back then true else s < -0.15)
+			hold(D.keySet[3], not back and s > 0.15)
 			return
 		end
 		pcall(function()
-			hum:Move(if D.coast then Vector3.zero else dir, false)
+			hum:Move(if back then -dir elseif D.coast then Vector3.zero else dir, false)
 		end)
 	end
 	local bound = pcall(function()
@@ -33322,6 +33386,20 @@ function N.driveRun()
 		return true
 	end
 	local car = N.myCar()
+	-- the first launch waits for the character and the plot (a SpawnCar before them gives no seat)
+	if not car and not (N.root() and N.myPlot()) then
+		setStatus("Waiting for your character and plot before driving")
+		task.wait(1)
+		return true
+	end
+	-- the game's throttle reads 0 while a TextBox has focus (GetThrottleSteer): let go of it before driving
+	pcall(function()
+		local tb = game:GetService("UserInputService"):GetFocusedTextBox()
+		if tb then
+			log("DRIVE released focused textbox " .. tb:GetFullName())
+			tb:ReleaseFocus()
+		end
+	end)
 	-- parts bought since the last run go on the car before the next launch (the build is locked while driving)
 	if not car and N.wants("AutoBuild") then
 		for _ = 1, 4 do
@@ -33365,21 +33443,14 @@ function N.driveRun()
 		task.wait(1)
 		return true
 	end
-	-- the game's throttle reads 0 while a TextBox has focus (GetThrottleSteer): let go of it before driving
-	pcall(function()
-		local tb = game:GetService("UserInputService"):GetFocusedTextBox()
-		if tb then
-			log("DRIVE released focused textbox " .. tb:GetFullName())
-			tb:ReleaseFocus()
-		end
-	end)
 	do
 		local hum = N.humanoid()
 		log("DRIVE seat", "seated=" .. tostring(hum ~= nil and hum.SeatPart ~= nil), "driver=" .. tostring(car:GetAttribute("DriverUserId") == LocalPlayer.UserId), "anchored=" .. tostring(part.Anchored))
 	end
-	D.keySet = { "W", "A", "D" }
+	D.keySet = D.keySets[D.input] or D.keySets.keys
 	local startX = part.Position.X
 	local maxX, lastX, lastProgressAt, emptyAt = startX, startX, os.clock(), nil
+	local slowAt, nudged = nil, false
 	local startedAt = os.clock()
 	local inputChecked = false
 	local reason = "?"
@@ -33411,20 +33482,30 @@ function N.driveRun()
 		D.offset = offset or 0
 		D.target = N.roadTarget(p)
 		N.nitroTick(car)
-		-- input check: no progress in the first 5 s with fuel = the MoveDirection path is not read, hold the keys instead
+		-- input check: no progress in the first 5 s with fuel = this input is not read; next one: W keys -> arrows ->
+		-- MoveDirection. The input that moves the car is remembered per PlaceVersion.
 		if not inputChecked and os.clock() - startedAt > 5 then
 			inputChecked = true
 			if studs < 5 and fuel > 0 then
-				if D.input == "move" then
-					D.input = "keys"
-					log("DRIVE input=keys (no progress with MoveDirection)")
+				local nextInput = if D.input == "keys" then "arrows" elseif D.input == "arrows" then "move" else nil
+				if nextInput then
+					N.releaseKeys()
+					log("DRIVE input=" .. nextInput .. " (no progress with " .. D.input .. ")")
+					D.input = nextInput
+					D.keySet = D.keySets[nextInput] or D.keySets.keys
 					startedAt = os.clock()
+					lastProgressAt = os.clock()
 					inputChecked = false
 				else
-					logProblem("The car does not move with MoveDirection or the W key")
+					logProblem("The car does not move with the W key, the arrow keys or MoveDirection")
+					D.input = "keys"
+					D.keySet = D.keySets.keys
 					reason = "no move"
 					break
 				end
+			elseif studs >= 5 and D.savedInput ~= D.input then
+				D.savedInput = D.input
+				N.saveInput()
 			end
 		end
 		if D.abort then
@@ -33452,19 +33533,35 @@ function N.driveRun()
 		else
 			emptyAt = nil
 		end
+		-- stuck on a wall or a wreck: once the run is under way (30 studs), 2 s under 3 studs/s with fuel left -> 1 s of
+		-- reverse with the wheel turned; still stuck 6 s after the stop -> the run ends (DespawnCar) and the planner goes on
+		local now = os.clock()
 		if p.X > lastX + 5 then
-			lastX, lastProgressAt = p.X, os.clock()
-		elseif os.clock() - lastProgressAt > 15 then
-			if studs < 30 and D.input == "keys" and D.keySet[1] == "W" then
-				-- the car never left the start with WASD: the game also reads the arrow keys, try those
-				N.releaseKeys()
-				D.keySet = { "Up", "Left", "Right" }
-				lastProgressAt = os.clock()
-				log("DRIVE input=arrows (no progress with WASD)")
-			else
+			lastX, lastProgressAt = p.X, now
+			if nudged and not slowAt then
+				nudged = false
+			end
+		end
+		if studs >= 30 and fuel > 0 and D.speed < 3 and now >= (D.nudgeUntil or 0) then
+			slowAt = slowAt or now
+			if not nudged and now - slowAt > 2 then
+				nudged = true
+				D.nudgeUntil = now + 1
+				log("DRIVE stuck nudge", "studs=" .. math.floor(studs))
+			elseif now - slowAt > 6 then
 				reason = "stuck"
 				break
 			end
+		elseif D.speed >= 3 then
+			slowAt = nil
+		end
+		if now - lastProgressAt > 10 and studs >= 30 then
+			-- moving but not along the road (spinning, sliding on a wall)
+			reason = "stuck"
+			break
+		elseif now - lastProgressAt > 20 then
+			reason = "stuck"
+			break
 		end
 		if N.wantBoss() then
 			reason = "boss"
@@ -33479,10 +33576,13 @@ function N.driveRun()
 	end
 	D.active = false
 	D.target = nil
+	D.nudgeUntil = 0
 	N.releaseKeys()
 	pcall(function()
 		N.humanoid():Move(Vector3.zero, false)
 	end)
+	-- the planner re-prices the parts on the measured income of this run
+	N.Plan.usefulAt = nil
 	local studs = maxX - startX
 	if car.Parent then
 		send("DespawnCar")
@@ -33512,7 +33612,7 @@ function N.driveRun()
 end
 -- ===== Rolls and Smart Buy =====
 N.Inv = {}
-N.Roll = { shown = {}, decision = {}, at = -1e9, last = "-", total = 0, good = 0, noResult = 0, resultAt = {}, promptsLogged = {}, station = "RollBlocks", count = 0, sinceRun = 0 }
+N.Roll = { shown = {}, decision = {}, verdict = {}, at = -1e9, last = "-", total = 0, good = 0, noResult = 0, resultAt = {}, promptsLogged = {}, station = "RollBlocks", count = 0, sinceRun = 0 }
 do
 	local R = N.Roll
 	local function mine(plotName)
@@ -33552,19 +33652,30 @@ do
 		if not mine(plotName) or not (on("AutoRoll") or N.planner()) then
 			return
 		end
-		local skip = R.decision[station] ~= "buy"
-		-- the roll goes through after the answer: the server's cooldown starts now
+		-- the part on the pedestal is judged here by the same Smart Buy verdict (a high rarity often reaches the hub only
+		-- through this question): buy -> keep it (skip=false) and rollStep buys it next, else skip and roll on
+		local yes, why = N.judgeRoll(station, partId)
+		local skip = not yes
+		if not skip then
+			R.shown[station] = R.shown[station] or { id = partId, at = os.clock() }
+			R.shown[station].id = partId
+		end
 		R.at = os.clock()
 		R.resultAt[station] = os.clock()
 		task.spawn(send, "ConfirmRollSkip", requestId, skip)
-		log("ROLL confirm", station, tostring(partId), "skip=" .. tostring(skip))
+		log("ROLL confirm", station, tostring(partId), "skip=" .. tostring(skip), why)
 	end)
 	N.onPacket("InventoryChanged", function(id, count)
 		count = tonumber(count) or 0
 		N.Inv[id] = if count > 0 then count else nil
 	end)
 	N.onPacket("PlaceRejected", function(reason)
-		log("BUILD rejected", tostring(reason))
+		-- the game also sends its own notices here (fuel out, car deployed): not an answer to a placement
+		local r = tostring(reason)
+		if r == "OutOfFuel" or r == "CarDeployed" or not N.BuildState.busy then
+			return
+		end
+		log("BUILD rejected", r)
 		N.BuildState.rejectedAt = os.clock()
 		N.BuildState.reason = tostring(reason)
 	end)
@@ -33659,6 +33770,17 @@ function N.buyVerdict(id)
 	end
 	return false, "payback " .. N.longTime(payback)
 end
+-- One verdict per part on a pedestal: decision, the ROLL line and the Plot tab text.
+function N.judgeRoll(station, id)
+	local R = N.Roll
+	local yes, why, use = N.buyVerdict(id)
+	local def = N.partDef(id) or {}
+	R.decision[station] = if yes then "buy" else "skip"
+	R.verdict[station] = { id = id, why = why, use = use }
+	R.last = string.format("%s (%s): %s", tostring(def.Name or id), tostring(def.Rarity or "?"), if yes then "buying, " .. why else "skipped, " .. why)
+	log("ROLL", station, tostring(id), tostring(def.Rarity), "cost " .. formatNumber(def.Cost), "->", if yes then "buy" else "skip", why)
+	return yes, why, use
+end
 function N.pickStation()
 	local mode = optionText("RollStation", "Both")
 	if mode == "Blocks" then
@@ -33716,12 +33838,14 @@ function N.rollStep()
 	end
 	local shown = R.shown[station]
 	if shown and not R.decision[station] then
-		local yes, why, use = N.buyVerdict(shown.id)
+		N.judgeRoll(station, shown.id)
+	end
+	if shown and R.decision[station] == "buy" and not shown.tried then
+		shown.tried = true
+		local verdict = R.verdict[station] or {}
+		local why, use = verdict.why or "-", verdict.use
 		local def = N.partDef(shown.id) or {}
-		R.decision[station] = if yes then "buy" else "skip"
-		R.last = string.format("%s (%s): %s", tostring(def.Name or shown.id), tostring(def.Rarity or "?"), if yes then "bought, " .. why else "skipped, " .. why)
-		log("ROLL", station, shown.id, tostring(def.Rarity), "cost " .. formatNumber(def.Cost), "->", if yes then "buy" else "skip", why)
-		if yes and buy then
+		if buy then
 			N.reachPrompt(buy, "buy")
 			local before = N.Inv[shown.id] or 0
 			local cashBefore = N.cash()
@@ -33740,6 +33864,7 @@ function N.rollStep()
 				Session.buyCash += tonumber(def.Cost) or 0
 				R.good += 1
 				N.noteBuyPrice(def.Cost)
+				R.last = string.format("%s (%s): bought, %s", tostring(def.Name or shown.id), tostring(def.Rarity or "?"), why)
 				log("BUY", shown.id, "price", formatNumber(def.Cost), "gain", if use then formatNumber(use.gain) .. "/s" else "-", why)
 				if N.Events.bought then
 					pcall(N.Events.bought, tostring(def.Name or shown.id), def.Cost, def.Rarity)
@@ -34320,6 +34445,24 @@ function N.redeemAllCodes()
 	notify("Codes", if n > 0 then n .. " codes to redeem" else "All known codes are done on this account", 4)
 	return n
 end
+-- A code that can still be tried right now (bootstrap: the planner places the free parts before it rolls).
+function N.codesPending()
+	if not C.loaded then
+		codesLoad()
+	end
+	if C.busy or #C.queue > 0 then
+		return true
+	end
+	if not N.wants("AutoCodes") then
+		return false
+	end
+	for _, known in ipairs(C.known) do
+		if C.state[known] == nil and (C.tries[known] or 0) < 3 and codeReady(known) then
+			return true
+		end
+	end
+	return false
+end
 function N.codeStep()
 	if not C.loaded then
 		codesLoad()
@@ -34531,7 +34674,8 @@ function N.spendStep()
 			if best then
 				log("PLAN skill", text, if N.cash() >= best.cost then "| buying now" else "| driving until " .. formatNumber(best.cost) .. " cash", "| income", formatNumber(rate) .. "/s", "| cash", formatNumber(N.cash()))
 			else
-				log("PLAN idle reason=skills: " .. text, "| income", formatNumber(rate) .. "/s")
+				-- not a planner decision (the planner keeps driving and rolling): a plain SKILLS line
+				log("SKILLS " .. text, "| income", formatNumber(rate) .. "/s")
 			end
 		end
 		if best and N.cash() >= best.cost then
@@ -34653,6 +34797,9 @@ function N.planMode()
 		return "drive"
 	end
 	if N.planner() then
+		-- decide now (a run just ended: sinceRun is 0 again), not on the planner loop's next second: a stale "drive"
+		-- launched a second run before the rolls of the plan
+		N.planTick()
 		return N.Plan.mode or "drive"
 	end
 	local drive, roll = on("AutoDrive"), on("AutoRoll")
@@ -34696,21 +34843,33 @@ function N.planTick()
 	-- It costs the driving it replaces: income per second x ~5.5 s per roll (3 s cooldown + spin + walk).
 	local rollValue = pGood * N.avgGain(rate) * 3600
 	local rollCost = rate * 5.5
-	-- 4 rolls between runs (more runs per minute), 8 when a roll is worth more than the driving it replaces, 12 when 3x more
-	if rollValue > rollCost * 3 then
-		rolls = 12
-	elseif rollValue > rollCost then
-		rolls = 8
+	-- 4 rolls between runs, more the more a roll is worth than the driving it replaces (4 per 1x, at most 16)
+	if rollValue > rollCost then
+		rolls = math.clamp(math.floor(4 * rollValue / math.max(rollCost, 0.01)), 4, 16)
 	end
 	local mode, say
 	local _, runStuds = N.carScore(N.aggregates(N.readBuild()))
+	local far = runStuds > 0 and N.farFromStations()
+	if not far then
+		P.farRuns = nil
+	end
 	if runStuds <= 0 then
-		-- bootstrap: no working car (seat, wheels, engine, fuel) -> roll for the missing part
-		if cash >= price then
-			mode, say = "roll", "roll: the car cannot run yet, rolling for the missing part"
+		-- bootstrap: no working car (seat, wheels, engine, fuel). Parts in the inventory or a free code (COMMUNITY: engine
+		-- + tank) come first, Auto Build places them within seconds; otherwise roll for the missing part.
+		if N.bootstrapPending() then
+			mode, say = "build", "build: the car is missing a part, placing the free parts (codes, inventory) first"
 		else
-			mode, say = "roll", string.format("roll: the car cannot run yet and cash %s is short, rolling until a cheap part shows", formatNumber(cash))
+			mode, say = "roll", string.format("roll: the car is missing a part, rolling for it (cash %s)", formatNumber(cash))
 		end
+	elseif #N.Rate.runs == 0 then
+		mode, say = "drive", "drive: first run, measuring the income of this car"
+	elseif far and (P.farRuns == nil or P.farRuns >= Session.runs) then
+		-- after the boss the character stands in the arena: a run (DespawnCar puts it back on the plot) beats a long walk;
+		-- one run only, if it did not bring the character back the planner walks
+		P.farRuns = P.farRuns or Session.runs
+		mode, say = "drive", "drive: far from the roll stations, a run brings the character back to the plot"
+	elseif price >= 1e12 then
+		mode, say = "drive", string.format("drive: %s cash/s, no part pays back yet", formatNumber(rate))
 	elseif cash < price then
 		mode, say = "drive", string.format("drive: %s cash/s until %s cash buys the cheapest part that pays back", formatNumber(rate), formatNumber(price))
 	elseif R.sinceRun < rolls then
@@ -34728,10 +34887,12 @@ end
 -- The cheapest catalog part that would pay back on this car (refreshed every 60 s): rolls are useless below it.
 function N.usefulPrice()
 	local P = N.Plan
-	if P.usefulAt and os.clock() - P.usefulAt < 60 then
+	local sig = N.buildSig()
+	if P.usefulAt and os.clock() - P.usefulAt < 60 and P.usefulSig == sig then
 		return P.useful
 	end
 	P.usefulAt = os.clock()
+	P.usefulSig = sig
 	local b = N.readBuild()
 	local best = math.huge
 	local horizon = optionNumber("PaybackHours", 24) * 3600
@@ -34756,6 +34917,35 @@ function N.usefulPrice()
 	end
 	P.useful = if best < math.huge then best else 1e12
 	return P.useful
+end
+-- More than ~10 s of walking from the blocks roll station (and no car out): the next run is the faster way back.
+function N.farFromStations()
+	if N.myCar() then
+		return false
+	end
+	local roll = N.stationPrompts("RollBlocks")
+	local pos, me = roll and N.promptPos(roll), N.myPos()
+	if not (pos and me) then
+		return false
+	end
+	return Vector3.new(pos.X - me.X, 0, pos.Z - me.Z).Magnitude > N.footSpeed() * 10
+end
+-- Bootstrap: a part in the inventory that Auto Build can still put on the car, or a code not tried yet (the hub's own
+-- codes come first: COMMUNITY gives the only free engine and fuel tank).
+function N.bootstrapPending()
+	local b = N.readBuild()
+	for id, n in pairs(N.Inv) do
+		if (tonumber(n) or 0) > 0 and os.clock() > (N.BuildState.blocked[id] or 0) then
+			local use = N.bestUse(id, b)
+			if use and use.gain > 0 then
+				return true
+			end
+		end
+	end
+	-- codes get 60 s (each answer can take up to 12 s); after that the planner rolls for the part
+	local P = N.Plan
+	P.bootAt = P.bootAt or os.clock()
+	return os.clock() - P.bootAt < 60 and N.codesPending ~= nil and N.codesPending()
 end
 N.Plan.gains = {}
 function N.noteBuyGain(g)
@@ -36115,6 +36305,14 @@ do
 			if N.driveRun() then
 				return
 			end
+		elseif mode == "build" then
+			-- bootstrap: the free parts go on the car right now (codes run in the chores loop)
+			setStatus("Placing the free parts on your car (seat, wheels, engine, fuel)")
+			if not N.myCar() and N.buildStep() then
+				return
+			end
+			task.wait(0.5)
+			return
 		elseif mode == "roll" then
 			if N.inBattle() then
 				setStatus("In a boss battle (Auto Boss is off)")
@@ -36157,6 +36355,8 @@ do
 		if any and choreDue("inventory", 300) then
 			send("RequestInventory")
 		end
+		-- codes first: COMMUNITY's free engine and tank are what the first build places
+		N.codeStep()
 		if N.wants("AutoBuild") and choreDue("build", 1.5) then
 			N.buildStep()
 		end
@@ -36164,7 +36364,6 @@ do
 			N.spendStep()
 		end
 		N.rewardStep()
-		N.codeStep()
 		-- AFK: the game asks the server for a rejoin after 900 s without input (AfkRejoin, InputChanged resets it).
 		if on("AfkGuard") and any and choreDue("afk", 60) then
 			pcall(function()
