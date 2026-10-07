@@ -33729,7 +33729,7 @@ do
 		return selected(Options.SellProtect, entry.rarity)
 	end
 	-- Hit Speed: the server takes one hit per 0.92 x the swing gap (EggConfig.HitCooldownFactor, PickaxeConfig
-	-- SwingCooldown 0.5 = 0.46 s at base, burst 2). Fast sits just above that floor (0.94-0.98 x gap = 0.47-0.49 s), so
+	-- SwingCooldown 0.5 = 0.46 s at base, burst 2). Fast sits just above that floor (0.935-0.96 x gap = 0.468-0.48 s), so
 	-- no hit is rejected (anything faster is dropped by the server, so it is not offered); Normal is the game's own swing.
 	function N.hitSpeedPick()
 		return if optionText("HitSpeed", "Fast") == "Normal" then "Normal" else "Fast"
@@ -33737,7 +33737,7 @@ do
 	function N.hitRange()
 		local base = N.swingGap()
 		local range = ({
-			Fast = { base * 0.94, base * 0.98 },
+			Fast = { base * 0.935, base * 0.96 },
 		})[N.hitSpeedPick()] or { base, base + 0.06 }
 		return range[1], range[2]
 	end
@@ -35282,8 +35282,45 @@ do
 		P.modelRate = base.rate
 		-- Time: train when the best schedule starts on the treadmill. A started training run keeps going to its target
 		-- (re-checked every 60 s), so the hub does not walk back and forth every few seconds.
-		local committed = P.activity == "train" and P.trainTarget and state.power < P.trainTarget and os.clock() < (P.commitUntil or 0)
-		if not committed then
+		local cash = N.cash()
+		local income = math.max(N.cashPerSecond(), state.income)
+		-- Money first (tester 2026-10-07): while training earns nothing, a purchase that pays back before the training
+		-- would even finish (pickaxe, plot, satchel, treadmill, trail) is bought first, farming for it. The options are
+		-- priced against the farm-only schedule, so a better pickaxe counts for the whole horizon, not only after the training.
+		local fList, fPick, fValid, fBase
+		local moneyFirst = false
+		if base.train > 0 and state.canTrain and state.canFarm and not P.moneyFirstOff then
+			local farmState = P.copy(state, { canTrain = false })
+			fBase = P.evaluate(farmState, horizon)
+			if fBase.value > 0 then
+				fList = P.options(farmState, horizon, fBase)
+				fPick, fValid = P.choose(fList, cash, income, horizon)
+				local top = fValid[1]
+				if (top and top.eta + top.payback < base.train) or (#state.placed == 0 and state.income <= 0 and not fPick and not P.choose(P.options(state, horizon, base), cash, income, horizon)) then
+					moneyFirst = true
+				end
+			end
+		end
+		if moneyFirst then
+			local topLabel = if fValid[1] then fValid[1].label else "first income"
+			if P.activity == "train" or P.moneyFirstKey ~= topLabel then
+				P.moneyFirstKey = topLabel
+				if N.planOn() then
+					log(if fValid[1] then string.format("PLAN money first: farm zone %s for %s ($%s, pays back in %s) before training (%s)", tostring(fBase.zone), topLabel, formatNumber(fValid[1].cost), P.formatSeconds(fValid[1].payback), P.formatSeconds(base.train)) else string.format("PLAN money first: farm zone %s until the first animal earns, before training (%s)", tostring(fBase.zone), P.formatSeconds(base.train)))
+				end
+			end
+			P.activity = "farm"
+			P.trainTarget = nil
+			base = fBase
+			P.base = base
+			P.modelRate = base.rate
+		else
+			P.moneyFirstKey = nil
+		end
+		local committed = not moneyFirst and P.activity == "train" and P.trainTarget and state.power < P.trainTarget and os.clock() < (P.commitUntil or 0)
+		if moneyFirst then
+			-- nothing: farming is already set above
+		elseif not committed then
 			if base.train > 0 and state.canTrain then
 				if P.activity ~= "train" and N.planOn() then
 					log(string.format("PLAN train on the treadmill to %s speed (%s), then farm zone %s: more speed earns more in 24 h than farming now", formatNumber(base.target), P.formatSeconds(base.train), tostring(base.zone)))
@@ -35297,10 +35334,12 @@ do
 			end
 		end
 		P.farmZone = if base.train <= 0 then base.zone else nil
-		local list = P.options(state, horizon, base)
-		local cash = N.cash()
-		local income = math.max(N.cashPerSecond(), state.income)
-		local pick, valid = P.choose(list, cash, income, horizon)
+		local pick, valid
+		if moneyFirst then
+			pick, valid = fPick, fValid
+		else
+			pick, valid = P.choose(P.options(state, horizon, base), cash, income, horizon)
+		end
 		P.pick, P.valid = pick, valid
 		local best = valid[1]
 		P.summary = if best
@@ -37674,6 +37713,66 @@ do
 			end
 			Perf.work.esp = (Perf.work.esp or 0) + (os.clock() - started)
 			task.wait(0.4)
+		end
+	end)
+	-- Treadmill watchdog (tester clip 2026-10-07: the character kept running on the treadmill while the planner wanted
+	-- to farm). Planner on and no progress (power, cash, eggs, hits, banked) for 25 s, or the character still on the
+	-- treadmill 8 s after the plan switched to farm: stand up, step off, re-plan.
+	task.spawn(function()
+		local W = { sig = nil, since = os.clock(), offSince = nil, recoveredAt = -1e9 }
+		while alive() do
+			task.wait(2)
+			pcall(function()
+				if not (N.planOn() and anyAutoOn()) or N.manualRunning() or N.flung() or N.inHell() or N.tutorial() then
+					W.sig, W.since, W.offSince = nil, os.clock(), nil
+					return
+				end
+				local root, hum = rootPart(), humanoid()
+				if not root or not hum or hum.Health <= 0 then
+					return
+				end
+				local now = os.clock()
+				local sig = string.format("%.0f|%.0f|%d|%d|%d", N.power(), N.cash(), Session.eggs, Session.hits, Session.banked)
+				if sig ~= W.sig then
+					W.sig, W.since = sig, now
+				end
+				local farmPlanned = N.Plan.activity ~= "train" and not N.carrying()
+				local onTreadmill = N.Train.startedAt ~= nil or LocalPlayer:GetAttribute("PublicTreadmillSlot") ~= nil
+				local _, hitbox = N.treadmill()
+				if not onTreadmill and hitbox and (root.Position - hitbox.Position).Magnitude < 5 and farmPlanned then
+					onTreadmill = true
+				end
+				if farmPlanned and onTreadmill then
+					W.offSince = W.offSince or now
+				else
+					W.offSince = nil
+				end
+				local reason
+				if W.offSince and now - W.offSince > 8 then
+					reason = "farm planned but still on the treadmill"
+				elseif now - W.since > 25 and now - Session.started > 60 then
+					reason = string.format("no progress for %ds (%s)", math.floor(now - W.since), tostring(Status))
+				end
+				if reason and now - W.recoveredAt > 15 then
+					W.recoveredAt = now
+					W.since, W.offSince = now, nil
+					log("STUCK treadmill -> recovering reason=" .. reason)
+					N.leaveTreadmill()
+					pcall(function()
+						hum.Sit = false
+						hum:ChangeState(Enum.HumanoidStateType.Jumping)
+					end)
+					local away = if hitbox then (root.Position - hitbox.Position) * Vector3.new(1, 0, 1) else Vector3.zero
+					local dir = if away.Magnitude > 0.1 then away.Unit else Vector3.new(0, 0, 1)
+					pcall(function()
+						root.CFrame = root.CFrame + dir * 14 + Vector3.new(0, 4, 0)
+						root.AssemblyLinearVelocity = Vector3.zero
+					end)
+					N.Plan.commitUntil = 0
+					N.Plan.update(true)
+					log("STUCK treadmill -> recovered reason=" .. reason)
+				end
+			end)
 		end
 	end)
 	-- Builds every label text here, the draw thread below only copies strings.
