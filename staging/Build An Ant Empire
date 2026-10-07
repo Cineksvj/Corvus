@@ -33678,6 +33678,10 @@ function N.equipStep(force)
 	E.want = false
 	local fill, swap = N.equipNeeded()
 	if not (fill or swap) then
+		E.last = "team is already the best"
+		if on("AutoEquipBest") and N.choreDue and N.choreDue("equipIdle", 120) then
+			log("EQUIP best idle", "team is already the best, checking again every 20 s")
+		end
 		return false
 	end
 	E.at = os.clock()
@@ -34241,7 +34245,7 @@ function N.guideStep()
 end
 -- Rewards: online reward ladder, 7-day login, event check-in, group daily, index milestones, mail, ride progress, codes.
 -- Each one asks the game's own model whether something is claimable first, then sends the same action as its button.
-N.Reward = { log = {}, at = {}, mods = {}, tried = {} }
+N.Reward = { log = {}, at = {}, mods = {}, tried = {}, last = "-" }
 local function rewardNote(text)
 	Session.rewards += 1
 	table.insert(N.Reward.log, 1, text)
@@ -34401,27 +34405,24 @@ end
 -- Every reward runs for its own toggle or for the Smart Planner autopilot.
 function N.rewardStep()
 	local auto = N.planner()
-	if (auto or on("AutoOnline")) and due("online", 30) then
-		N.onlineStep()
+	-- A manual claim toggle that finds nothing says so (one CLAIM check line per kind every 5 minutes).
+	local function run(toggle, key, seconds, fn, label)
+		if not ((auto or on(toggle)) and due(key, seconds)) then
+			return
+		end
+		local got = fn()
+		if not got and not auto and on(toggle) and due("say" .. key, 300) then
+			N.Reward.last = label .. ": nothing to claim yet"
+			log("CLAIM check", label, "nothing claimable yet")
+		end
 	end
-	if (auto or on("AutoSevenDay")) and due("seven", 120) then
-		N.sevenDayStep()
-	end
-	if (auto or on("AutoCheckIn")) and due("checkin", 300) then
-		N.checkInStep()
-	end
-	if (auto or on("AutoGroupReward")) and due("group", 600) then
-		N.groupStep()
-	end
-	if (auto or on("AutoIndex")) and due("index", 60) then
-		N.indexStep()
-	end
-	if (auto or on("AutoMail")) and due("mail", 300) then
-		N.mailStep()
-	end
-	if (auto or on("AutoRide")) and due("ride", 120) then
-		N.rideStep()
-	end
+	run("AutoOnline", "online", 30, N.onlineStep, "Online reward")
+	run("AutoSevenDay", "seven", 120, N.sevenDayStep, "7-day reward")
+	run("AutoCheckIn", "checkin", 300, N.checkInStep, "Event check-in")
+	run("AutoGroupReward", "group", 600, N.groupStep, "Group reward")
+	run("AutoIndex", "index", 60, N.indexStep, "Index rewards")
+	run("AutoMail", "mail", 300, N.mailStep, "Mail")
+	run("AutoRide", "ride", 120, N.rideStep, "Ride rewards")
 end
 -- Codes: CodeService.RemoteFunction:InvokeServer("Redeem", code) through the game's CodeService client, answer (ok, message).
 -- Known codes come from the hub and the online list HubRepo .. "Codes"; each code is tried once per account and the result
@@ -35531,6 +35532,9 @@ do
 		mirror("SmartSell", "Smart Sell", "Same as Farm > Smart Sell: best price and the Black Market")
 		mirror("AutoRoll", "Auto Roll", "Same as Farm > Auto Roll: rolls every 3 s and buys ants by payback")
 		mirror("SmartPlanner", "Smart Planner", "Same as Farm > Smart Planner: the autopilot plays the whole game by profit math")
+		mirror("AutoUpgrades", "Auto Upgrades", "Same as Upgrades > Auto Upgrades: buys the picked kinds by payback")
+		mirror("AutoEquipBest", "Auto Equip Best", "Same as Items > Auto Equip Best")
+		mirror("AutoOnline", "Claim Online Rewards", "Same as Rewards > Claim Online Rewards")
 		mirror("AutoEvents", "Auto Events", "Same as Farm > Auto Events")
 		QuickBox:AddButton({
 			Text = "Stop Everything",
@@ -36505,6 +36509,9 @@ do
 		if auto or on("AutoUpgrades") then
 			-- Up to 8 purchases per tick: with a fast-growing income one buy per 1.5 s leaves gold idle (the planner-only
 			-- soak fell behind "every toggle" for that alone). Each step re-reads gold and the backpack.
+			if not auto and choreDue("autoUpLog", 120) then
+				log("AUTO upgrade", "on, kinds=" .. table.concat(picked(Options.UpgradeKinds), "/"), "| gold", formatNumber(N.gold()))
+			end
 			for _ = 1, 8 do
 				if not N.planStep() then
 					break
@@ -36595,7 +36602,7 @@ do
 					table.insert(rows, N.planText(N.Plan.list[i]))
 				end
 				I.list = if #rows > 0 then table.concat(rows, "\n") else "Turn on Auto Upgrades or the Smart Planner"
-				I.rewards = string.format("Claimed <b>%d</b> this session%s", Session.rewards, if #N.Reward.log > 0 then "\n" .. table.concat(N.Reward.log, "\n") else "")
+				I.rewards = string.format("Claimed <b>%d</b> this session%s", Session.rewards, if #N.Reward.log > 0 then "\n" .. table.concat(N.Reward.log, "\n") elseif N.Reward.last ~= "-" then "\n" .. N.Reward.last else "")
 				local okCodes, usedCodes, badCodes = N.codeCounts()
 				I.codes = string.format("Known %d  \u{00B7}  worked %d, used %d, invalid %d\nLast: %s", #N.Codes.known, okCodes, usedCodes, badCodes, N.Codes.last)
 				I.ants = string.format("%d ants in %d slots, %d in the backpack\n%s", #eq, slots, #N.stacks(), N.Equip.last)
