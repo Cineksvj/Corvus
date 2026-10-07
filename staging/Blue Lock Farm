@@ -34484,6 +34484,27 @@ function N.rainStep()
 	end
 	return false
 end
+-- A probe the server rejected on this PlaceVersion hides its control and stops its loop (no fake options). The probe file is
+-- per PlaceVersion, so a game update brings the control back. Idempotent: logs once per change.
+N.Hidden = {}
+function N.rejected(name)
+	return N.probeResult(name) == "rejected"
+end
+function N.hideUi(name, toggle, dead)
+	dead = dead == true
+	if (N.Hidden[name] == true) == dead then
+		return
+	end
+	N.Hidden[name] = dead
+	if type(toggle) == "table" and type(toggle.SetVisible) == "function" then
+		pcall(toggle.SetVisible, toggle, not dead)
+	end
+	log("PROBE", name, if dead then "rejected, hidden" else "shown again")
+end
+function N.applyHidden()
+	N.hideUi("tower_auto", Toggles.AutoTower, N.rejected("tower_auto"))
+	N.hideUi("tutorial_hold", Toggles.TutorialHold, N.rejected("tutorial_hold"))
+end
 -- Infinity Tower (InfinityTowerGuiClient 38892): StartInfinityTowerBattle(tower, {<= 4 guids}), then the auto button
 -- SetInfinityTowerAutoBattle(battle, true). Server simulated; Entrance floors pay a few Trait/Grade tokens.
 N.Tower = { last = "-", probed = false }
@@ -34526,14 +34547,14 @@ end
 N.Tut = { hooked = false, dropped = 0, since = nil, probed = false }
 function N.tutorialHoldStep()
 	local T = N.Tut
-	if not on("TutorialHold") then
+	if not on("TutorialHold") or N.rejected("tutorial_hold") then
 		return
 	end
 	if not T.hooked and type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
 		T.hooked = true
 		local old
 		old = hookmetamethod(game, "__namecall", function(self, ...)
-			if getnamecallmethod() == "FireServer" and typeof(self) == "Instance" and self.Name == "TutorialEndRemote" and on("TutorialHold") and alive() then
+			if getnamecallmethod() == "FireServer" and typeof(self) == "Instance" and self.Name == "TutorialEndRemote" and on("TutorialHold") and not N.rejected("tutorial_hold") and alive() then
 				T.dropped += 1
 				return nil
 			end
@@ -35869,11 +35890,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
 		Labels.Perf = PerfBox:AddLabel({ Text = "Collecting numbers...", DoesWrap = true })
 		local UtilBox = holder:AddRightGroupbox("Utility", "wrench")
-		UtilBox:AddToggle("AfkGuard", {
-			Text = "Stop AFK Rejoin",
-			Default = true,
-			Tooltip = "The game rejoins you to a new server after 15 minutes without input (Shared.Core.AntiAfk). While Corvus farms, a tiny mouse nudge every 2 minutes counts as input",
-		})
 	end)
 	-- Live stats card: one Discord message (POST ?wait=true gives its id) edited in place every 2 minutes.
 	local Card = { id = nil, at = -1e9, url = nil }
@@ -36456,25 +36472,13 @@ do
 		N.rerollStep()
 		N.weatherStep()
 		N.tutorialHoldStep()
-		if on("AutoTower") and choreDue("tower", 300) then
+		if on("AutoTower") and not N.rejected("tower_auto") and choreDue("tower", 300) then
 			N.towerStep()
 		end
 		local best = N.allUnits()[1]
 		if best then
 			local def = N.unitIndex()[best.name or ""]
 			Session.bestUnit = string.format("%s%s (%s/ball)", if best.variant ~= "Normal" then best.variant .. " " else "", def and def.display or tostring(best.name), formatNumber(best.cpd))
-		end
-		-- AFK: the game's AntiAfk fires RejoinRemote after 900 s without input. A mouse move through VirtualInputManager
-		-- is input for the game and for Roblox's idle timer.
-		if on("AfkGuard") and anyAutoOn() and choreDue("afk", 120) then
-			pcall(function()
-				local vim = game:GetService("VirtualInputManager")
-				local camera = workspace.CurrentCamera
-				local size = camera and camera.ViewportSize or Vector2.new(800, 600)
-				vim:SendMouseMoveEvent(size.X / 2 + 1, size.Y / 2, game)
-				task.wait(0.05)
-				vim:SendMouseMoveEvent(size.X / 2, size.Y / 2, game)
-			end)
 		end
 		task.wait(1)
 	end)
@@ -36491,6 +36495,7 @@ do
 		while alive() do
 			local started = os.clock()
 			local ok, err = pcall(function()
+				N.applyHidden()
 				if not N.D.data then
 					return
 				end
