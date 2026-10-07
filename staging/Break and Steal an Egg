@@ -31698,23 +31698,29 @@ end
 			end)
 			Guard.Hooked = Done and Old ~= nil
 		end
-		if not Guard.Hooked and typeof(hookfunction) == "function" then
+		-- second layer: hook the method values themselves (games that cache MarketplaceService.PromptX in a local never hit __namecall)
+		if typeof(hookfunction) == "function" then
 			local Wrap = if typeof(newcclosure) == "function" then newcclosure else function(F) return F end
+			Guard.FnHooked = if typeof(Guard.FnHooked) == "table" then Guard.FnHooked else {}
 			for Name in Methods do
-				pcall(function()
-					local Old
-					Old = hookfunction(MPS[Name], Wrap(function(Self, ...)
-						local B = select(2, ...)
-						if Self == MPS and Guard.Block and Guard.Block(Name, if B ~= nil then B else "-") then
-							return nil
-						end
-						return Old(Self, ...)
-					end))
-					Guard.Hooked = true
-				end)
+				if not Guard.FnHooked[Name] then
+					pcall(function()
+						local Old
+						Old = hookfunction(MPS[Name], Wrap(function(Self, ...)
+							local B = select(2, ...)
+							if Self == MPS and Guard.Block and Guard.Block(Name, if B ~= nil then B else "-") then
+								return nil
+							end
+							return Old(Self, ...)
+						end))
+						Guard.FnHooked[Name] = true
+						Guard.Hooked = true
+					end)
+				end
 			end
 		end
-		-- server-started prompts never pass through the client methods: hide the CoreGui prompt app the moment it draws something
+		-- server-started prompts never pass through the client methods: keep the CoreGui prompt app switched off (checked every 0.15 s,
+		-- on every new child and on every property flip), because the app turns itself back on for each new prompt
 		local CoreGui = game:GetService("CoreGui")
 		local function IsPrompt(Obj)
 			if typeof(Obj) ~= "Instance" or not Obj:IsA("ScreenGui") then
@@ -31723,33 +31729,68 @@ end
 			local N = string.lower(Obj.Name)
 			return string.find(N, "purchaseprompt", 1, true) ~= nil or string.find(N, "upsell", 1, true) ~= nil
 		end
-		local function Watch(Obj)
-			local Armed = false
-			local function Apply()
-				if Armed and Library.BlockRobuxPrompts and not Library.Unloaded and Obj.Enabled then
-					PurchaseGuardOff[Obj] = true
-					Obj.Enabled = false
-					task.spawn(Note, "CoreGui", Obj.Name)
-				end
+		local function HideNote(Obj)
+			local Key = "hid:" .. Obj.Name
+			local Now = os.clock()
+			if LastLogged[Key] and Now - LastLogged[Key] < 60 then
+				return
 			end
+			LastLogged[Key] = Now
+			Library:CorvusLog("GUARD hid purchase prompt " .. Obj.Name)
+		end
+		local function Hide(Obj)
+			if Library.BlockRobuxPrompts and not Library.Unloaded and Obj.Enabled then
+				PurchaseGuardOff[Obj] = true
+				Obj.Enabled = false
+			end
+		end
+		local Watched = {}
+		local function Watch(Obj)
+			if Watched[Obj] then
+				return
+			end
+			Watched[Obj] = true
 			Library:GiveSignal(Obj.DescendantAdded:Connect(function()
-				Armed = true
-				pcall(Apply)
+				if Library.BlockRobuxPrompts and not Library.Unloaded then
+					pcall(Hide, Obj)
+					task.spawn(HideNote, Obj)
+				end
 			end))
 			Library:GiveSignal(Obj:GetPropertyChangedSignal("Enabled"):Connect(function()
-				pcall(Apply)
+				if Library.BlockRobuxPrompts and Obj.Enabled then
+					pcall(Hide, Obj)
+					task.spawn(HideNote, Obj)
+				end
 			end))
+			pcall(Hide, Obj)
 		end
-		for _, Obj in CoreGui:GetChildren() do
-			if IsPrompt(Obj) then
-				Watch(Obj)
+		local function Scan()
+			for _, Obj in CoreGui:GetChildren() do
+				if IsPrompt(Obj) then
+					Watch(Obj)
+					Hide(Obj)
+				end
 			end
 		end
+		pcall(Scan)
 		Library:GiveSignal(CoreGui.ChildAdded:Connect(function(Obj)
 			if IsPrompt(Obj) then
 				pcall(Watch, Obj)
 			end
 		end))
+		task.spawn(function()
+			while not Library.Unloaded do
+				pcall(Scan)
+				task.wait(0.15)
+			end
+		end)
+		for _, Event in { "PromptPurchaseFinished", "PromptGamePassPurchaseFinished", "PromptProductPurchaseFinished", "PromptBundlePurchaseFinished" } do
+			pcall(function()
+				Library:GiveSignal(MPS[Event]:Connect(function()
+					Library:CorvusLog("GUARD purchase prompt finished " .. Event)
+				end))
+			end)
+		end
 	end)
 	getgenv().CorvusLibrary = Library
     return Library
