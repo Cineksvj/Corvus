@@ -32710,7 +32710,6 @@ do
 		AutoEquipBest = true,
 		AutoCrates = true,
 		ServerHop = true,
-		AfkGuard = true,
 	}
 	function N.wants(name)
 		return on(name) or (N.PlannerOwns[name] == true and on("SmartPlanner"))
@@ -34387,7 +34386,7 @@ do
 				best, bestValue, why = skin, value, text
 			end
 		end
-		N.Plan.knifeText = if best then string.format("%s: %s (%.1f XP pts per match)", best, why, bestValue) else "-"
+		N.Plan.knifeText = if best then string.format("%s: %s (XP %s per match)", best, why, if bestValue < 0.05 then "0" else string.format("%.1f", bestValue)) else "-"
 		return best, bestValue, why
 	end
 	-- Chance that one crate gives a knife better than the best owned speed perk.
@@ -34568,7 +34567,26 @@ do
 		if N.playerCount() < 2 then
 			return "alone on the server: hopping to a server with players"
 		end
-		return "lobby: claiming rewards, knives and crates until the next match"
+		return "lobby: " .. (N.Plan.chore or "claiming rewards, knives and crates") .. " until the next match"
+	end
+	-- Never idle in the lobby: a named chore every 15 s (queue pre-steps, wallet/knife refresh, rewards).
+	function N.lobbyChore(now)
+		local P = N.Plan
+		if N.inMatch() then
+			P.chore = nil
+			return
+		end
+		if now - (P.choreAt or -1e9) < 15 then
+			return
+		end
+		P.choreAt = now
+		P.actionAt = now
+		local ok = pcall(function()
+			N.playStep()
+			N.armoryGet(true)
+			N.rewardStep()
+		end)
+		P.chore = if ok then "queued, refreshing wallet, knives and rewards" else "queued, chores retrying"
 	end
 	function N.planTick()
 		if not N.planner() then
@@ -34581,6 +34599,7 @@ do
 			P.actionAt = now
 		end
 		N.watchHeroes()
+		N.lobbyChore(now)
 		local knife = N.bestKnife()
 		local crate, crateWhy = N.crateDecision()
 		local choice = N.planHeroChoice()
@@ -34592,7 +34611,7 @@ do
 		if key ~= P.lastLogKey or now - P.lastLogAt > 60 then
 			P.lastLogKey = key
 			P.lastLogAt = now
-			log("PLAN", "now=" .. P.nowText, "| knife", P.knifeText, "| crate", tostring(crate), tostring(crateWhy or P.spendText), "| hero", P.heroText, "| detour", detour)
+			log("PLAN", "now=" .. P.nowText, "| knife", P.knifeText, "| crate", if crate then crate .. ": " .. tostring(crateWhy) else tostring(crateWhy or (P.spendText ~= "" and P.spendText) or "no crate yet"), "| hero", P.heroText, "| detour", detour)
 		end
 		-- No match for a minute while the planner is on: say exactly why (never a silent idle).
 		if now - P.actionAt > 60 and now - (P.idleAt or -1e9) > 60 then
@@ -34603,7 +34622,7 @@ do
 			elseif N.playerCount() < 2 then
 				reason = string.format("server has %d player, a match needs 2: server hop runs after 60 s", N.playerCount())
 			else
-				reason = "no match started for 60 s: phase " .. N.phase() .. ", waiting for the server's next match"
+				reason = string.format("queue closed: server phase %s for %d s, waiting for its next match (chores keep running)", N.phase(), math.floor(now - P.actionAt))
 			end
 			log("PLAN idle", "reason=" .. reason)
 		end
@@ -35359,11 +35378,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
 		Labels.Perf = PerfBox:AddLabel({ Text = "Measuring...", DoesWrap = true })
 		local UtilBox = holder:AddRightGroupbox("Utility", "wrench")
-			UtilBox:AddToggle("AfkGuard", {
-				Text = "Anti AFK",
-				Default = true,
-				Tooltip = "Roblox disconnects after 20 minutes without input. While Corvus farms, a tiny mouse nudge every 2 minutes counts as input",
-			})
 			UtilBox:AddToggle("ServerHop", {
 				Text = "Server Hop When Empty",
 				Default = false,
@@ -35956,16 +35970,6 @@ do
 			end
 		end
 		N.hopStep()
-		if N.wants("AfkGuard") and anyAutoOn() and choreDue("afk", 120) then
-			pcall(function()
-				local vim = game:GetService("VirtualInputManager")
-				local camera = workspace.CurrentCamera
-				local size = camera and camera.ViewportSize or Vector2.new(800, 600)
-				vim:SendMouseMoveEvent(size.X / 2 + 1, size.Y / 2, game)
-				task.wait(0.05)
-				vim:SendMouseMoveEvent(size.X / 2, size.Y / 2, game)
-			end)
-		end
 		task.wait(1)
 	end)
 	-- Smart Planner: decides and logs PLAN only while its toggle is on.
