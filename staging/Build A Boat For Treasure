@@ -20180,8 +20180,8 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         Library.MinSize = Vector2.new(math.min(WindowInfo.MinContainerWidth, MaxX), Library.OriginalMinSize.Y)
     
         WindowInfo.Size = UDim2.fromOffset(
-            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, MaxX),
-            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, MaxY)
+            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, math.max(Library.MinSize.X, MaxX)),
+            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, math.max(Library.MinSize.Y, MaxY))
         )
         Library.MobileWindowSize = Vector2.new(WindowInfo.Size.X.Offset, WindowInfo.Size.Y.Offset)
         if typeof(WindowInfo.Font) == "EnumItem" then
@@ -27365,6 +27365,15 @@ end
                 end,
             })
     
+            General:AddToggle("CorvusBlockRobux", {
+                Text = "Block Robux Prompts",
+                Description = "Hides every Robux purchase pop-up while the hub runs",
+                Default = Library.BlockRobuxPrompts ~= false,
+                Callback = function(Value)
+                    Library:SetBlockRobuxPrompts(Value)
+                end,
+            })
+
             local DiagBox = Tab:AddRightGroupbox("Diagnostics", "activity")
             DiagBox:AddToggle("CorvusDiagnostics", {
             	Text = "Send anonymous diagnostics",
@@ -27508,6 +27517,7 @@ end
                     "CorvusShareCode",
                     "CorvusAutoSave",
                     "CorvusNoRender",
+                    "CorvusBlockRobux",
                 })
                 SaveManager:SetFolder(Folder)
                 if Info.SubFolder then
@@ -31600,6 +31610,128 @@ end
 		end
 		return Mirror
 	end
+	-- CORVUS-PURCHASEGUARD (owner 2026-10-07): no Robux purchase prompt may appear because of automation.
+	-- Client calls to MarketplaceService:Prompt* are swallowed (namecall hook, installed once per session), server-started prompts are hidden
+	-- by switching the CoreGui PurchasePrompt app off. Default ON, Settings > General "Block Robux Prompts". Log: GUARD blocked purchase prompt <method> <id>
+	Library.BlockRobuxPrompts = Library:GetSetting("BlockRobuxPrompts", true) ~= false
+	local PurchaseGuardOff = {}
+	local function PurchaseGuardRelease()
+		for Obj in PurchaseGuardOff do
+			PurchaseGuardOff[Obj] = nil
+			pcall(function()
+				Obj.Enabled = true
+			end)
+		end
+	end
+	function Library:SetBlockRobuxPrompts(Value: boolean)
+		Library.BlockRobuxPrompts = Value == true
+		Library:SetSetting("BlockRobuxPrompts", Value == true)
+		if Value ~= true then
+			PurchaseGuardRelease()
+		end
+	end
+	table.insert(Library.UnloadSignals, PurchaseGuardRelease)
+	pcall(function()
+		local Genv = getgenv()
+		local Guard = Genv.CorvusPurchaseGuard
+		if typeof(Guard) ~= "table" then
+			Guard = {}
+			Genv.CorvusPurchaseGuard = Guard
+		end
+		local Methods = {
+			PromptPurchase = true, PromptProductPurchase = true, PromptGamePassPurchase = true, PromptBundlePurchase = true,
+			PromptSubscriptionPurchase = true, PromptPremiumPurchase = true, PromptRobloxPurchase = true,
+			PromptBulkPurchase = true, PromptThirdPartyPurchase = true,
+		}
+		local LastLogged = {}
+		local function Note(Kind, Id)
+			local Key = tostring(Kind) .. ":" .. tostring(Id)
+			local Now = os.clock()
+			if LastLogged[Key] and Now - LastLogged[Key] < 60 then
+				return
+			end
+			LastLogged[Key] = Now
+			Library:CorvusLog("GUARD blocked purchase prompt " .. tostring(Kind) .. " " .. tostring(Id))
+		end
+		-- the hook lives in getgenv, so a re-run only swaps the callback (Guard.Block) and never stacks a second hook
+		Guard.Block = function(Method, Id)
+			if Library.Unloaded or not Library.BlockRobuxPrompts then
+				return false
+			end
+			task.spawn(Note, Method, Id)
+			return true
+		end
+		local MPS = game:GetService("MarketplaceService")
+		if not Guard.Hooked and typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
+			local Wrap = if typeof(newcclosure) == "function" then newcclosure else function(F) return F end
+			local Old
+			local Done = pcall(function()
+				Old = hookmetamethod(game, "__namecall", Wrap(function(Self, ...)
+					local Method = getnamecallmethod()
+					if Methods[Method] and Self == MPS then
+						local B = select(2, ...)
+						if Guard.Block and Guard.Block(Method, if B ~= nil then B else "-") then
+							return nil
+						end
+					end
+					return Old(Self, ...)
+				end))
+			end)
+			Guard.Hooked = Done and Old ~= nil
+		end
+		if not Guard.Hooked and typeof(hookfunction) == "function" then
+			local Wrap = if typeof(newcclosure) == "function" then newcclosure else function(F) return F end
+			for Name in Methods do
+				pcall(function()
+					local Old
+					Old = hookfunction(MPS[Name], Wrap(function(Self, ...)
+						local B = select(2, ...)
+						if Self == MPS and Guard.Block and Guard.Block(Name, if B ~= nil then B else "-") then
+							return nil
+						end
+						return Old(Self, ...)
+					end))
+					Guard.Hooked = true
+				end)
+			end
+		end
+		-- server-started prompts never pass through the client methods: hide the CoreGui prompt app the moment it draws something
+		local CoreGui = game:GetService("CoreGui")
+		local function IsPrompt(Obj)
+			if typeof(Obj) ~= "Instance" or not Obj:IsA("ScreenGui") then
+				return false
+			end
+			local N = string.lower(Obj.Name)
+			return string.find(N, "purchaseprompt", 1, true) ~= nil or string.find(N, "upsell", 1, true) ~= nil
+		end
+		local function Watch(Obj)
+			local Armed = false
+			local function Apply()
+				if Armed and Library.BlockRobuxPrompts and not Library.Unloaded and Obj.Enabled then
+					PurchaseGuardOff[Obj] = true
+					Obj.Enabled = false
+					task.spawn(Note, "CoreGui", Obj.Name)
+				end
+			end
+			Library:GiveSignal(Obj.DescendantAdded:Connect(function()
+				Armed = true
+				pcall(Apply)
+			end))
+			Library:GiveSignal(Obj:GetPropertyChangedSignal("Enabled"):Connect(function()
+				pcall(Apply)
+			end))
+		end
+		for _, Obj in CoreGui:GetChildren() do
+			if IsPrompt(Obj) then
+				Watch(Obj)
+			end
+		end
+		Library:GiveSignal(CoreGui.ChildAdded:Connect(function(Obj)
+			if IsPrompt(Obj) then
+				pcall(Watch, Obj)
+			end
+		end))
+	end)
 	getgenv().CorvusLibrary = Library
     return Library
     end)()
