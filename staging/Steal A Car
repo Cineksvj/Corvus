@@ -36390,12 +36390,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		local holder = Tabs.Misc or Tabs.Main
 		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
 		Labels.Perf = PerfBox:AddLabel({ Text = "Waiting for the first sample", DoesWrap = true })
-		local UtilBox = holder:AddRightGroupbox("AFK", "moon")
-		UtilBox:AddToggle("AfkGuard", {
-			Text = "Anti AFK",
-			Default = true,
-			Tooltip = "Roblox disconnects after 20 minutes without input. While a Corvus automation runs, a tiny mouse nudge every 2 minutes counts as input",
-		})
 	end)
 	-- Live stats card: one Discord message (POST ?wait=true gives its id) edited in place every 2 minutes.
 	local Card = { id = nil, at = -1e9, url = nil }
@@ -37064,17 +37058,6 @@ do
 		end
 		if (N.planner() or N.wants("AutoBuyTrails")) and choreDue("trailData", 300) then
 			N.fetchTrails()
-		end
-		-- Roblox's idle kick after 20 min: a mouse move through VirtualInputManager while an automation runs.
-		if on("AfkGuard") and anyAutoOn() and choreDue("afk", 120) then
-			pcall(function()
-				local vim = game:GetService("VirtualInputManager")
-				local camera = workspace.CurrentCamera
-				local size = camera and camera.ViewportSize or Vector2.new(800, 600)
-				vim:SendMouseMoveEvent(size.X / 2 + 1, size.Y / 2, game)
-				task.wait(0.05)
-				vim:SendMouseMoveEvent(size.X / 2, size.Y / 2, game)
-			end)
 		end
 		task.wait(1)
 	end)
