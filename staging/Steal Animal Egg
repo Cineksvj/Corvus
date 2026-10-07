@@ -20178,8 +20178,8 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         Library.MinSize = Vector2.new(math.min(WindowInfo.MinContainerWidth, MaxX), Library.OriginalMinSize.Y)
     
         WindowInfo.Size = UDim2.fromOffset(
-            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, MaxX),
-            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, MaxY)
+            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, math.max(Library.MinSize.X, MaxX)),
+            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, math.max(Library.MinSize.Y, MaxY))
         )
         Library.MobileWindowSize = Vector2.new(WindowInfo.Size.X.Offset, WindowInfo.Size.Y.Offset)
         if typeof(WindowInfo.Font) == "EnumItem" then
@@ -32567,6 +32567,7 @@ do
 				hum:MoveTo(wp.Position)
 			end)
 			local started = os.clock()
+			local lastP, lastMoveAt, tries = N.myPos(), os.clock(), 0
 			while os.clock() - started < 4 and os.clock() <= deadline do
 				if stop and stop() then
 					return false
@@ -32578,6 +32579,29 @@ do
 				if N.flatDist(p, target) <= near then
 					return true
 				end
+				-- Against a wall (no progress for 0.8 s): jump, then step sideways, then give up so the caller re-plans from here.
+				if lastP and N.flatDist(p, lastP) > 0.8 then
+					lastP, lastMoveAt = p, os.clock()
+				elseif os.clock() - lastMoveAt > 0.8 then
+					lastMoveAt = os.clock()
+					tries += 1
+					if tries >= 3 then
+						N.Walk.path = "wall"
+						return false
+					end
+					pcall(function()
+						hum.Jump = true
+						local dir = (wp.Position - p)
+						local side = Vector3.new(-dir.Z, 0, dir.X)
+						if side.Magnitude > 0.1 then
+							hum:MoveTo(p + side.Unit * (if tries == 1 then 6 else -6))
+						end
+					end)
+					task.wait(0.35)
+					pcall(function()
+						hum:MoveTo(wp.Position)
+					end)
+				end
 				task.wait(0.1)
 			end
 		end
@@ -32585,8 +32609,17 @@ do
 		return p ~= nil and N.flatDist(p, target) <= near
 	end
 	local function walkLeg(hum, target, near, deadline, stop)
-		if followPath(hum, target, near, deadline, stop) then
-			return true
+		-- Re-plan from where we stand up to 4 times (a wall hit ends one plan, the next one starts from the new spot).
+		for _ = 1, 4 do
+			if followPath(hum, target, near, deadline, stop) then
+				return true
+			end
+			if N.Walk.path ~= "wall" or os.clock() > deadline or not alive() or (stop and stop()) then
+				break
+			end
+		end
+		if N.Walk.path == "wall" then
+			return false
 		end
 		local lastDist, lastAt, sentAt = math.huge, os.clock(), -1e9
 		while os.clock() < deadline and alive() do
@@ -34410,6 +34443,17 @@ do
 	function N.indexStep()
 		local list = N.indexClaimable()
 		if #list == 0 then
+			if os.clock() - (N.Reward.diagAt or -1e9) > 60 then
+				N.Reward.diagAt = os.clock()
+				local fc, cc = 0, 0
+				for _ in pairs(N.foundSet()) do
+					fc += 1
+				end
+				for _ in pairs(N.claimedSet()) do
+					cc += 1
+				end
+				log("INDEX none claimable found=", fc, "claimed=", cc, "tutorial=", tostring(N.attr("TutorialStep")), "foundAttr=", string.sub(tostring(N.attr("AnimalsFound")), 1, 120), "forModel=", type(N.G.IndexRewards and N.G.IndexRewards.forModel))
+			end
 			return 0
 		end
 		local n = N.indexClaimAll(list) or 0
