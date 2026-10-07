@@ -36638,12 +36638,40 @@ do
 		end
 		return Library.ActiveTab == nil or Library.ActiveTab == tab
 	end
+	-- The thread of the UI loop loses its rights ('lacking capability Plugin' every ~30 s on the live log): a group that fails for that
+	-- reason is queued and run on the Heartbeat (frame) thread, which always has them (same fix as Blue Lock Farm).
+	local UiLater, uiMoved = {}, false
+	pcall(function()
+		Library:GiveSignal(RunService.Heartbeat:Connect(function()
+			if #UiLater == 0 then
+				return
+			end
+			local queue = UiLater
+			UiLater = {}
+			for _, fn in ipairs(queue) do
+				pcall(fn)
+			end
+		end))
+	end)
 	task.spawn(function()
 		local uiErrorAt = -1e9
 		local function group(fn)
 			N.fixIdentity()
 			local ok, err = xpcall(fn, debug.traceback)
-			if not ok and os.clock() - uiErrorAt > 30 then
+			if ok then
+				return
+			end
+			if string.find(tostring(err), "lacking capability", 1, true) then
+				if #UiLater < 20 then
+					table.insert(UiLater, fn)
+				end
+				if not uiMoved then
+					uiMoved = true
+					log("UI thread lost its rights, UI updates now run on the frame thread")
+				end
+				return
+			end
+			if os.clock() - uiErrorAt > 30 then
 				uiErrorAt = os.clock()
 				log("ERROR", "ui", string.sub(tostring(err), 1, 300))
 			end
