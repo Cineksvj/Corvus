@@ -27503,6 +27503,7 @@ end
     
             if SaveManager then
                 SaveManager:SetLibrary(Library)
+                pcall(Library.HardenSaveManager, Library, SaveManager)
                 SaveManager:IgnoreThemeSettings()
                 SaveManager:SetIgnoreIndexes({
                     "MenuKeybind",
@@ -27677,6 +27678,14 @@ end
                     pcall(function()
                         Target = SaveManager:GetAutoloadConfig()
                     end)
+                    if Library.ConfigLoadFailed and Target == Library.ConfigLoadFailed then
+                        -- the autoload config did not load this session: never overwrite the player's file with defaults
+                        if not Library.ConfigAutoSavePaused then
+                            Library.ConfigAutoSavePaused = true
+                            Library:CorvusLog("CONFIG auto save paused, " .. tostring(Target) .. " did not load and is kept as it is")
+                        end
+                        return
+                    end
                     if typeof(Target) ~= "string" or Target == "" or Target == "none" then
                         Target = "Auto Save"
                         pcall(SaveManager.SaveAutoloadConfig, SaveManager, Target)
@@ -31623,6 +31632,207 @@ end
 		end
 		return Mirror
 	end
+	-- CORVUS-CONFIGLOAD (player feedback 2026-10-07: "after I loaded the config none of the settings were active").
+	-- The Obsidian SaveManager is fetched live from GitHub: it applies saved values one by one with task.defer, drops a
+	-- value whose control does not exist yet and a dropdown value whose list is filled later (tower lists, eggs...).
+	-- Corvus applies a config itself: right away, every control through SetValue (callbacks and loops start), a true
+	-- toggle that already shows true still gets its callback, and controls or dropdown values that appear later are
+	-- applied the moment they exist (retried for 60 s). Log: CONFIG loaded <name> controls=<n> on=<list> [later=<n>].
+	local ConfigKinds = { Toggle = "Toggles", Slider = "Options", Dropdown = "Options", Input = "Options", KeyPicker = "Options", ColorPicker = "Options" }
+	local function ConfigSameSet(A: any, B: any): boolean
+		local Left, Right = {}, {}
+		for Key, On in (if typeof(A) == "table" then A else {}) do
+			if typeof(On) ~= "boolean" then
+				Left[tostring(On)] = true
+			elseif On then
+				Left[tostring(Key)] = true
+			end
+		end
+		for Key, On in (if typeof(B) == "table" then B else {}) do
+			if typeof(On) ~= "boolean" then
+				Right[tostring(On)] = true
+			elseif On then
+				Right[tostring(Key)] = true
+			end
+		end
+		for Key in Left do
+			if not Right[Key] then
+				return false
+			end
+		end
+		for Key in Right do
+			if not Left[Key] then
+				return false
+			end
+		end
+		return true
+	end
+	-- true = the control now holds the saved value, false = not yet (control missing or its list not filled yet)
+	local function ConfigApplyOne(Option: any): boolean
+		local List = Library[ConfigKinds[Option.type] or ""]
+		local Element = List and List[Option.idx]
+		if typeof(Element) ~= "table" or typeof(Element.SetValue) ~= "function" then
+			return false
+		end
+		local Kind = Option.type
+		if Kind == "Toggle" then
+			local Want = Option.value == true
+			if Element.Value ~= Want then
+				task.spawn(Element.SetValue, Element, Want)
+			elseif Want and typeof(Element.RunChanged) == "function" then
+				task.spawn(Element.RunChanged, Element)
+			end
+			return true
+		elseif Kind == "Slider" then
+			local Want = tonumber(Option.value)
+			if Want and Element.Value ~= Want then
+				task.spawn(Element.SetValue, Element, Want)
+			end
+			return true
+		elseif Kind == "Input" then
+			if typeof(Option.text) == "string" and Element.Value ~= Option.text then
+				task.spawn(Element.SetValue, Element, Option.text)
+			end
+			return true
+		elseif Kind == "Dropdown" then
+			local Want = Option.value
+			if Element.Multi then
+				if ConfigSameSet(Element.Value, Want) then
+					return true
+				end
+				task.spawn(Element.SetValue, Element, if typeof(Want) == "table" then Want else {})
+				return ConfigSameSet(Element.Value, Want)
+			end
+			if Element.Value == Want then
+				return true
+			end
+			task.spawn(Element.SetValue, Element, Want)
+			return Element.Value == Want
+		elseif Kind == "KeyPicker" then
+			if Option.key ~= nil then
+				task.spawn(Element.SetValue, Element, { Option.key, Option.mode, Option.modifiers })
+			end
+			return true
+		elseif Kind == "ColorPicker" then
+			if typeof(Option.value) == "string" and typeof(Element.SetValueRGB) == "function" then
+				local Ok, Color = pcall(Color3.fromHex, Option.value)
+				if Ok then
+					task.spawn(Element.SetValueRGB, Element, Color, Option.transparency)
+				end
+			end
+			return true
+		end
+		return true
+	end
+	local function ConfigOnList(): string
+		local Names = {}
+		for Name, Toggle in Library.Toggles do
+			if typeof(Name) == "string" and typeof(Toggle) == "table" and Toggle.Value == true and string.sub(Name, 1, 6) ~= "Corvus" then
+				table.insert(Names, Name)
+			end
+		end
+		table.sort(Names)
+		return if #Names > 0 then table.concat(Names, ",") else "-"
+	end
+	function Library:ApplyConfigObjects(Objects: any, Ignore: any, Name: string?): (number, number)
+		Ignore = if typeof(Ignore) == "table" then Ignore else {}
+		Name = tostring(Name or "config")
+		local Applied, Later = 0, {}
+		for _, Option in (if typeof(Objects) == "table" then Objects else {}) do
+			if typeof(Option) == "table" and typeof(Option.idx) == "string" and ConfigKinds[Option.type] and not Ignore[Option.idx] then
+				local Ok, Done = pcall(ConfigApplyOne, Option)
+				if Ok and Done then
+					Applied += 1
+				else
+					table.insert(Later, Option)
+				end
+			elseif typeof(Option) == "table" and Option.type == "Groupbox" and typeof(Option.tabIdx) == "string" then
+				pcall(function()
+					local Tab = Library.Tabs[Option.tabIdx]
+					local Box = Tab and Tab.Groupboxes and Tab.Groupboxes[Option.idx]
+					if Box and typeof(Box.SetCollapsed) == "function" and (Box.Collapsed == true) ~= (Option.collapsed == true) then
+						Box:SetCollapsed(Option.collapsed == true)
+					end
+				end)
+			end
+		end
+		Library.ConfigLoadedName = Name
+		Library:CorvusLog(string.format("CONFIG loaded %s controls=%d on=%s%s", Name, Applied, ConfigOnList(), if #Later > 0 then " later=" .. #Later else ""))
+		if #Later > 0 then
+			local Token = {}
+			Library.ConfigRetryToken = Token
+			task.spawn(function()
+				local Deadline = os.clock() + 60
+				while #Later > 0 and os.clock() < Deadline and not Library.Unloaded and Library.ConfigRetryToken == Token do
+					task.wait(0.5)
+					local Still = {}
+					for _, Option in Later do
+						local Ok, Done = pcall(ConfigApplyOne, Option)
+						if not (Ok and Done) then
+							table.insert(Still, Option)
+						end
+					end
+					if #Still < #Later then
+						Library:CorvusLog(string.format("CONFIG late %s applied=%d waiting=%d on=%s", Name, #Later - #Still, #Still, ConfigOnList()))
+					end
+					Later = Still
+				end
+				if #Later > 0 and Library.ConfigRetryToken == Token then
+					local Missing = {}
+					for Index, Option in Later do
+						if Index > 8 then
+							break
+						end
+						table.insert(Missing, tostring(Option.idx))
+					end
+					Library:CorvusLog(string.format("CONFIG skipped %s count=%d (%s)", Name, #Later, table.concat(Missing, ",")))
+				end
+			end)
+		end
+		return Applied, #Later
+	end
+	-- Routes SaveManager:Load / LoadJSON / LoadAutoloadConfig through ApplyConfigObjects. Only a real SaveManager
+	-- (raw Load function) is patched; the offline stub stays as it is.
+	function Library:HardenSaveManager(SM: any)
+		if typeof(SM) ~= "table" or typeof(rawget(SM, "Load")) ~= "function" or rawget(SM, "CorvusHardened") then
+			return
+		end
+		rawset(SM, "CorvusHardened", true)
+		local BaseLoad = rawget(SM, "Load")
+		local LoadingName = nil
+		rawset(SM, "LoadJSON", function(_, Content: string)
+			if typeof(Content) ~= "string" or string.match(Content, "^%s*$") then
+				return false, "No JSON provided"
+			end
+			local Ok, Decoded = pcall(HttpService.JSONDecode, HttpService, Content)
+			if not Ok or typeof(Decoded) ~= "table" or typeof(Decoded.objects) ~= "table" then
+				return false, "Failed to decode config data"
+			end
+			if Library.KeybindFrame and typeof(Decoded.keybindMenu) == "table" then
+				pcall(function()
+					Library.KeybindFrame.Visible = Decoded.keybindMenu.visible == true
+				end)
+			end
+			Library:ApplyConfigObjects(Decoded.objects, SM.Ignore, LoadingName or Decoded.name)
+			return true
+		end)
+		rawset(SM, "Load", function(Self, Name: string)
+			LoadingName = Name
+			local Ok, Success, Error = pcall(BaseLoad, Self, Name)
+			LoadingName = nil
+			if not Ok then
+				return false, tostring(Success)
+			end
+			if Success then
+				Library.ConfigLoadFailed = nil
+			else
+				Library.ConfigLoadFailed = Name
+				Library:CorvusLog(string.format("CONFIG not loaded %s: %s", tostring(Name), tostring(Error)))
+			end
+			return Success, Error
+		end)
+	end
+	-- CORVUS-CONFIGLOAD-END
 	-- CORVUS-PURCHASEGUARD (owner 2026-10-07): no Robux purchase prompt may appear because of automation.
 	-- Client calls to MarketplaceService:Prompt* are swallowed (namecall hook, installed once per session), server-started prompts are hidden
 	-- by switching the CoreGui PurchasePrompt app off. Default ON, Settings > General "Block Robux Prompts". Log: GUARD blocked purchase prompt <method> <id>
