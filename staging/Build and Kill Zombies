@@ -20177,8 +20177,8 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         Library.MinSize = Vector2.new(math.min(WindowInfo.MinContainerWidth, MaxX), Library.OriginalMinSize.Y)
     
         WindowInfo.Size = UDim2.fromOffset(
-            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, MaxX),
-            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, MaxY)
+            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, math.max(Library.MinSize.X, MaxX)),
+            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, math.max(Library.MinSize.Y, MaxY))
         )
         Library.MobileWindowSize = Vector2.new(WindowInfo.Size.X.Offset, WindowInfo.Size.Y.Offset)
         if typeof(WindowInfo.Font) == "EnumItem" then
@@ -32823,9 +32823,14 @@ N.Drive = {
 }
 do
 	local D = N.Drive
+	D.keyAt = {}
+	D.keySet = { "W", "A", "D" }
 	local function hold(name, down)
-		if D.keys[name] ~= down then
+		local now = os.clock()
+		-- a held key is re-sent every 0.5 s: the game's input can lose a key (focus change, a menu), the flag must not hide it
+		if D.keys[name] ~= down or (down and now - (D.keyAt[name] or 0) > 0.5) then
 			D.keys[name] = down
+			D.keyAt[name] = now
 			N.key(down, name)
 		end
 	end
@@ -32836,6 +32841,7 @@ do
 			end
 		end
 		table.clear(D.keys)
+		table.clear(D.keyAt)
 		if D.nitroHeld and D.nitroKey then
 			N.key(false, D.nitroKey)
 		end
@@ -32861,9 +32867,9 @@ do
 		if D.input == "keys" then
 			local right = part.CFrame.RightVector
 			local s = if right then dir:Dot(right) else 0
-			hold("W", not D.coast)
-			hold("A", s < -0.15)
-			hold("D", s > 0.15)
+			hold(D.keySet[1], not D.coast)
+			hold(D.keySet[2], s < -0.15)
+			hold(D.keySet[3], s > 0.15)
 			return
 		end
 		pcall(function()
@@ -33207,6 +33213,19 @@ function N.driveRun()
 		task.wait(1)
 		return true
 	end
+	-- the game's throttle reads 0 while a TextBox has focus (GetThrottleSteer): let go of it before driving
+	pcall(function()
+		local tb = game:GetService("UserInputService"):GetFocusedTextBox()
+		if tb then
+			log("DRIVE released focused textbox " .. tb:GetFullName())
+			tb:ReleaseFocus()
+		end
+	end)
+	do
+		local hum = N.humanoid()
+		log("DRIVE seat", "seated=" .. tostring(hum ~= nil and hum.SeatPart ~= nil), "driver=" .. tostring(car:GetAttribute("DriverUserId") == LocalPlayer.UserId), "anchored=" .. tostring(part.Anchored))
+	end
+	D.keySet = { "W", "A", "D" }
 	local startX = part.Position.X
 	local maxX, lastX, lastProgressAt, emptyAt = startX, startX, os.clock(), nil
 	local startedAt = os.clock()
@@ -33284,8 +33303,16 @@ function N.driveRun()
 		if p.X > lastX + 5 then
 			lastX, lastProgressAt = p.X, os.clock()
 		elseif os.clock() - lastProgressAt > 15 then
-			reason = "stuck"
-			break
+			if studs < 30 and D.input == "keys" and D.keySet[1] == "W" then
+				-- the car never left the start with WASD: the game also reads the arrow keys, try those
+				N.releaseKeys()
+				D.keySet = { "Up", "Left", "Right" }
+				lastProgressAt = os.clock()
+				log("DRIVE input=arrows (no progress with WASD)")
+			else
+				reason = "stuck"
+				break
+			end
 		end
 		if N.wantBoss() then
 			reason = "boss"
@@ -34369,8 +34396,12 @@ function N.spendStep()
 					pcall(N.Events.skill, best.name, best.cost)
 				end
 			else
-				N.Skill.blocked[best.id] = os.clock() + 120
-				log("SPEND skill failed", best.id)
+				-- no reply: say why (a car still out, the tutorial, the cash) and ask again soon, answers right after a join can be late
+				local why = if N.myCar() then "car still out" elseif N.tutorial() < 8 then "tutorial" elseif N.cash() < best.cost then "cash short" else "no server answer"
+				N.Skill.fails = (N.Skill.fails or 0) + 1
+				N.Skill.blocked[best.id] = os.clock() + math.min(20 * N.Skill.fails, 120)
+				N.Skill.known = false
+				log("SPEND skill refused reason=" .. why, best.id)
 			end
 			return true
 		end
@@ -35913,7 +35944,7 @@ do
 			task.wait(0.5)
 			return
 		end
-		if not N.myPlot() then
+		if not N.myPlot() and not N.inBattle() then
 			setStatus("Waiting for your plot")
 			task.wait(1)
 			return
@@ -35938,11 +35969,16 @@ do
 				task.wait(1)
 				return
 			end
-			if N.myCar() and not N.Drive.active then
-				send("DespawnCar")
-				task.wait(2)
-				return
-			end
+			if N.myCar() and not N.Drive.active and os.clock() >= (N.Drive.despawnSkip or 0) then
+					send("DespawnCar")
+					if not waitFor(function()
+						return N.myCar() == nil
+					end, 8) then
+						N.Drive.despawnSkip = os.clock() + 60
+						log("DRIVE car stays after DespawnCar, rolling anyway for 60 s")
+					end
+					return
+				end
 			if N.chestStep() then
 				return
 			end
