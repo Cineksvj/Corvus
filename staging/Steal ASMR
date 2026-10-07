@@ -32757,7 +32757,7 @@ do
 		end
 		local last = points[#points] or from
 		local d = N.flatDist(last, to)
-		local legs = math.ceil(d / 350)
+		local legs = math.ceil(d / 300)
 		for i = 1, legs - 1 do
 			local t = i / legs
 			table.insert(points, Vector3.new(last.X + (to.X - last.X) * t, to.Y, last.Z + (to.Z - last.Z) * t))
@@ -32766,7 +32766,7 @@ do
 		return points
 	end
 	N.route = route
-	local function followPath(hum, target, near, deadline)
+	local function followPath(hum, target, near, deadline, stop)
 		local ok, waypoints = pcall(function()
 			local path = game:GetService("PathfindingService"):CreatePath({ AgentRadius = 2.5, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 8 })
 			path:ComputeAsync(N.root().Position, target)
@@ -32793,13 +32793,41 @@ do
 				hum:MoveTo(wp.Position)
 			end)
 			local started = os.clock()
+			local lastP, lastMoveAt, tries = N.myPos(), os.clock(), 0
 			while os.clock() - started < 4 and os.clock() <= deadline do
+				if stop and stop() then
+					return false
+				end
 				local p = N.myPos()
-				if not p or N.flatDist(p, wp.Position) <= 3 then
+				-- At high walk speed one step covers many studs: the arrival radius grows with the speed (135 -> 16 studs).
+				if not p or N.flatDist(p, wp.Position) <= math.max(3, (tonumber(hum.WalkSpeed) or 16) * 0.12) then
 					break
 				end
 				if N.flatDist(p, target) <= near then
 					return true
+				end
+				-- Against a wall (no progress for 0.8 s): jump, then step sideways, then give up so the caller re-plans from here.
+				if lastP and N.flatDist(p, lastP) > 0.8 then
+					lastP, lastMoveAt = p, os.clock()
+				elseif os.clock() - lastMoveAt > 0.8 then
+					lastMoveAt = os.clock()
+					tries += 1
+					if tries >= 3 then
+						N.Walk.path = "wall"
+						return false
+					end
+					pcall(function()
+						hum.Jump = true
+						local dir = (wp.Position - p)
+						local side = Vector3.new(-dir.Z, 0, dir.X)
+						if side.Magnitude > 0.1 then
+							hum:MoveTo(p + side.Unit * (if tries == 1 then 6 else -6))
+						end
+					end)
+					task.wait(0.35)
+					pcall(function()
+						hum:MoveTo(wp.Position)
+					end)
 				end
 				task.wait(0.1)
 			end
@@ -32807,13 +32835,22 @@ do
 		local p = N.myPos()
 		return p ~= nil and N.flatDist(p, target) <= near
 	end
-	local function walkLeg(hum, target, near, deadline, abort)
-		if followPath(hum, target, near, deadline) then
-			return true
+	local function walkLeg(hum, target, near, deadline, stop)
+		-- Re-plan from where we stand up to 4 times (a wall hit ends one plan, the next one starts from the new spot).
+		for _ = 1, 4 do
+			if followPath(hum, target, near, deadline, stop) then
+				return true
+			end
+			if N.Walk.path ~= "wall" or os.clock() > deadline or not alive() or (stop and stop()) then
+				break
+			end
+		end
+		if N.Walk.path == "wall" then
+			return false
 		end
 		local lastDist, lastAt, sentAt = math.huge, os.clock(), -1e9
 		while os.clock() < deadline and alive() do
-			if abort and abort() then
+			if stop and stop() then
 				return false
 			end
 			local p = N.myPos()
@@ -33271,7 +33308,19 @@ do
 		if pin and nest.zone ~= pin and not (nest.rare and on("RareSniper")) then
 			return false
 		end
-		return N.zoneOpen(nest.def) and (N.Steal.skip[nest.stand] or 0) < os.clock()
+		if not (N.zoneOpen(nest.def) and (N.Steal.skip[nest.stand] or 0) < os.clock()) then
+		return false
+	end
+	-- Carrying slows you (MovementSpeed.CarryMultiplier: 1 - 0.05 * log2(size), at least 0.8): never start a run the guard
+	-- would win (live 2026-10-07: caught again and again at walk 67 vs guard 58 with a big egg).
+	local hum = N.humanoid()
+	local ws = tonumber(hum and hum.WalkSpeed) or 0
+	local size = tonumber(nest.size) or 1
+	local carry = if size > 1 then math.max(0.8, 1 - 0.05 * math.log(size, 2)) else 1
+	if ws > 0 and tonumber(nest.def.GuardSpeed) and ws * carry < nest.def.GuardSpeed * 1.02 and nest.zoneIndex and nest.zoneIndex > 1 then
+		return false
+	end
+	return true
 	end
 	-- The best nest: gain over the weakest slot per second of the run. Rare (Secret+) nests first with Rare Sniper.
 	function N.pickTarget()
