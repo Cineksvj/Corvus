@@ -33589,6 +33589,25 @@ do
 			writefile(N.Probe.file, table.concat(lines, "\n"))
 		end)
 	end
+	-- A probe the server rejected on this PlaceVersion hides its control (no fake options). The memory file is per
+	-- PlaceVersion, so a game update brings the control back. Idempotent: logs once per change.
+	N.Hidden = {}
+	function N.hideUi(name, toggle, dead)
+		dead = dead == true
+		if (N.Hidden[name] == true) == dead then
+			return
+		end
+		N.Hidden[name] = dead
+		if type(toggle) == "table" and type(toggle.SetVisible) == "function" then
+			pcall(toggle.SetVisible, toggle, not dead)
+		end
+		log("PROBE " .. name .. (if dead then " rejected, hidden" else " shown again"))
+	end
+	function N.applyHidden()
+		N.hideUi("spawn_return", Toggles.FastReturn, N.probeGet("spawn_return") == "rejected")
+		N.hideUi("wall_skip", Toggles.WallProbe, N.probeGet("wall_skip") == "rejected")
+		N.hideUi("egg_open", Toggles.EggOpenProbe, N.probeGet("egg_open") == "rejected" and N.probeGet("egg_skip") == "rejected")
+	end
 	-- ===== Animals and eggs (Database.Friends) =====
 	local MutationMulti = N.G.Shared.MUTATION_MULTIPLIERS or { Golden = 2, Diamond = 2.5, Rainbow = 3, Cursed = 4 }
 	function N.mutationMulti(mutation, events)
@@ -35838,11 +35857,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
 		Labels.Perf = PerfBox:AddLabel({ Text = "Waiting for the first sample...", DoesWrap = true })
 		local UtilBox = holder:AddRightGroupbox("Utility", "wrench")
-		UtilBox:AddToggle("AfkGuard", {
-			Text = "Anti-AFK",
-			Default = true,
-			Tooltip = "The game reports you idle after 15 minutes without input (AFK Idle Reset Request) and Roblox kicks after 20. While Corvus farms, a tiny mouse nudge every 2 minutes counts as input",
-		})
 	end)
 	-- Live stats card: one Discord message (POST ?wait=true gives its id) edited in place every 2 minutes.
 	local Card = { id = nil, at = -1e9, url = nil }
@@ -36451,18 +36465,6 @@ do
 		if N.job("AutoEquipBest") and choreDue("equipBest", 30) then
 			N.equipBestStep()
 		end
-		-- AFK: the game reports idle players after 15 min without input; a mouse move through VirtualInputManager is
-		-- input for the game and for Roblox's idle timer.
-		if on("AfkGuard") and anyAutoOn() and choreDue("afk", 120) then
-			pcall(function()
-				local vim = game:GetService("VirtualInputManager")
-				local camera = workspace.CurrentCamera
-				local size = camera and camera.ViewportSize or Vector2.new(800, 600)
-				vim:SendMouseMoveEvent(size.X / 2 + 1, size.Y / 2, game)
-				task.wait(0.05)
-				vim:SendMouseMoveEvent(size.X / 2, size.Y / 2, game)
-			end)
-		end
 		if choreDue("resync", 300) then
 			N.fetchData()
 		end
@@ -36500,6 +36502,7 @@ do
 			local started = os.clock()
 			local ok, err = pcall(function()
 				local I = N.InfoText
+				N.applyHidden()
 				local d = N.d()
 				local animals, eggs = N.plotAnimals()
 				I.info = string.format(
