@@ -36389,6 +36389,7 @@ return N.spendable() >= item.price
 end
 return N.Plan.approve(shopKind(item), item.price, item.name)
 end
+N.ShopRej = {}
 local function shopWants(manual)
 local list = {}
 if not N.Shop.stock then
@@ -36398,7 +36399,10 @@ for _, item in ipairs(N.ShopItems) do
 local modeled = shopKind(item) ~= "shop"
 if selected(Options.ShopItems, item.name) or (not manual and modeled and N.plannerOn()) then
 local amount = N.stockOf(item.category, item.name)
-if amount > 0 and shopOk(item, manual) then
+local rj = N.ShopRej[item.name]
+if rj and os.clock() < rj.untilAt and rj.price == item.price and not manual then
+N.ShopWhy = item.name .. " refused " .. rj.n .. "x, retry in " .. math.ceil(rj.untilAt - os.clock()) .. "s"
+elseif amount > 0 and shopOk(item, manual) then
 table.insert(list, item)
 end
 end
@@ -36442,6 +36446,9 @@ local spot = stallSpot(item.category)
 if spot then
 N.dismount()
 local rung = N.moveMode()
+if N.Shop.safe then
+rung = "Safe"
+end
 if #N.basketItems() > 0 then
 rung = "Safe"
 end
@@ -36461,8 +36468,26 @@ fire("Game/BuyWithCash", item.category, item.name)
 local ok = waitFor(function()
 return N.cash() < before
 end, 2)
-log("ACT shop_buy via=" .. (if N.Shop.travel then "teleport" else "remote") .. " " .. (ok and "ok" or "rejected"))
+local via = if N.Shop.safe then "walk" elseif N.Shop.travel then "teleport" else "remote"
+log("ACT shop_buy via=" .. via .. " " .. (ok and "ok" or "rejected"))
+if ok then
+N.ShopRej[item.name] = nil
+N.ShopWhy = nil
+end
 if not ok then
+local rj = N.ShopRej[item.name] or { n = 0 }
+rj.n += 1
+rj.price = item.price
+rj.untilAt = os.clock() + math.min(30 * 2 ^ (rj.n - 1), 1800)
+N.ShopRej[item.name] = rj
+N.ShopWhy = item.name .. " refused by the server with enough cash, backing off " .. math.floor(rj.untilAt - os.clock()) .. "s"
+log("ACT shop_buy backoff item=" .. item.name .. " n=" .. rj.n .. " wait=" .. math.floor(rj.untilAt - os.clock()) .. "s reason=server refused although cash $" .. formatNumber(N.cash()) .. " >= $" .. formatNumber(item.price))
+if N.Shop.travel and not N.Shop.safe and rj.n >= 2 then
+N.Shop.safe = true
+log("ACT shop_buy degrade to=walk reason=teleport rejected " .. rj.n .. "x")
+elseif not N.Shop.travel and rj.n >= 2 then
+log("ACT shop_buy degrade to=teleport reason=remote rejected " .. rj.n .. "x")
+end
 N.Shop.failures += 1
 log("SHOP buy did not go through", item.name)
 if N.Shop.failures >= 2 and not N.Shop.travel then
