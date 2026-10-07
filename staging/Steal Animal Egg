@@ -36633,12 +36633,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 		local holder = Tabs.Misc or Tabs.Main
 		local PerfBox = holder:AddLeftGroupbox("Performance", "gauge")
 		Labels.Perf = PerfBox:AddLabel({ Text = "Collecting numbers...", DoesWrap = true })
-		local UtilBox = holder:AddRightGroupbox("AFK", "moon")
-		UtilBox:AddToggle("AfkGuard", {
-			Text = "Anti AFK",
-			Default = true,
-			Tooltip = "The game moves you to a new server after 18 minutes without input (AfkRejoinClient). While a Corvus automation runs, a tiny mouse nudge every 2 minutes counts as input",
-		})
 	end)
 	-- Live stats card: one Discord message (POST ?wait=true gives its id) edited in place every 2 minutes.
 	local Card = { id = nil, at = -1e9, url = nil }
@@ -37271,18 +37265,6 @@ do
 		end
 		N.codeStep()
 		N.sampleEating()
-		-- AfkRejoinClient asks the server for a new server after 1080 s without input. A mouse move through
-		-- VirtualInputManager while an automation runs counts as input.
-		if on("AfkGuard") and anyAutoOn() and choreDue("afk", 120) then
-			pcall(function()
-				local vim = game:GetService("VirtualInputManager")
-				local camera = workspace.CurrentCamera
-				local size = camera and camera.ViewportSize or Vector2.new(800, 600)
-				vim:SendMouseMoveEvent(size.X / 2 + 1, size.Y / 2, game)
-				task.wait(0.05)
-				vim:SendMouseMoveEvent(size.X / 2, size.Y / 2, game)
-			end)
-		end
 		task.wait(1)
 	end)
 	-- Smart Planner: its own loop. Its numbers feed the labels; PLAN lines are written only while the toggle is on.
