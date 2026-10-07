@@ -33820,7 +33820,10 @@ N.SaveDirty = true
 end
 function Track.event(kind, title, sub, icon, color)
 Metrics.event(kind, title, color)
+-- the Live Feed shows eggs only (spawned, picked, delivered, lost, hatched, volcano); shop/nest/reward rows stay out of it
+if kind == "Spawn" or kind == "Volcano" then
 feedPush({ Title = title, Sub = sub or "", Right = kind, Image = icon or "sparkles", Color = color or "#7dd3fc" })
+end
 end
 end
 local Farm
@@ -34665,8 +34668,19 @@ return false, 0, 0
 end
 local toEgg = travelSeconds(from, info.pos, mode, 1)
 local back = travelSeconds(info.pos, home, "Safe", N.carryMultiplier(info.weight, info.name))
-local limit = info.breakSeconds - N.deliveryMargin() - optionNumber("PickupDelay", 0.2)
+-- lag margin: the worst frame of the last PERF window delays the whole trip
+local lastPerf = Perf and Perf.last
+local lag = math.clamp(tonumber(lastPerf and lastPerf.worst) or 0, 0, 1.5)
+local limit = info.breakSeconds - N.deliveryMargin() - optionNumber("PickupDelay", 0.2) - lag
 return back <= limit, toEgg, back
+end
+local NoTimeLog = {}
+function N.wanted_noTime(id)
+if os.clock() - (NoTimeLog[id] or -1e9) < 30 then
+return false
+end
+NoTimeLog[id] = os.clock()
+return true
 end
 local function targetList(from, extraCheck)
 local list = {}
@@ -34682,6 +34696,9 @@ info.waitDrop = math.max(0, info.dropEndsAt - now)
 if ok and (not extraCheck or extraCheck(info)) then
 info.score = N.eggScore(info, from)
 table.insert(list, info)
+elseif not ok and N.wanted_noTime(info.id) then
+log(string.format("EGG skipped %s: not enough time trip=%.1fs timer=%.1fs", info.name, back, info.breakSeconds))
+Farm.view.noTime = info.name
 end
 end
 end
@@ -34789,6 +34806,7 @@ log("DELIVERED", info.name)
 Track.delivered(info)
 elseif breakAt and serverNow() >= breakAt - 0.5 then
 log("BROKE", info.name)
+log(string.format("EGG lost name=%s timer=%.1fs trip=%s reason=timer ran out before delivery (frame lag %.0fms)", tostring(info.name), tonumber(info.breakSeconds) or 0, if info.back then string.format("%.1fs", info.back) else "?", (tonumber(Perf and Perf.last and Perf.last.worst) or 0) * 1000))
 Track.lost(info.name, "The timer ran out before it got home")
 elseif home then
 log("DELIVERED", info.name)
@@ -38412,13 +38430,20 @@ end
 local from = root.Position
 local list = {}
 local now = serverNow()
+local budgetAt = os.clock()
 for _, info in ipairs(N.worldEggs()) do
+if os.clock() - budgetAt > 0.004 then
+task.wait()
+budgetAt = os.clock()
+end
 info.distance = flat(from, info.pos)
 info.wanted = N.eggWanted(info) and not N.skipped(info.id)
 local ok = N.reachInfo(info, from)
 info.reachable = ok
 info.newChance = N.newPetChance(info.name)
 info.waitDrop = math.max(0, info.dropEndsAt - now)
+-- score once per egg: the comparator used to recompute it O(n log n) times (the 40 % CPU scan)
+info.score = N.eggScore(info, from)
 table.insert(list, info)
 end
 table.sort(list, function(a, b)
@@ -38429,7 +38454,7 @@ end
 if a.reachable ~= b.reachable then
 return a.reachable
 end
-local sa, sb = N.eggScore(a, from), N.eggScore(b, from)
+local sa, sb = a.score, b.score
 if sa ~= sb then
 return sa > sb
 end
@@ -41019,7 +41044,7 @@ reportError("scan", err)
 end
 Perf.work.scan = (Perf.work.scan or 0) + (os.clock() - started)
 end
-task.wait(if wanted then 1 else 2)
+task.wait(if wanted then 2 else 4)
 end
 end)
 task.spawn(function()
