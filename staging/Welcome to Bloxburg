@@ -5023,7 +5023,12 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
                 if typeof(Entry.Target) == "string" and Library.OnUserToggle then
                 	pcall(Library.OnUserToggle, Entry.Target, Toggle.Value)
                 end
-                Library:Notify({ Title = tostring(Toggle.Text), Description = if Toggle.Value then "ON" else "OFF", Time = 1.5 })
+                local NoteKey = tostring(Toggle.Text) .. (if Toggle.Value then "1" else "0")
+                Library.QuickNoteAt = Library.QuickNoteAt or {}
+                if os.clock() - (Library.QuickNoteAt[NoteKey] or 0) > 1.5 then
+                    Library.QuickNoteAt[NoteKey] = os.clock()
+                    Library:Notify({ Title = tostring(Toggle.Text), Description = if Toggle.Value then "ON" else "OFF", Time = 1.5 })
+                end
             end
         elseif Entry.Kind == "Button" then
             local Button = Library.QuickButtons[Entry.Target]
@@ -5035,11 +5040,25 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         end
     end
     
+    local QuickKeysHeld, QuickLastRun, QuickLastNote = {}, {}, {}
+    table.insert(Library.Signals, UserInputService.InputEnded:Connect(function(Input)
+        if Input.UserInputType == Enum.UserInputType.Keyboard then
+            QuickKeysHeld[Input.KeyCode.Name] = nil
+        end
+    end))
+    table.insert(Library.Signals, UserInputService.WindowFocusReleased:Connect(function()
+        table.clear(QuickKeysHeld)
+    end))
     table.insert(Library.Signals, UserInputService.InputBegan:Connect(function(Input, Processed)
         if Library.Unloaded or Input.UserInputType ~= Enum.UserInputType.Keyboard or Input.KeyCode == Enum.KeyCode.Unknown then
             return
         end
         local KeyName = Input.KeyCode.Name
+        local HeldAt = QuickKeysHeld[KeyName]
+        if HeldAt and os.clock() - HeldAt < 10 then
+            return
+        end
+        QuickKeysHeld[KeyName] = os.clock()
         local Pending = Library.QuickBindPending
         if Pending then
             Library.QuickBindPending = nil
@@ -5062,11 +5081,12 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             Library:Notify({ Title = Pending.Label, Description = "Bound to " .. KeyName, Time = 3 })
             return
         end
-        if Processed or UserInputService:GetFocusedTextBox() then
+        if Processed ~= false or UserInputService:GetFocusedTextBox() then
             return
         end
         local Entry = Library:GetQuickBinds()[KeyName]
-        if Entry then
+        if Entry and os.clock() - (QuickLastRun[KeyName] or 0) >= 0.4 then
+            QuickLastRun[KeyName] = os.clock()
             Library:RunQuickBind(Entry)
         end
     end))
@@ -32222,6 +32242,221 @@ do
 		return Status
 	end
 end
+-- Movement core (owner 2026-10-07: "it moves jerkily, stops and starts, like on a stick, there is no tween").
+-- Causes in the old code (log 2026-10-06 14:56): (1) the path walk insisted on every 4-stud waypoint (arrival 2 studs,
+-- the last one 1.5) and then on the exact approach point, so the character stopped beside furniture it could already
+-- use (`WALK stuck n=1 action=jump ... dist 1 waypoint 9/9`; 17 studs took 17.2 s); (2) every stuck check froze the walk
+-- for 0.35-0.7 s (jump, side-step) and re-planned from zero (up to 8 ComputeAsync calls plus a door pass that waits up to
+-- 1.5 s per door); (3) in jobs the Blatant rung was one CFrame jump plus a 0.35 s freeze (no tween, a frozen pose), and
+-- the Fast tween forced the height to the station's Y + 3 every frame (stations are counter tops, so the body floated
+-- and fell back every frame) with the velocity zeroed and no run animation.
+-- Now ONE glide for every move that does not need physical presence: a per-frame CFrame step along a polyline (path
+-- waypoints or a straight line) at a constant speed, the height from a ground ray under the next point (steps up at
+-- most 2.5 studs, so counters and tables are passed, not climbed; `fly` lerps the height instead), facing the travel
+-- direction, the character's own run animation playing, the velocity zeroed so physics never fights it, and
+-- N.Travel.movedAt kept fresh so the snapback watcher (p05_mode) knows it is our own movement. Arrival = the caller's
+-- own test (in reach of the object) or the last point within `near`. Origin test every frame: the body more than
+-- 12 studs from where we put it = a server snapback -> opts.onSnap or N.glideSnap (speed halves, min 22, the full speed
+-- again after 10 min; never straight to walking).
+-- Logs: `MOVE glide <why> studs=<n> t=<s> speed=<n> result=ok|snapback|timeout` (moves over 8 studs, at most every 5 s
+-- per why), `MOVE snapback glide speed=<n> reason=`, `MOVE retry glide speed=<n>`.
+N.Move = { base = 80, speed = 80, fast = 100, retryAt = 0, logAt = {}, glides = 0, snaps = 0 }
+do
+	local M = N.Move
+	-- walking: the waypoint arrival radius grows with WalkSpeed (one 0.05 s poll covers WalkSpeed * 0.05 studs), the
+	-- last waypoint a little wider so the walk never stops 1 stud short and waits for a stuck check
+	function M.arriveRadius(walkSpeed, last)
+		local ws = tonumber(walkSpeed) or 16
+		return math.max(if last then 2.5 else 2, ws * 0.12)
+	end
+	-- moves `pos` along points[i..] by `step` studs on the flat plane (Y unchanged); returns the new position and index
+	function M.advance(pos, points, i, step)
+		while step > 1e-6 and i <= #points do
+			local target = points[i]
+			local flat = Vector3.new(target.X - pos.X, 0, target.Z - pos.Z)
+			local d = flat.Magnitude
+			if d <= step then
+				pos = Vector3.new(target.X, pos.Y, target.Z)
+				step -= d
+				i += 1
+			else
+				pos = pos + flat.Unit * step
+				step = 0
+			end
+		end
+		return pos, i
+	end
+	-- root height over the ground hit: steps up at most 2.5 studs (higher = a counter or wall to pass through, keep the
+	-- height), down at most 8 per call (a gap: keep the height, never fall through the map)
+	function M.heightAt(hereY, hip, hitY)
+		if hitY == nil then
+			return hereY
+		end
+		local y = hitY + hip
+		if y > hereY + 2.5 or y < hereY - 8 then
+			return hereY
+		end
+		return y
+	end
+	-- the glide speed for plot moves by the Speed dropdown: Blatant = full, Fast = half, Legit = nil (walk)
+	function M.speedFor(mode)
+		mode = mode or (if N.jobSpeed then N.jobSpeed() else "Blatant")
+		if mode == "Legit" then
+			return nil
+		end
+		if M.speed < M.base and M.retryAt > 0 and os.clock() >= M.retryAt then
+			M.speed, M.retryAt = M.base, 0
+			log("MOVE retry", "glide", "speed=" .. M.speed)
+		end
+		return if mode == "Fast" then math.max(M.speed / 2, 22) else M.speed
+	end
+	function N.glideSnap(why)
+		M.snaps += 1
+		M.speed = math.max(M.speed / 2, 22)
+		M.retryAt = os.clock() + 600
+		log("MOVE snapback", "glide", "speed=" .. math.floor(M.speed), "reason=" .. tostring(why))
+	end
+	-- the character's own run animation (Animate.run / Animate.walk), one track per Animator
+	local Tracks = setmetatable({}, { __mode = "k" })
+	local function runTrack(hum, speed)
+		local ok, track = pcall(function()
+			local animator = hum:FindFirstChildOfClass("Animator")
+			if not animator then
+				return nil
+			end
+			local t = Tracks[animator]
+			if not t then
+				local animate = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Animate")
+				local holder = animate and (animate:FindFirstChild("run") or animate:FindFirstChild("walk"))
+				local anim = holder and holder:FindFirstChildOfClass("Animation")
+				if not anim then
+					return nil
+				end
+				t = animator:LoadAnimation(anim)
+				t.Looped = true
+				Tracks[animator] = t
+			end
+			t:Play(0.1)
+			t:AdjustSpeed(math.clamp(speed / 16, 1, 2.5))
+			return t
+		end)
+		return if ok then track else nil
+	end
+	-- ok, why ("arrived" | "snapback" | "timeout" | "no character" | "stopped")
+	function N.glide(points, opts)
+		opts = opts or {}
+		local root, hum = N.root(), N.humanoid()
+		if not (root and hum) or #points == 0 then
+			return false, "no character"
+		end
+		local speed = math.max(tonumber(opts.speed) or M.speed, 8)
+		local near = opts.near or 0.75
+		local start, t0 = root.Position, os.clock()
+		local total, prev = 0, start
+		for _, p in ipairs(points) do
+			total += Vector3.new(p.X - prev.X, 0, p.Z - prev.Z).Magnitude
+			prev = p
+		end
+		local deadline = t0 + (opts.timeout or (total / speed * 2 + 4))
+		local hip = 3
+		pcall(function()
+			hip = hum.HipHeight + root.Size.Y / 2
+		end)
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { LocalPlayer.Character }
+		pcall(function()
+			hum.Sit = false
+		end)
+		local track = runTrack(hum, speed)
+		local i, expect = 1, start
+		local flyFrom, flyTotal = start.Y, math.max(total, 0.01)
+		local last = points[#points]
+		local function finish(ok, why)
+			if track then
+				pcall(function()
+					track:Stop(0.15)
+				end)
+			end
+			pcall(function()
+				local r = N.root()
+				if r then
+					r.AssemblyLinearVelocity = Vector3.zero
+				end
+			end)
+			M.glides += 1
+			local studs = math.floor((start - (expect or start)).Magnitude)
+			local key = tostring(opts.why or "move")
+			if studs >= 8 and os.clock() - (M.logAt[key] or -1e9) >= 5 then
+				M.logAt[key] = os.clock()
+				log("MOVE glide", key, "studs=" .. studs, "t=" .. string.format("%.1fs", os.clock() - t0), "speed=" .. math.floor(speed), "result=" .. why)
+			end
+			return ok, why
+		end
+		while alive() do
+			if opts.stop and opts.stop() then
+				return finish(false, "stopped")
+			end
+			if opts.done and opts.done() then
+				return finish(true, "arrived")
+			end
+			local dt = task.wait()
+			root, hum = N.root(), N.humanoid()
+			if not (root and hum) or hum.Health <= 0 then
+				return finish(false, "no character")
+			end
+			local here = root.Position
+			if (here - expect).Magnitude > 12 then
+				local why = string.format("pulled back %d studs", math.floor((here - expect).Magnitude))
+				if opts.onSnap then
+					opts.onSnap(why)
+				else
+					N.glideSnap(why)
+				end
+				return finish(false, "snapback")
+			end
+			if os.clock() > deadline then
+				return finish(false, "timeout")
+			end
+			local step = speed * math.clamp(tonumber(dt) or 1 / 60, 1 / 240, 0.1)
+			local nextPos
+			nextPos, i = M.advance(here, points, i, step)
+			local y
+			if opts.fly then
+				local left = Vector3.new(last.X - nextPos.X, 0, last.Z - nextPos.Z).Magnitude
+				y = flyFrom + ((last.Y + hip) - flyFrom) * math.clamp(1 - left / flyTotal, 0, 1)
+			else
+				local hit = workspace:Raycast(Vector3.new(nextPos.X, here.Y + 2, nextPos.Z), Vector3.new(0, -12, 0), params)
+				y = M.heightAt(here.Y, hip, hit and hit.Position.Y)
+			end
+			nextPos = Vector3.new(nextPos.X, y, nextPos.Z)
+			local dir = Vector3.new(nextPos.X - here.X, 0, nextPos.Z - here.Z)
+			if dir.Magnitude > 0.05 then
+				root.CFrame = CFrame.lookAt(nextPos, nextPos + dir.Unit)
+			else
+				local look = root.CFrame.LookVector
+				local flatLook = Vector3.new(look.X, 0, look.Z)
+				root.CFrame = if flatLook.Magnitude > 0.1 then CFrame.lookAt(nextPos, nextPos + flatLook.Unit) else CFrame.new(nextPos)
+			end
+			pcall(function()
+				root.AssemblyLinearVelocity = Vector3.zero
+			end)
+			expect = nextPos
+			if N.Travel then
+				N.Travel.movedAt = os.clock()
+			end
+			if i > #points or Vector3.new(last.X - nextPos.X, 0, last.Z - nextPos.Z).Magnitude <= near then
+				if opts.done == nil or opts.done() then
+					return finish(true, "arrived")
+				end
+				if i > #points then
+					return finish(false, "end of route")
+				end
+			end
+		end
+		return finish(false, "stopped")
+	end
+end
 local Session = {
 	started = os.clock(),
 	shifts = 0,
@@ -32321,8 +32556,9 @@ do
 	--      262945), so inside a shift the hub parks ONCE and acts from there: "remote" (reach 26, no steps between
 	--      stations in reach) -> "exact" (act from the old close approach `near`) after 2 rejects in 120 s; back to remote
 	--      after 10 min. Walking does not fix a rejected task, so a reject never degrades the MOVEMENT.
-	--  (2) MOVE rung (how the hub gets to the spot): "teleport" (CFrame jump, only while JobSpeed is Blatant, origin test
-	--      0.35 s later) -> "tween" (CFrame steps at m.speed studs/s, JobSpeed Fast or after a snapback) -> "walk" (only the
+	--  (2) MOVE rung (how the hub gets to the spot): "teleport" (JobSpeed Blatant: a smooth N.glide at N.Move.fast
+	--      studs/s, a single CFrame jump only beyond 80 studs) -> "tween" (N.glide at m.speed studs/s, JobSpeed Fast or
+	--      after a snapback) -> "walk" (only the
 	--      exceptions below). A SNAPBACK (the server put us back) degrades teleport -> tween and halves the tween speed
 	--      (min 22), NEVER straight to walk; teleport is tried again after 10 min. Legit speed = walk.
 	--  WALK-ONLY EXCEPTIONS (NoPark): CaveMiner, HutFisherman, LumberWoodcutter (the targets are world nodes found by
@@ -32429,6 +32665,40 @@ do
 		pcall(N.detach)
 		local start = root.Position
 		local cf = root.CFrame - root.CFrame.Position
+		-- owner 2026-10-07 ("no tween, it stops and starts"): moves inside a building are a smooth glide (p02_move),
+		-- Blatant at N.Move.fast studs/s (26 studs = 0.26 s, faster than the old jump + 0.35 s origin test), Fast / after a
+		-- snapback at m.speed; only a jump longer than 80 studs stays a single teleport.
+		local function glideThere(speed)
+			local from = N.root()
+			if not from then
+				return false
+			end
+			local ok = N.glide({ standAt(from.Position) }, {
+				speed = speed,
+				near = 0.75,
+				why = "job " .. job,
+				done = function()
+					local r = N.root()
+					return r ~= nil and flatTo(r.Position) <= near
+				end,
+				onSnap = function(how)
+					N.actSnapback(job, "glide " .. how)
+				end,
+			})
+			local r = N.root()
+			if ok or (r and flatTo(r.Position) <= near) then
+				m.moves += 1
+				if os.clock() - m.moveLogAt > 20 then
+					m.moveLogAt = os.clock()
+					log("ACT move", job, "glide ok", "speed=" .. math.floor(speed), "n=" .. m.moves)
+				end
+				return true
+			end
+			return false
+		end
+		if rung ~= "teleport" or flatTo(start) <= 80 then
+			return glideThere(if rung == "teleport" then N.Move.fast else m.speed)
+		end
 		if rung == "teleport" then
 			local goal = standAt(start)
 			root.CFrame = CFrame.new(goal) * cf
@@ -32452,50 +32722,8 @@ do
 				return flatTo(root.Position) <= near + 6
 			end
 		end
-		-- tween: CFrame steps at m.speed studs/s, origin test every 0.5 s
-		local last, lastAt = os.clock(), os.clock()
-		local deadline = os.clock() + 12
-		while alive() and os.clock() < deadline do
-			root = N.root()
-			if not root then
-				return false
-			end
-			if flatTo(root.Position) <= near then
-				m.moves += 1
-				if os.clock() - m.moveLogAt > 20 then
-					m.moveLogAt = os.clock()
-					log("ACT move", job, "tween ok", "speed=" .. math.floor(m.speed), "n=" .. m.moves)
-				end
-				return true
-			end
-			local now = os.clock()
-			local step = math.min(m.speed * (now - last), 40)
-			last = now
-			local here = root.Position
-			local goal = standAt(here)
-			local d = goal - here
-			local p = if d.Magnitude > step then here + d.Unit * step else goal
-			root.CFrame = CFrame.new(p) * (root.CFrame - root.CFrame.Position)
-			pcall(function()
-				root.AssemblyLinearVelocity = Vector3.zero
-			end)
-			if now - lastAt >= 0.5 then
-				lastAt = now
-				if T then
-					T.movedAt = now
-				end
-				local expect = p
-				task.wait()
-				root = N.root()
-				if root and (root.Position - expect).Magnitude > 12 then
-					N.actSnapback(job, "tween pulled back")
-					return false
-				end
-			else
-				task.wait()
-			end
-		end
-		return false
+		-- the long jump was put back: glide there at the (halved) tween speed, never walk
+		return glideThere(m.speed)
 	end
 	-- (state, near | rung): "here" = already in reach, act now; "move" = go there by the movement rung (teleport/tween)
 	-- with the returned near; nil = old behaviour (walk)
@@ -38594,7 +38822,7 @@ do
 	end
 	-- Last resort on your own plot (and inside a job building): short CFrame hops straight to the goal. notes.md
 	-- Anticheat: no position/speed check and no teleport kick exist in the dump; the game itself teleports you
-	-- (ToPlot, GoToWork). Hops of 3 studs every 0.03 s.
+	-- (ToPlot, GoToWork). A straight glide (p02_move, height lerped), no longer 3-stud hops every 0.03 s.
 	function N.hopTo(goal, why)
 		local root = N.root()
 		if not root then
@@ -38603,20 +38831,8 @@ do
 		local start = root.Position
 		local target = Vector3.new(goal.X, math.max(goal.Y, start.Y - 6), goal.Z)
 		log("WALK hop", tostring(why), "from", posText(start), "to", posText(target), "dist", math.floor((target - start).Magnitude))
-		local steps = math.max(1, math.ceil((target - start).Magnitude / 3))
-		for i = 1, steps do
-			root = N.root()
-			if not root then
-				return false
-			end
-			local p = start:Lerp(target, i / steps)
-			root.CFrame = CFrame.new(p) * (root.CFrame - root.CFrame.Position)
-			pcall(function()
-				root.AssemblyLinearVelocity = Vector3.zero
-			end)
-			task.wait(0.03)
-		end
-		return true
+		local ok = N.glide({ target }, { speed = N.Move.speedFor("Blatant") or N.Move.base, fly = true, why = "hop" })
+		return ok
 	end
 	-- distance from a point to the object's box (0 inside), else to its position
 	local function boxDist(object, pos, p)
@@ -38674,8 +38890,10 @@ do
 		end
 		return nil, last
 	end
-	-- follows the waypoints; false + reason when stuck 2 s, blocked or out of time
-	local function followPath(path, deadline)
+	-- follows the waypoints; false + reason when stuck, blocked or out of time; true as soon as `arrived()` holds (the
+	-- object is in reach: no stop at every waypoint, no last-meter shuffle). The arrival radius grows with WalkSpeed
+	-- (N.Move.arriveRadius), the next MoveTo goes out before the humanoid brakes, no stuck count while in the air.
+	local function followPath(path, deadline, arrived)
 		local points = path:GetWaypoints()
 		local blocked = false
 		local conn = path.Blocked:Connect(function()
@@ -38713,13 +38931,20 @@ do
 					log("WALK blocked at", posText(root.Position), "(path blocked)")
 					return done(false, "blocked")
 				end
+				if arrived and arrived() then
+					return done(true)
+				end
 				local flat = Vector3.new(wp.Position.X - root.Position.X, 0, wp.Position.Z - root.Position.Z).Magnitude
-				if flat <= (if i == #points then 1.5 else 2) then
+				if flat <= N.Move.arriveRadius(hum.WalkSpeed, i == #points) then
 					break
 				end
-				if flat < best - 0.25 then
-					best, bestAt = flat, os.clock()
-				elseif os.clock() - bestAt > 0.9 or os.clock() - wpStart > wpTimeout then
+				local airborne = false
+				pcall(function()
+					airborne = hum.FloorMaterial == Enum.Material.Air
+				end)
+				if flat < best - 0.25 or airborne then
+					best, bestAt = math.min(best, flat), os.clock()
+				elseif os.clock() - bestAt > 1.2 or os.clock() - wpStart > wpTimeout then
 					stuckN += 1
 					local action = N.unstick(stuckN, wp.Position, "waypoint " .. i .. "/" .. #points)
 					if action == "repath" then
@@ -38756,6 +38981,58 @@ do
 		local function onMyPlot(p)
 			return plot ~= nil and N.plotAt and N.plotAt(p) == plot
 		end
+		-- ACTION SPEED LADDER on your own plot (notes.md Anticheat: no position or speed check, the game itself moves you
+		-- with ToPlot): needs, garden and furniture are used from range, so no physical presence is needed -> glide along
+		-- the navmesh path (doors pass-through, no door opening, no stuck checks), straight glide when there is no path.
+		-- A snapback halves the glide speed and glides again; real walking only with Speed = Legit or after 2 failed glides.
+		local root0 = N.root()
+		local glideSpeed = N.Move.speedFor()
+		if glideSpeed and not jobMode and root0 and onMyPlot(root0.Position) then
+			-- still on a bed / chair / shower (AttachService weld): get up first, a welded body cannot glide
+			if N.attachWeld and N.attachWeld() then
+				pcall(N.detach)
+			end
+			for _ = 1, 2 do
+				local root = N.root()
+				if not root then
+					return false
+				end
+				if arrived() then
+					return true
+				end
+				local path, goal
+				for idx, g in ipairs(approachPoints(object, pos, root.Position)) do
+					if idx > 2 then
+						break
+					end
+					path = computePath(root.Position, g)
+					if path then
+						goal = g
+						break
+					end
+				end
+				local points, fly = {}, false
+				if path then
+					for k, wp in ipairs(path:GetWaypoints()) do
+						if k > 1 then
+							table.insert(points, wp.Position)
+						end
+					end
+				end
+				if #points == 0 then
+					goal = approachPoints(object, pos, root.Position)[1]
+					points, fly = { goal }, true
+				end
+				local ok = N.glide(points, { speed = N.Move.speedFor() or glideSpeed, near = 1, done = arrived, fly = fly, timeout = math.max(deadline - os.clock(), 3), why = "plot" })
+				if ok or arrived() then
+					return true
+				end
+				if os.clock() >= deadline then
+					return false
+				end
+			end
+			log("MOVE fallback", "plot glide -> walk", "reason=2 glides did not arrive")
+		end
 		local fails, teleported, hopped = 0, false, false
 		while alive() and os.clock() < deadline do
 			local root = N.root()
@@ -38791,8 +39068,11 @@ do
 			end
 			if path then
 				log("WALK path", "waypoints=" .. #path:GetWaypoints(), "status=" .. status, "to", posText(goal), "dist", math.floor(boxDist(object, pos, root.Position)))
-				if followPath(path, deadline) then
-					N.walkTo(goal, 1.5, 3, true)
+				if followPath(path, deadline, arrived) then
+					if arrived() then
+						return true
+					end
+					N.walkTo(goal, 2.5, 3, true)
 					if arrived() then
 						return true
 					end
