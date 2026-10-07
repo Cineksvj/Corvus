@@ -33380,6 +33380,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     
     	if lockedTarget and not isLockValid(lockedTarget) then
     		lockedTarget = nil
+    		Auto.farmBroken = (Auto.farmBroken or 0) + 1
     	end
     
     	if not lockedTarget then
@@ -34642,6 +34643,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	local plan = S.farmOP == true
     	local rows = {
     		{ "AutoFarm", "autoFarm", plan or S.fishSmart == true },
+    		{ "AutoTap", "autoTap", plan },
     		{ "AutoHatch", "autoHatch", plan or S.eggSmart == true },
     		{ "AutoFish", "autoFish", S.fishSmart == true },
     		{ "AutoRebirth", "autoRebirth", S.rebirthSmart == true },
@@ -34670,6 +34672,12 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
     	while alive() do
     		task.wait(1)
     		pcall(Auto.drive)
+    		if Auto.farmPresence then
+    			local ok, err = pcall(Auto.farmPresence)
+    			if not ok then
+    				Auto.logEvery("farmpresence", 300, "PROBLEM", "farm presence", tostring(err))
+    			end
+    		end
     	end
     end)
     -- what changed a toggle is always in the log: the saved config at start (AUTOLOAD) or the player (CLICK)
@@ -35471,6 +35479,137 @@ end
     local function getRoot()
     	local char = LocalPlayer.Character
     	return char and char:FindFirstChild("HumanoidRootPart")
+    end
+
+    -- the breakable area folders of a world (Breakables.<Area>.<model>)
+    function Auto.areaFolderIn(world)
+    	if not (Breakables and world) then return nil end
+    	local direct = Breakables:FindFirstChild(world)
+    	local best, bestCount = nil, 0
+    	for _, folder in ipairs(Breakables:GetChildren()) do
+    		local count, inWorld = 0, false
+    		for _, model in ipairs(folder:GetChildren()) do
+    			if model:IsA("Model") then
+    				count += 1
+    				if not inWorld then
+    					local pos = getModelPosition(model)
+    					inWorld = pos ~= nil and getWorldAt(pos) == world
+    				end
+    			end
+    		end
+    		if inWorld and (folder == direct or count > bestCount) then
+    			best, bestCount = folder, if folder == direct then math.huge else count
+    		end
+    	end
+    	return best
+    end
+
+    -- Smart Planner owns farming: keep the character's pets on the farm world's breakables, log what farming earns
+    function Auto.farmPresence()
+    	if not S.autoFarm then return end
+    	local now = os.clock()
+    	local F = Auto.FarmPresence
+    	if not F then
+    		F = { logAt = now, brokenAt = Auto.farmBroken or 0, coins = nil, moveAt = -1e9, fails = 0 }
+    		Auto.FarmPresence = F
+    	end
+    	local bd = getDataFolder("BreakableData")
+    	local areaVal = bd and bd:FindFirstChild("Area")
+    	local inVal = bd and bd:FindFirstChild("InArea")
+    	local autoVal = bd and bd:FindFirstChild("AutoBreaking")
+    	local area = if areaVal then tostring(areaVal.Value) else ""
+    	local inside = inVal ~= nil and inVal.Value == true
+    	local cum = Auto.Metrics and Auto.Metrics.cum
+    	local coins = cum and tonumber(cum.Coins) or nil
+    	if F.coins == nil then
+    		F.coins = coins
+    	end
+    	if now - F.logAt >= 60 then
+    		local broken = (Auto.farmBroken or 0) - F.brokenAt
+    		Auto.log("FARM", "breaking=" .. broken .. "/min", "coins+=" .. (if coins and F.coins then string.format("%.0f", coins - F.coins) else "?"), "area=" .. area, "inArea=" .. tostring(inside), "autoBreak=" .. tostring(autoVal ~= nil and autoVal.Value == true), "tap=" .. tostring(S.autoTap == true), "by=" .. (if S.farmOP then "planner" else "switch"))
+    		F.logAt, F.brokenAt, F.coins = now, Auto.farmBroken or 0, coins
+    	end
+    	if autoVal and autoVal.Value ~= true and SetAutoBreaking and now - (F.autoAt or -1e9) > 5 then
+    		F.autoAt = now
+    		pcall(function() SetAutoBreaking:FireServer(true) end)
+    	end
+    	if not S.farmOP then return end
+    	local mover = Auto.Mover
+    	if (mover and mover.busy) or (Auto.Fish and Auto.Fish.active) or now - F.moveAt < 15 then return end
+    	local root = getRoot()
+    	if not root then return end
+    	local world = getWorldAt(root.Position)
+    	if not world or inside then return end
+    	local current = if area ~= "" and Breakables then Breakables:FindFirstChild(area) else nil
+    	local currentOk = false
+    	if current then
+    		for _, model in ipairs(current:GetChildren()) do
+    			local pos = model:IsA("Model") and getModelPosition(model) or nil
+    			if pos then
+    				currentOk = getWorldAt(pos) == world
+    				break
+    			end
+    		end
+    	end
+    	local hatching = os.clock() - (HatchState.activeAt or -1e9) < 6
+    	-- pets already work this world's area from where we stand, and the egg needs us here
+    	if currentOk and hatching then return end
+    	if currentOk and now - F.moveAt < 120 then return end
+    	local folder = Auto.areaFolderIn(world)
+    	if not folder then
+    		Auto.logEvery("farmnoarea:" .. world, 300, "PLAN", "idle", "reason=no breakable area loaded in " .. world)
+    		return
+    	end
+    	local sum, n, models = Vector3.zero, 0, {}
+    	for _, model in ipairs(folder:GetChildren()) do
+    		local pos = model:IsA("Model") and getModelPosition(model) or nil
+    		if pos then
+    			sum += pos
+    			n += 1
+    			table.insert(models, pos)
+    		end
+    	end
+    	if n == 0 then return end
+    	local center = sum / n
+    	local spot, best = nil, math.huge
+    	for _, pos in ipairs(models) do
+    		local d = (pos - center).Magnitude
+    		if d < best then
+    			spot, best = pos, d
+    		end
+    	end
+    	F.moveAt = now
+    	if mover then
+    		mover.busy = true
+    		mover.task = "Going into " .. folder.Name .. " to farm"
+    	end
+    	pcall(function()
+    		root.AssemblyLinearVelocity = Vector3.zero
+    		root.CFrame = CFrame.new(spot + Vector3.new(4, 4, 4))
+    	end)
+    	local waited = 0
+    	while waited < 3 and not (inVal and inVal.Value == true) do
+    		waited += task.wait(0.25) or 0.25
+    	end
+    	if mover then
+    		mover.busy = false
+    		mover.task = ""
+    	end
+    	local entered = inVal ~= nil and inVal.Value == true
+    	Auto.log("FARM", "move", "area=" .. folder.Name, "world=" .. world, "was=" .. (if area ~= "" then area else "none"), "entered=" .. tostring(entered), "areaNow=" .. (if areaVal then tostring(areaVal.Value) else "?"))
+    	if entered then
+    		F.fails = 0
+    		if SetAutoBreaking then
+    			pcall(function() SetAutoBreaking:FireServer(true) end)
+    		end
+    	else
+    		F.fails += 1
+    		if F.fails >= 3 then
+    			F.moveAt = now + 300
+    			F.fails = 0
+    			Auto.log("PLAN", "idle", "reason=could not enter the breakable area of " .. world .. ", retry in 5 min")
+    		end
+    	end
     end
     
     EggBox:AddButton({
@@ -41210,8 +41349,9 @@ end
     					local value = cum.Coins + P.w.Rubies * cum.Rubies + P.w.Gems * cum.Gems
     					local last = P.last
     					local activity = plActivity()
-    					if last and last.activity then
+    					if last and last.activity and last.c then
     						local dt = now - last.t
+    						value = last.value + math.max(0, cum.Coins - last.c) + P.w.Rubies * math.max(0, cum.Rubies - last.r) + P.w.Gems * math.max(0, cum.Gems - last.g)
     						if dt > 0 and dt < 60 then
     							local decay = 0.5 ^ (dt / 1800)
     							for _, a in pairs(P.act) do
@@ -41224,7 +41364,7 @@ end
     							a.t += dt
     						end
     					end
-    					P.last = { t = now, value = value, activity = activity }
+    					P.last = { t = now, value = value, activity = activity, c = cum.Coins, r = cum.Rubies, g = cum.Gems }
     					-- fishing vs farming: measure both, keep the better one (tokens from fish are not counted as money)
     					local farm, fishAct = P.act.Farm, P.act.Fish
     					if not ((S.fishSmart or S.farmOP) and S.autoFish) then
