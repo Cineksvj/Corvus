@@ -34179,7 +34179,14 @@ do
 			end
 		end
 	end
-	-- Boosts: keeps one active per picked category, always the strongest tier you own.
+	-- Potions (the game calls them Boosts; BoostConfig, dump line 34812; server BoostService.useBoost, line 5434):
+	-- Use(key) takes one from the inventory and adds its duration to that potion's own timer. Per category only the
+	-- highest tier ticks, weaker ones of the same category are frozen until it ends (line 5371-5431), and different
+	-- categories (Luck, Dragon Luck, Shadow Speed ...) run side by side. No debounce or rate limit on the server.
+	-- A potion is only drunk when its effect pays right now: luck and roll speed while rolling runs, income while the
+	-- plot earns, damage during a tower run. A stronger tier than the running one is drunk at once (the weaker one is
+	-- frozen, not lost).
+	N.Potion = { pending = nil, text = "-", waits = {}, used = 0 }
 	function N.boostCategories()
 		local seen, list = {}, {}
 		local ok, entries = pcall(N.G.Entry.entriesOfKind, "Boost")
@@ -34192,41 +34199,193 @@ do
 		table.sort(list)
 		return list
 	end
-	function N.boostStep()
-		if not on("AutoBoosts") then
-			return false
+	-- Kind of effect and its size from the potion's buffs: luck (Luck multiplier), income (Money Multiplier), speed
+	-- (Roll Duration base, negative = faster), damage (Damage/Health Multiplier).
+	function N.potionEffect(cfg)
+		local buffs = type(cfg) == "table" and type(cfg.buffs) == "table" and cfg.buffs or {}
+		for buff, data in pairs(buffs) do
+			local amount = tonumber(type(data) == "table" and data.amount) or 0
+			if buff == "Luck" then
+				return "luck", amount
+			elseif buff == "Money Multiplier" then
+				return "income", amount
+			elseif buff == "Roll Duration" then
+				return "speed", amount
+			elseif buff == "Damage Multiplier" or buff == "Health Multiplier" then
+				return "damage", amount
+			end
 		end
-		local active = {}
+		local category = tostring(type(cfg) == "table" and cfg.category or "")
+		if string.find(category, "Luck", 1, true) then
+			return "luck", 1
+		elseif string.find(category, "Income", 1, true) then
+			return "income", 1
+		elseif string.find(category, "Speed", 1, true) then
+			return "speed", 0
+		elseif string.find(category, "Damage", 1, true) then
+			return "damage", 1
+		end
+		return nil, 0
+	end
+	function N.potionEffectText(kind, amount, duration)
+		local size = if kind == "speed" then string.format("roll %+.3gs", amount) else string.format("x%s", formatNumber(amount))
+		local name = ({ luck = "Luck", income = "Income", speed = "Speed", damage = "Damage" })[kind] or "?"
+		return string.format("%s %s for %s", name, size, N.longTime(duration or 0))
+	end
+	-- Nil when the potion's effect is used right now, else the plain reason it would be wasted.
+	function N.potionIdle(kind)
+		if kind == "luck" or kind == "speed" then
+			if not on("AutoRoll") then
+				return "rolling is off"
+			end
+			if N.manualRunning and N.manualRunning() then
+				return "rolling is paused"
+			end
+			if N.Roll.fullSince and os.clock() - N.Roll.fullSince > 20 then
+				return "unit storage is full"
+			end
+		elseif kind == "income" then
+			if (N.plotIncome and N.plotIncome() or 0) <= 0 then
+				return "no plot income yet"
+			end
+		elseif kind == "damage" then
+			if not N.Tower.running then
+				return "no tower run"
+			end
+		else
+			return "unknown effect"
+		end
+		return nil
+	end
+	-- Money the potion adds over its duration: income = plot $/s x (multiplier - 1) x time; luck and speed = the
+	-- extra plot income of the better/faster drops (the planner's own roll maths, p05) x time; damage = tower floors.
+	function N.potionValue(kind, amount, duration)
+		local ok, value = pcall(function()
+			if kind == "income" then
+				return N.plotIncome() * math.max(amount - 1, 0) * duration
+			elseif kind == "luck" or kind == "speed" then
+				N.measureRates()
+				local ctx = N.spendContext()
+				local change = if kind == "luck" then { luck = ctx.luck * math.max(amount, 1), tag = "potion" } else { rate = ctx.rate * ctx.duration / math.max(ctx.duration + amount, 0.2), tag = "potion" }
+				return math.max(N.changeGain(ctx, change), 0) * duration
+			end
+			return 0
+		end)
+		return if ok and type(value) == "number" and value == value then value else 0
+	end
+	-- Running tier per category, and the seconds it has left.
+	function N.potionsRunning()
+		local running = {}
+		local now = 0
+		pcall(function()
+			now = workspace:GetServerTimeNow()
+		end)
 		for _, entry in pairs(N.field("ActiveEntries", {}) or {}) do
 			local cfg = type(entry) == "table" and N.entry(entry.name)
 			if cfg and cfg.kind == "Boost" and cfg.category then
-				active[cfg.category] = true
-			end
-		end
-		local best = {}
-		for key, item in pairs(N.inventory()) do
-			local cfg = type(item) == "table" and (tonumber(item.amount) or 0) > 0 and N.entry(item.name)
-			if cfg and cfg.kind == "Boost" and cfg.category and not active[cfg.category] and selected(Options.BoostCats, cfg.category) then
-				local current = best[cfg.category]
-				local weakFirst = optionText("BoostOrder", "Strongest first") == "Weakest first"
 				local tier = tonumber(cfg.tier) or 0
-				if not current or (if weakFirst then tier < current.tier else tier > current.tier) then
-					best[cfg.category] = { key = key, tier = tonumber(cfg.tier) or 0, name = item.name }
+				local left = tonumber(entry.remaining) or 0
+				if type(entry.startedAt) == "number" and now > 0 then
+					left = math.max(0, left - math.max(0, now - entry.startedAt))
+				end
+				local current = running[cfg.category]
+				if not current or tier > current.tier then
+					running[cfg.category] = { tier = tier, name = entry.name, left = left }
 				end
 			end
 		end
+		return running
+	end
+	-- The last drink is checked on the next step: one potion less in the bag (or its timer running) = accepted.
+	local function checkPending()
+		local P = N.Potion
+		local pending = P.pending
+		if not pending or os.clock() - pending.at < 1 then
+			return
+		end
+		P.pending = nil
+		local ok = N.amount(pending.key) < pending.before
+		if not ok then
+			local entry = (N.field("ActiveEntries", {}) or {})[pending.name]
+			ok = type(entry) == "table" and (tonumber(entry.remaining) or 0) > pending.remaining
+		end
+		log(string.format("POTION use %s effect=%s value=$%s %s", pending.name, pending.effect, formatNumber(pending.value), if ok then "ok" else "rejected"))
+	end
+	function N.boostStep()
+		checkPending()
+		if not on("AutoBoosts") then
+			return false
+		end
+		local P = N.Potion
+		local running = N.potionsRunning()
+		local weakFirst = optionText("BoostOrder", "Strongest first") == "Weakest first"
+		local best = {}
+		for key, item in pairs(N.inventory()) do
+			local cfg = type(item) == "table" and (tonumber(item.amount) or 0) > 0 and N.entry(item.name)
+			if cfg and cfg.kind == "Boost" and cfg.category and selected(Options.BoostCats, cfg.category) then
+				local tier = tonumber(cfg.tier) or 0
+				local live = running[cfg.category]
+				-- Strongest first: drink a tier above the running one now (the weaker one waits, frozen). Weakest
+				-- first: only when nothing of that kind runs, saving the strong ones for later.
+				local wanted = if weakFirst then live == nil else (live == nil or tier > live.tier)
+				if wanted then
+					local current = best[cfg.category]
+					if not current or (if weakFirst then tier < current.tier else tier > current.tier) then
+						best[cfg.category] = { key = key, tier = tier, name = item.name, cfg = cfg }
+					end
+				end
+			end
+		end
+		local waits = {}
 		for category, pick in pairs(best) do
-			-- Luck boosts start inside a Luck Event, income boosts inside a Cash Event (x2.5 on top), when picked.
+			local kind, amount = N.potionEffect(pick.cfg)
+			local idle = N.potionIdle(kind)
 			local event = N.boostEvent(category)
-			if not (event and N.holdForEvent(event, category .. " boosts")) then
+			if idle then
+				table.insert(waits, pick.name .. " waits: " .. idle)
+			elseif event and N.holdForEvent(event, category .. " potions") then
+				table.insert(waits, pick.name .. " waits for the next " .. event)
+			else
+				local duration = tonumber(pick.cfg.duration) or 300
+				local entry = (N.field("ActiveEntries", {}) or {})[pick.name]
+				P.pending = {
+					key = pick.key,
+					name = pick.name,
+					before = N.amount(pick.key),
+					remaining = if type(entry) == "table" then tonumber(entry.remaining) or 0 else 0,
+					effect = N.potionEffectText(kind, amount, duration),
+					value = N.potionValue(kind, amount, duration),
+					at = os.clock(),
+				}
 				fire(R.boost, pick.key)
 				Session.boosts += 1
-				log("BOOST used", pick.name, "weather", tostring(N.weatherNow() or "none"))
+				P.used += 1
 				task.wait(0.4)
 				return true
 			end
 		end
+		table.sort(waits)
+		P.waits = waits
 		return false
+	end
+	-- Label text: what runs now and what waits (and why), plain words.
+	function N.potionText()
+		local parts = {}
+		local running = N.potionsRunning()
+		local names = {}
+		for category in pairs(running) do
+			table.insert(names, category)
+		end
+		table.sort(names)
+		for _, category in ipairs(names) do
+			local info = running[category]
+			table.insert(parts, string.format("%s  %s left", info.name, N.longTime(info.left)))
+		end
+		local text = if #parts > 0 then "Running: " .. table.concat(parts, ", ") else "No potion running"
+		if on("AutoBoosts") and #N.Potion.waits > 0 then
+			text ..= "\n" .. table.concat(N.Potion.waits, "\n", 1, math.min(#N.Potion.waits, 4))
+		end
+		return text .. string.format("\nUsed this session: %d", N.Potion.used)
 	end
 	-- Gear: free to swap, so the best piece per slot for the chosen focus is always worn.
 	local GearWeights = {
@@ -34271,8 +34430,14 @@ do
 		end
 		return false
 	end
-	-- Trait and grade rerolls on the best earners on the plot, until each reaches the target. The game refuses to
-	-- roll over a protected trait or grade, so a Samurai/S or better is never thrown away.
+	-- Traits and grades (TraitService.RollTrait dump line 11434, GradeService.RollGrade line 5087): Roll(unitKey) costs
+	-- 1 Trait Reroll / 1 Gem, debounce 0.25 s, owned unit only; the server refuses to roll over a trait/grade the
+	-- player protected (ProtectedTraits/ProtectedGrades; Samurai+ and S+ by default, line 32353). The new trait is
+	-- drawn with LuckWeights (line 54894): weight x luck ^ (log(maxW / w) / log(maxW / minW)), luck = Trait/Grade Luck.
+	-- Only incomeMultiplier counts (Damage/Health traits = x1 for income).
+	-- Policy (optimal stopping with k rerolls left): W1 = E[m], Wk = E[max(m, Wk-1)]. A unit with multiplier c is
+	-- rolled only while Wk > c (the expected end result beats what it has), and never at or above the Keep tier.
+	-- Gain of that roll = income without the trait x (Wk - c); the unit with the biggest gain goes first.
 	function N.rankTable(kind)
 		return if kind == "trait" then N.G.Traits else N.G.Grades
 	end
@@ -34303,37 +34468,165 @@ do
 		local list = N.field(if kind == "trait" then "ProtectedTraits" else "ProtectedGrades", {}) or {}
 		return list[name] == true
 	end
-	function N.rerollPick(kind)
-		local target = N.rankMult(kind, optionText(if kind == "trait" then "TraitTarget" else "GradeTarget", ""))
+	N.RerollCost = { trait = "Trait Reroll", grade = "Gems" }
+	-- Odds of every trait/grade at the player's Trait/Grade Luck, exactly like LuckWeights.Get.
+	function N.rankOdds(kind)
+		local luck = N.buff(if kind == "trait" then "Trait Luck" else "Grade Luck", 1) or 1
+		if luck <= 0 then
+			luck = 1
+		end
+		local maxW, minW = 0, math.huge
+		for _, data in pairs(N.rankTable(kind)) do
+			local w = tonumber(type(data) == "table" and data.weight) or 0
+			if w > 0 then
+				maxW = math.max(maxW, w)
+				minW = math.min(minW, w)
+			end
+		end
+		local span = if minW >= maxW then 0 else math.log(maxW / minW)
+		local list, total = {}, 0
+		for name, data in pairs(N.rankTable(kind)) do
+			local w = tonumber(type(data) == "table" and data.weight) or 0
+			if w > 0 then
+				local x = w * luck ^ (if span <= 0 then 0 else math.log(maxW / w) / span)
+				total += x
+				table.insert(list, { name = name, w = x, mult = tonumber(data.incomeMultiplier) or 1 })
+			end
+		end
+		for _, item in ipairs(list) do
+			item.p = if total > 0 then item.w / total else 0
+		end
+		return list, luck
+	end
+	N.RerollW = {}
+	-- Expected end multiplier with k rerolls left, playing the optimal stopping rule.
+	function N.rerollWorth(kind, k)
+		k = math.clamp(math.floor(k), 0, 5000)
+		if k <= 0 then
+			return 0
+		end
+		local odds, luck = N.rankOdds(kind)
+		if #odds == 0 then
+			return 0
+		end
+		local cache = N.RerollW[kind]
+		if not cache or cache.luck ~= luck or cache.n ~= #odds then
+			cache = { luck = luck, n = #odds, w = {} }
+			N.RerollW[kind] = cache
+		end
+		local w = cache.w
+		if not w[1] then
+			local e = 0
+			for _, item in ipairs(odds) do
+				e += item.p * item.mult
+			end
+			w[1] = e
+		end
+		for i = #w + 1, k do
+			local prev, e = w[i - 1], 0
+			for _, item in ipairs(odds) do
+				e += item.p * math.max(item.mult, prev)
+			end
+			w[i] = e
+			if e - prev < 1e-12 then
+				for j = i + 1, k do
+					w[j] = e
+				end
+				break
+			end
+		end
+		return w[k]
+	end
+	-- Rerolls you may spend now (above the Keep slider).
+	function N.rerollBudget(kind)
+		local reserve = math.floor(optionNumber(if kind == "trait" then "TraitReserve" else "GradeReserve", 0))
+		return math.max(N.amount(N.RerollCost[kind]) - reserve, 0)
+	end
+	-- Expected $/s one more roll on this unit is worth with k rerolls in hand (0 = do not roll), and why.
+	function N.rerollGain(kind, info, k)
+		local current = if kind == "trait" then info.trait else info.grade
+		if N.protected(kind, current) then
+			return 0, "protected"
+		end
+		local c = N.rankMult(kind, current)
+		local keep = N.rankMult(kind, optionText(if kind == "trait" then "TraitTarget" else "GradeTarget", ""))
+		if current and c >= keep then
+			return 0, "at the Keep tier"
+		end
+		local worth = N.rerollWorth(kind, k)
+		if worth <= c + 1e-9 then
+			return 0, "too few rerolls to beat " .. tostring(current or "none")
+		end
+		local plain = (tonumber(info.income) or 0) / math.max(c, 1e-9)
+		return plain * (worth - c), nil
+	end
+	function N.rerollPick(kind, k)
+		k = k or N.rerollBudget(kind)
 		local limit = math.floor(optionNumber(if kind == "trait" then "TraitUnits" else "GradeUnits", 3))
-		local count = 0
+		local count, best, bestGain, why = 0, nil, 0, nil
 		for _, info in ipairs(N.units()) do
 			if info.slot then
 				count += 1
 				if count > limit then
 					break
 				end
-				local current = if kind == "trait" then info.trait else info.grade
-				if N.rankMult(kind, current) < target and not N.protected(kind, current) then
-					return info
+				local gain, reason = N.rerollGain(kind, info, k)
+				if gain > bestGain then
+					best, bestGain = info, gain
+				elseif not why and reason then
+					why = reason
 				end
 			end
 		end
-		return nil
+		return best, bestGain, why
 	end
-	N.Reroll = { at = -1e9 }
+	local function unitTag(info)
+		return string.sub(tostring(info.key), 1, 8) .. " " .. tostring(info.name)
+	end
+	N.Reroll = { at = -1e9, pending = nil, text = { trait = "-", grade = "-" } }
+	-- The last roll is read back on the next step: the unit's new trait, keep or reroll, and the gain it was worth.
+	local function checkRoll()
+		local Rr = N.Reroll
+		local pending = Rr.pending
+		if not pending or os.clock() - pending.at < 0.3 then
+			return
+		end
+		Rr.pending = nil
+		N.Data.at = -1e9
+		N.UnitCache.at = -1e9
+		local _, byKey = N.units()
+		local info = byKey[pending.key]
+		local spent = N.amount(N.RerollCost[pending.kind]) < pending.before
+		local got = info and (if pending.kind == "trait" then info.trait else info.grade)
+		if not spent then
+			log(string.format("%s roll unit=%s rejected cost=0", string.upper(pending.kind), pending.tag))
+			return
+		end
+		local verdict = "keep"
+		if info then
+			local more = N.rerollGain(pending.kind, info, N.rerollBudget(pending.kind))
+			verdict = if more > 0 then "reroll" else "keep"
+		end
+		log(string.format("%s roll unit=%s got=%s %s cost=1 %s gain=$%s/s", string.upper(pending.kind), pending.tag, tostring(got or "none"), verdict, N.RerollCost[pending.kind], formatNumber(pending.gain)))
+	end
 	function N.rerollStep()
-		if os.clock() - N.Reroll.at < 0.35 then
+		checkRoll()
+		if os.clock() - N.Reroll.at < 0.35 or N.Reroll.pending then
 			return false
 		end
 		for _, kind in ipairs({ "trait", "grade" }) do
 			local toggle = if kind == "trait" then "AutoTrait" else "AutoGrade"
-			local token = if kind == "trait" then "Trait Reroll" else "Gems"
-			local reserve = math.floor(optionNumber(if kind == "trait" then "TraitReserve" else "GradeReserve", 0))
-			if on(toggle) and N.amount(token) > reserve then
-				local info = N.rerollPick(kind)
+			if on(toggle) then
+				local k = N.rerollBudget(kind)
+				local info, gain, why = nil, 0, nil
+				if k > 0 then
+					info, gain, why = N.rerollPick(kind, k)
+				end
+				local label = if kind == "trait" then "Traits" else "Grades"
 				if info then
+					N.Reroll.text[kind] = string.format("%s: rolling %s (%s), worth +$%s/s per roll", label, tostring(info.name), tostring((if kind == "trait" then info.trait else info.grade) or "none"), formatNumber(gain))
 					N.Reroll.at = os.clock()
+					N.Reroll.pending = { kind = kind, key = info.key, tag = unitTag(info), before = N.amount(N.RerollCost[kind]), gain = gain, at = os.clock() }
 					fire(if kind == "trait" then R.trait else R.grade, info.key)
 					if kind == "trait" then
 						Session.traitRolls += 1
@@ -34343,9 +34636,36 @@ do
 					N.UnitCache.at = -1e9
 					return true
 				end
+				N.Reroll.text[kind] = string.format("%s: waiting, %s", label, if k <= 0 then "no " .. N.RerollCost[kind] .. " above the Keep amount" else (why or "best units are done"))
+			else
+				N.Reroll.text[kind] = nil
 			end
 		end
 		return false
+	end
+	-- $/s that `extra` more rerolls of this kind add to the best unit (the planner prices ticket packs with it).
+	function N.rerollPackGain(kind, extra)
+		local k = N.rerollBudget(kind)
+		local best = 0
+		local limit = math.floor(optionNumber(if kind == "trait" then "TraitUnits" else "GradeUnits", 3))
+		local count = 0
+		for _, info in ipairs(N.units()) do
+			if info.slot then
+				count += 1
+				if count > limit then
+					break
+				end
+				local current = if kind == "trait" then info.trait else info.grade
+				local c = N.rankMult(kind, current)
+				local keep = N.rankMult(kind, optionText(if kind == "trait" then "TraitTarget" else "GradeTarget", ""))
+				if not N.protected(kind, current) and not (current and c >= keep) then
+					local plain = (tonumber(info.income) or 0) / math.max(c, 1e-9)
+					local gain = plain * (math.max(c, N.rerollWorth(kind, k + extra)) - math.max(c, N.rerollWorth(kind, k)))
+					best = math.max(best, gain)
+				end
+			end
+		end
+		return best
 	end
 end
 do
@@ -35191,6 +35511,25 @@ do
 				end
 			end
 		end
+		-- Trait Reroll / Gems packs (QuestConfig.Shop: 10 for 1 ticket) are priced by what they add to the best plot
+		-- unit's expected trait/grade multiplier (N.rerollPackGain, optimal stopping), only while Auto Traits/Grades
+		-- (or the planner) would spend them.
+		for _, pack in ipairs({ { kind = "trait", toggle = "AutoTrait", name = "Trait Reroll" }, { kind = "grade", toggle = "AutoGrade", name = "Gems" } }) do
+			if on(pack.toggle) then
+				local price = N.ticketPrice(pack.name)
+				local amount = 10
+				for _, item in ipairs(type(N.G.Quest.Shop) == "table" and N.G.Quest.Shop or {}) do
+					if item.name == pack.name then
+						amount = tonumber(item.amount) or 10
+					end
+				end
+				local ok, gain = pcall(N.rerollPackGain, pack.kind, amount)
+				gain = if ok and type(gain) == "number" then gain else 0
+				if price < math.huge and gain > 0 then
+					table.insert(list, { name = pack.name, price = price, gain = gain, ratio = gain / price })
+				end
+			end
+		end
 		table.sort(list, function(a, b)
 			return a.ratio > b.ratio
 		end)
@@ -35912,7 +36251,7 @@ do
 	Tabs.Slots = Tabs.Plot
 	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Smart Planner, upgrade tree, rebirth, gear and towers")
 	Tabs.Towers = Tabs.Upgrades
-	Tabs.Rewards = N.addTab("Rewards", "gift", "Daily, codes, quests, tickets, boosts and rerolls")
+	Tabs.Rewards = N.addTab("Rewards", "gift", "Daily, codes, quests, tickets, potions and traits")
 	Tabs.Items = Tabs.Rewards
 	-- Stats and Webhook share one tab (packed tabs: each alone had too few controls).
 	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress, rates and Discord webhook posts")
@@ -36389,25 +36728,22 @@ do
 		QuestBox:AddToggle("AutoTicketSpins", { Text = "Spend Spare Tickets", Default = false, Tooltip = "After the gamepasses, spare tickets buy the item below" })
 		QuestBox:AddDropdown("SpareTickets", { Text = "Spare Tickets On", Values = { "Lucky Spin", "Gems", "Trait Reroll" }, Default = "Lucky Spin", Tooltip = "Lucky Spin costs 10 tickets, 10 Gems or 10 Trait Rerolls cost 1 ticket" })
 		Labels.Quests = QuestBox:AddLabel({ Text = "-", DoesWrap = true })
-		local BoostBox = Tabs.Items:AddLeftGroupbox("Boosts", "zap")
-		BoostBox:AddToggle("AutoBoosts", { Text = "Auto Use Boosts", Default = false, Tooltip = "Keeps one boost running per picked kind, the strongest one you own. Also redeems gamepass items (gifted or traded) you do not own yet" })
-		BoostBox:AddDropdown("BoostOrder", { Text = "Use Order", Values = { "Strongest first", "Weakest first" }, Default = "Strongest first", Tooltip = "Weakest first saves your strong boosts for later" })
-		-- Every luck and income kind by default: the tower drops (Dragon, Cursed, Pirate, Leaf, Slayer) are their own
-		-- kinds and run next to the plain ones (owner log 2026-10-05: tower boosts were piling up unused).
-		local boostKinds, boostDefault = N.boostCategories(), {}
-		for _, kind in ipairs(boostKinds) do
-			if N.boostEvent(kind) then
-				table.insert(boostDefault, kind)
-			end
-		end
-		BoostBox:AddDropdown("BoostCats", { Text = "Boost Kinds", Values = boostKinds, Default = boostDefault, Multi = true, AllowNull = true })
-		local RerollBox = Tabs.Items:AddRightGroupbox("Trait And Grade Rerolls", "wand-sparkles")
-		RerollBox:AddToggle("AutoTrait", { Text = "Auto Trait Reroll", Default = false, Tooltip = "Rerolls traits on your best plot units until they reach the target. Samurai and better are protected by the game" })
-		RerollBox:AddDropdown("TraitTarget", { Text = "Trait Target", Values = N.rankNames("trait"), Default = "Samurai" })
+		local BoostBox = Tabs.Items:AddLeftGroupbox("Potions", "zap")
+		BoostBox:AddToggle("AutoBoosts", { Text = "Auto Potions", Default = false, Tooltip = "Drinks your potions (the game's Boosts) when they pay: luck and roll speed only while rolling, income only while the plot earns, damage only during a tower run. A stronger potion replaces a weaker running one (the weaker one waits, not lost). Also redeems gamepass items you do not own yet" })
+		BoostBox:AddDropdown("BoostOrder", { Text = "Use Order", Values = { "Strongest first", "Weakest first" }, Default = "Strongest first", Tooltip = "Weakest first saves your strong potions for later" })
+		-- Every kind by default: the tower drops (Dragon, Cursed, Pirate, Leaf, Slayer, Shadow) are their own kinds and
+		-- run next to the plain ones (owner log 2026-10-05: tower boosts were piling up unused). A potion is only drunk
+		-- while its effect is used (N.potionIdle), so damage and speed kinds no longer waste anything.
+		local boostKinds = N.boostCategories()
+		BoostBox:AddDropdown("BoostCats", { Text = "Potion Kinds", Values = boostKinds, Default = table.clone(boostKinds), Multi = true, AllowNull = true })
+		Labels.Potions = BoostBox:AddLabel({ Text = "-", DoesWrap = true })
+		local RerollBox = Tabs.Items:AddRightGroupbox("Traits And Grades", "wand-sparkles")
+		RerollBox:AddToggle("AutoTrait", { Text = "Auto Traits", Default = false, Tooltip = "Spends Trait Rerolls on your best plot units, only while the expected income gain of a roll is positive. Never rolls over the Keep tier or a trait you protected in the game" })
+		RerollBox:AddDropdown("TraitTarget", { Text = "Keep Trait At Or Above", Values = N.rankNames("trait"), Default = "Samurai" })
 		RerollBox:AddSlider("TraitUnits", { Text = "Units", Default = 3, Min = 1, Max = 16, Rounding = 0, Suffix = " best" })
 		RerollBox:AddSlider("TraitReserve", { Text = "Keep Rerolls", Default = 0, Min = 0, Max = 100, Rounding = 0 })
-		RerollBox:AddToggle("AutoGrade", { Text = "Auto Grade Reroll", Default = false, Tooltip = "Uses Gems to reroll grades on your best plot units until they reach the target. S and better are protected" })
-		RerollBox:AddDropdown("GradeTarget", { Text = "Grade Target", Values = N.rankNames("grade"), Default = "S" })
+		RerollBox:AddToggle("AutoGrade", { Text = "Auto Grades", Default = false, Tooltip = "Spends Gems on grades of your best plot units, only while the expected income gain of a roll is positive. Never rolls over the Keep tier or a grade you protected in the game" })
+		RerollBox:AddDropdown("GradeTarget", { Text = "Keep Grade At Or Above", Values = N.rankNames("grade"), Default = "S" })
 		RerollBox:AddSlider("GradeUnits", { Text = "Units", Default = 3, Min = 1, Max = 16, Rounding = 0, Suffix = " best" })
 		RerollBox:AddSlider("GradeReserve", { Text = "Keep Gems", Default = 0, Min = 0, Max = 100, Rounding = 0 })
 		Labels.Reroll = RerollBox:AddLabel({ Text = "-", DoesWrap = true })
@@ -37799,13 +38135,21 @@ do
 						N.codesText(),
 						if #N.Reward.log > 0 then "\n" .. table.concat(N.Reward.log, "\n") else ""
 					)
+					local rerollLines = {}
+					for _, kind in ipairs({ "trait", "grade" }) do
+						if N.Reroll.text[kind] then
+							table.insert(rerollLines, N.Reroll.text[kind])
+						end
+					end
 					I.reroll = string.format(
-						"Trait Rerolls <b>%d</b>  \u{00B7}  Gems <b>%d</b>\nUsed this session: %d traits, %d grades",
+						"Trait Rerolls <b>%d</b>  \u{00B7}  Gems <b>%d</b>%s\nUsed this session: %d traits, %d grades",
 						N.amount("Trait Reroll"),
 						N.amount("Gems"),
+						if #rerollLines > 0 then "\n" .. table.concat(rerollLines, "\n") else "",
 						Session.traitRolls,
 						Session.gradeRolls
 					)
+					I.potions = N.potionText()
 				end
 			end)
 			if not ok then
@@ -37993,6 +38337,7 @@ do
 						Labels.Rewards:SetText(I.rewards or "-")
 						Labels.Quests:SetText(I.quests or "-")
 						Labels.Reroll:SetText(I.reroll or "-")
+						Labels.Potions:SetText(I.potions or "-")
 					end)
 				end
 				if shown(Tabs.Stats) then
