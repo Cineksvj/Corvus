@@ -20182,8 +20182,8 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
         Library.MinSize = Vector2.new(math.min(WindowInfo.MinContainerWidth, MaxX), Library.OriginalMinSize.Y)
     
         WindowInfo.Size = UDim2.fromOffset(
-            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, MaxX),
-            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, MaxY)
+            math.clamp(WindowInfo.Size.X.Offset, Library.MinSize.X, math.max(Library.MinSize.X, MaxX)),
+            math.clamp(WindowInfo.Size.Y.Offset, Library.MinSize.Y, math.max(Library.MinSize.Y, MaxY))
         )
         Library.MobileWindowSize = Vector2.new(WindowInfo.Size.X.Offset, WindowInfo.Size.Y.Offset)
         if typeof(WindowInfo.Font) == "EnumItem" then
@@ -33082,12 +33082,16 @@ do
 	end
 	-- The best nest: gain over the weakest slot per second of the run. Rare (Secret+) nests first with Rare Sniper.
 	function N.pickTarget()
+		local diag = { seen = 0, open = 0, late = 0, nogain = 0 }
+		N.Steal.diag = diag
 		local floor = N.slotFloor()
 		local weakest = N.placedItems()[1]
 		local best, bestScore, bestGain
 		local day = N.dayInfo()
 		for _, nest in ipairs(N.nests()) do
+			diag.seen += 1
 			if N.canSteal(nest) then
+				diag.open += 1
 				local T = N.runTime(nest.pos)
 				-- 5 % margin: an item only just above the weakest would never take its spot (same rule as placing).
 				-- Income starts after the egg has grown: value over one hour, grow time included.
@@ -33100,6 +33104,11 @@ do
 				-- you home).
 				local need = if N.nightProbeOn and N.nightProbeOn() then T / 2 + 3 else T + 6
 				local enoughDay = (tonumber(day.Remaining) or 0) > need
+				if not enoughDay then
+					diag.late += 1
+				elseif gain <= 0 and not wantIndex then
+					diag.nogain += 1
+				end
 				if enoughDay and (gain > 0 or wantIndex) then
 					local score = math.max(gain, 0) / T + (if wantIndex then 1e-9 else 0)
 					if nest.rare and on("RareSniper") then
@@ -34311,7 +34320,12 @@ do
 			if N.dayInfo().GateClosed then
 				return nil, "night, the gate is closed"
 			end
-			return nil, "no nest beats your plot"
+			local d = N.Steal.diag or {}
+			return nil, string.format("no nest to grab (stocked %d, open zones %d, too late in the day %d, no gain %d)", d.seen or 0, d.open or 0, d.late or 0, d.nogain or 0)
+		end
+		-- Bootstrap: no income at all -> the first placed item IS the income; training cannot beat that.
+		if N.planner() and (gain or 0) > 0 and N.income() <= 0 then
+			return nest, string.format("bootstrap: free pad, +%s/s", formatNumber(gain or 0))
 		end
 		-- Rare rush: a Secret+ nest sits in a zone a few minutes of training away (and the day lasts) -> train for it now
 		-- instead of running for commons.
