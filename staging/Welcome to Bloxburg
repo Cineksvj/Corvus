@@ -32128,6 +32128,56 @@ do
 		return box.done and box.ok, box.result, box.result2
 	end
 end
+-- Earnings meter (owner screenshot 2026-10-07: the game's Hairdresser Earnings 322, the hub "Earned $5.42K
+-- ($154.97K/h)"). The old meter added EVERY rise of the wallet: the first sample ran before the JobHandler loaded
+-- (money 0), so the whole wallet ($3.16K, live log `earned 3.16K` with 0 tasks) counted as earned, plus daily rewards,
+-- and the rate divided by the time since the hub started (min 60 s). Now only the game's own shift pay counts
+-- (ClientStats Job.ShiftEarnings, the number the game shows): the current shift = that value, a shift that ends (job
+-- changes or the value drops back = the game started a new shift) is banked into the session total; $/h = shift pay /
+-- shift working time (min 60 s), the session rate = session pay / working time of all shifts. Nothing is saved or
+-- loaded: a rejoin (new hub run) starts at 0.
+N.Earn = { total = 0, job = "", start = nil, last = 0, work = 0, shifts = 0 }
+do
+	local E = N.Earn
+	local function bank(now)
+		if E.job ~= "" and E.start then
+			E.total += E.last
+			E.work += math.max(now - E.start, 0)
+			E.shifts += 1
+		end
+	end
+	-- one sample: job = the job you are clocked in for ("" = none), value = the game's ShiftEarnings
+	function E.tick(job, value, now)
+		job = job or ""
+		value = tonumber(value) or 0
+		if job ~= E.job then
+			bank(now)
+			E.job, E.start, E.last = job, if job ~= "" then now else nil, 0
+		elseif job ~= "" and value < E.last then
+			-- same job, the game's shift pay fell back: a new shift began
+			bank(now)
+			E.start, E.last = now, 0
+		end
+		if job ~= "" then
+			E.last = math.max(value, 0)
+		end
+	end
+	function E.shiftPay()
+		return if E.job ~= "" then E.last else 0
+	end
+	function E.shiftSeconds(now)
+		return if E.job ~= "" and E.start then math.max(now - E.start, 0) else 0
+	end
+	function E.shiftRate(now)
+		return E.shiftPay() / math.max(E.shiftSeconds(now), 60) * 3600
+	end
+	function E.sessionPay()
+		return E.total + E.shiftPay()
+	end
+	function E.sessionRate(now)
+		return E.sessionPay() / math.max(E.work + E.shiftSeconds(now), 60) * 3600
+	end
+end
 local formatNumber, allows, selected, on, optionNumber, optionText, Status, setStatus, picked
 do
 	local Suffixes = { "", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc", "Ud", "Dd", "Td", "Qad", "Qid", "Sxd", "Spd", "Ocd", "Nod", "Vg" }
@@ -38658,8 +38708,7 @@ do
 		if best > 0 then
 			return best
 		end
-		local elapsed = math.max(os.clock() - Session.started, 60)
-		local session = Session.earned / elapsed * 3600
+		local session = N.Earn.sessionRate(os.clock())
 		-- nothing measured yet (owner log 2026-10-05: "trip worth $0", lossPerHour=$0 at 0 % moods): assume a
 		-- beginner job's $1000/h so the mood loss is never valued at zero
 		return if session > 0 then session else 1000
@@ -42034,16 +42083,19 @@ do
 				if Session.moneyStart == nil and money > 0 then
 					Session.moneyStart = money
 				end
-				-- money spent on things does not count as negative earnings
-				if N.Job.money and money > N.Job.money then
-					Session.earned += money - N.Job.money
-				end
 				N.Job.money = money
-				local elapsed = math.max(os.clock() - Session.started, 60)
+				-- earnings = the game's own shift pay only (p02_earn), never wallet deltas or saved values
+				local nowClock = os.clock()
+				local job0 = if N.jobHandler() then N.currentJob() else ""
+				N.Earn.tick(job0, if job0 ~= "" then N.shiftEarnings() else 0, nowClock)
+				Session.earned = N.Earn.sessionPay()
+				local elapsed = math.max(nowClock - Session.started, 60)
 				N.InfoText.stats = {
 					money = "$" .. formatNumber(money),
 					earned = "$" .. formatNumber(Session.earned),
-					rate = "$" .. formatNumber(math.floor(Session.earned / elapsed * 3600)) .. "/h",
+					rate = "$" .. formatNumber(math.floor(N.Earn.sessionRate(nowClock))) .. "/h",
+					shift = "$" .. formatNumber(N.Earn.shiftPay()),
+					shiftRate = "$" .. formatNumber(math.floor(N.Earn.shiftRate(nowClock))) .. "/h",
 					time = string.format("%dh %02dm", elapsed // 3600, (elapsed % 3600) // 60),
 				}
 				local working = N.workOn()
@@ -42092,8 +42144,8 @@ do
 					Session.done,
 					Session.correct,
 					Session.wrong,
-					N.InfoText.stats.earned,
-					N.InfoText.stats.rate,
+					N.InfoText.stats.shift,
+					N.InfoText.stats.shiftRate,
 					if N.Hair.last ~= "" then "\nLast haircut: " .. N.Hair.last else ""
 				)
 			end)
