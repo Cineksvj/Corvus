@@ -35150,9 +35150,13 @@ local Window, Tabs, Labels
 do
 	do
 		local setIdentity = setthreadidentity or set_thread_identity or setidentity or (syn and syn.set_thread_identity)
-		if setIdentity then
-			pcall(setIdentity, 8)
+		-- The UI thread loses its rights after a while ('lacking capability Plugin' every ~30 s in the live log): set again before every UI group.
+		function N.fixIdentity()
+			if setIdentity then
+				pcall(setIdentity, 8)
+			end
 		end
+		N.fixIdentity()
 	end
 	Window = Library:CreateWindow({
 		Title = "Corvus",
@@ -36634,6 +36638,7 @@ do
 	task.spawn(function()
 		local uiErrorAt = -1e9
 		local function group(fn)
+			N.fixIdentity()
 			local ok, err = xpcall(fn, debug.traceback)
 			if not ok and os.clock() - uiErrorAt > 30 then
 				uiErrorAt = os.clock()
