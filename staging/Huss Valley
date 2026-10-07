@@ -33500,6 +33500,39 @@ function N.catcherStep()
 	end
 	return string.format("Chasing %s (%.0f studs)", best.name, d)
 end
+-- Hands-free stab (HelpStab): the same claim as catcherStep, from where the player stands; never steers.
+function N.stabStep()
+	if not (N.inMatch() and N.role() == "Catcher" and N.runState() == "Active") or not N.canMelee() then
+		return
+	end
+	local root = N.root()
+	if not root then
+		return
+	end
+	local now = os.clock()
+	if now - N.Catch.meleeAt < N.meleeGap() then
+		return
+	end
+	local pos = root.Position
+	local look = N.lookOf(root)
+	local myVel = N.velocity(root)
+	local F = N.readField()
+	for _, p in ipairs(N.participants()) do
+		if p.root and p.attr("GameRole") == "Runner" and p.attr("RunState") == "Active" and math.abs(p.root.Position.Z) < F.lineZ - 0.5 then
+			local tpos = p.root.Position
+			if N.inReach(pos, look, tpos, myVel, N.velocity(p.root)) then
+				N.Catch.meleeAt = now
+				local id = HttpService:GenerateGUID(false)
+				N.Catch.pending[id] = true
+				if send("Game.MeleeEvent", { id = id, at = N.serverTime(), direction = look, position = pos }) then
+					Session.melee += 1
+					log("HELP stab", p.name, string.format("%.1f studs", (N.flat(tpos) - N.flat(pos)).Magnitude))
+				end
+				return
+			end
+		end
+	end
+end
 -- The game's choice dialogs: the lead catcher picks a runner (SelectHero), the picked runner answers Chicken or Hero.
 N.Choice = { sentKey = nil, seenAt = nil }
 function N.choiceStep()
@@ -33564,7 +33597,7 @@ function N.playStep()
 	if N.attr("AFK") == true and N.canAFK() and os.clock() - N.Play.afkAt > 10 then
 		N.Play.afkAt = os.clock()
 		send("Game.PlayerPreferences", "SetAFK", false)
-		log("PLAY afk off")
+		log(if N.wants("AutoPlay") then "PLAY afk off" else "HELP queue afk off")
 	end
 	if N.attr("TutorialSession") == true and os.clock() - N.Play.tutorialAt > 3 then
 		local state = {}
@@ -33575,7 +33608,7 @@ function N.playStep()
 			if state.mode == "Prompt" then
 				N.Play.tutorialAt = os.clock()
 				send("Tutorial.Action", "Skip", state.token)
-				log("PLAY tutorial skipped")
+				log(if N.wants("AutoPlay") then "PLAY tutorial skipped" else "HELP queue tutorial skipped")
 			elseif state.mode == "Travel" and N.attr("TutorialReturnError") == true then
 				N.Play.tutorialAt = os.clock()
 				send("Tutorial.Action", "RetryReturn", state.token)
@@ -33596,7 +33629,7 @@ N.onEvent("Presentation.MovementGuardEvent", function(kind, data)
 	log("AC warning", title, "|", message)
 	N.steer(nil)
 	N.quiet = true
-	for _, name in ipairs({ "AutoEscape", "AutoCatch", "AutoPlay", "AutoCollect", "AutoDodge", "SmartPlanner" }) do
+	for _, name in ipairs({ "AutoEscape", "AutoCatch", "AutoPlay", "AutoCollect", "AutoDodge", "HelpStab", "SmartPlanner" }) do
 		local t = Toggles[name]
 		if t and t.Value then
 			pcall(t.SetValue, t, false)
@@ -34397,6 +34430,9 @@ do
 		{ "AutoCollect", "Collect gems" },
 		{ "AutoDodge", "Perfect dodge" },
 		{ "AutoCatch", "Catch as catcher" },
+		{ "HelpStab", "Stab in place" },
+		{ "HelpQueue", "Stay in matches" },
+		{ "HelpChoice", "Answer match cards" },
 		{ "AutoQuests", "Daily quests" },
 		{ "AutoEventKnives", "Event quest knives" },
 		{ "AutoJourney", "Journey rewards" },
@@ -34478,6 +34514,28 @@ do
 			Tooltip = "Hero crosses alone for more XP but every catcher chases you. Smart Planner picks by your measured escape rate instead",
 		})
 		Labels.Play = PlayBox:AddLabel({ Text = "-", DoesWrap = true })
+		local HelpBox = Tabs.Match:AddLeftGroupbox("Hands-free helpers (you keep control of the character)", "hand")
+		HelpBox:AddLabel({ Text = "These never walk for you: you steer, Corvus does the clicking and chores. Rewards, crates and knives are in the Rewards tab and need no movement either.", DoesWrap = true })
+		HelpBox:AddToggle("AutoDodge", {
+			Text = "Auto Perfect Dodge",
+			Default = false,
+			Tooltip = "Presses the game's own dash (Space) the moment a catcher starts his stab or dive at you: the dash makes you immune for 0.28 s (the game's PERFECT DODGE). Works while you run yourself too",
+		})
+		HelpBox:AddToggle("HelpStab", {
+			Text = "Auto Stab (in place)",
+			Default = false,
+			Tooltip = "As a catcher: stabs the moment a runner is inside the game's own reach check, from where you stand. You steer, it never moves you. Same claim and pace as a real click",
+		})
+		HelpBox:AddToggle("HelpQueue", {
+			Text = "Stay in matches",
+			Default = false,
+			Tooltip = "Keeps AFK off in the lobby so the game puts you in every match, and skips the practice tutorial. No movement",
+		})
+		HelpBox:AddToggle("HelpChoice", {
+			Text = "Answer match cards",
+			Default = false,
+			Tooltip = "Answers the Chicken or Hero card (your Chicken or Hero choice from Auto Play) and picks the hero as lead catcher. No movement",
+		})
 		local RunBox = Tabs.Match:AddRightGroupbox("Escape (Runner)", "footprints")
 		RunBox:AddToggle("AutoEscape", {
 			Text = "Auto Escape",
@@ -34492,11 +34550,6 @@ do
 		})
 		RunBox:AddSlider("GemDetour", { Text = "Gem detour", Default = 8, Min = 0, Max = 20, Rounding = 0, Suffix = " studs", Tooltip = "Longest extra path for a gem. Smart Planner sets it from your escape rate" })
 		RunBox:AddToggle("WaitOpening", { Text = "Wait for an opening", Default = true, Tooltip = "Stays behind the start line (safe) while every lane runs into a catcher, up to 16 s of the 30 s run" })
-		RunBox:AddToggle("AutoDodge", {
-			Text = "Auto Perfect Dodge",
-			Default = false,
-			Tooltip = "Presses the game's own dash (Space) the moment a catcher starts his stab or dive at you: the dash makes you immune for 0.28 s (the game's PERFECT DODGE). Works while you run yourself too",
-		})
 		Labels.Run = RunBox:AddLabel({ Text = "-", DoesWrap = true })
 		local CatchBox = Tabs.Match:AddLeftGroupbox("Catch (Catcher)", "crosshair")
 		CatchBox:AddToggle("AutoCatch", {
@@ -35555,7 +35608,7 @@ do
 			task.wait(0.5)
 			return
 		end
-		if N.wants("AutoPlay") then
+		if N.wants("AutoPlay") or on("HelpChoice") then
 			N.choiceStep()
 		end
 		local moving = false
@@ -35604,6 +35657,15 @@ do
 		end
 		task.wait(0.2)
 	end)
+	-- Hands-free stab: a catcher who steers himself; the hub only clicks (never moves the character).
+	loop("helpers", function()
+		if N.Manual.running or not on("HelpStab") or N.wants("AutoCatch") or typing() then
+			task.wait(0.3)
+			return
+		end
+		N.stabStep()
+		task.wait(0.05)
+	end)
 	-- Remote-only chores: rewards, wallet, knives, crates, server hop, anti AFK. They never move the character.
 	loop("chores", function()
 		if N.Manual.running then
@@ -35616,7 +35678,7 @@ do
 		if Session.coinsStart == nil and N.Armory.state.loaded then
 			Session.coinsStart, Session.gemsStart = N.coins(), N.gems()
 		end
-		if N.wants("AutoPlay") then
+		if N.wants("AutoPlay") or on("HelpQueue") then
 			N.playStep()
 		end
 		N.rewardStep()
