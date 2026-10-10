@@ -1,0 +1,1567 @@
+-- ══════════════════ CORVUS HUB — by Dastan ══════════════════
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local LocalPlayer = Players.LocalPlayer
+
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+local Window = Rayfield:CreateWindow({
+    Name = "Corvus Hub",
+    LoadingTitle = "Loading...",
+    LoadingSubtitle = "by Dastan",
+    ConfigurationSaving = { Enabled = false },
+})
+local Main = Window:CreateTab("Main", 4483362458)
+
+local function WaitForPath(names, timeout)
+    local obj = ReplicatedStorage
+    for _, name in ipairs(names) do
+        if not obj then return nil end
+        obj = obj:WaitForChild(name, timeout or 10)
+    end
+    return obj
+end
+
+local TapEvent           = WaitForPath({"RemoteServices", "TapService", "RE", "TapRequested"})
+local PetEvent           = WaitForPath({"RemoteServices", "PetService", "RE", "PetActionRequested"})
+local EggEvent           = WaitForPath({"RemoteServices", "EggService", "RE", "EggHatchRequested"})
+local MachineEvent       = WaitForPath({"RemoteServices", "MachineService", "RE", "MachineCraftRequested"})
+local MachineResultEvent = WaitForPath({"RemoteServices", "MachineService", "RE", "MachineCraftResult"})
+local EggResultEvent     = WaitForPath({"RemoteServices", "EggService", "RE", "EggHatchResult"})
+
+local function GetHrp()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+-- ═══════════ AUTO TAP ═══════════
+local TapConn
+Main:CreateToggle({
+    Name = "Auto Tap",
+    CurrentValue = false,
+    Callback = function(Value)
+        if TapConn then TapConn:Disconnect() TapConn = nil end
+        if Value and TapEvent then
+            TapConn = RunService.Heartbeat:Connect(function()
+                TapEvent:FireServer({ Auto = false, ClientSequence = 1 })
+            end)
+        end
+    end,
+})
+
+-- ═══════════ AUTO EQUIP BEST (Clicks) ═══════════
+local EquipOn = false
+Main:CreateToggle({
+    Name = "Auto Equip Best",
+    CurrentValue = false,
+    Callback = function(Value)
+        EquipOn = Value
+        if Value and PetEvent then
+            task.spawn(function()
+                while EquipOn do
+                    PetEvent:FireServer({ Action = "EquipBest", Mode = "Clicks" })
+                    task.wait(1)
+                end
+            end)
+        end
+    end,
+})
+
+-- ═══════════ PET DATA ═══════════
+-- Data.Pets.Owned[uid] = { Name, Tier, Locked, Frozen }, Data.Pets.Equipped = { uid }, Data.Pets.StorageLimit = max pets
+local DataController
+local function GetData()
+    if not DataController then
+        local ok, dc = pcall(function() return require(ReplicatedStorage.Controllers.Core.DataController) end)
+        if not ok or type(dc) ~= "table" then return nil end
+        DataController = dc
+    end
+    local ok, rep = pcall(function() return DataController:GetReplica() end)
+    if ok and type(rep) == "table" and type(rep.Data) == "table" and type(rep.Data.Pets) == "table" then
+        return rep.Data
+    end
+end
+
+local function Storage()
+    local data = GetData()
+    if not (data and type(data.Pets.Owned) == "table") then return nil end
+    local n = 0
+    for _ in pairs(data.Pets.Owned) do n += 1 end
+    return n, tonumber(data.Pets.StorageLimit) or 150
+end
+
+-- ═══════════ AUTO OPEN VOID EGG (x8, no animation) ═══════════
+local EGG, MAX_INFLIGHT = "Void", 2
+
+-- hatch count: the biggest one you can use, the way the game's own auto-open picks it:
+-- 8 needs the x8 gamepass (or an OctoHatch boost) and enough coins for 8 eggs, else 3, else 1.
+local GamepassPerks, BoostFormula, EggPricing, LaunchEggConfig
+pcall(function()
+    GamepassPerks = require(ReplicatedStorage.Shared.Monetization.GamepassPerks)
+    BoostFormula = require(ReplicatedStorage.Shared.Items.BoostFormula)
+    EggPricing = require(ReplicatedStorage.Shared.Pets.EggPricing)
+    LaunchEggConfig = require(ReplicatedStorage.Shared.Pets.LaunchEggConfig)
+end)
+local LastCount = 8
+local function HatchCount()
+    local data = GetData()
+    if not data then return LastCount end
+    local ok, n = pcall(function()
+        local has8 = (GamepassPerks and GamepassPerks.Has(data, "x8Egg")) or (BoostFormula and BoostFormula.HasType(data, "OctoHatch"))
+        local coins = (data.Currencies and data.Currencies.Coins) or 0
+        local price = LaunchEggConfig and LaunchEggConfig[EGG] and LaunchEggConfig[EGG].Price
+        local function afford(k)
+            if not (EggPricing and price) then return true end
+            return EggPricing.GetTotal(data, EGG, price, k) <= coins
+        end
+        if has8 and afford(8) then return 8 end
+        if afford(3) then return 3 end
+        return 1
+    end)
+    if ok and type(n) == "number" then LastCount = n end
+    return LastCount
+end
+local Seq, LastClientSeq, InOwnHatch = 0, 0, false
+local EggWanted, EggConn = false, nil
+local EggHolds = 0 -- > 0 while a trip (crafting, digging, ...) keeps the egg paused
+local function HoldEgg(on) EggHolds = math.max(0, EggHolds + (on and 1 or -1)) end
+local Pending, NextSendAt = {}, 0 -- hatch requests waiting for the server answer: [Seq] = sent at
+local EggTooFar = false -- set when the server answers "TooFar": the egg keeper below walks you back to the egg
+
+local function FireHatch()
+    if LastClientSeq > Seq then Seq = LastClientSeq end -- continue the game's own counter
+    Seq += 1
+    InOwnHatch = true
+    EggEvent:FireServer({ Egg = EGG, Auto = false, Count = HatchCount(), Seq = Seq })
+    InOwnHatch = false
+    return Seq
+end
+
+-- The server paces hatches itself (it holds a request until the previous one is done and reports it in `Held`), so
+-- spamming only fills its queue and gets "RateLimited"/"Cancelled" answers. The game's own client keeps the next request
+-- one step "ahead" of the current one. Same here: keep exactly MAX_INFLIGHT requests open, refill the moment one is answered.
+if EggResultEvent then
+    EggResultEvent.OnClientEvent:Connect(function(r)
+        if type(r) ~= "table" then return end
+        if r.Seq ~= nil then Pending[r.Seq] = nil else Pending[next(Pending) or 0] = nil end
+        if r.Success == true or r.Forced == true then return end
+        local wait = (r.Error == "RateLimited" and 0.4) or (r.Error == "Cancelled" and 0.1) or (r.Error == "StorageFull" and 1) or 2
+        NextSendAt = os.clock() + wait
+        if r.Error == "TooFar" then EggTooFar = true end
+        if r.Error ~= "RateLimited" and r.Error ~= "Cancelled" and r.Error ~= "StorageFull" then
+            warn("[Egg] " .. tostring(r.Error))
+        end
+    end)
+end
+
+-- learn the game's hatch counter so the server does not drop our requests as old ones
+pcall(function()
+    if not (EggEvent and hookmetamethod and getnamecallmethod) then return end
+    local wrap = newcclosure or function(f) return f end
+    local old
+    old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+        if self == EggEvent and getnamecallmethod() == "FireServer" and not InOwnHatch then
+            local args = ...
+            if type(args) == "table" and type(args.Seq) == "number" and args.Seq > LastClientSeq then
+                LastClientSeq = args.Seq
+            end
+        end
+        return old(self, ...)
+    end))
+end)
+
+-- hatch animation: destroy the hatch screens while the egg toggle is on
+local function IsHatchGui(obj)
+    if not obj:IsA("ScreenGui") then return false end
+    local n = string.lower(obj.Name)
+    return string.find(n, "hatch") or string.find(n, "reveal") or string.find(n, "opening")
+end
+pcall(function()
+    local pg = LocalPlayer:WaitForChild("PlayerGui")
+    pg.ChildAdded:Connect(function(child)
+        if EggWanted and IsHatchGui(child) then pcall(function() child:Destroy() end) end
+    end)
+end)
+
+Main:CreateToggle({
+    Name = "Auto Open Void Egg",
+    CurrentValue = false,
+    Callback = function(Value)
+        EggWanted = Value
+        if EggConn then EggConn:Disconnect() EggConn = nil end
+        if not Value then return end
+        if not EggEvent then warn("[Egg] remote not found") return end
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        if pg then
+            for _, g in ipairs(pg:GetChildren()) do
+                if IsHatchGui(g) then pcall(function() g:Destroy() end) end
+            end
+        end
+        Pending, NextSendAt = {}, 0
+        EggConn = RunService.Heartbeat:Connect(function()
+            if not EggWanted or EggHolds > 0 then return end
+            local now = os.clock()
+            if now < NextSendAt then return end
+            local open = 0
+            for seq, sentAt in pairs(Pending) do
+                if now - sentAt > 12 then Pending[seq] = nil else open += 1 end
+            end
+            while open < MAX_INFLIGHT do
+                Pending[FireHatch()] = now
+                open += 1
+            end
+        end)
+    end,
+})
+
+-- ═══════════ ONE TRIP AT A TIME ═══════════
+-- every feature that moves the character (crafting, digging, chests, mining, ...) takes this lock first
+local BusyBy = nil
+local function Acquire(who)
+    local t0 = os.clock()
+    while BusyBy ~= nil and BusyBy ~= who do
+        if os.clock() - t0 > 5 then warn("[" .. who .. "] waiting: " .. tostring(BusyBy) .. " is still busy") t0 = os.clock() end
+        task.wait(0.2)
+    end
+    BusyBy = who
+end
+local function Release(who)
+    if BusyBy == who then BusyBy = nil end
+end
+
+-- ═══════════ SHARED HELPERS ═══════════
+local Remotes = ReplicatedStorage:WaitForChild("RemoteServices", 10)
+
+local function RF(service, name)
+    local s = Remotes and Remotes:FindFirstChild(service)
+    s = s and s:FindFirstChild("RF")
+    return s and s:FindFirstChild(name)
+end
+local function RE(service, name)
+    local s = Remotes and Remotes:FindFirstChild(service)
+    s = s and s:FindFirstChild("RE")
+    return s and s:FindFirstChild(name)
+end
+local function Invoke(rf, ...)
+    if not rf then return nil, "remote missing" end
+    local ok, r = pcall(rf.InvokeServer, rf, ...)
+    if not ok then return nil, tostring(r) end
+    return r
+end
+local function Req(path)
+    local ok, m = pcall(function()
+        local obj = ReplicatedStorage
+        for _, n in ipairs(path) do obj = obj:WaitForChild(n, 5) end
+        return require(obj)
+    end)
+    return ok and m or nil
+end
+local function Now() return workspace:GetServerTimeNow() end
+local function Field(t, ...)
+    if type(t) ~= "table" then return nil end
+    for _, k in ipairs({ ... }) do if t[k] ~= nil then return t[k] end end
+    return nil
+end
+
+-- short table dump for the console
+local function Dump(v, depth)
+    depth = depth or 0
+    if type(v) ~= "table" then return tostring(v) end
+    if depth >= 2 then return "{...}" end
+    local out = {}
+    for k, x in pairs(v) do
+        out[#out + 1] = tostring(k) .. "=" .. Dump(x, depth + 1)
+        if #out >= 12 then out[#out + 1] = "..." break end
+    end
+    return "{" .. table.concat(out, ", ") .. "}"
+end
+
+-- ── islands: everything lives on its own island and only loads after the game's own teleport ──
+-- IslandService.RF.Travel({ Island = name, Source = "Menu" }) is what the portal menu sends; the server moves you and
+-- then sets LocalPlayer's "CurrentIsland" attribute. Nothing on an island (dig site, shrine, machines, breakables,
+-- the mine portal...) exists in workspace until you are there.
+local ISLANDS = { "Spawn", "Sky Island", "Autumn", "Mushroom", "Desert", "Crystal Cave", "Shadow Realm" }
+local function CurrentIsland() return LocalPlayer:GetAttribute("CurrentIsland") end
+
+-- one status line in the GUI (and the console) so you can see what a feature is doing without F9
+local StatusLabel = Main:CreateLabel("Status: idle")
+local LastStatusText = ""
+local function Status(text)
+    if text == LastStatusText then return end
+    LastStatusText = text
+    print("[Status] " .. text)
+    pcall(function() StatusLabel:Set("Status: " .. text) end)
+end
+
+local function IslandUnlocked(data, island)
+    if island == "Spawn" or island == nil then return true end
+    local p = data and data.Progression
+    return type(p) == "table" and type(p.UnlockedIslands) == "table" and p.UnlockedIslands[island] == true
+end
+
+local function TravelTo(island)
+    if island == nil or CurrentIsland() == island then return true end
+    Status("travelling to " .. island .. " (now on " .. tostring(CurrentIsland()) .. ")")
+    local travel = RF("IslandService", "Travel")
+    if not travel then Status("IslandService.RF.Travel remote not found") return false end
+    local r = Invoke(travel, { Island = island, Source = "Menu" })
+    if island == "Spawn" and not (type(r) == "table" and r.Success) then
+        r = Invoke(travel, { ReturnToSpawn = true, Source = "Menu" })
+    end
+    print("[Travel] -> " .. island .. ": " .. Dump(r))
+    for _ = 1, 80 do
+        if CurrentIsland() == island then
+            Status("arrived on " .. island .. ", waiting for it to load")
+            task.wait(2) -- let the island stream in
+            return true
+        end
+        task.wait(0.25)
+    end
+    Status("travel to " .. island .. " failed: " .. Dump(r) .. " (still on " .. tostring(CurrentIsland()) .. ")")
+    return false
+end
+
+-- waits for something to show up after a teleport (streaming); finder() returns the object or nil
+local function WaitFor(finder, seconds)
+    local t0 = os.clock()
+    repeat
+        local obj = finder()
+        if obj then return obj end
+        task.wait(0.25)
+    until os.clock() - t0 > (seconds or 10)
+    return nil
+end
+
+local function Island(name) -- workspace.Ts2Islands[name], once loaded
+    local f = workspace:FindFirstChild("Ts2Islands")
+    return f and f:FindFirstChild(name)
+end
+
+-- looks for something that lives on an unknown island: checks the current island, then travels through the
+-- unlocked ones. finder() returns the object or nil. The island is cached under `key` once found.
+local KnownIsland = { -- where things are known to be; anything else is searched once and remembered
+    ["machine:Golden"] = "Shadow Realm",
+    ["machine:Diamond"] = "Crystal Cave",
+    ["machine:Rainbow"] = "Shadow Realm",
+}
+local function FindOnIslands(key, finder, timeoutEach)
+    local obj = finder()
+    if obj then KnownIsland[key] = CurrentIsland() return obj end
+    local order = {}
+    if KnownIsland[key] then table.insert(order, KnownIsland[key]) end
+    local cur = CurrentIsland()
+    for _, n in ipairs(ISLANDS) do if n ~= cur and n ~= KnownIsland[key] then table.insert(order, n) end end
+    local data = GetData()
+    for _, island in ipairs(order) do
+        if (island == KnownIsland[key] or IslandUnlocked(data, island)) and TravelTo(island) then
+            Status("looking for " .. key .. " on " .. island)
+            obj = WaitFor(finder, timeoutEach or 6)
+            if obj then KnownIsland[key] = island return obj end
+        end
+    end
+    return nil
+end
+
+-- ═══════════ AUTO CRAFT: Golden -> Diamond -> Rainbow ═══════════
+-- Storage nearly full (fewer free slots than one x8 hatch needs) -> pause the egg, then in this order, each step only
+-- while the storage is STILL full after the previous one:
+--   1. Golden machine: every set of 6 same Normal pets            (MachineCraftRequested Craft, Machine="Golden")
+--   2. Diamond machine: every set of 5 same Golden pets           (Machine="Diamond")
+--   3. Rainbow machine: claim finished pods, start pods with 5 same Diamond pets (Machine="Shiny", Start/Claim; 30 s each)
+-- then teleport back to where you were and resume the egg. The crafting menus/cutscenes are kept closed meanwhile.
+local MenuController
+pcall(function() MenuController = require(ReplicatedStorage.Controllers.UI.MenuController) end)
+
+local STAGES = {
+    { machine = "Golden",  point = "Golden",  tier = "Normal", need = 6 },
+    { machine = "Diamond", point = "Diamond", tier = "Golden", need = 5 },
+}
+local RAINBOW = { machine = "Shiny", point = "Rainbow", tier = "Diamond", need = 5, maxQueue = 3 }
+
+-- pets of one tier grouped by name, skipping locked / frozen / equipped ones
+local function GetGroups(tier)
+    local data = GetData()
+    if not (data and type(data.Pets.Owned) == "table") then return nil end
+    local equipped = {}
+    for _, id in ipairs(data.Pets.Equipped or {}) do equipped[id] = true end
+    local groups = {}
+    for id, pet in pairs(data.Pets.Owned) do
+        if type(pet) == "table" and pet.Tier == tier and pet.Locked ~= true and pet.Frozen == nil
+            and not equipped[id] and type(pet.Name) == "string" then
+            local g = groups[pet.Name]
+            if not g then g = {} groups[pet.Name] = g end
+            table.insert(g, id)
+        end
+    end
+    return groups
+end
+
+-- the biggest complete set for a stage, or nil
+local function PickSet(stage)
+    local groups = GetGroups(stage.tier)
+    if not groups then return nil end
+    local best
+    for _, ids in pairs(groups) do
+        if #ids >= stage.need and (not best or #ids > #best) then best = ids end
+    end
+    if not best then return nil end
+    local use = {}
+    for i = 1, stage.need do use[i] = best[i] end
+    return use
+end
+
+local function Full()
+    local n, limit = Storage()
+    return n ~= nil and limit - n < HatchCount()
+end
+
+-- the circle you stand on to open a machine: a part tagged "InteractionPoint" named Golden / Diamond / Rainbow.
+-- We stand at its middle ON THE FLOOR (ray down from the middle), not at the middle of its box.
+local function MachineTarget(pointName)
+    local hrp = GetHrp()
+    local best, bestDist
+    for _, p in ipairs(CollectionService:GetTagged("InteractionPoint")) do
+        if p.Name == pointName then
+            local cf, size
+            if p:IsA("BasePart") then cf, size = p.CFrame, p.Size
+            elseif p:IsA("Model") then cf, size = p:GetBoundingBox() end
+            if cf then
+                local d = hrp and (hrp.Position - cf.Position).Magnitude or 0
+                if not bestDist or d < bestDist then best, bestDist = { cf = cf, size = size }, d end
+            end
+        end
+    end
+    if not best then return nil end
+    local pos = best.cf.Position
+    local y = pos.Y - best.size.Y / 2 + 3
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    local hit = workspace:Raycast(pos, Vector3.new(0, -(best.size.Y / 2 + 12), 0), params)
+    if hit then y = hit.Position.Y + 3 end
+    return Vector3.new(pos.X, y, pos.Z)
+end
+
+local function TeleportTo(pos, settle)
+    local hrp = GetHrp()
+    if not hrp then return false end
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.CFrame = CFrame.new(pos)
+    task.wait(settle or 0.5)
+    return true
+end
+
+-- the machines sit on different islands: travel to the right one (learned once), then stand on the circle
+local MachineSkipUntil = {}
+local function GoTo(pointName)
+    if (MachineSkipUntil[pointName] or 0) > os.clock() then return false end
+    local target = FindOnIslands("machine:" .. pointName, function() return MachineTarget(pointName) end, 6)
+    local hrp = GetHrp()
+    if not (target and hrp) then
+        MachineSkipUntil[pointName] = os.clock() + 300
+        warn("[Craft] " .. pointName .. " machine circle not found on any unlocked island; skipping it for 5 min")
+        return false
+    end
+    if (hrp.Position - target).Magnitude > 2.5 then TeleportTo(target, 0.6) end
+    return true
+end
+
+-- ── keep the crafting GUI closed while we craft ──
+-- The game opens the machine menu whenever you stand on the circle and the "CraftingRoll" menu on every result, and each
+-- menu open/close hides and shows the whole HUD through HudController. Forcing the ScreenGuis off every frame fought
+-- that and left the HUD hidden. Now MenuController.Open is simply ignored for the crafting menus while a trip runs, and
+-- the HUD is explicitly shown again when the trip ends.
+local HudController
+pcall(function() HudController = require(ReplicatedStorage.Controllers.UI.HudController) end)
+local CRAFT_MENUS = { "Golden", "Diamond", "CraftingRoll", "RainbowFuse", "RainbowMachine", "RainbowCraft", "GoldenBulk", "DiamondOld" }
+local CraftMenuSet = {}
+for _, n in ipairs(CRAFT_MENUS) do CraftMenuSet[n] = true end
+local Hiding = false
+
+pcall(function()
+    if type(MenuController) ~= "table" or type(MenuController.Open) ~= "function" or table.isfrozen(MenuController) then return end
+    local realOpen = MenuController.Open
+    MenuController.Open = function(self, name, ...)
+        if Hiding and CraftMenuSet[name] then return end
+        return realOpen(self, name, ...)
+    end
+end)
+
+-- the crafting cutscenes / glow / 3D stage are client-only: make them no-ops while a trip runs
+pcall(function()
+    local function stub(path, names)
+        local obj = ReplicatedStorage
+        for _, n in ipairs(path) do obj = obj:FindFirstChild(n) if not obj then return end end
+        local m = require(obj)
+        if type(m) ~= "table" or table.isfrozen(m) then return end
+        for _, name in ipairs(names) do
+            local real = m[name]
+            if type(real) == "function" then
+                m[name] = function(...)
+                    if Hiding then return nil end
+                    return real(...)
+                end
+            end
+        end
+    end
+    stub({ "Modules", "Client", "Pets", "GoldenMachineStage" }, { "Begin", "Arm", "Resolve" })
+    stub({ "Modules", "Client", "Pets", "DiamondMachineRig" }, { "Begin", "Arm", "Resolve" })
+    stub({ "Modules", "Client", "Pets", "DiamondCraftCutscene" }, { "Begin" })
+    stub({ "Modules", "Client", "Common", "ScreenGlow" }, { "Play" })
+end)
+
+-- HudController:SetHudHidden(true, reason) is what hides the HUD. During a trip every hide is swallowed (and the reason
+-- remembered); when the trip ends each remembered reason is explicitly un-hidden, and the HUD ScreenGuis tagged
+-- "HideDuringCutscene" are switched back on in case a cutscene disabled them directly.
+local HudReasons, RealSetHudHidden = {}, nil
+pcall(function()
+    if type(HudController) ~= "table" or type(HudController.SetHudHidden) ~= "function" or table.isfrozen(HudController) then return end
+    RealSetHudHidden = HudController.SetHudHidden
+    HudController.SetHudHidden = function(self, hidden, reason, ...)
+        local key = reason or "Gameplay"
+        if Hiding and hidden then
+            HudReasons[key] = true
+            return
+        end
+        if not hidden then HudReasons[key] = nil end
+        return RealSetHudHidden(self, hidden, reason, ...)
+    end
+end)
+
+local function ShowHud()
+    pcall(function()
+        if not HudController then return end
+        local set = RealSetHudHidden or HudController.SetHudHidden
+        HudReasons.Menu = true
+        for reason in pairs(HudReasons) do pcall(set, HudController, false, reason) end
+        HudReasons = {}
+    end)
+    pcall(function()
+        for _, g in ipairs(CollectionService:GetTagged("HideDuringCutscene")) do
+            if g:IsA("ScreenGui") and not g.Enabled then g.Enabled = true end
+        end
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        local game_ = pg and pg:FindFirstChild("Game")
+        if game_ then
+            game_:SetAttribute("TS2HudHidden", false)
+            game_:SetAttribute("TS2MenuHudHidden", false)
+        end
+    end)
+end
+
+local function StartHiding()
+    Hiding = true
+    if MenuController then
+        for _, n in ipairs(CRAFT_MENUS) do pcall(MenuController.Close, MenuController, n) end
+    end
+end
+
+local function StopHiding()
+    Hiding = false
+    if MenuController then
+        for _, n in ipairs(CRAFT_MENUS) do pcall(MenuController.Close, MenuController, n) end
+    end
+    ShowHud()
+    task.delay(0.6, ShowHud)
+    task.delay(2.5, ShowHud)
+end
+
+-- ── server answers ──
+local ResultSeq, LastResult = 0, nil
+if MachineResultEvent then
+    MachineResultEvent.OnClientEvent:Connect(function(r)
+        if type(r) == "table" then
+            ResultSeq += 1
+            LastResult = r
+        end
+    end)
+end
+
+-- fires one machine request and waits for the answer. `done()` returns true when the data shows it went through.
+local function Request(args, done)
+    local seq0 = ResultSeq
+    local ok, err = pcall(function() MachineEvent:FireServer(args) end)
+    if not ok then return false, tostring(err) end
+    local t0 = os.clock()
+    while os.clock() - t0 < 6 and ResultSeq == seq0 do
+        if done and done() then return true end
+        task.wait(0.05)
+    end
+    if ResultSeq > seq0 then
+        if LastResult.Success == true then return true end
+        return false, tostring(LastResult.Error or LastResult.Message or LastResult.Reason or "refused")
+    end
+    if done and done() then return true end
+    return false, "no answer from the server"
+end
+
+local function PetsGone(ids)
+    return function()
+        local data = GetData()
+        return data ~= nil and data.Pets.Owned[ids[1]] == nil
+    end
+end
+
+-- crafts every complete set of one stage; returns how many went through
+local function CraftStage(stage)
+    if not PickSet(stage) then return 0 end
+    Status("craft: going to the " .. stage.machine .. " machine")
+    if not GoTo(stage.point) then return 0 end
+    Status("craft: " .. stage.machine)
+    local crafted, fails = 0, 0
+    while true do
+        local use = PickSet(stage)
+        if not use then break end
+        local ok, why = Request({ PetIds = use, Machine = stage.machine, Action = "Craft" }, PetsGone(use))
+        if ok then
+            crafted += 1
+            fails = 0
+            task.wait(0.35)
+        else
+            fails += 1
+            warn("[Craft] " .. stage.machine .. ": " .. tostring(why))
+            if fails >= 4 then break end
+            task.wait(math.min(0.5 * 2 ^ (fails - 1), 4))
+            GoTo(stage.point)
+        end
+    end
+    return crafted
+end
+
+-- rainbow pods: Data.Machines.Shiny.Queue[craftId] = { Name, PetCount, EndTime }
+local function RainbowQueue()
+    local data = GetData()
+    local m = data and data.Machines and data.Machines.Shiny
+    return (m and type(m.Queue) == "table") and m.Queue or nil
+end
+
+local function RainbowReadyIds()
+    local q = RainbowQueue()
+    local ready, total, now = {}, 0, workspace:GetServerTimeNow()
+    for id, entry in pairs(q or {}) do
+        total += 1
+        if type(entry) == "table" and type(entry.EndTime) == "number" and entry.EndTime <= now then table.insert(ready, id) end
+    end
+    return ready, total
+end
+
+-- claims finished pods and starts new ones with 5 same Diamond pets (30 s each); returns pets removed from storage
+local function CraftRainbow()
+    local ready, total = RainbowReadyIds()
+    local canStart = total - #ready < RAINBOW.maxQueue and PickSet(RAINBOW) ~= nil
+    if #ready == 0 and not canStart then return 0 end
+    if not GoTo(RAINBOW.point) then return 0 end
+    for _, id in ipairs(ready) do
+        local ok, why = Request({ Machine = "Shiny", Action = "Claim", CraftId = id }, function()
+            local q = RainbowQueue()
+            return q ~= nil and q[id] == nil
+        end)
+        if not ok then warn("[Craft] Rainbow claim: " .. tostring(why)) end
+        task.wait(0.35)
+    end
+    local removed, fails = 0, 0
+    while true do
+        local _, queued = RainbowReadyIds()
+        if queued >= RAINBOW.maxQueue then break end
+        local use = PickSet(RAINBOW)
+        if not use then break end
+        local ok, why = Request({ PetIds = use, Machine = "Shiny", Action = "Start" }, PetsGone(use))
+        if ok then
+            removed += #use
+            fails = 0
+            task.wait(0.35)
+        else
+            fails += 1
+            warn("[Craft] Rainbow start: " .. tostring(why))
+            if fails >= 3 then break end
+            task.wait(1)
+        end
+    end
+    return removed
+end
+
+local CraftToken = 0
+Main:CreateToggle({
+    Name = "Auto Craft (Golden > Diamond > Rainbow)",
+    CurrentValue = false,
+    Callback = function(Value)
+        CraftToken += 1
+        local my = CraftToken
+        if not Value then return end
+        if not MachineEvent then warn("[Craft] remote not found") return end
+        task.spawn(function()
+            local held = false
+            while my == CraftToken do
+                if Full() then
+                    if not held then HoldEgg(true) held = true end
+                    task.wait(1.2) -- let hatches in flight land
+                    Acquire("craft")
+                    if my ~= CraftToken then Release("craft") break end
+                    local hrp = GetHrp()
+                    local home, homeIsland = hrp and hrp.Position, CurrentIsland()
+                    StartHiding()
+                    local did = 0
+                    for _, stage in ipairs(STAGES) do
+                        if my ~= CraftToken then break end
+                        if Full() then did += CraftStage(stage) end
+                    end
+                    if my == CraftToken and Full() then did += CraftRainbow() end
+                    if my == CraftToken then GoHome(homeIsland, home) end
+                    StopHiding()
+                    Release("craft")
+                    if did == 0 or Full() then
+                        task.wait(did == 0 and 20 or 2) -- nothing crafted: wait longer so the egg is not held for nothing
+                    elseif held then
+                        HoldEgg(false) held = false
+                    end
+                else
+                    if held then HoldEgg(false) held = false end
+                    task.wait(0.15)
+                end
+            end
+            if held then HoldEgg(false) end
+            StopHiding()
+        end)
+    end,
+})
+
+-- ═══════════ EXTRA FEATURES (dig site, chests, shrine, breakables, mining, pet defense, duck, events) ═══════════
+-- Everything below was read from the game's own client code; the server is not visible, so distance / timing rules are
+-- the ones the client enforces. Each feature is one toggle; trips take the lock above and pause the egg meanwhile.
+local TapSeq = 0
+local function Tap()
+    if not TapEvent then return end
+    TapSeq += 1
+    TapEvent:FireServer({ Auto = false, ClientSequence = TapSeq })
+end
+
+-- runs fn(alive) in a loop while the toggle is on; fn is called again every `every` seconds
+local function LoopToggle(name, every, fn)
+    local token = 0
+    Main:CreateToggle({
+        Name = name,
+        CurrentValue = false,
+        Callback = function(Value)
+            token += 1
+            local my = token
+            if not Value then return end
+            task.spawn(function()
+                local function alive() return my == token end
+                while alive() do
+                    local ok, err = pcall(fn, alive)
+                    if not ok then warn("[" .. name .. "] " .. tostring(err)) Status(name .. " error: " .. tostring(err)) end
+                    if alive() then task.wait(every) end
+                end
+            end)
+        end,
+    })
+end
+
+-- a trip: lock + pause the egg + come back to where you were (island first, then the exact spot).
+-- While the egg opener is on, "home" is always the egg itself (see the egg keeper below).
+local EggHome = nil -- { island = ..., pos = Vector3 }
+local function GoHome(island, pos)
+    if EggWanted and EggHome then island, pos = EggHome.island, EggHome.pos end
+    if island and CurrentIsland() ~= island then TravelTo(island) end
+    if pos then TeleportTo(pos + Vector3.new(0, 1, 0), 0.4) end
+end
+
+local function Trip(who, body)
+    Status(who .. ": starting trip")
+    Acquire(who)
+    HoldEgg(true)
+    local hrp = GetHrp()
+    local home, homeIsland = hrp and hrp.Position, CurrentIsland()
+    local ok, err = pcall(body)
+    if not ok then warn("[" .. who .. "] " .. tostring(err)) Status(who .. " error: " .. tostring(err)) end
+    Status(who .. ": going back to " .. tostring(homeIsland))
+    GoHome(homeIsland, home)
+    HoldEgg(false)
+    Release(who)
+    Status(who .. ": done")
+end
+
+-- ── egg keeper: the Void egg is on Shadow Realm (LaunchEggConfig.Void.Island); if you are on another island or more
+-- than 25 studs from it, or the server answers "TooFar", travel there and stand in front of the egg ──
+local function EggIsland()
+    local cfg = LaunchEggConfig and LaunchEggConfig[EGG]
+    return (cfg and (cfg.Island or (cfg.Zone ~= "Spawn" and nil))) or "Spawn"
+end
+
+local function EggModel()
+    local eggs = workspace:FindFirstChild("Eggs")
+    return eggs and eggs:FindFirstChild(EGG)
+end
+
+local function EggStandPos(m)
+    local cf = m:GetPivot()
+    return cf.Position + cf.LookVector * 7 + Vector3.new(0, 2, 0)
+end
+
+local function GoToEgg()
+    Status("egg: going to the " .. EGG .. " egg on " .. EggIsland())
+    if not TravelTo(EggIsland()) then return false end
+    local m = WaitFor(EggModel, 15)
+    if not m then Status("egg: workspace.Eggs." .. EGG .. " not found on " .. tostring(CurrentIsland())) return false end
+    local pos = EggStandPos(m)
+    TeleportTo(pos, 0.8)
+    EggHome = { island = CurrentIsland(), pos = pos }
+    EggTooFar = false
+    Status("egg: at the " .. EGG .. " egg")
+    return true
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if EggWanted and BusyBy == nil then
+            local m = EggModel()
+            local hrp = GetHrp()
+            local far = EggTooFar or CurrentIsland() ~= EggIsland() or not m
+                or (hrp and (hrp.Position - EggStandPos(m)).Magnitude > 25)
+            if far then
+                Acquire("egg")
+                HoldEgg(true)
+                pcall(GoToEgg)
+                HoldEgg(false)
+                Release("egg")
+                task.wait(2)
+            end
+        end
+    end
+end)
+
+-- ── breakables: Void Crystal, Crystal Cluster, Glow Mushroom, ... (HoneyPot ingredients) ──
+-- Breakables are hit by ordinary taps while you stand within TapRange (14 studs) of their edge. Your own island
+-- breakable spawns when you come within 100 studs of its spot (workspace.IslandBreakableSpots has one Vector3
+-- attribute per spot) and it is off cooldown (Data.IslandBreakables[spot] = ready time). It hops away when hit.
+local IslandBreakableConfig = Req({ "Shared", "Game", "IslandBreakableConfig" })
+local SPOT_ORDER = { "ShadowRelm", "CrystalCave", "Mushroom", "Desert", "Autumn", "SkyIsland" } -- Void Crystal first
+
+local function SpotCfg(id)
+    local spots = IslandBreakableConfig and IslandBreakableConfig.Spots
+    if type(spots) ~= "table" then return nil end
+    if type(spots[id]) == "table" then return spots[id] end
+    for _, v in pairs(spots) do if type(v) == "table" and v.Id == id then return v end end
+    return nil
+end
+
+local function BreakableUsable(m)
+    if not (m:IsA("Model") and m:GetAttribute("BreakableBroken") ~= true and m:GetAttribute("BreakableDespawned") ~= true) then return false end
+    local owner = m:GetAttribute("BreakableOwner")
+    if owner ~= nil and owner ~= LocalPlayer.UserId then return false end
+    return (m:GetAttribute("BreakableHealth") or 0) > 0
+end
+
+local function FindBreakable(typeMatch)
+    for _, m in ipairs(CollectionService:GetTagged("Breakable")) do
+        local t = m:GetAttribute("BreakableType")
+        if type(t) == "string" and typeMatch(t) and BreakableUsable(m) then return m end
+    end
+    return nil
+end
+
+-- stands next to the breakable and taps it until it is gone; returns true when broken
+local function BreakIt(m, alive)
+    local t0 = os.clock()
+    while alive() and m.Parent and os.clock() - t0 < 120 do
+        if m:GetAttribute("BreakableBroken") == true or (m:GetAttribute("BreakableHealth") or 0) <= 0 then return true end
+        local rest, size = m:GetAttribute("BreakableRest"), m:GetAttribute("BreakableSize")
+        local hrp = GetHrp()
+        if typeof(rest) == "CFrame" and typeof(size) == "Vector3" and hrp then
+            local d = (hrp.Position - rest.Position) * Vector3.new(1, 0, 1)
+            local horiz = math.max(d.Magnitude - math.max(size.X, size.Z) * 0.5, 0)
+            local vert = math.abs(hrp.Position.Y - (rest.Position.Y - size.Y * 0.5))
+            if horiz > 10 or vert > 10 then
+                TeleportTo(rest.Position + Vector3.new(0, size.Y * 0.5 + 2, 0) + rest.LookVector * (math.max(size.X, size.Z) * 0.5 + 5), 0.25)
+            end
+            Tap()
+        end
+        task.wait(0.11) -- GameConfig.ClickFxInterval; server HitInterval 0.1
+    end
+    return false
+end
+
+LoopToggle("Auto Breakables (Void Crystal, clusters, mushrooms...)", 3, function(alive)
+    local data = GetData()
+    if not (data and IslandBreakableConfig) then Status("Breakables: config / data not ready") return end
+    local spotsFolder = workspace:FindFirstChild("IslandBreakableSpots")
+    local anyReady = false
+    for _, id in ipairs(SPOT_ORDER) do
+        if not alive() then return end
+        local cfg = SpotCfg(id)
+        local pos = spotsFolder and spotsFolder:GetAttribute(id)
+        if cfg and (typeof(pos) == "Vector3" or (cfg.Island and CurrentIsland() ~= cfg.Island)) then
+            local unlocked = true
+            pcall(function() unlocked = IslandBreakableConfig.IsUnlocked(data, cfg) end)
+            local ready = 0
+            pcall(function() ready = IslandBreakableConfig.GetReadyAt(data, id) end)
+            if unlocked and (ready or 0) <= Now() then
+                anyReady = true
+                Trip("breakable", function()
+                    if not TravelTo(cfg.Island) then return end
+                    local sf = WaitFor(function() return workspace:FindFirstChild("IslandBreakableSpots") end, 10)
+                    pos = (sf and sf:GetAttribute(id)) or pos
+                    if typeof(pos) ~= "Vector3" then warn("[Breakable] " .. id .. ": spot position not published yet") return end
+                    TeleportTo(pos + Vector3.new(0, 4, 0), 0.5)
+                    local m
+                    for _ = 1, 40 do -- the server spawns your instance once you are near the spot
+                        m = FindBreakable(function(t) return t == cfg.Type end)
+                        if m or not alive() then break end
+                        task.wait(0.25)
+                    end
+                    if m then
+                        if BreakIt(m, alive) then print("[Breakable] broke " .. tostring(m:GetAttribute("BreakableTitle") or id)) end
+                        task.wait(1.5)
+                    else
+                        warn("[Breakable] " .. id .. ": no breakable appeared (island locked or still on cooldown?)")
+                    end
+                end)
+            end
+        end
+    end
+    if not anyReady then Status("Breakables: all on cooldown or locked") end
+end)
+
+-- ── dig site (Autumn) ──
+-- DigService.RF.Begin() -> session { Id, Round = { Epoch, Phase, Speed, Width, Center, Sequence }, Remaining, ... }
+-- then Hit(Id, Round.Sequence, serverTime) when DigConfig.IsHit(round, serverTime); 10 digs per hour.
+local DigConfig = Req({ "Shared", "Minigames", "DigConfig" })
+local DigWorld = Req({ "Shared", "Minigames", "DigWorld" })
+
+-- The game's own DigController:Activate() does Begin / Hit with the right timing (and draws the bar), so we just stand
+-- in the zone and call it whenever the cursor is inside the target. It answers { Error = "Busy" | "TooSoon" | ... }.
+local DigController, DigRewardPopup
+pcall(function() DigController = require(ReplicatedStorage.Controllers.Minigames.DigController) end)
+
+LoopToggle("Auto Dig Site", 5, function(alive)
+    local data = GetData()
+    if not (data and DigConfig and DigController) then warn("[Dig] DigConfig / DigController not found") return end
+    local left, waitFor = 0, 0
+    pcall(function() left, waitFor = DigConfig.Allowance(data.Digging or {}, os.time()) end)
+    if (left or 0) <= 0 then Status(string.format("Dig: no digs left, %d min until reset", math.ceil((waitFor or 0) / 60))) return end
+    Trip("dig", function()
+        if not TravelTo("Autumn") then return end
+        local zone = WaitFor(function()
+            local site
+            pcall(function() site = DigWorld and DigWorld.GetSite() end)
+            local autumn = Island("Autumn")
+            site = site or (autumn and autumn:FindFirstChild("Digsite"))
+            return site and site:FindFirstChild("DigZone")
+        end, 15)
+        if not zone then warn("[Dig] dig site not found on Autumn") return end
+        TeleportTo(zone.Position + Vector3.new(0, 2, 0), 0.8)
+        local lastWhy, idle = nil, 0
+        while alive() do
+            local l = 0
+            pcall(function() l = DigConfig.Allowance((GetData() or data).Digging or {}, os.time()) end)
+            if (l or 0) <= 0 then print("[Dig] out of digs for this hour") break end
+            local s = DigController:GetState()
+            local fire = true
+            if type(s) == "table" and type(s.Round) == "table" then
+                -- "perfect" = cursor within the inner 40 % of the target (DigController uses Width * 0.4 / 2);
+                -- the hit time is passed to the server, so this is exact, not latency-dependent
+                local now = Now()
+                local r = s.Round
+                local ok, d = pcall(function() return math.abs(DigConfig.Cursor(r, now) - r.Center) end)
+                fire = ok and now >= (r.Epoch or 0) and d <= r.Width * 0.4 / 2 * 0.85
+            end
+            if fire then
+                local r = DigController:Activate()
+                local why = type(r) == "table" and r.Error or nil
+                if why == "NotAtDigsite" then
+                    TeleportTo(zone.Position + Vector3.new(0, 2, 0), 0.5)
+                elseif why and why ~= "Busy" and why ~= "TooSoon" and why ~= "Revealing" and why ~= "StaleRound" then
+                    if why ~= lastWhy then warn("[Dig] " .. Dump(r)) lastWhy = why end
+                    if why == "Cooldown" or why == "MenuOpen" or why == "Typing" then idle += 1 end
+                    if idle > 20 then break end
+                    task.wait(0.5)
+                elseif type(r) == "table" and r.Complete then
+                    print("[Dig] " .. tostring(r.Reward) .. " x" .. tostring(r.Amount))
+                    task.wait(1.7)
+                    pcall(function() DigRewardPopup:Close() end)
+                end
+            end
+            task.wait()
+        end
+    end)
+end)
+
+-- the "You Found!" screen after a dig is DigRewardPopup.Show -> RewardPopupController; skipped while auto-dig runs
+pcall(function()
+    DigRewardPopup = require(ReplicatedStorage.Controllers.Minigames.DigRewardPopup)
+    if type(DigRewardPopup) ~= "table" or table.isfrozen(DigRewardPopup) then return end
+    local realShow = DigRewardPopup.Show
+    DigRewardPopup.Show = function(...)
+        if BusyBy == "dig" then return end
+        return realShow(...)
+    end
+end)
+
+-- ── tap chests (Sky Island, Desert): TapChestService.RF.Claim(id) once the 6 h cooldown is over ──
+local TapChestConfig = Req({ "Shared", "Game", "TapChestConfig" })
+
+local CHESTS = { { Id = "SkyIsland", Island = "Sky Island" }, { Id = "Desert", Island = "Desert" } }
+
+LoopToggle("Auto Open Chests", 15, function(alive)
+    local data = GetData()
+    if not (data and TapChestConfig) then return end
+    for _, chest in ipairs(CHESTS) do
+        if not alive() then return end
+        local readyAt = 0
+        pcall(function() readyAt = TapChestConfig.GetReadyAt(data, chest.Id) end)
+        if (readyAt or 0) - Now() <= 0 then
+            Trip("chest", function()
+                if not TravelTo(chest.Island) then return end
+                local m = WaitFor(function()
+                    for _, c in ipairs(CollectionService:GetTagged("TapChest")) do
+                        if c:GetAttribute("TapChestId") == chest.Id then return c end
+                    end
+                end, 10)
+                if not m then warn("[Chest] " .. chest.Id .. ": chest model not found on " .. chest.Island) return end
+                local front, size = m:GetAttribute("TapChestFront"), m:GetAttribute("TapChestSize")
+                local anchor = typeof(front) == "CFrame" and (front.Position - Vector3.new(0, (typeof(size) == "Vector3" and size.Y or 4) / 2, 0)) or m:GetPivot().Position
+                local look = typeof(front) == "CFrame" and front.LookVector or Vector3.new(0, 0, 1)
+                TeleportTo(anchor + look * 6 + Vector3.new(0, 3, 0), 0.8)
+                local r = Invoke(RF("TapChestService", "Claim"), chest.Id)
+                print("[Chest] " .. chest.Id .. ": " .. Dump(r))
+                task.wait(0.5)
+            end)
+        end
+    end
+end)
+
+-- ── shrine: keep the "Golden" blessing (golden & rainbow chance); it resets when you leave the game ──
+local ShrineConfig = Req({ "Shared", "Game", "ShrineConfig" })
+
+local ShrineFailures = 0
+LoopToggle("Auto Shrine (Golden blessing)", 10, function(alive)
+    if LocalPlayer:GetAttribute("ShrineBlessing") == "Golden" then ShrineFailures = 0 return end
+    if ShrineFailures >= 3 then Status("Shrine: gave up after 3 failed tries (see console)") return end
+    Trip("shrine", function()
+        if not TravelTo("Autumn") then return end
+        local shrine = WaitFor(function()
+            local s
+            pcall(function() s = ShrineConfig and ShrineConfig.FindShrine() end)
+            local autumn = Island("Autumn")
+            return s or (autumn and autumn:FindFirstChild("Shrine", true))
+        end, 15)
+        if not shrine then warn("[Shrine] shrine not found on Autumn") ShrineFailures += 1 return end
+        local circle = shrine:FindFirstChild("Circle")
+        local att = circle and circle:FindFirstChild("PromptAttachment")
+        local pos = att and att.WorldPosition or shrine:GetPivot().Position
+        TeleportTo(pos + Vector3.new(0, 3, 4), 0.8)
+        local r = Invoke(RF("ShrineService", "Choose"), "Golden")
+        print("[Shrine] Choose(Golden): " .. Dump(r) .. " | blessing now = " .. tostring(LocalPlayer:GetAttribute("ShrineBlessing")))
+        task.wait(1)
+        if LocalPlayer:GetAttribute("ShrineBlessing") ~= "Golden" then ShrineFailures += 1 end
+    end)
+end)
+
+-- ── lucky ducky: the duck is a GUI; claim it as soon as the server announces it ──
+do
+    local spawnEv = RE("LuckyDuckyService", "Spawn")
+    local DuckOn = false
+    Main:CreateToggle({
+        Name = "Auto Click Lucky Duck",
+        CurrentValue = false,
+        Callback = function(Value) DuckOn = Value end,
+    })
+    if spawnEv then
+        spawnEv.OnClientEvent:Connect(function(d)
+            if not DuckOn or type(d) ~= "table" or type(d.Id) ~= "string" then return end
+            task.wait(0.4) -- MinReaction 0.3 s
+            local r = Invoke(RF("LuckyDuckyService", "Claim"), d.Id)
+            if type(r) == "table" and r.Success then print("[Duck] " .. tostring(r.Reward or "caught"))
+            else warn("[Duck] " .. tostring(type(r) == "table" and r.Reason or r)) end
+        end)
+    end
+end
+
+-- ── world events: balloons, flying pigs, lucky blocks, meteors / mystery egg ──
+local BalloonFlight = Req({ "Shared", "Admin", "BalloonFlight" })
+local PigFlight = Req({ "Shared", "Admin", "PigFlight" })
+local Balloons, Pigs = {}, {}
+do
+    local function track(store)
+        return function(b) if type(b) == "table" and type(b.Uid) == "string" then store[b.Uid] = b end end
+    end
+    local function untrack(store)
+        return function(uid) if type(uid) == "table" then uid = uid.Uid end if uid ~= nil then store[uid] = nil end end
+    end
+    pcall(function()
+        RE("BalloonPartyService", "Launched").OnClientEvent:Connect(track(Balloons))
+        RE("BalloonPartyService", "Popped").OnClientEvent:Connect(untrack(Balloons))
+    end)
+    pcall(function()
+        RE("PigsCouldFlyService", "Launched").OnClientEvent:Connect(track(Pigs))
+        RE("PigsCouldFlyService", "Caught").OnClientEvent:Connect(untrack(Pigs))
+        RE("PigsCouldFlyService", "Retired").OnClientEvent:Connect(untrack(Pigs))
+    end)
+end
+
+local function RefreshActive()
+    local b = Invoke(RF("BalloonPartyService", "GetActive"))
+    if type(b) == "table" then for _, e in ipairs(b) do if type(e) == "table" and e.Uid then Balloons[e.Uid] = e end end end
+    local p = Invoke(RF("PigsCouldFlyService", "GetActive"))
+    if type(p) == "table" then for _, e in ipairs(p) do if type(e) == "table" and e.Uid then Pigs[e.Uid] = e end end end
+end
+
+local function IsEventBreakable(t)
+    return string.find(t, "Meteor", 1, true) ~= nil or t == "MysteryEgg"
+end
+
+local function EventWork(alive)
+    local now = Now()
+    local hrp = GetHrp()
+    if not hrp then return false end
+    local did = false
+    -- balloons: RE.Hit:FireServer(uid) within HitRange 150
+    local hitB = RE("BalloonPartyService", "Hit")
+    for uid, b in pairs(Balloons) do
+        if not alive() then return did end
+        local t = now - (b.LaunchedAt or now)
+        if BalloonFlight and t >= (BalloonFlight.Lifetime or 25) then
+            Balloons[uid] = nil
+        elseif hitB and BalloonFlight then
+            local pos
+            pcall(function() pos = BalloonFlight.Position(b, t) end)
+            if pos then
+                if (pos - hrp.Position).Magnitude > 120 then TeleportTo(pos - Vector3.new(0, 10, 0), 0.15) hrp = GetHrp() or hrp end
+                hitB:FireServer(uid)
+                did = true
+                task.wait(0.11)
+            end
+        end
+    end
+    -- pigs: RE.Hit:FireServer(uid) within 120, max every 0.5 s per pig
+    local hitP = RE("PigsCouldFlyService", "Hit")
+    for uid, p in pairs(Pigs) do
+        if not alive() then return did end
+        local t = now - (p.LaunchedAt or now)
+        if PigFlight and t >= (PigFlight.Lifetime or 60) then
+            Pigs[uid] = nil
+        elseif hitP and PigFlight and now - (p._last or 0) >= 0.5 then
+            local pos
+            pcall(function() pos = PigFlight.CFrame(p, t).Position end)
+            if pos then
+                if (pos - hrp.Position).Magnitude > 100 then TeleportTo(pos - Vector3.new(0, 8, 0), 0.15) hrp = GetHrp() or hrp end
+                p._last = now
+                hitP:FireServer(uid)
+                did = true
+            end
+        end
+    end
+    -- lucky blocks: RE.CollectRequested:FireServer(model.Name) within Scale * 7 studs
+    local collect = RE("LuckyBlockEventService", "CollectRequested")
+    for _, m in ipairs(CollectionService:GetTagged("LuckyBlockEventServer")) do
+        if not alive() then return did end
+        if collect and m:IsA("Model") and m:GetAttribute("Opened") ~= true then
+            local pos = m:GetPivot().Position
+            TeleportTo(pos + Vector3.new(0, 2, 3), 0.3)
+            for _ = 1, 8 do
+                if m:GetAttribute("Opened") == true then break end
+                collect:FireServer(m.Name)
+                task.wait(0.3)
+            end
+            did = true
+        end
+    end
+    -- meteors / mystery egg: breakables broken by taps
+    local m = FindBreakable(IsEventBreakable)
+    if m then BreakIt(m, alive) did = true end
+    return did
+end
+
+local LastEventRefresh = 0
+LoopToggle("Auto Events (balloons, pigs, lucky blocks, meteors)", 0.2, function(alive)
+    if os.clock() - LastEventRefresh > 5 then LastEventRefresh = os.clock() RefreshActive() end
+    local hasWork = next(Balloons) ~= nil or next(Pigs) ~= nil or #CollectionService:GetTagged("LuckyBlockEventServer") > 0
+        or FindBreakable(IsEventBreakable) ~= nil
+    if not hasWork then return end
+    Trip("events", function()
+        while alive() and EventWork(alive) do task.wait(0.05) end
+    end)
+end)
+
+-- ── pet defense (bone pit, Colosseum): you tap the enemies yourself; one run every 2 h ──
+local Opponents, ColRunning = {}, false
+pcall(function()
+    local function add(e) if type(e) == "table" and e.Id ~= nil then Opponents[e.Id] = e end end
+    RE("ColosseumService", "WaveDefenseOpponentSpawned").OnClientEvent:Connect(add)
+    RE("ColosseumService", "WaveDefenseWaveStarting").OnClientEvent:Connect(function(d)
+        if type(d) == "table" and type(d.PendingSpawns) == "table" then for _, e in ipairs(d.PendingSpawns) do add(e) end end
+    end)
+    RE("ColosseumService", "WaveDefenseOpponentDefeated").OnClientEvent:Connect(function(d) if type(d) == "table" then Opponents[d.OpponentId] = nil end end)
+    RE("ColosseumService", "WaveDefenseHeartLost").OnClientEvent:Connect(function(d) if type(d) == "table" then Opponents[d.OpponentId] = nil end end)
+    RE("ColosseumService", "WaveDefenseWaveComplete").OnClientEvent:Connect(function(d)
+        if type(d) == "table" and type(d.Offers) == "table" and #d.Offers > 0 then
+            task.spawn(function() Invoke(RF("ColosseumService", "ChooseColosseumUpgrade"), d.Offers[1], d.WaveCompleted) end)
+        end
+    end)
+    RE("ColosseumService", "WaveDefenseGameOver").OnClientEvent:Connect(function() ColRunning = false end)
+end)
+
+LoopToggle("Auto Pet Defense (bone pit)", 30, function(alive)
+    local data = GetData()
+    if not data then return end
+    local col = data.Colosseum or {}
+    local left = (col.Cooldown or 0) + 7200 - os.time()
+    if left > 0 then Status(string.format("PetDefense: cooldown, %d min left", math.ceil(left / 60))) return end
+    if LocalPlayer:GetAttribute("ColosseumActive") then Status("PetDefense: a run is already active") return end
+    Trip("colosseum", function()
+        local entrance = FindOnIslands("colosseum", function()
+            local island = workspace:FindFirstChild("WaveDefence Island")
+            local wd = island and island:FindFirstChild("WaveDefense")
+            return wd and wd:FindFirstChild("Colosseum")
+        end, 6)
+        if not entrance then warn("[PetDefense] colosseum entrance not found on any unlocked island") return end
+        local cf = entrance:IsA("Model") and entrance:GetPivot() or entrance.CFrame
+        TeleportTo(cf.Position + Vector3.new(0, 3, 0), 0.8)
+        Opponents = {}
+        local r = Invoke(RF("ColosseumService", "StartWaveDefense"))
+        print("[PetDefense] StartWaveDefense: " .. Dump(r))
+        if type(r) ~= "table" or r.OnCooldown or r.Error then return end
+        if type(r.PendingSpawns) == "table" then for _, e in ipairs(r.PendingSpawns) do Opponents[e.Id] = e end end
+        ColRunning = true
+        local attack, crit = RF("ColosseumService", "AttackOpponent"), RF("ColosseumService", "CriticalAttackOpponent")
+        local lastCrit, t0 = -1e9, os.clock()
+        while alive() and ColRunning and os.clock() - t0 < 1800 do
+            local now = Now()
+            local best
+            for _, e in pairs(Opponents) do
+                if (e.SpawnTime or 0) <= now and (e.ArrivalTime or 0) > now and (not best or e.ArrivalTime < best.ArrivalTime) then best = e end
+            end
+            if best then
+                if now - lastCrit >= 4.1 then
+                    local c = Invoke(crit, best.Id)
+                    if c then lastCrit = now end
+                end
+                local res = Invoke(attack, best.Id)
+                if type(res) == "table" then
+                    if res.Defeated then Opponents[best.Id] = nil end
+                    if res.NewArrivalTime then best.ArrivalTime = res.NewArrivalTime end
+                end
+            end
+            task.wait(0.13) -- server minimum 0.12 s between taps
+        end
+        if ColRunning then Invoke(RF("ColosseumService", "EndWaveDefense")) ColRunning = false end
+        task.wait(2)
+        Invoke(RF("ColosseumService", "ReturnFromArena"))
+        task.wait(1)
+        local d2 = GetData()
+        local c2 = d2 and d2.Colosseum or {}
+        if c2.PendingReward ~= nil then
+            local old, new = c2.Relic, c2.PendingReward
+            local replace = old == nil or (type(old) == "table" and type(new) == "table" and (new.Value or 0) > (old.Value or 0))
+            Invoke(RF("ColosseumService", "ClaimMinigameReward"), replace and "replace" or "keep")
+            print("[PetDefense] relic " .. (replace and "replaced" or "kept"))
+        end
+    end)
+end)
+
+-- ── mining cave (Crystal Cave) ──
+-- Enter() at the portal, Hit(stateId, x, y, z) on grid cells that are exposed (top layer or next to a removed cell),
+-- CollectDrop(stateId, dropId) within 10 studs of the drop, Sell() on the Sell pad when the bag is full.
+-- This toggle keeps the lock the whole time it is on, so eggs / crafting wait until you turn it off.
+local MC = Req({ "Shared", "Minigames", "Mining", "MiningConfig" })
+local MW = Req({ "Shared", "Minigames", "Mining", "MiningWorld" })
+local MSave = Req({ "Shared", "Minigames", "Mining", "MineSave" })
+
+local MineState, Removed, OreCache = nil, {}, {}
+pcall(function()
+    RE("MiningService", "MineReset").OnClientEvent:Connect(function(s)
+        if type(s) == "table" and s.Active then MineState = s Removed = {} OreCache = {} end
+    end)
+end)
+
+local function MineMarker()
+    local m
+    pcall(function() m = MW.Marker() end)
+    return m or (workspace:FindFirstChild("MineArea") and workspace.MineArea:FindFirstChild("MineArea"))
+end
+
+local function ApplyState(s)
+    if type(s) ~= "table" then return end
+    MineState = s
+    if type(s.Removed) == "string" and MSave and MC then
+        local marker = MineMarker()
+        if marker then
+            pcall(function()
+                local w, d, h = MC.Dimensions(marker)
+                Removed = MSave.Decode(s.Removed, w, d, h) or {}
+            end)
+        end
+    end
+end
+
+local function ToolInfo()
+    local tools = MC and MC.Tools
+    local t = tools and tools[(MineState and MineState.Tool) or 1]
+    return {
+        Damage = Field(t, "Damage", "damage") or 1,
+        Power = Field(t, "Power", "power") or 1,
+        Interval = Field(t, "Interval", "Speed", "speed") or 0.45,
+        Range = Field(t, "Range", "range") or 20,
+    }
+end
+
+local function CellOre(x, y, z)
+    local k = MC.Key(x, y, z)
+    local c = OreCache[k]
+    if not c then
+        local ore, stats
+        pcall(function() ore, stats = MC.Ore(MineState.Seed, x, y, z) end)
+        c = { name = Field(ore, "name", "Name") or "?", value = Field(ore, "value", "Value") or 1, health = Field(stats, "health", "Health") or 4, req = Field(stats, "pickaxeRequirement", "PickaxeRequirement") or 0 }
+        OreCache[k] = c
+    end
+    return c
+end
+
+local BadCells = {} -- [key] = os.clock() until which the cell is skipped (rejected by the server)
+
+local function PickCell()
+    local marker = MineMarker()
+    if not (marker and MineState) then return nil end
+    local w, d, h = MC.Dimensions(marker)
+    local tool = ToolInfo()
+    local best, bestScore
+    for y = 0, d - 1 do
+        for x = 0, w - 1 do
+            for z = 0, h - 1 do
+                local k = MC.Key(x, y, z)
+                if not Removed[k] and (BadCells[k] or 0) < os.clock() then
+                    local exposed = y == 0
+                    if not exposed then pcall(function() exposed = MC.Exposed(Removed, x, y, z) end) end
+                    if exposed then
+                        local o = CellOre(x, y, z)
+                        if o.req <= tool.Power then
+                            local score = o.value / math.ceil(o.health / tool.Damage) + y * 0.01
+                            if not best or score > bestScore then best, bestScore = Vector3.new(x, y, z), score end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- the server only accepts a hit when MiningSight.CanSee(marker, removed, eye, x, y, z) passes for your position
+-- ("That block is behind solid rock." otherwise), so every candidate spot is checked with the same function first.
+local MSight = Req({ "Shared", "Minigames", "Mining", "MiningSight" })
+
+local function CanSeeFrom(pos, x, y, z)
+    if not MSight then return true end
+    local ok, res = pcall(MSight.CanSee, MineMarker(), Removed, pos + Vector3.new(0, 1.5, 0), x, y, z)
+    return ok and res == true
+end
+
+-- candidate spots to stand on, best first; each one is verified with CanSeeFrom
+local function StandSpots(x, y, z)
+    local marker = MineMarker()
+    local pos = MC.Position(marker, x, y, z)
+    local size = MC.BlockSize or 4
+    local spots = {}
+    if y == 0 then table.insert(spots, pos + Vector3.new(0, size / 2 + 3, 0)) end
+    for _, n in ipairs({ { 0, -1, 0 }, { 1, 0, 0 }, { -1, 0, 0 }, { 0, 0, 1 }, { 0, 0, -1 } }) do
+        local nx, ny, nz = x + n[1], y + n[2], z + n[3]
+        if ny < 0 then
+            table.insert(spots, pos + Vector3.new(0, size / 2 + 3, 0))
+        elseif Removed[MC.Key(nx, ny, nz)] then
+            local c = MC.Position(marker, nx, ny, nz)
+            table.insert(spots, c - Vector3.new(0, size / 2 - 3, 0)) -- feet on the floor of that empty cell
+            table.insert(spots, c)
+        end
+    end
+    table.insert(spots, pos + Vector3.new(0, size, 0))
+    return spots
+end
+
+local function StandFor(x, y, z)
+    for _, p in ipairs(StandSpots(x, y, z)) do
+        if CanSeeFrom(p, x, y, z) then return p end
+    end
+    return nil
+end
+
+local function MineSell()
+    local surface, sell = RF("MiningService", "Surface"), RF("MiningService", "Sell")
+    Invoke(surface, "Sell")
+    task.wait(1)
+    local pad
+    pcall(function() pad = MW.Part("Sell") end)
+    if pad then TeleportTo(pad.Position + Vector3.new(0, 3, 0), 0.8) end
+    local r = Invoke(sell)
+    if type(r) == "table" then ApplyState(r.State or r) print("[Mine] sold for " .. tostring(r.Sold or "?")) else warn("[Mine] sell: " .. tostring(r)) end
+end
+
+local MiningController
+pcall(function() MiningController = require(ReplicatedStorage.Controllers.Minigames.MiningController) end)
+
+LoopToggle("Auto Mine (cave)", 0.5, function(alive)
+    if not (MC and MW and MSave) then Status("Mine: mining modules not found") task.wait(10) return end
+    Acquire("mine")
+    HoldEgg(true)
+    Status("Mine: " .. (LocalPlayer:GetAttribute("MiningActive") == true and "mining" or "going to the cave portal"))
+    local ok, err = pcall(function()
+        local hit, collect, stateRf = RF("MiningService", "Hit"), RF("MiningService", "CollectDrop"), RF("MiningService", "State")
+        if LocalPlayer:GetAttribute("MiningActive") ~= true or not MineState then
+            -- the portal is on Crystal Cave; standing on it makes the game's own MiningController call Enter()
+            if not TravelTo("Crystal Cave") then task.wait(5) return end
+            local portal = WaitFor(function()
+                local p
+                pcall(function() p = MW.Portal() end)
+                return p
+            end, 15)
+            if not portal then warn("[Mine] cave portal not found on Crystal Cave") task.wait(5) return end
+            TeleportTo(portal.CFrame.Position + Vector3.new(0, 2, 0), 0.5)
+            local r
+            for _ = 1, 40 do -- wait for the game to enter (2 s debounce + transition)
+                if LocalPlayer:GetAttribute("MiningActive") == true then break end
+                task.wait(0.25)
+            end
+            pcall(function() r = MiningController and MiningController:GetState() end)
+            if type(r) ~= "table" or not r.Active then r = Invoke(stateRf) end
+            if type(r) ~= "table" or not r.Active then
+                r = Invoke(RF("MiningService", "Enter"))
+            end
+            print("[Mine] enter: MiningActive=" .. tostring(LocalPlayer:GetAttribute("MiningActive")) .. " state=" .. Dump(r))
+            if type(r) ~= "table" or not r.Active then task.wait(5) return end
+            if typeof(r.SurfacePosition) == "Vector3" then pcall(function() LocalPlayer:RequestStreamAroundAsync(r.SurfacePosition, 3) end) end
+            ApplyState(r)
+        end
+        if not MineMarker() then warn("[Mine] mine marker (workspace.MineArea.MineArea) not loaded yet") task.wait(1) return end
+        -- mine block after block without leaving this call (no 0.5 s gaps between blocks)
+        local mined, t0 = 0, os.clock()
+        while alive() and LocalPlayer:GetAttribute("MiningActive") == true do
+            if (MineState.Count or 0) >= (MineState.Capacity or math.huge) then
+                Status("Mine: bag full, selling")
+                MineSell()
+                if (MineState.Count or 0) >= (MineState.Capacity or math.huge) then task.wait(3) break end
+            end
+            local c = PickCell()
+            if not c then Status("Mine: no block to mine (all mined? waiting for the refill)") task.wait(2) break end
+            local x, y, z = c.X, c.Y, c.Z
+            local tool = ToolInfo()
+            local pos = MC.Position(MineMarker(), x, y, z)
+            local ore = CellOre(x, y, z)
+            local fails, hits = 0, 0
+            local key = MC.Key(x, y, z)
+            while alive() and fails < 4 do
+                local hrp = GetHrp()
+                if not hrp or (hrp.Position - pos).Magnitude > tool.Range - 2 or not CanSeeFrom(hrp.Position, x, y, z) then
+                    local spot = StandFor(x, y, z)
+                    if not spot then
+                        warn("[Mine] " .. key .. " (" .. ore.name .. "): no spot with line of sight, skipping it")
+                        BadCells[key] = os.clock() + 120
+                        break
+                    end
+                    Status("Mine: moving to " .. ore.name .. " at " .. key)
+                    TeleportTo(spot, 0.45) -- give the server time to see the new position
+                end
+                local r = Invoke(hit, MineState.Id, x, y, z)
+                if type(r) ~= "table" then warn("[Mine] hit returned " .. tostring(r)) fails += 1 task.wait(0.5)
+                elseif r.Throttled then task.wait(0.15)
+                elseif r.Error then
+                    fails += 1
+                    local h = GetHrp()
+                    warn(string.format("[Mine] hit %s (%s) try %d: %s | me=%s sees=%s", key, ore.name, fails, Dump(r),
+                        h and tostring(h.Position) or "?", tostring(h and CanSeeFrom(h.Position, x, y, z))))
+                    if fails >= 4 then BadCells[key] = os.clock() + 120 end
+                    task.wait(0.4)
+                else
+                    hits += 1
+                    if r.State then ApplyState(r.State) end
+                    local hp = (type(r.Health) == "number" and r.Health) or ore.health
+                    local dmg = (type(r.Damage) == "number" and r.Damage) or (hits * tool.Damage)
+                    Status(string.format("Mine: %s at %s  %d/%d dmg (%d hits) | bag %s/%s | %d mined",
+                        ore.name, key, math.min(dmg, hp), hp, hits, tostring(MineState.Count), tostring(MineState.Capacity), mined))
+                    if r.Broken then
+                        mined += 1
+                        Removed[r.Key or MC.Key(x, y, z)] = true
+                        if r.Drop ~= nil then
+                            local dropId = (type(r.Drop) == "table" and r.Drop.Id) or r.Key or MC.Key(x, y, z)
+                            local h = GetHrp()
+                            if not h or (h.Position - pos).Magnitude > 8 then TeleportTo(pos, 0.15) end
+                            local cr = Invoke(collect, MineState.Id, dropId)
+                            if type(cr) == "table" and cr.State then ApplyState(cr.State) end
+                        end
+                        break
+                    end
+                    task.wait(tool.Interval)
+                end
+            end
+            Status(string.format("Mine: %d blocks (%.1f/min) | bag %s/%s | last: %s", mined, mined / math.max(os.clock() - t0, 1) * 60,
+                tostring(MineState.Count), tostring(MineState.Capacity), tostring(hits) .. " hits"))
+        end
+    end)
+    if not ok then warn("[Mine] " .. tostring(err)) end
+    HoldEgg(false)
+    Release("mine")
+end)
+
+-- ── shiny stars (15, two or three per island) ──
+-- The server only places the stars of the island you are on, so each island is visited with the game's own teleport
+-- (IslandService.RF.Travel) and the script waits for the island to load before it walks to the stars.
+-- Star models are tagged "ShinyStar" with attributes ShinyStarId / ShinyStarCenter; ShinyStarService.RF.Collect(id)
+-- works within ServerReach (22 studs). Found ones are in Data.ShinyStars.Found[id].
+local ShinyStarConfig = Req({ "Shared", "Game", "ShinyStarConfig" })
+
+local function StarFound(data, id)
+    local ok, f = pcall(function() return ShinyStarConfig.IsFound(data, id) end)
+    if ok then return f == true end
+    local ss = data and data.ShinyStars
+    return type(ss) == "table" and type(ss.Found) == "table" and ss.Found[id] == true
+end
+
+local function MissingStarsOn(island, data)
+    local n = 0
+    for _, star in ipairs((ShinyStarConfig and ShinyStarConfig.Stars) or {}) do
+        if star.Island == island and not StarFound(data, star.Id) then n += 1 end
+    end
+    return n
+end
+
+LoopToggle("Auto Find Shiny Stars", 20, function(alive)
+    local data = GetData()
+    if not (data and ShinyStarConfig) then return end
+    local todo = {}
+    for _, island in ipairs(ISLANDS) do
+        if IslandUnlocked(data, island) and MissingStarsOn(island, data) > 0 then table.insert(todo, island) end
+    end
+    if #todo == 0 then return end
+    Trip("stars", function()
+        local startIsland = LocalPlayer:GetAttribute("CurrentIsland")
+        local collect = RF("ShinyStarService", "Collect")
+        for _, island in ipairs(todo) do
+            if not alive() then break end
+            if TravelTo(island) then
+                local seen = {}
+                local t0 = os.clock()
+                while alive() and os.clock() - t0 < 20 do
+                    local d = GetData() or data
+                    local m
+                    for _, star in ipairs(CollectionService:GetTagged("ShinyStar")) do
+                        local id = star:GetAttribute("ShinyStarId")
+                        if type(id) == "string" and not seen[id] and not StarFound(d, id) and typeof(star:GetAttribute("ShinyStarCenter")) == "Vector3" then m = star break end
+                    end
+                    if not m then
+                        if MissingStarsOn(island, d) == 0 or os.clock() - t0 > 8 then break end
+                        task.wait(0.5)
+                    else
+                        local id = m:GetAttribute("ShinyStarId")
+                        seen[id] = true
+                        TeleportTo(m:GetAttribute("ShinyStarCenter") + Vector3.new(0, 1, 0), 0.6)
+                        local r = Invoke(collect, id)
+                        if type(r) == "table" and r.Success then print(string.format("[Stars] %s (%s/%s)", id, tostring(r.Found), tostring(r.Total)))
+                        else warn("[Stars] " .. id .. ": " .. tostring(type(r) == "table" and r.Reason or r)) end
+                        task.wait(0.5)
+                    end
+                end
+            end
+        end
+        if startIsland and alive() then TravelTo(startIsland) end
+    end)
+end)
