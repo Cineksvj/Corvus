@@ -1,9 +1,17 @@
 -- ══════════════════ CORVUS HUB — by Dastan ══════════════════
+-- Auto Tap | Auto Equip Best (Clicks) | Auto Open Void egg (x8, no animation) | Auto Craft (Golden > Diamond > Rainbow, then back to the egg)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CollectionService = game:GetService("CollectionService")
 local LocalPlayer = Players.LocalPlayer
+
+-- only one copy of this hub may run: a new one stops the previous (loader re-runs, double execution)
+local G = (getgenv and getgenv()) or _G
+local Killed = false
+pcall(function() if type(G.CorvusTapSim) == "table" and type(G.CorvusTapSim.Stop) == "function" then G.CorvusTapSim.Stop() end end)
+local Instance = {}
+G.CorvusTapSim = Instance
 
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 local Window = Rayfield:CreateWindow({
@@ -13,6 +21,10 @@ local Window = Rayfield:CreateWindow({
     ConfigurationSaving = { Enabled = false },
 })
 local Main = Window:CreateTab("Main", 4483362458)
+Instance.Stop = function()
+    Killed = true
+    pcall(function() Rayfield:Destroy() end)
+end
 
 local function WaitForPath(names, timeout)
     local obj = ReplicatedStorage
@@ -44,6 +56,7 @@ Main:CreateToggle({
         if TapConn then TapConn:Disconnect() TapConn = nil end
         if Value and TapEvent then
             TapConn = RunService.Heartbeat:Connect(function()
+                if Killed then TapConn:Disconnect() return end
                 TapEvent:FireServer({ Auto = false, ClientSequence = 1 })
             end)
         end
@@ -59,7 +72,7 @@ Main:CreateToggle({
         EquipOn = Value
         if Value and PetEvent then
             task.spawn(function()
-                while EquipOn do
+                while EquipOn and not Killed do
                     PetEvent:FireServer({ Action = "EquipBest", Mode = "Clicks" })
                     task.wait(1)
                 end
@@ -200,6 +213,7 @@ Main:CreateToggle({
         end
         Pending, NextSendAt = {}, 0
         EggConn = RunService.Heartbeat:Connect(function()
+            if Killed then EggConn:Disconnect() return end
             if not EggWanted or EggHolds > 0 then return end
             local now = os.clock()
             if now < NextSendAt then return end
@@ -217,18 +231,37 @@ Main:CreateToggle({
 
 -- ═══════════ ONE TRIP AT A TIME ═══════════
 -- every feature that moves the character (crafting, digging, chests, mining, ...) takes this lock first
-local BusyBy = nil
-local function Acquire(who)
-    local t0 = os.clock()
+local BusyBy, BusySince = nil, 0
+local TRIP_LIMIT = 240 -- seconds a trip may hold the lock; after that the watchdog frees it
+-- waits up to `maxWait` seconds (default 180) for the lock; returns false when it gave up
+local function Acquire(who, maxWait)
+    local t0, start = os.clock(), os.clock()
     while BusyBy ~= nil and BusyBy ~= who do
-        if os.clock() - t0 > 5 then warn("[" .. who .. "] waiting: " .. tostring(BusyBy) .. " is still busy") t0 = os.clock() end
+        if Killed then return false end
+        if os.clock() - start > (maxWait or 180) then
+            warn("[" .. who .. "] gave up waiting: " .. tostring(BusyBy) .. " kept the lock too long")
+            return false
+        end
+        if os.clock() - t0 > 15 then warn("[" .. who .. "] waiting: " .. tostring(BusyBy) .. " is still busy") t0 = os.clock() end
         task.wait(0.2)
     end
-    BusyBy = who
+    BusyBy, BusySince = who, os.clock()
+    return true
 end
 local function Release(who)
     if BusyBy == who then BusyBy = nil end
 end
+-- watchdog: a trip that hangs (server never answers, loop that never ends) must not block everything else forever
+task.spawn(function()
+    while not Killed do
+        task.wait(5)
+        if BusyBy ~= nil and os.clock() - BusySince > TRIP_LIMIT then
+            warn("[Watchdog] " .. tostring(BusyBy) .. " held the lock for " .. math.floor(os.clock() - BusySince) .. " s; freeing it")
+            BusyBy = nil
+            EggHolds = 0
+        end
+    end
+end)
 
 -- ═══════════ SHARED HELPERS ═══════════
 local Remotes = ReplicatedStorage:WaitForChild("RemoteServices", 10)
@@ -610,13 +643,22 @@ local function CraftStage(stage)
     if not GoTo(stage.point) then return 0 end
     Status("craft: " .. stage.machine)
     local crafted, fails = 0, 0
-    while true do
+    local t0, lastFirst = os.clock(), nil
+    while os.clock() - t0 < 120 and not Killed do
         local use = PickSet(stage)
         if not use then break end
+        if use[1] == lastFirst then
+            -- the server said ok but the pets are still in the data: do not loop on the same set forever
+            task.wait(1)
+            use = PickSet(stage)
+            if not use or use[1] == lastFirst then warn("[Craft] " .. stage.machine .. ": pet data did not update after the craft, stopping") break end
+        end
         local ok, why = Request({ PetIds = use, Machine = stage.machine, Action = "Craft" }, PetsGone(use))
         if ok then
             crafted += 1
             fails = 0
+            lastFirst = use[1]
+            Status(string.format("craft: %s #%d", stage.machine, crafted))
             task.wait(0.35)
         else
             fails += 1
@@ -692,28 +734,36 @@ Main:CreateToggle({
         if not MachineEvent then warn("[Craft] remote not found") return end
         task.spawn(function()
             local held = false
-            while my == CraftToken do
+            while my == CraftToken and not Killed do
                 if Full() then
                     if not held then HoldEgg(true) held = true end
                     task.wait(1.2) -- let hatches in flight land
-                    Acquire("craft")
-                    if my ~= CraftToken then Release("craft") break end
-                    local hrp = GetHrp()
-                    local home, homeIsland = hrp and hrp.Position, CurrentIsland()
-                    StartHiding()
-                    local did = 0
-                    for _, stage in ipairs(STAGES) do
-                        if my ~= CraftToken then break end
-                        if Full() then did += CraftStage(stage) end
-                    end
-                    if my == CraftToken and Full() then did += CraftRainbow() end
-                    if my == CraftToken then GoHome(homeIsland, home) end
-                    StopHiding()
-                    Release("craft")
-                    if did == 0 or Full() then
-                        task.wait(did == 0 and 20 or 2) -- nothing crafted: wait longer so the egg is not held for nothing
-                    elseif held then
-                        HoldEgg(false) held = false
+                    if not Acquire("craft") then
+                        task.wait(5)
+                    elseif my ~= CraftToken then
+                        Release("craft")
+                        break
+                    else
+                        local hrp = GetHrp()
+                        local home, homeIsland = hrp and hrp.Position, CurrentIsland()
+                        StartHiding()
+                        local did = 0
+                        local okRun, err = pcall(function()
+                            for _, stage in ipairs(STAGES) do
+                                if my ~= CraftToken then break end
+                                if Full() then did += CraftStage(stage) end
+                            end
+                            if my == CraftToken and Full() then did += CraftRainbow() end
+                        end)
+                        if not okRun then warn("[Craft] " .. tostring(err)) Status("craft error: " .. tostring(err)) end
+                        if my == CraftToken then pcall(GoHome, homeIsland, home) end
+                        StopHiding()
+                        Release("craft")
+                        if did == 0 or Full() then
+                            task.wait(did == 0 and 20 or 2) -- nothing crafted: wait longer so the egg is not held for nothing
+                        elseif held then
+                            HoldEgg(false) held = false
+                        end
                     end
                 else
                     if held then HoldEgg(false) held = false end
@@ -747,7 +797,7 @@ local function LoopToggle(name, every, fn)
             local my = token
             if not Value then return end
             task.spawn(function()
-                local function alive() return my == token end
+                local function alive() return my == token and not Killed end
                 while alive() do
                     local ok, err = pcall(fn, alive)
                     if not ok then warn("[" .. name .. "] " .. tostring(err)) Status(name .. " error: " .. tostring(err)) end
@@ -769,7 +819,7 @@ end
 
 local function Trip(who, body)
     Status(who .. ": starting trip")
-    Acquire(who)
+    if not Acquire(who) then return end
     HoldEgg(true)
     local hrp = GetHrp()
     local home, homeIsland = hrp and hrp.Position, CurrentIsland()
@@ -813,15 +863,14 @@ local function GoToEgg()
 end
 
 task.spawn(function()
-    while true do
+    while not Killed do
         task.wait(1)
         if EggWanted and BusyBy == nil then
             local m = EggModel()
             local hrp = GetHrp()
             local far = EggTooFar or CurrentIsland() ~= EggIsland() or not m
                 or (hrp and (hrp.Position - EggStandPos(m)).Magnitude > 25)
-            if far then
-                Acquire("egg")
+            if far and Acquire("egg", 5) then
                 HoldEgg(true)
                 pcall(GoToEgg)
                 HoldEgg(false)
@@ -1402,7 +1451,7 @@ pcall(function() MiningController = require(ReplicatedStorage.Controllers.Miniga
 
 LoopToggle("Auto Mine (cave)", 0.5, function(alive)
     if not (MC and MW and MSave) then Status("Mine: mining modules not found") task.wait(10) return end
-    Acquire("mine")
+    if not Acquire("mine") then return end
     HoldEgg(true)
     Status("Mine: " .. (LocalPlayer:GetAttribute("MiningActive") == true and "mining" or "going to the cave portal"))
     local ok, err = pcall(function()
