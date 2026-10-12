@@ -13,9 +13,11 @@ end
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
--- The game version this hub was built and audited on (dump header "PlaceVersion: 3518", 2026-10-11, Builder I; the
--- 3097 -> 3518 audit is in notes.md "Changelog 2026-10-11 Builder I"). Info and Main show it next to the live game.PlaceVersion.
-local BUILT_ON = 3518
+-- The game version this hub was built and audited on (dump header "PlaceVersion: 3687", 2026-10-12, Builder N; the
+-- 3518 -> 3687 diff is dump/CHANGES_3687.md: scripts +45 -1 ~71, remotes only PlayerGui BindableEvents + one new
+-- ReconnectService.RE.TeleportStateReported the hub never fires; every RemoteServices remote the hub uses is
+-- unchanged, the EggService hatch Count/GetCount logic is identical). Info and Main show it next to the live game.PlaceVersion.
+local BUILT_ON = 3687
 do
 	local waited = 0
 	local ok = false
@@ -32790,6 +32792,24 @@ do
 				and isInt(t.Seq, 1)
 		end,
 		["EggService.RE.StopOfflineHatch"] = true,
+		-- strategy.md item 9 (Offline mode): the game's own delete-on-hatch list (EggController 189489-189492): a species per
+		-- egg the server auto-deletes on hatch so an offline/AFK hatch session does not stall at the storage cap. Entries are
+		-- AutoDeleteKey strings (name, or name_tier for non-Normal; HatchRulesConfig.AutoDeleteKey 3687 L400330) = ASCII pet
+		-- names; the hub only ever sends the junk species its own Auto Delete filters pick (never Secret/equipped/protected).
+		["EggService.RE.AutoDeleteRequested"] = function(t, ...)
+			if select("#", ...) > 0 or type(t) ~= "table" or not onlyKeys(t, { Egg = true, Entries = true }) or not N.validEgg(t.Egg) or type(t.Entries) ~= "table" then
+				return false
+			end
+			if #t.Entries > 200 then
+				return false
+			end
+			for _, k in ipairs(t.Entries) do
+				if type(k) ~= "string" or #k > 255 or string.find(k, "[\128-\255]") then
+					return false
+				end
+			end
+			return true
+		end,
 		["PetService.RE.PetActionRequested"] = function(t, ...)
 			if select("#", ...) > 0 or type(t) ~= "table" then
 				return false
@@ -32842,10 +32862,18 @@ do
 			return select("#", ...) == 0 and onlyKeys(t, { Engaged = true, Restart = true }) and type(t.Engaged) == "boolean" and (t.Restart == nil or (t.Restart == true and t.Engaged == true))
 		end,
 	}
-	local SettingNames = { HatchAnimation = true, EggLuck = true, GamepassPerks = true, HideClicks = true }
+	local SettingNames = { HatchAnimation = true, EggLuck = true, GamepassPerks = true, HideClicks = true, DisabledGamepasses = true }
 	local InvokeAllowed = {
 		["SettingsService.RF.UpdateSetting"] = function(t, ...)
-			return select("#", ...) == 0 and onlyKeys(t, { Name = true, Value = true }) and SettingNames[t.Name] == true and (type(t.Value) == "boolean" or isInt(t.Value, 1, 3))
+			if select("#", ...) ~= 0 or not onlyKeys(t, { Name = true, Value = true }) or SettingNames[t.Name] ~= true then
+				return false
+			end
+			-- strategy.md item 12: DisabledGamepasses is a list (ProfileTemplate 3687 L385957 = {}); the hub only ever clears
+			-- it (Value = {}) so no gamepass perk (x8, luck rolls, storage) is left switched off.
+			if t.Name == "DisabledGamepasses" then
+				return type(t.Value) == "table" and next(t.Value) == nil
+			end
+			return type(t.Value) == "boolean" or isInt(t.Value, 1, 3)
 		end,
 		-- The two shapes the game's client sends (3097 L128203-128221 menu / HeightBar incl. "Spawn", L128283-128291 portal);
 		-- never {ReturnToSpawn=true} (a field of the server's encounter, "Invalid portal request." live).
@@ -32878,6 +32906,14 @@ do
 		["LeaderboardService.RF.GetPendingRewards"] = true,
 		["LeaderboardService.RF.ClaimReward"] = function(id, ...)
 			return select("#", ...) == 0 and (isStr(id) or isInt(id))
+		end,
+		-- strategy.md item 11: read-only rank lookup, logged once per session as `LB rank= score=` (the game's own HUD fires
+		-- GetPlacement("PetPower"), 3687 L136224).
+		["LeaderboardService.RF.GetPlacement"] = function(id, ...)
+			return select("#", ...) == 0 and isStr(id)
+		end,
+		["LeaderboardService.RF.GetLastWeekPlacement"] = function(id, ...)
+			return select("#", ...) == 0 and isStr(id)
 		end,
 		["LuckyDuckyService.RF.Claim"] = function(id, ...)
 			return select("#", ...) == 0 and isStr(id)
@@ -33376,6 +33412,7 @@ do
 		AutoEnchant = true,
 		AutoRelic = true,
 		AutoDelete = true,
+		AutoOfflineDelete = true,
 		AutoEquip = true,
 		IndexHunter = true,
 	}
@@ -35082,6 +35119,15 @@ do
 				log("SETTING", s[1] .. "=" .. tostring(s[2]))
 			end
 		end
+		-- strategy.md item 12: a disabled gamepass silently removes x8 / luck rolls / storage / secret luck
+		-- (GamepassPerks.Has 3687 L92393-92398); DisabledGamepasses is a list (ProfileTemplate L385957 = {}). Clear it so
+		-- every owned perk is on. Never lists a pass to disable; only clears.
+		local disabled = current.DisabledGamepasses
+		local anyDisabled = type(disabled) == "table" and next(disabled) ~= nil
+		if anyDisabled or force then
+			invoke("SettingsService.RF.UpdateSetting", { Name = "DisabledGamepasses", Value = {} })
+		end
+		log("SETTINGS", "gamepass perks on, none disabled" .. (anyDisabled and " (cleared the disabled list)" or ""))
 	end
 
 	-- ===== Rebirth (B3, G5-1; live_findings 4, 14, 17, 21b): RebirthService.RE.RebirthRequested {Index} or, with the "Auto
@@ -36812,6 +36858,62 @@ do
 		log(string.format("DELETE batch %d: %d sent, %d freed, storage %d, deleted this session %d", N.Del.batch, #ids, freed, N.storage(), Session.deleted))
 		return freed
 	end
+
+	-- ===== strategy.md item 9 (Offline mode): the game's own server delete-on-hatch list (EggService.RE.AutoDeleteRequested,
+	-- EggController 3687 L189489-189492). While AutoOfflineDelete is on, the server auto-deletes, for the egg the hub
+	-- hatches, the SAME junk species the Auto Delete Junk filters pick, so a long AFK / offline hatch session (an Auto
+	-- session keeps hatching up to 10,000 eggs, OfflineHatchConfig) never stalls at the storage cap. Species keys only
+	-- (AutoDeleteKey 3687 L400330: the name for Normal), from the egg's own pool via PetCfg rarity, never
+	-- Secret/Godly/Exclusive/protected/index-kept and never a Mythical Void pet (kept for the machines). Off -> clear it. =====
+	N.Offline = { egg = nil, keyText = nil }
+	function N.offlineJunkKeys(egg)
+		local cfg = N.eggCfg(egg)
+		if type(cfg) ~= "table" or type(cfg.Pets) ~= "table" then
+			return {}
+		end
+		local rarities = {}
+		for _, r in ipairs(picked(Options.DeleteRarities)) do
+			rarities[r] = true
+		end
+		local protect = N.protectedNames()
+		local keys = {}
+		for name in pairs(cfg.Pets) do
+			if type(name) == "string" and not string.find(name, "[\128-\255]") then
+				local pc = N.tableOr(N.G.PetCfg)[name]
+				local rarity = (type(pc) == "table" and pc.Rarity) or "Common"
+				local secret = string.match(tostring(rarity), "^Secret") ~= nil or (N.indexIsSecret and N.indexIsSecret(name))
+				local mythicVoid = rarity == "Mythical" and N.petEgg and N.petEgg(name) == "Void"
+				if rarities[rarity] and not NeverRarity[rarity] and not secret and not protect[name] and not mythicVoid and not (N.indexKeeps and N.indexKeeps(name, "Normal")) then
+					table.insert(keys, name)
+				end
+			end
+		end
+		table.sort(keys)
+		return keys
+	end
+	function N.offlineDeleteStep()
+		if not N.does("AutoOfflineDelete") then
+			if N.Offline.keyText ~= nil and N.Offline.keyText ~= "" then
+				fire("EggService.RE.AutoDeleteRequested", { Egg = N.Offline.egg or "Void", Entries = {} })
+				log("OFFLINE prep: server auto-delete list cleared (toggle off)")
+			end
+			N.Offline.egg, N.Offline.keyText = nil, nil
+			return
+		end
+		-- the egg the hatch loop already settled on (never call N.pickEgg here: it has side effects and logs)
+		local egg = N.Hatch.target or N.tableOr(N.Plan).egg or (Options.HatchEgg and Options.HatchEgg.Value)
+		if type(egg) ~= "string" or egg == "Best (Smart)" or not N.validEgg(egg) then
+			return
+		end
+		local keys = N.offlineJunkKeys(egg)
+		local text = egg .. "|" .. table.concat(keys, ",")
+		if text == N.Offline.keyText then
+			return
+		end
+		N.Offline.egg, N.Offline.keyText = egg, text
+		fire("EggService.RE.AutoDeleteRequested", { Egg = egg, Entries = keys })
+		log(string.format("OFFLINE prep: %s server auto-delete %d junk species (10,000-egg offline budget)", egg, #keys))
+	end
 end
 do
 	local Due = {}
@@ -36979,7 +37081,24 @@ do
 			end
 		end
 	end
+	-- strategy.md item 11: log the Pet Power leaderboard placement once per session (read-only; the game's own HUD fires
+	-- GetPlacement("PetPower"), 3687 L136224). Settles the owned-vs-equipped question (if Score tracks all owned pets, keep
+	-- the storage full of the strongest; the planner change is only informational for now).
+	N.LbRankLogged = false
+	function N.lbRankStep()
+		if N.LbRankLogged then
+			return
+		end
+		N.LbRankLogged = true
+		local placement = invoke("LeaderboardService.RF.GetPlacement", "PetPower")
+		if type(placement) == "table" then
+			local rank = tonumber(placement.Rank or placement.Placement or placement.Position)
+			local score = tonumber(placement.Score or placement.Value or placement.Power)
+			log(string.format("LB rank=%s score=%s board=PetPower", rank and tostring(rank) or "?", score and formatNumber(score) or "?"))
+		end
+	end
 	function N.boardStep()
+		N.lbRankStep()
 		if due("board", 900) then
 			local pending = invoke("LeaderboardService.RF.GetPendingRewards")
 			if type(pending) == "table" then
@@ -42373,14 +42492,39 @@ do
 	function N.digDue()
 		return N.islandUnlocked("Autumn") and N.digLeft() > 0 and not held("dig")
 	end
+	-- The server (and DigWorld.Contains, 3687 L393390-393417) wants the HumanoidRootPart inside the DigZone BOX
+	-- (object space |X|<=Size.X/2, |Z|<=Size.Z/2, Y in [-1,9]); the sloped Path part sits off that box. Resolve the
+	-- real DigZone (streamed in via findStreamed), never Path. Builder (3687): the old build teleported to
+	-- `DigZone or Path` + world (0,3,0) and landed off the box -> `DigService.RF.Begin -> {Error=Stand on the digsite
+	-- to dig.}` on the owner's run (live_findings R8 12:40).
 	local function digZone()
-		local okS, site = pcall(function()
-			return X.DigWorld.GetSite()
-		end)
-		if not okS or not site then
+		local site = N.findStreamed("Digsite", function()
+			local okS, s = pcall(function()
+				return X.DigWorld.GetSite()
+			end)
+			if okS and s then
+				return s
+			end
+			local isl = N.islandFolder("Autumn")
+			return isl and isl:FindFirstChild("Digsite") or nil
+		end, 4, false)
+		if not site then
 			return nil
 		end
-		return site:FindFirstChild("DigZone") or site:FindFirstChild("Path")
+		local zone = site:FindFirstChild("DigZone", true)
+		if zone and zone:IsA("BasePart") then
+			return zone
+		end
+		return nil
+	end
+	-- Stand at the CENTRE of the DigZone box (zone.CFrame, so a rotated pad is handled), a little above the floor and
+	-- well inside Y<=9; a longer settle so the position replicates to the server before RF.Begin.
+	function N.standOnDigZone(zone)
+		if not zone or not zone:IsA("BasePart") then
+			return false
+		end
+		N.learnPlace("Digsite", zone.Position)
+		return N.teleport((zone.CFrame * CFrame.new(0, 2.5, 0)).Position, 0.5)
 	end
 	local function nextHitTime(round, from)
 		local cursor, isHit = X.Dig.Cursor, X.Dig.IsHit
@@ -42406,6 +42550,7 @@ do
 		return type(id) == "string" or N.isInt(id)
 	end
 	function N.digRun(maxGames)
+		maxGames = tonumber(maxGames) or 3
 		local zone = digZone()
 		if not zone then
 			backoff("dig", 1800)
@@ -42413,18 +42558,39 @@ do
 			return 0
 		end
 		N.loopStatus("Main", "digging at the Autumn dig site")
-		N.teleport(zone.Position + Vector3.new(0, 3, 0), 0.3)
+		N.standOnDigZone(zone)
 		local wins = 0
 		local gap = (tonumber(X.Dig.MinHitInterval) or 0.16) + 0.03
 		for _ = 1, maxGames do
 			if N.digLeft() <= 0 or not alive() then
 				break
 			end
-			local state = invoke("DigService.RF.Begin")
+			-- Begin with an off-pad retry: a cooldown answer is final; any other failure means the HumanoidRootPart is
+			-- off the DigZone box ("Stand on the digsite to dig." from the server, "NotAtDigsite" from the client echo),
+			-- so stand on the pad centre and retry up to 3 times before giving up.
+			local state
+			local offPad = false
+			for attempt = 1, 3 do
+				state = invoke("DigService.RF.Begin")
+				if type(state) == "table" and not state.Error and state.Id ~= nil then
+					offPad = false
+					break
+				end
+				local cooldown = type(state) == "table" and state.Error == "Cooldown" and tonumber(state.Remaining)
+				if cooldown then
+					offPad = false
+					break
+				end
+				offPad = true
+				if attempt < 3 then
+					N.standOnDigZone(zone)
+					task.wait(0.35)
+				end
+			end
 			if type(state) ~= "table" or state.Error or state.Id == nil then
 				local cooldown = type(state) == "table" and state.Error == "Cooldown" and tonumber(state.Remaining)
-				backoff("dig", cooldown or 600)
-				log("DIG begin refused:", brief(state))
+				backoff("dig", cooldown or (offPad and 300 or 600))
+				log("DIG begin refused:", brief(state), offPad and "(off the digsite, stood on the pad centre and retried)" or "")
 				break
 			end
 			local lastHit = N.serverTime()
@@ -43796,7 +43962,11 @@ do
 			-- the best use of one hatched copy: on the team as it is, or as 1/n of a Golden / Diamond / Rainbow craft
 			local best = math.max(N.tierPower(pw, "Normal") - weakest, 0)
 			for _, path in ipairs(paths) do
-				best = math.max(best, math.max(N.tierPower(pw, path.tier) - weakest, 0) / path.copies)
+				local v = math.max(N.tierPower(pw, path.tier) - weakest, 0) / path.copies
+				if path.bonus then
+					v *= path.bonus
+				end
+				best = math.max(best, v)
 			end
 			return best
 		end
@@ -43876,8 +44046,48 @@ do
 				end
 			end
 		end
+		local bonus = N.goldenBonus and N.goldenBonus() or 1
+		if bonus > 1 and list[1] and list[1].tier == "Golden" then
+			list[1].bonus = bonus
+		end
 		PathCache.at, PathCache.list = now, list
 		return list
+	end
+	-- strategy.md item 6: the Golden craft achievements (3687 L381364-381400: 5 / 200 / 500 / 1000 goldens crafted ->
+	-- Achievements.Multipliers.GoldenLuck cumulative x1.05 / x1.05 / x1.6 / x1.7) permanently raise the golden hatch rate
+	-- (a golden is x3 power). While the milestone is not reached, value a golden craft a little above its bare x3 pet so
+	-- the planner keeps crafting goldens toward x1.7 golden luck. Read-only numbers for the Machines status + a log line.
+	local GoldenTiers = { { 5, 1.05 }, { 200, 1.05 }, { 500, 1.6 }, { 1000, 1.7 } }
+	function N.goldenMilestone()
+		local crafts = tonumber(N.sub(N.sub(N.data(), "Achievements"), "Progress").GoldenCrafts) or 0
+		for _, t in ipairs(GoldenTiers) do
+			if crafts < t[1] then
+				return { crafts = crafts, nextAt = t[1], nextMult = t[2], active = true }
+			end
+		end
+		return { crafts = crafts, nextAt = nil, nextMult = nil, active = false }
+	end
+	-- A bounded nudge (<= +20 %) so the audited egg/coin math is not distorted; it only tilts which hatched copy the
+	-- planner would rather turn into a golden while the milestone is open, strongest near the x1.6 / x1.7 tiers.
+	function N.goldenBonus()
+		local m = N.goldenMilestone()
+		if not m.active or not m.nextMult then
+			return 1
+		end
+		return 1 + math.clamp((m.nextMult - 1) * 0.25, 0, 0.2)
+	end
+	local GoldenLogged = ""
+	function N.goldenMilestoneLog()
+		local m = N.goldenMilestone()
+		local key = m.active and (m.nextAt .. "") or "done"
+		if key ~= GoldenLogged then
+			GoldenLogged = key
+			if m.active then
+				log(string.format("CRAFT goldens %d/%d (next: golden luck x%.2g)", m.crafts, m.nextAt, m.nextMult))
+			else
+				log(string.format("CRAFT goldens %d/1000 (golden luck milestone complete)", m.crafts))
+			end
+		end
 	end
 	-- True when the eggs win the coins (or no rebirth runs at all); false = rebirths first, eggs from the surplus.
 	-- Re-evaluated every 2 s; a flip is logged once as PLAN coins.
@@ -44698,6 +44908,7 @@ do
 		{ "AutoDiamond", "Auto Diamond" },
 		{ "AutoRainbow", "Auto Rainbow" },
 		{ "AutoDelete", "Auto Delete Junk" },
+		{ "AutoOfflineDelete", "Offline Auto-Delete (away)" },
 		{ "AutoXPTreats", "Auto XP Treats" },
 		{ "AutoCoinTreat", "Auto 2x Coins Treat" },
 		{ "AutoEnchant", "Auto Enchant" },
@@ -44922,6 +45133,11 @@ do
 			Multi = true,
 			AllowNull = true,
 			Searchable = true,
+		})
+		DelBox:AddToggle("AutoOfflineDelete", {
+			Text = "Offline Auto-Delete (away)",
+			Default = false,
+			Tooltip = "For long AFK / offline hatch sessions (the game keeps hatching from an Auto session, up to 10,000 eggs, but stalls when the storage fills). While this is on, the game's own server delete-on-hatch list removes the SAME junk species your Auto Delete Junk filters pick, for the egg you hatch, so the offline session does not stall. Only junk species (never Secret, Godly, Exclusive, equipped, locked, protected or index-kept pets); switching it off clears the list. Runs only while this toggle is on",
 		})
 		Labels.Delete = DelBox:AddLabel({ Text = "-", DoesWrap = true })
 		local TreatBox = Tabs.Pets:AddLeftGroupbox("Treats And XP", "candy")
@@ -46940,6 +47156,9 @@ do
 		local due = N.dueMachines()
 		if #due > 0 and os.clock() - N.Craft.tripFailAt > 60 then
 			local n, limit = N.storage()
+			if N.goldenMilestoneLog then
+				N.goldenMilestoneLog()
+			end
 			N.planLog("craft", string.format("craft trip: storage %d/%d, %d machine%s due", n, limit, #due, if #due == 1 then "" else "s"), 300, 30)
 			N.guardTrip("craft", N.craftTrip, if N.storageFull() then "storage full" elseif N.storageHeld() then "storage held by the game's delete list" else "set ready")
 			return
@@ -47243,6 +47462,11 @@ do
 		local planner = N.planner()
 		if (N.does("AutoSettings")) and choreDue("settings", 60) then
 			N.applySettings()
+		end
+		-- strategy.md item 9 (Offline mode): keep the server delete-on-hatch list in step with the toggle and the hatch egg
+		-- (position-free remote; runs whether or not a trip is active). The function clears the list when the toggle is off.
+		if choreDue("offlineDelete", 10) then
+			N.offlineDeleteStep()
 		end
 		-- REV-3: Auto Equip manages the whole team; the Smart Planner alone only fills empty slots (the owner's own pets stay)
 		local equipFull = on("AutoEquip")
