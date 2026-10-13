@@ -13,11 +13,12 @@ end
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
--- The game version this hub was built and audited on (dump header "PlaceVersion: 3687", 2026-10-12, Builder N; the
--- 3518 -> 3687 diff is dump/CHANGES_3687.md: scripts +45 -1 ~71, remotes only PlayerGui BindableEvents + one new
--- ReconnectService.RE.TeleportStateReported the hub never fires; every RemoteServices remote the hub uses is
--- unchanged, the EggService hatch Count/GetCount logic is identical). Info and Main show it next to the live game.PlaceVersion.
-local BUILT_ON = 3687
+-- The game version this hub was built and audited on (live check 2026-10-13 on 3933, dump/CHANGES_3933.md: the code dump
+-- stays 3687 because Potassium's decompiler fails on 3933 bytecode; remotes 257 -> 269 with nothing removed, every remote
+-- the hub fires unchanged, configs read live via require identical; the game now streams menus/modules on demand
+-- (LazyContentService), so client modules may appear late: the hide-wrappers in p04 attach when a module arrives).
+-- Info and Main show it next to the live game.PlaceVersion.
+local BUILT_ON = 3933
 do
 	local waited = 0
 	local ok = false
@@ -31416,13 +31417,13 @@ end
     			PendingCount = 0
     			setStatus("Off, nothing is sent")
     		else
-    			setStatus("On, first send within a minute")
+    			setStatus("On, first send within 10 minutes")
     		end
     	end
     	function Library:GetDiagnostics()
     		return DiagOn
     	end
-    	setStatus(if DiagOn then "On, first send within a minute" else "Off, nothing is sent")
+    	setStatus(if DiagOn then "On, first send within 10 minutes" else "Off, nothing is sent")
     	-- every hub writes its status log with writefile/appendfile to Corvus_<GAME>_log.txt: read the new lines there
     	local env = getgenv()
     	local function isLog(name)
@@ -31450,7 +31451,7 @@ end
     	end
     	task.spawn(function()
     		while not Library.Unloaded do
-    			task.wait(60)
+    			task.wait(600)
     			pcall(flush)
     		end
     	end)
@@ -36607,14 +36608,12 @@ do
 			return real(self, hidden, reason, ...)
 		end
 	end)
-	for _, spec in ipairs({
-		{ "Modules.Client.Pets.GoldenMachineStage", { "Begin", "Arm", "Resolve" } },
-		{ "Modules.Client.Pets.DiamondMachineRig", { "Begin", "Arm", "Resolve" } },
-		{ "Modules.Client.Pets.DiamondCraftCutscene", { "Begin" } },
-		{ "Modules.Client.Common.ScreenGlow", { "Play" } },
-	}) do
-		local mod = N.safeRequire(spec[1])
-		for _, fname in ipairs(spec[2]) do
+	-- 3933: the game streams its craft/cutscene modules on demand (LazyContentConfig.PetPresentationCode:
+	-- GoldenMachineStage, DiamondCraftCutscene, ...), so they are missing at boot and arrive right before a craft plays.
+	-- Each wrapper attaches the moment the module exists (now, or on ChildAdded of its folder); never a 12 s wait,
+	-- never a "REQUIRE failed" line for a module the game simply has not sent yet.
+	local function hideWrap(mod, fnames)
+		for _, fname in ipairs(fnames) do
 			wrap(mod, fname, function(real)
 				return function(...)
 					if Hide.on then
@@ -36624,6 +36623,52 @@ do
 				end
 			end)
 		end
+	end
+	local function lazyWrap(path, fnames)
+		local parts = {}
+		for part in path:gmatch("[^%.]+") do
+			table.insert(parts, part)
+		end
+		local name = table.remove(parts)
+		local folder = ReplicatedStorage
+		for _, part in ipairs(parts) do
+			folder = folder and folder:FindFirstChild(part)
+		end
+		if not folder then
+			return
+		end
+		local attached = false
+		local function attach(inst)
+			if attached or not inst or inst.Name ~= name or not inst:IsA("ModuleScript") then
+				return
+			end
+			local ok, mod = pcall(require, inst)
+			if ok and type(mod) == "table" then
+				attached = true
+				hideWrap(mod, fnames)
+				log("HIDE wrapper attached", name)
+			end
+		end
+		attach(folder:FindFirstChild(name))
+		if not attached then
+			local conn
+			conn = folder.ChildAdded:Connect(function(inst)
+				task.defer(attach, inst)
+			end)
+			table.insert(N.Restore, function()
+				if conn then
+					conn:Disconnect()
+				end
+			end)
+		end
+	end
+	for _, spec in ipairs({
+		{ "Modules.Client.Pets.GoldenMachineStage", { "Begin", "Arm", "Resolve" } },
+		{ "Modules.Client.Pets.DiamondMachineRig", { "Begin", "Arm", "Resolve" } },
+		{ "Modules.Client.Pets.DiamondCraftCutscene", { "Begin" } },
+		{ "Modules.Client.Common.ScreenGlow", { "Play" } },
+	}) do
+		lazyWrap(spec[1], spec[2])
 	end
 	local function closeMenus()
 		if type(MenuController) == "table" and type(MenuController.Close) == "function" then
@@ -39932,6 +39977,22 @@ do
 		table.clear(Arena.opponents)
 		Arena.charge, Arena.lastCrit, Arena.waves, Arena.result, Arena.offerAt, Arena.waveLogged = 0, -1e9, 0, nil, nil, false
 		local start = invoke("ColosseumService.RF.StartWaveDefense")
+		-- 3933: a run whose reward was never claimed (hub reloaded or teleported mid-run) blocks every new start with
+		-- {Error="Claim your previous reward first.", RewardData={NewRelic, WaveReached, ...}}. Claim it by the same rule as
+		-- after a run (replace only a weaker relic; the Smart Planner alone swaps none), then start once more.
+		if type(start) == "table" and type(start.RewardData) == "table" and type(start.RewardData.NewRelic) == "table" then
+			local pendingRelic = start.RewardData.NewRelic
+			local relic, cur = N.currentRelic()
+			local newScore = N.relicScore(pendingRelic.Boosts)
+			local choice = if newScore > cur or next(relic) == nil then "replace" else "keep"
+			if choice == "replace" and next(relic) ~= nil and not on("AutoPetDefense") then
+				choice = "keep"
+			end
+			local claimed = invoke("ColosseumService.RF.ClaimMinigameReward", choice)
+			log("DEFENSE claimed the pending reward first", "wave", tostring(start.RewardData.WaveReached), "relic", tostring(pendingRelic.Name), choice, brief(claimed))
+			task.wait(0.5)
+			start = invoke("ColosseumService.RF.StartWaveDefense")
+		end
 		if type(start) ~= "table" or start.OnCooldown or start.Error then
 			Arena.nextAt = os.clock() + math.max(tonumber(type(start) == "table" and start.Remaining) or 300, 60)
 			note("defense", "not started: " .. brief(start))
