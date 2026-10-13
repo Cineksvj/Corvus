@@ -1765,9 +1765,25 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
     
     local FetchIcons = false
     local Icons: IconModule | nil = nil
-    
+    -- First run without the Lucide cache: while the download runs, GetIcon hands out a placeholder (Pending) and
+    -- ApplyLucideIcon remembers every image it was applied to (Users: image -> icon name); SetIconModule fills them in
+    local IconState = { Pending = false, Users = setmetatable({}, { __mode = "k" }), LoadBase = function() end }
+
+    function Library:IconsReady(): boolean
+        return FetchIcons and Icons ~= nil
+    end
+
     function Library:GetIcon(IconName: string)
         if not FetchIcons or not Icons then
+            if IconState.Pending and typeof(IconName) == "string" and IconName ~= "" then
+                return {
+                    Url = "",
+                    ImageRectOffset = Vector2.zero,
+                    ImageRectSize = Vector2.zero,
+                    IconName = IconName,
+                    Pending = true,
+                }
+            end
             return
         end
     
@@ -1842,7 +1858,19 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         if not (ImageGui:IsA("ImageLabel") or ImageGui:IsA("ImageButton")) then
             return
         end
-    
+
+        if Icon.Pending then
+            local Real = if FetchIcons and Icons then Library:GetIcon(Icon.IconName) else nil
+            if Real then
+                Icon = Real
+            elseif not (FetchIcons and Icons) then
+                IconState.Users[ImageGui] = Icon.IconName
+            end
+        end
+        if not Icon.Pending then
+            IconState.Users[ImageGui] = nil
+        end
+
         ImageGui.Image = Icon.Url or ImageGui.Image
         ImageGui.ImageRectOffset = Icon.ImageRectOffset or ImageGui.ImageRectOffset
         ImageGui.ImageRectSize = Icon.ImageRectSize or ImageGui.ImageRectSize
@@ -2383,10 +2411,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
     
     local CheckIcon, ArrowIcon, ResizeIcon, KeyIcon, MoveIcon, PopOutIcon, CloseIcon
     local ExpandIcon, CopyIcon, BellIcon, BellOffIcon, MinusIcon, PlusIcon, TrashIcon
-    function Library:SetIconModule(module: IconModule)
-        FetchIcons = true
-        Icons = module
-    
+    function IconState.LoadBase()
         CheckIcon = Library:GetIcon("check")
         ArrowIcon = Library:GetIcon("chevron-up")
         ResizeIcon = Library:GetIcon("move-diagonal-2")
@@ -2402,9 +2427,26 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         PlusIcon = Library:GetIcon("plus")
         TrashIcon = Library:GetIcon("trash-2")
     end
-    
+    function Library:SetIconModule(module: IconModule)
+        FetchIcons = true
+        Icons = module
+        IconState.Pending = false
+        IconState.LoadBase()
+        -- images that asked for an icon before the module arrived (tabs, checks, arrows, buttons...) get it now
+        local Users = IconState.Users
+        IconState.Users = setmetatable({}, { __mode = "k" })
+        for ImageGui, Name in Users do
+            local Icon = Library:GetIcon(Name)
+            if Icon then
+                pcall(Library.ApplyLucideIcon, Library, ImageGui, Icon)
+            end
+        end
+    end
+
     -- Lucide icons: a cached copy loads from disk at once, the download only refreshes the cache in the background
-	-- (a synchronous download here held the whole start on slow executors)
+	-- (a synchronous download here held the whole start on slow executors). Without a usable cache (first run on an
+	-- executor) the download starts here, Library:CreateWindow waits for it up to 4 s from now, and anything that asks
+	-- for an icon earlier or later gets a placeholder that SetIconModule fills in. LOAD shows icons=cache|net|late|none.
 	do
 		local LucideUrl = "https://raw.githubusercontent.com/mstudio45/lucide-roblox-direct/refs/heads/main/source.lua"
 		local LucideFile = "Corvus/lucide.lua"
@@ -2429,24 +2471,55 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
 			end
 		end)
 		local UsedCache = ApplyIcons(Cached)
+		local Settled, WaitOver = UsedCache, false
 		CorvusLoadTimes.icons = os.clock() - IconsT0
+		CorvusLoadTimes.iconsState = if UsedCache then "cache" else "none"
+		if not UsedCache then
+			IconState.Pending = true
+			IconState.LoadBase()
+		end
 		task.spawn(function()
 			local Ok, Source = pcall(game.HttpGet, game, LucideUrl)
-			if not Ok or typeof(Source) ~= "string" or #Source < 1000 or Source == Cached then
+			local Fresh = Ok and typeof(Source) == "string" and #Source >= 1000 and Source ~= Cached
+			if Fresh then
+				pcall(function()
+					if isfolder and makefolder and not isfolder("Corvus") then
+						makefolder("Corvus")
+					end
+					if writefile then
+						writefile(LucideFile, Source)
+					end
+				end)
+			end
+			if not UsedCache then
+				if Fresh and not Library.Unloaded and ApplyIcons(Source) then
+					CorvusLoadTimes.iconsState = string.format(if WaitOver then "late(%.1fs)" else "net(%.1fs)", os.clock() - IconsT0)
+				else
+					IconState.Pending = false
+					IconState.LoadBase()
+					CorvusLoadTimes.iconsState = "none"
+				end
+			end
+			Settled = true
+		end)
+		-- called by CreateWindow before the UI is built: no cache -> wait for the download, at most Limit s after its start
+		function Library:WaitForIcons(Limit: number?)
+			if Settled or WaitOver then
 				return
 			end
-			pcall(function()
-				if isfolder and makefolder and not isfolder("Corvus") then
-					makefolder("Corvus")
+			local T0 = os.clock()
+			local Deadline = IconsT0 + (Limit or 4)
+			while not Settled and not Library.Unloaded and os.clock() < Deadline do
+				if not pcall(task.wait, 0.05) then
+					break
 				end
-				if writefile then
-					writefile(LucideFile, Source)
-				end
-			end)
-			if not UsedCache and not Library.Unloaded then
-				ApplyIcons(Source)
 			end
-		end)
+			CorvusLoadTimes.icons = (CorvusLoadTimes.icons or 0) + (os.clock() - T0)
+			if not Settled then
+				WaitOver = true
+				CorvusLoadTimes.iconsState = "late(pending)"
+			end
+		end
 	end
     
     Library.Cursor = {}
@@ -13620,7 +13693,10 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             ImageProperties.ImageRectSize = Icon.ImageRectSize
     
             local ImageLabel = New("ImageLabel", ImageProperties)
-    
+            if Icon.Pending then
+                Library:ApplyLucideIcon(ImageLabel, Icon)
+            end
+
             function Image:SetHeight(Height: number)
                 assert(Height > 0, "Height must be greater than 0.")
     
@@ -17843,6 +17919,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             end
             Visit(Library.Toggles)
             Visit(Library.Options)
+            if typeof(Library.SyncMirrors) == "function" then
+                pcall(Library.SyncMirrors, Library)
+            end
             return true, Applied
         end
     
@@ -19316,7 +19395,10 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                 ZIndex = 6,
                 Parent = Holder,
             })
-    
+            if CloseIcon and CloseIcon.Pending then
+                Library:ApplyLucideIcon(CloseButton, CloseIcon)
+            end
+
             CloseButton.MouseEnter:Connect(function()
                 TweenService:Create(CloseButton, Library.TweenInfo, {
                     ImageTransparency = 0,
@@ -25682,7 +25764,7 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                 return Count > 0 and Now - LastChange >= 0.45
             end
             Steps[3].Ready = function()
-                return Library:GetIcon("check") ~= nil
+                return Library:IconsReady()
             end
             Steps[4].Ready = function()
                 return InfiniteYield.Loaded or not InfiniteYield.Loading
@@ -26234,6 +26316,7 @@ end)
                 { Name = "Steal ASMR", PlaceId = 82081400078378 },
                 { Name = "Steal Animal Egg", PlaceId = 99679692310083 },
                 { Name = "Steal From The Rich", PlaceId = 120475074479690 },
+                { Name = "Tap Simulator Reborn", PlaceId = 72858262610964 },
                 { Name = "Tongue Escape", PlaceId = 122245938604556 },
                 { Name = "Welcome to Bloxburg", PlaceId = 185655149 },
             }
@@ -31315,13 +31398,13 @@ end
     			PendingCount = 0
     			setStatus("Off, nothing is sent")
     		else
-    			setStatus("On, first send within a minute")
+    			setStatus("On, first send within 10 minutes")
     		end
     	end
     	function Library:GetDiagnostics()
     		return DiagOn
     	end
-    	setStatus(if DiagOn then "On, first send within a minute" else "Off, nothing is sent")
+    	setStatus(if DiagOn then "On, first send within 10 minutes" else "Off, nothing is sent")
     	-- every hub writes its status log with writefile/appendfile to Corvus_<GAME>_log.txt: read the new lines there
     	local env = getgenv()
     	local function isLog(name)
@@ -31349,7 +31432,7 @@ end
     	end
     	task.spawn(function()
     		while not Library.Unloaded do
-    			task.wait(60)
+    			task.wait(600)
     			pcall(flush)
     		end
     	end)
@@ -31436,12 +31519,13 @@ end
 		local Total = if T.shown and typeof(Loader.begin) == "number" then T.shown - Loader.begin elseif T.shown then T.shown - CorvusLoadT0 else nil
 		return string.format(
 			"LOAD fetch=%s compile=%s boot=%s lib=%s icons=%s ui=%s addons=%s community=%s discord=%s game=%s total=%s",
-			F(Loader.fetch), F(Loader.compile), F(BootTime), F(T.lib), F(T.icons), F(T.ui), F(T.addons), F(T.community), F(T.discord), F(GameTime), F(Total)
+			F(Loader.fetch), F(Loader.compile), F(BootTime), F(T.lib), if typeof(T.iconsState) == "string" then T.iconsState else F(T.icons), F(T.ui), F(T.addons), F(T.community), F(T.discord), F(GameTime), F(Total)
 		)
 	end
 	do
 		local BaseCreateWindow = Library.CreateWindow
 		function Library:CreateWindow(...)
+			Library:WaitForIcons()
 			local T0 = os.clock()
 			local Window = BaseCreateWindow(self, ...)
 			if CorvusLoadTimes.shown == nil then
@@ -31513,6 +31597,9 @@ end
 			return
 		end
 		Library.AutoloadFired = true
+		if typeof(Library.SyncMirrors) == "function" then
+			pcall(Library.SyncMirrors, Library)
+		end
 		Library:LogStart()
 		local Hook = Library.OnAutoload
 		if Hook == false then
@@ -31543,8 +31630,24 @@ end
 			return Window
 		end
 	end
-	-- Quick Start rule: a second control for an existing toggle in another groupbox. Both stay in sync both ways,
-	-- the original keeps the only callback and the only config key (the mirror is not in Library.Toggles).
+	-- CORVUS-MIRROR (Quick Start rule): a second control for an existing toggle in another groupbox. Both stay in sync
+	-- both ways, the original keeps the only callback and the only config key (the mirror is not in Library.Toggles).
+	-- The mirror shows the original's value from every source: it is repainted before the original's callback runs (a
+	-- callback that waits or errors never leaves it stale), after every config load, share code and reset
+	-- (Library:SyncMirrors) and by a 0.5 s check that only repaints mirrors (it never changes an original).
+	Library.MirrorSyncs = {}
+	function Library:SyncMirrors(): number
+		local Fixed = 0
+		for Index = #Library.MirrorSyncs, 1, -1 do
+			local Ok, Alive, Changed = pcall(Library.MirrorSyncs[Index])
+			if Ok and Alive == false then
+				table.remove(Library.MirrorSyncs, Index)
+			elseif Ok and Changed then
+				Fixed += 1
+			end
+		end
+		return Fixed
+	end
 	function Library:MirrorToggle(Idx: string, Box: any, Opts: any?)
 		Opts = if typeof(Opts) == "table" then Opts else {}
 		local Original = Library.Toggles[Idx]
@@ -31567,20 +31670,38 @@ end
 		Mirror.MirrorOf = Idx
 		local ShowValue = Mirror.SetValue
 		local Syncing = false
-		local function Sync()
-			if Syncing or Mirror.Destroyed then
-				return
+		-- repaints only the mirror (no callback of the original); true = it showed something else
+		local function Paint(Value: any): boolean
+			if Syncing or Mirror.Destroyed or Mirror.Value == Value then
+				return false
 			end
 			Syncing = true
-			if Mirror.Value ~= Original.Value then
-				pcall(ShowValue, Mirror, Original.Value)
-			end
+			pcall(ShowValue, Mirror, Value)
 			Syncing = false
+			return true
+		end
+		-- alive (false = mirror destroyed, drop it), changed
+		local function Sync(): (boolean, boolean)
+			if Mirror.Destroyed then
+				return false, false
+			end
+			return true, Paint(Original.Value)
 		end
 		local BaseSet = Original.SetValue
 		Original.SetValue = function(Self, Value)
+			Paint(Value)
 			BaseSet(Self, Value)
 			Sync()
+		end
+		table.insert(Library.MirrorSyncs, Sync)
+		if not Library.MirrorWatch then
+			Library.MirrorWatch = true
+			task.spawn(function()
+				while not Library.Unloaded do
+					task.wait(0.5)
+					Library:SyncMirrors()
+				end
+			end)
 		end
 		local BaseDisabled = Original.SetDisabled
 		if typeof(BaseDisabled) == "function" then
@@ -31594,7 +31715,7 @@ end
 				pcall(Mirror.SetDisabled, Mirror, true)
 			end
 		end
-		-- the mirror's own switch (click, quick bar) drives the original; Sync then repaints the mirror
+		-- the mirror's own switch (click, quick bar) drives the original, whose SetValue repaints the mirror
 		Mirror.SetValue = function(_, Value)
 			Original:SetValue(Value)
 		end
@@ -31614,6 +31735,7 @@ end
 		end
 		return Mirror
 	end
+	-- CORVUS-MIRROR-END
 	-- CORVUS-CONFIGLOAD (player feedback 2026-10-07: "after I loaded the config none of the settings were active").
 	-- The Obsidian SaveManager is fetched live from GitHub: it applies saved values one by one with task.defer, drops a
 	-- value whose control does not exist yet and a dropdown value whose list is filled later (tower lists, eggs...).
@@ -31739,6 +31861,10 @@ end
 			end
 		end
 		Library.ConfigLoadedName = Name
+		-- Quick Start mirrors show the loaded values (CORVUS-MIRROR)
+		if typeof(Library.SyncMirrors) == "function" then
+			pcall(Library.SyncMirrors, Library)
+		end
 		Library:CorvusLog(string.format("CONFIG loaded %s controls=%d on=%s%s", Name, Applied, ConfigOnList(), if #Later > 0 then " later=" .. #Later else ""))
 		if #Later > 0 then
 			local Token = {}
@@ -31755,6 +31881,9 @@ end
 						end
 					end
 					if #Still < #Later then
+						if typeof(Library.SyncMirrors) == "function" then
+							pcall(Library.SyncMirrors, Library)
+						end
 						Library:CorvusLog(string.format("CONFIG late %s applied=%d waiting=%d on=%s", Name, #Later - #Still, #Still, ConfigOnList()))
 					end
 					Later = Still
@@ -32409,6 +32538,9 @@ do
 			end
 		end
 		Log.dirty = true
+		if N.logHook then
+			pcall(N.logHook, line)
+		end
 	end
 	Library.LoadLogger = function(line)
 		pcall(log, line)
@@ -32441,6 +32573,8 @@ do
 			executor = table.concat({ identifyexecutor() }, " ")
 		end)
 		log("BOOT", GameName, "place", game.PlaceId, "job", string.sub(tostring(game.JobId), 1, 8), "executor", executor)
+		-- Which build produced a log (build.py writes the source hash here).
+		log("BUILD huss", "69a0663", "changes=safezone-axis,one-heading-90dps,lane-risk-model,gap-start-rule,nav-sense-rays,stuck-slide,pos-velocity-prediction,latency-lead,stab-or-dive,recorder,round-log")
 	end
 	Perf = { frames = 0, time = 0, worst = 0, hitches = 0, freezes = 0, work = {}, hitchLogAt = 0, last = nil }
 	Library:GiveSignal(RunService.Heartbeat:Connect(function(dt)
@@ -32915,10 +33049,13 @@ do
 		return if ok and typeof(v) == "Vector3" then N.flat(v) else Vector3.new(0, 0, 0)
 	end
 	-- The field of the ACTIVE map (MapVoteConfig: Map1 THE VALLEY, Map2 THE BARN, Map3 HOMETOWN; the game's MapLocator
-	-- reads ChickenOrHero.Game.ActiveMap): <map>.Field Grass (X range, ground height) and the two safe Lines (Z). zc =
-	-- the field's middle (Z), lineZ = half the distance between the lines. Re-read when the active map changes.
-	-- Fallback = the Map1 dump values.
-	N.Field = { xMin = 32, xMax = 204, lineZ = 116.5, zc = 0, groundY = nil, found = false, mapId = "Map1", map = nil }
+	-- reads ChickenOrHero.Game.ActiveMap). The truth is the game's own safe zones: <map>.Field.SafezoneASide and
+	-- SafezoneBSide (SafezoneSignsClient, dump 59665). The crossing axis u runs from zone A to zone B (any map
+	-- rotation), the field's width axis v = (u.Z, 0, -u.X). All runner/catcher math works in FIELD coordinates:
+	-- local Z along u (zc = the middle, +-lineZ = the zones' inner edges), local X along v (xMin..xMax = the width),
+	-- N.L / N.W convert positions, N.Ld / N.Wd directions (Map1 = the identity: u = +Z, v = +X).
+	-- Fallback without zones: Grass (width) + the Line parts (Z), then the Map1 dump values.
+	N.Field = { xMin = 32, xMax = 204, lineZ = 116.5, zc = 0, cx = 0, groundY = nil, found = false, mapId = "Map1", map = nil, u = Vector3.new(0, 0, 1), v = Vector3.new(1, 0, 0), c = Vector3.new(0, 0, 0), depth = 12, source = "default" }
 	function N.activeMap()
 		local ok, map = pcall(function()
 			local ref = ReplicatedStorage.ChickenOrHero.Game:FindFirstChild("ActiveMap")
@@ -32929,6 +33066,30 @@ do
 		end
 		return workspace:FindFirstChild("Map1")
 	end
+	-- Box of a part or model: cframe, size.
+	local function boxOf(inst)
+		local ok, cf, size = pcall(function()
+			if inst:IsA("BasePart") then
+				return inst.CFrame, inst.Size
+			end
+			return inst:GetBoundingBox()
+		end)
+		if ok and cf and size then
+			return cf, size
+		end
+		return nil
+	end
+	-- Extent of a box along a flat unit axis.
+	local function extent(cf, size, axis)
+		local ok, r = pcall(function()
+			return math.abs(cf.RightVector:Dot(axis)) * size.X + math.abs(cf.UpVector:Dot(axis)) * size.Y + math.abs(cf.LookVector:Dot(axis)) * size.Z
+		end)
+		if ok and type(r) == "number" then
+			return r
+		end
+		return math.abs(axis.X) * size.X + math.abs(axis.Y) * size.Y + math.abs(axis.Z) * size.Z
+	end
+	N.boxExtent = extent
 	function N.readField()
 		local map = N.activeMap()
 		if N.Field.found and map == N.Field.map then
@@ -32937,35 +33098,91 @@ do
 		local field = map and map:FindFirstChild("Field")
 		if field then
 			local F = N.Field
-			local lines = {}
-			for _, part in ipairs(field:GetChildren()) do
-				if part.Name == "Grass" and part.Size then
-					F.xMin = part.Position.X - part.Size.X / 2
-					F.xMax = part.Position.X + part.Size.X / 2
-					F.groundY = part.Position.Y + part.Size.Y / 2
-					F.grassZ = part.Position.Z
-				elseif part.Name == "Line" then
-					table.insert(lines, part.Position.Z)
+			local za, zb = field:FindFirstChild("SafezoneASide"), field:FindFirstChild("SafezoneBSide")
+			local grass = field:FindFirstChild("Grass")
+			local gcf, gsize
+			if grass then
+				gcf, gsize = boxOf(grass)
+				if gcf then
+					F.groundY = gcf.Position.Y + extent(gcf, gsize, Vector3.new(0, 1, 0)) / 2
 				end
 			end
-			if #lines >= 2 then
-				table.sort(lines)
-				F.zc = (lines[1] + lines[#lines]) / 2
-				F.lineZ = (lines[#lines] - lines[1]) / 2
-			elseif #lines == 1 then
-				F.zc = F.grassZ or 0
-				F.lineZ = math.abs(lines[1] - F.zc)
+			local acf, asize, bcf, bsize
+			if za and zb then
+				acf, asize = boxOf(za)
+				bcf, bsize = boxOf(zb)
+			end
+			if acf and bcf and N.flat(bcf.Position - acf.Position).Magnitude > 20 then
+				local u = N.unit(N.flat(bcf.Position - acf.Position))
+				local v = Vector3.new(u.Z, 0, -u.X)
+				local c = N.flat(acf.Position + bcf.Position) / 2
+				local half = N.flat(bcf.Position - acf.Position).Magnitude / 2
+				local depthA, depthB = extent(acf, asize, u), extent(bcf, bsize, u)
+				F.u, F.v, F.c = u, v, c
+				F.cx, F.zc = c.X, c.Z
+				F.lineZ = half - math.min(depthA, depthB) / 2
+				F.depth = math.min(depthA, depthB)
+				local width = math.min(extent(acf, asize, v), extent(bcf, bsize, v))
+				if gcf then
+					width = math.max(width, extent(gcf, gsize, v))
+				end
+				F.xMin, F.xMax = F.cx - width / 2, F.cx + width / 2
+				F.groundY = F.groundY or (acf.Position.Y + extent(acf, asize, Vector3.new(0, 1, 0)) / 2)
+				F.source = "zones"
+			else
+				local lines = {}
+				for _, part in ipairs(field:GetChildren()) do
+					if part.Name == "Line" and part:IsA("BasePart") then
+						table.insert(lines, part.Position.Z)
+					end
+				end
+				F.u, F.v = Vector3.new(0, 0, 1), Vector3.new(1, 0, 0)
+				if gcf then
+					F.xMin = gcf.Position.X - extent(gcf, gsize, F.v) / 2
+					F.xMax = gcf.Position.X + extent(gcf, gsize, F.v) / 2
+				end
+				if #lines >= 2 then
+					table.sort(lines)
+					F.zc = (lines[1] + lines[#lines]) / 2
+					F.lineZ = (lines[#lines] - lines[1]) / 2
+				elseif #lines == 1 then
+					F.zc = if gcf then gcf.Position.Z else 0
+					F.lineZ = math.abs(lines[1] - F.zc)
+				end
+				F.cx = 0
+				F.c = Vector3.new(0, 0, F.zc)
+				F.depth = 12
+				F.source = "lines"
 			end
 			F.found = true
 			F.map = map
 			F.mapId = map.Name
-			log("FIELD", F.mapId, string.format("x %.0f..%.0f, safe lines z=%.1f+-%.1f", F.xMin, F.xMax, F.zc, F.lineZ))
+			local ud = math.deg(math.atan2(F.u.X, F.u.Z)) % 360
+			log("FIELD", F.mapId, F.source, string.format("axis=%.0f width %.0f..%.0f, safe lines z=%.1f+-%.1f, zone depth %.0f", ud, F.xMin, F.xMax, F.zc, F.lineZ, F.depth))
 		end
 		return N.Field
 	end
+	-- Field coordinates (see above). Positions: N.L(world) -> field, N.W(field) -> world (flat). Directions: N.Ld, N.Wd.
+	function N.L(p)
+		local F = N.Field
+		local d = Vector3.new(p.X - F.c.X, 0, p.Z - F.c.Z)
+		return Vector3.new(F.cx + d:Dot(F.v), 0, F.zc + d:Dot(F.u))
+	end
+	function N.W(l)
+		local F = N.Field
+		return Vector3.new(F.c.X, 0, F.c.Z) + F.v * (l.X - F.cx) + F.u * (l.Z - F.zc)
+	end
+	function N.Ld(d)
+		local F = N.Field
+		return Vector3.new(d.X * F.v.X + d.Z * F.v.Z, 0, d.X * F.u.X + d.Z * F.u.Z)
+	end
+	function N.Wd(d)
+		local F = N.Field
+		return F.v * d.X + F.u * d.Z
+	end
 	-- Z inside the field: 0 = the middle, +-lineZ = the safe lines.
 	function N.fz(v)
-		return v.Z - N.Field.zc
+		return N.L(v).Z - N.Field.zc
 	end
 end
 local Session = {
@@ -33002,15 +33219,18 @@ N.Events = {}
 N.Manual = { running = false }
 -- Movement: the hub plays like a keyboard + mouse player under the game's forced SHIFT LOCK
 -- (ChickenOrHeroLockedCamera, dump 57595-57711: MouseBehavior LockCenter, AutoRotate off, the root faces the camera
--- look every PreSimulation). So the camera decides where the character faces, the game's movement speed (BodyFacing
+-- look every PreSimulation). The camera decides where the character faces, the movement speed (BodyFacing
 -- speedMultiplier: 0.9 sideways, 0.75 backwards, dump 84808) and where the stab goes (MeleeInputClient sends the root
--- look, 17381). The hub therefore turns the CAMERA toward the wanted heading (smoothly, like a mouse) and holds the
--- game's movement keys (W/A/S/D through VirtualInputManager) relative to that camera: W once the camera points the
--- way, W+D / D ... only while the camera is still turning. The game's CharacterMovementClient turns the keys into its
--- own speed, turning and dash rules (every input turn costs speed: TurnRetention90 0.65, MovementModel 85756), so the
--- server's movement guard sees a normal player. No teleport, no tween, no WalkSpeed change, no jump. If the keys do
--- not move the character (an executor without VirtualInputManager input), the probe falls back to Humanoid:Move.
-N.Move = { method = "keys", keys = {}, dir = nil, since = nil, fromPos = nil, fails = 0, okLogged = false, humanoidDir = nil, lastProbeAt = -1e9, oct = nil, urgent = false, camLogAt = -1e9, label = nil, camSet = nil, camChecks = 0, camKept = 0 }
+-- look, 17381). Every change of the travel direction costs speed (MovementModel 85756: speed x TurnRetention90 ^
+-- (angle / 90), runners 0.72, catchers 0.65), so the hub steers like a good player: ONE heading, turned smoothly.
+-- N.steer(want) only sets the wanted heading; every frame the heading follows it with a capped angular speed
+-- (N.turnRate: 90 deg/s at full running speed, up to 360 deg/s when standing; urgent 180, catchers 200 / 300 on the
+-- final approach) and an 8 degree deadband (small corrections are ignored), the camera is set to that heading and the
+-- game's W key is held, so the body runs exactly along the heading in gentle arcs. Strafe (waiting behind the line
+-- facing the field) and the dodge juke (45 degree input for 0.3 s, the game's Redirect needs >= 35 deg, 85504) use
+-- the side keys without turning the camera. No teleport, no tween, no WalkSpeed change, no jump. If the keys do not
+-- move the character (an executor without VirtualInputManager input), the probe falls back to Humanoid:Move.
+N.Move = { method = "keys", keys = {}, dir = nil, since = nil, fromPos = nil, fails = 0, okLogged = false, humanoidDir = nil, lastProbeAt = -1e9, oct = nil, urgent = false, label = nil, camSet = nil, camChecks = 0, camKept = 0, head = nil, face = nil, moveDir = nil, turning = false, jukeUntil = -1e9, jukeSide = 0, slideUntil = -1e9, slideDir = nil, slowSince = nil, spin = { deg = 0, time = 0, maxWin = 0, win = 0, winT = 0 } }
 do
 	local M = N.Move
 	local vim
@@ -33056,19 +33276,17 @@ do
 		end
 		return Vector3.new(0, 0, -1)
 	end
-	-- Keys for a world direction: forward = camera look, right = look x up = (-look.Z, 0, look.X).
-	-- Eight key directions (W, W+D, D, S+D, S, S+A, A, W+A). The nearest one is held; the current one is kept while it is
-	-- within 30 degrees (no flicker: every switch of the input direction costs the game's turn speed penalty). The
-	-- camera turn does the fine aiming.
+	-- Keys for a world direction relative to a facing (default: the camera): forward = look, right = (-look.Z, 0,
+	-- look.X). Eight key directions (W, W+D, D, S+D, S, S+A, A, W+A); the held set is kept while it is within 30 deg.
 	local Octants = { { W = true }, { W = true, D = true }, { D = true }, { S = true, D = true }, { S = true }, { S = true, A = true }, { A = true }, { W = true, A = true } }
-	function N.octantOf(dir)
-		local look = N.camLook()
+	function N.octantOf(dir, look)
+		look = look or N.camLook()
 		local right = Vector3.new(-look.Z, 0, look.X)
 		local f, r = dir:Dot(look), dir:Dot(right)
 		return (math.atan2(r, f) / (math.pi / 4)) % 8
 	end
-	function N.keysFor(dir, keep)
-		local oct = N.octantOf(dir)
+	function N.keysFor(dir, keep, look)
+		local oct = N.octantOf(dir, look)
 		local pick = math.floor(oct + 0.5) % 8
 		if keep ~= nil then
 			local err = math.abs(oct - keep)
@@ -33083,21 +33301,12 @@ do
 		end
 		return want, pick
 	end
-	local function applyKeys()
-		if M.method ~= "keys" or not M.dir then
-			return
-		end
-		if M.faceOnly then
-			if next(M.keys) ~= nil then
-				N.releaseKeys()
-			end
-			return
-		end
-		local want, pick = N.keysFor(M.dir, M.oct)
+	local function holdOctant(pick)
 		if pick == M.oct and next(M.keys) ~= nil then
 			return
 		end
 		M.oct = pick
+		local want = Octants[pick + 1]
 		for name in pairs(M.keys) do
 			if not want[name] then
 				keyEvent(name, false)
@@ -33112,12 +33321,44 @@ do
 			end
 		end
 	end
-	-- steer(dir[, urgent[, label]]): the wanted world heading (nil = stop). urgent = turn the camera fast (final stab
-	-- approach, dodge juke).
-	function N.steer(dir, urgent, label, faceOnly)
+	-- Angular speed cap of the heading (deg/s). A turn costs speed x (1 - retention ^ (angle / 90)): nothing while
+	-- standing, a lot at full speed, so the cap grows as the body slows down.
+	function N.turnRate(speed, urgent, catcher)
+		if catcher then
+			return if urgent then 300 else 200
+		end
+		local slow = math.clamp(1 - (speed or 0) / 20, 0, 1)
+		local rate = 90 + (360 - 90) * slow
+		if urgent then
+			rate = math.max(rate, 180)
+		end
+		return rate
+	end
+	-- One heading step (pure): turns cur toward want by at most rate x dt. Deadband: a wanted change under 8 deg is
+	-- ignored unless a turn is already running (it then finishes to within 2 deg). Returns the new heading, turning flag.
+	function N.headingStep(cur, want, dt, rate, turning)
+		local dot = math.clamp(cur:Dot(want), -1, 1)
+		local ang = math.acos(dot)
+		if not turning and ang < math.rad(8) then
+			return cur, false
+		end
+		if ang < math.rad(2) then
+			return want, false
+		end
+		local step = math.min(ang, math.rad(rate) * dt)
+		local sign = if cur.X * want.Z - cur.Z * want.X >= 0 then 1 else -1
+		local a = step * sign
+		local ca, sa = math.cos(a), math.sin(a)
+		return Vector3.new(cur.X * ca - cur.Z * sa, 0, cur.X * sa + cur.Z * ca).Unit, true
+	end
+	-- steer(want[, urgent[, label[, faceOnly[, face]]]]): want = the wanted travel direction (nil = stop).
+	-- faceOnly = turn toward it without walking; face = keep the camera on this heading and strafe toward want.
+	function N.steer(dir, urgent, label, faceOnly, face)
 		if dir == nil or dir.Magnitude < 0.05 then
 			M.dir = nil
 			M.camSet = nil
+			M.face = nil
+			M.moveDir = nil
 			M.faceOnly = false
 			M.since = nil
 			M.humanoidDir = nil
@@ -33125,97 +33366,156 @@ do
 			return
 		end
 		dir = N.unit(N.flat(dir))
-		if M.dir == nil then
+		if M.dir == nil or (M.faceOnly and not faceOnly) then
 			M.since = os.clock()
 			M.fromPos = N.myPos()
 		end
-		if M.faceOnly and not faceOnly then
-			M.since = os.clock()
-			M.fromPos = N.myPos()
+		if M.dir == nil then
+			M.head = N.camLook()
+			M.turning = false
 		end
 		M.dir = dir
 		M.urgent = urgent == true
 		M.label = label or M.label
 		M.faceOnly = faceOnly == true
-		if M.method == "humanoid" then
-			M.humanoidDir = if M.faceOnly then nil else dir
-			N.releaseKeys()
-			return
-		end
-		applyKeys()
+		M.face = if face then N.unit(N.flat(face)) else nil
 	end
-	-- Camera aim: rotates the camera (around its focus, pitch and zoom kept, like a mouse turn) toward the heading.
-	-- Turn rate: exponential (fast for a big turn, gentle near the target), at most 420 deg/s (900 when urgent), never a
-	-- 180 degree snap. Only while the hub steers; the player's own camera is untouched otherwise.
-	function N.camTurn(cur, want, dt, urgent)
-		local ang = math.acos(math.clamp(cur:Dot(want), -1, 1))
-		if ang < 0.002 then
-			return want, ang
-		end
-		local maxStep = math.rad(if urgent then 900 else 420) * dt
-		local step = math.min(ang, math.max(ang * (1 - math.exp(-(if urgent then 18 else 10) * dt)), math.rad(40) * dt), maxStep)
-		local sign = if cur.X * want.Z - cur.Z * want.X >= 0 then 1 else -1
-		local a = step * sign
-		local ca, sa = math.cos(a), math.sin(a)
-		return Vector3.new(cur.X * ca - cur.Z * sa, 0, cur.X * sa + cur.Z * ca).Unit, ang - step
+	-- Dodge juke: 45 degree side input for 0.3 s (side = +1 right / -1 left of the heading), camera untouched.
+	function N.juke(side)
+		M.jukeUntil = os.clock() + 0.3
+		M.jukeSide = if side >= 0 then 1 else -1
 	end
-	local function camStep(dt)
+	-- Heading changes per second while the hub steers (STEER summary spin=).
+	function N.spinReset()
+		M.spin = { deg = 0, time = 0, maxWin = 0, win = 0, winT = 0 }
+	end
+	local function frame(dt)
 		if not M.dir or not alive() then
 			return
 		end
-		local cam = workspace.CurrentCamera
+		dt = math.clamp(dt or 1 / 60, 0, 0.1)
 		local root = N.root()
-		if not (cam and root) then
+		if not root then
 			return
 		end
-		if cam.CameraType == Enum.CameraType.Scriptable then
+		local speed = N.velocity(root).Magnitude
+		local wantHead = M.face or M.dir
+		local before = M.head or N.camLook()
+		local rate = N.turnRate(speed, M.urgent, N.role() == "Catcher")
+		M.head, M.turning = N.headingStep(before, wantHead, dt, rate, M.turning)
+		-- Spin meter.
+		local turned = math.deg(math.acos(math.clamp(before:Dot(M.head), -1, 1)))
+		local S = M.spin
+		S.deg += turned
+		S.time += dt
+		S.win += turned
+		S.winT += dt
+		if S.winT >= 1 then
+			S.maxWin = math.max(S.maxWin, S.win / S.winT)
+			S.win, S.winT = 0, 0
+		end
+		-- Camera = heading (pitch and zoom kept, around the focus like a mouse turn).
+		local cam = workspace.CurrentCamera
+		if cam and cam.CameraType ~= Enum.CameraType.Scriptable then
+			local cf = cam.CFrame
+			local look3 = cf.LookVector
+			local cur = Vector3.new(look3.X, 0, look3.Z)
+			if cur.Magnitude > 0.01 then
+				cur = cur.Unit
+				-- Does the camera keep what we wrote last frame? (log once: CAM write=ok|ignored)
+				if M.camSet and M.camChecks < 30 then
+					M.camChecks += 1
+					if cur:Dot(M.camSet) > 0.996 then
+						M.camKept += 1
+					end
+					if M.camChecks == 30 then
+						log("CAM write=" .. (if M.camKept >= 20 then "ok" else "ignored"), "kept " .. M.camKept .. "/30 frames")
+					end
+				end
+				if cur:Dot(M.head) < 0.99995 then
+					local pitch = math.clamp(look3.Y, -0.6, 0.2)
+					local look = M.head * math.sqrt(1 - pitch * pitch) + Vector3.new(0, pitch, 0)
+					local focus = root.Position + Vector3.new(0, 1.5, 0)
+					pcall(function()
+						local f = cam.Focus
+						if f and f.Position and (f.Position - focus).Magnitude < 8 then
+							focus = f.Position
+						end
+					end)
+					local dist = math.clamp((cf.Position - focus).Magnitude, 6, 18)
+					pcall(function()
+						cam.CFrame = CFrame.lookAt(focus - look * dist, focus)
+					end)
+				end
+				M.camSet = M.head
+			end
+		end
+		-- Input.
+		if M.faceOnly then
+			M.moveDir = nil
+			if next(M.keys) ~= nil then
+				N.releaseKeys()
+			end
+			M.humanoidDir = nil
 			return
 		end
-		local cf = cam.CFrame
-		local look3 = cf.LookVector
-		local cur = Vector3.new(look3.X, 0, look3.Z)
-		if cur.Magnitude < 0.01 then
+		local move = if M.face then M.dir else M.head
+		-- Wall / invisible barrier: the body runs under 20 % of the game's commanded speed for 0.3 s while the input is
+		-- held -> the 3 cells ahead become barrier cells (map file) and the body slides along the wall (tangent toward
+		-- the wanted direction, the side with free cells) for 0.7 s, camera unchanged.
+		local now = os.clock()
+		local char = root.Parent
+		local blocked = char and (char:GetAttribute("MovementBlockReason") ~= nil or char:GetAttribute("MovementLocked") == true)
+		if not blocked and M.since and now - M.since > 0.5 and now > M.slideUntil then
+			local cmd = char and tonumber(char:GetAttribute("MovementSpeed")) or 0
+			if speed < 0.2 * math.max(cmd, 12) then
+				M.slowSince = M.slowSince or now
+				if now - M.slowSince > 0.3 then
+					M.slowSince = nil
+					N.navStuck(root.Position, move)
+					local right = Vector3.new(-move.Z, 0, move.X)
+					local function sideScore(t)
+						local g = N.navGrid()
+						local free = if g then (if N.navFree(g, N.flat(root.Position) + t * 8) then 1 else 0) else 1
+						return free * 2 + t:Dot(M.dir)
+					end
+					M.slideDir = if sideScore(right) >= sideScore(-right) then right else -right
+					M.slideUntil = now + 0.7
+					M.slides = (M.slides or 0) + 1
+					log("NAV slide", if M.slideDir == right then "right" else "left", string.format("at=(%.0f,%.0f)", root.Position.X, root.Position.Z))
+				end
+			else
+				M.slowSince = nil
+			end
+		end
+		if now < M.slideUntil and M.slideDir then
+			move = N.unit(M.slideDir + move * 0.3)
+		end
+		M.moveDir = move
+		if M.method == "humanoid" then
+			M.humanoidDir = move
 			return
 		end
-		cur = cur.Unit
-		-- Does the camera keep what we wrote last frame? (log once: CAM write=ok|ignored)
-		if M.camSet and M.camChecks < 30 then
-			M.camChecks += 1
-			if cur:Dot(M.camSet) > 0.996 then
-				M.camKept += 1
-			end
-			if M.camChecks == 30 then
-				log("CAM write=" .. (if M.camKept >= 20 then "ok" else "ignored"), "kept " .. M.camKept .. "/30 frames")
-			end
+		local pick
+		if M.face or now < M.slideUntil then
+			local _, p = N.keysFor(move, M.oct, M.head)
+			pick = p
+		else
+			pick = 0
 		end
-		local new = N.camTurn(cur, M.dir, math.clamp(dt or 1 / 60, 0, 0.1), M.urgent)
-		local pitch = math.clamp(look3.Y, -0.6, 0.2)
-		local look = new * math.sqrt(1 - pitch * pitch) + Vector3.new(0, pitch, 0)
-		local focus = root.Position + Vector3.new(0, 1.5, 0)
-		pcall(function()
-			local f = cam.Focus
-			if f and f.Position and (f.Position - focus).Magnitude < 8 then
-				focus = f.Position
-			end
-		end)
-		local dist = math.clamp((cf.Position - focus).Magnitude, 6, 18)
-		pcall(function()
-			cam.CFrame = CFrame.lookAt(focus - look * dist, focus)
-		end)
-		M.camSet = new
-		applyKeys()
-		if os.clock() - M.camLogAt > 20 then
-			M.camLogAt = os.clock()
-			log("CAM aim", string.format("heading=%.0f", math.deg(math.atan2(M.dir.X, -M.dir.Z)) % 360), "target=" .. tostring(M.label or "-"))
+		if os.clock() < M.jukeUntil then
+			pick = (pick + M.jukeSide) % 8
 		end
+		holdOctant(pick)
 	end
+	N.moveFrame = frame
 	-- Before the game's camera module (RenderPriority.Camera) reads the camera CFrame; Heartbeat where BindToRenderStep
 	-- is missing.
 	local bound = pcall(function()
-		RunService:BindToRenderStep("CorvusHussAim", Enum.RenderPriority.Camera.Value - 2, camStep)
+		RunService:BindToRenderStep("CorvusHussAim", Enum.RenderPriority.Camera.Value - 2, frame)
 	end)
 	if not bound then
-		Library:GiveSignal(RunService.Heartbeat:Connect(camStep))
+		Library:GiveSignal(RunService.Heartbeat:Connect(frame))
 	end
 	-- Fallback driver: Humanoid:Move every frame with the steering direction.
 	Library:GiveSignal(RunService.Heartbeat:Connect(function()
@@ -33267,7 +33567,7 @@ do
 			-- Input accepted, the body is blocked: a wall or a crowd in front.
 			M.fails = 0
 			if N.navBlocked then
-				N.navBlocked(pos, M.dir)
+				N.navBlocked(pos, M.moveDir or M.dir)
 			end
 			return
 		end
@@ -33279,7 +33579,6 @@ do
 				log("MOVE probe keys=fail", string.format("moved %.1f", moved), "-> humanoid")
 				N.releaseKeys()
 				M.method = "humanoid"
-				M.humanoidDir = M.dir
 			else
 				logProblem("Movement input is not accepted (keys and Humanoid:Move), trying keys again in 60 s")
 				M.method = "keys"
@@ -33292,6 +33591,7 @@ end
 -- from catchers (their position 0.35 s ahead) and the field edges, taking gems that are near the route, and taps the
 -- game's dash key (Space) when a catcher is about to reach it.
 N.Run = { key = nil, goalZ = nil, last = "", dashAt = -1e9, gem = nil }
+N.Gem = { risk = 0, matches = 0, total = 0 }
 N.GemLayout = { token = nil, points = {}, at = -1e9, collected = {}, collectedDist = {} }
 N.onEvent("Collectibles.GemEvent", function(kind, data)
 	if kind == "Layout" and type(data) == "table" then
@@ -33315,6 +33615,7 @@ N.onEvent("Collectibles.GemEvent", function(kind, data)
 			N.GemLayout.collected[data.id] = os.clock()
 			Session.gems += tonumber(data.amount) or 1
 			Session.gemPiles += 1
+			log("GEM pick", "n=" .. Session.gemPiles, "value=" .. tostring(data.amount or 1), string.format("risk=%.2f", N.Gem.risk or 0))
 		end
 	elseif kind == "Clear" then
 		if data == nil or data == N.GemLayout.token then
@@ -33326,10 +33627,10 @@ function N.threats(pos)
 	local list = {}
 	for _, p in ipairs(N.participants()) do
 		if p.root and p.attr("GameRole") == "Catcher" and p.attr("RunState") == "Active" then
-			local tpos = N.flat(p.root.Position)
-			local vel = N.velocity(p.root)
+			local tpos = N.L(p.root.Position)
+			local vel = N.Ld(N.velocity(p.root))
 			local ahead = tpos + vel * 0.35
-			table.insert(list, { p = p, pos = tpos, vel = vel, ahead = ahead, dist = (ahead - N.flat(pos)).Magnitude })
+			table.insert(list, { p = p, pos = tpos, vel = vel, ahead = ahead, dist = (ahead - N.L(pos)).Magnitude })
 		end
 	end
 	table.sort(list, function(a, b)
@@ -33425,7 +33726,7 @@ do
 		if cur then
 			local p = N.GemLayout.points[cur.id]
 			local got = N.GemLayout.collected[cur.id] ~= nil
-			local d = if p then (N.flat(p.position) - here).Magnitude else cur.minD
+			local d = if p then (N.L(p.position) - here).Magnitude else cur.minD
 			cur.minD = math.min(cur.minD, d, if got then N.GemLayout.collectedDist[cur.id] or cur.minD else cur.minD)
 			local passed = got or d > cur.minD + 2.5 or os.clock() - cur.at > 6 or N.GemLayout.token ~= cur.token
 			if passed then
@@ -33463,7 +33764,7 @@ do
 		return gp + N.unit(off) * r
 	end
 	function N.gemAim(gem, here, goal)
-		local gp = N.flat(gem.position)
+		local gp = N.L(gem.position)
 		if gem.probeOffset then
 			local side = if here.X >= gp.X then 1 else -1
 			return gp + Vector3.new(side * gem.probeOffset, 0, 0)
@@ -33474,7 +33775,8 @@ end
 -- The best gem on the way: ahead of the player (toward the goal line), the extra path at most the detour limit, no
 -- catcher within 20 studs of it.
 function N.pickGem(pos, goal, threats)
-	if not N.wants("AutoCollect") then
+	-- Owner 2026-10-07: gems are the player's own toggle; the Smart Planner plays only to win and never detours.
+	if not on("AutoCollect") then
 		return nil
 	end
 	local limit = N.gemDetour()
@@ -33482,10 +33784,10 @@ function N.pickGem(pos, goal, threats)
 		return nil
 	end
 	local best, bestScore
-	local here = N.flat(pos)
+	local here = N.L(pos)
 	local direct = (goal - here).Magnitude
 	for _, g in pairs(N.GemLayout.points) do
-		local gp = N.flat(g.position)
+		local gp = N.L(g.position)
 		local toward = (goal.Z - here.Z) * (gp.Z - here.Z)
 		if toward > 0 or (gp - here).Magnitude < 4 then
 			local ap = N.gemAimPoint(gp, here, goal)
@@ -33524,7 +33826,8 @@ function N.pickGem(pos, goal, threats)
 end
 function N.runnerStep()
 	local pos = N.myPos()
-	if not pos then
+	local root = N.root()
+	if not pos or not root then
 		return "Waiting for the character"
 	end
 	local F = N.readField()
@@ -33533,136 +33836,116 @@ function N.runnerStep()
 	if R.key ~= key then
 		R.key = key
 		-- Goal: the safe line on the other side from where this run starts.
-		R.goalZ = F.zc + (if pos.Z >= F.zc then -(F.lineZ + 6) else F.lineZ + 6)
+		-- Goal: inside the other safe zone (its first third), not against the map's back wall.
+		local into = math.clamp(F.depth * 0.35, 3, 8)
+		R.goalZ = F.zc + (if N.L(pos).Z >= F.zc then -(F.lineZ + into) else F.lineZ + into)
 		R.startedAt = os.clock()
 		R.gem = nil
-		-- Tactic (measured per map): "wait" = wait behind the line for an opening, "go" = best lane at once.
+		R.lane = nil
+		R.going = false
+		R.maxP = 0
+		R.minMargin = 99
+		R.hunters = 0
+		R.goAt = nil
+		-- Start rule (measured per map): "bold" = go once the best lane is even (escape odds >= 50 %), "patient" = wait
+		-- for a clear gap (>= 80 %). Both wait while every lane is losing, until the run clock (Session EndsAt,
+		-- GameConfig RunTime 30 / HeroTime 20) only leaves the crossing time + 3 s.
 		local why
-		if on("WaitOpening") or N.planner() then
-			R.tactic, why = N.tactPick("Runner", { "go", "wait" })
+		if N.phase() == "HeroRun" then
+			-- Alone against every catcher: no crowd to open a gap, waiting only shortens the clock.
+			R.tactic, why = "now", "hero run"
+		elseif on("WaitOpening") or N.planner() then
+			R.tactic, why = N.tactPick("Runner", { "bold", "patient" })
 		else
-			R.tactic, why = "go", "option"
+			R.tactic, why = "now", "option"
 		end
-		log("RUN start", "run", N.sattr("RunNumber"), N.phase(), string.format("from z=%.0f to z=%.0f", pos.Z, R.goalZ), "tactic=" .. R.tactic, "(" .. why .. ")")
+		log("RUN start", "run", N.sattr("RunNumber"), N.phase(), string.format("from z=%.0f to z=%.0f", N.L(pos).Z, R.goalZ), "tactic=" .. R.tactic, "(" .. why .. ")")
 	end
-	local here = N.flat(pos)
-	local threats = N.threats(pos)
-	local forward = Vector3.new(0, 0, if R.goalZ > pos.Z then 1 else -1)
 	N.oppTick()
-	-- Lane: the goal point on the line whose straight path passes farthest from the catchers still ahead.
-	local ahead = {}
-	for _, t in ipairs(threats) do
-		if (t.ahead - here):Dot(forward) > -4 then
-			table.insert(ahead, t)
+	N.navSense()
+	local here = N.L(pos)
+	local hunters = N.hunters()
+	local speed = N.velocity(root).Magnitude
+	local head = N.Ld(N.Move.head or N.camLook())
+	-- The other runners on the field (catchers split their attention between them).
+	local others = {}
+	for _, p in ipairs(N.participants()) do
+		if p.root and p.attr("GameRole") == "Runner" and p.attr("RunState") == "Active" and math.abs(N.fz(p.root.Position)) < F.lineZ then
+			table.insert(others, N.L(p.root.Position))
 		end
 	end
-	-- Lane score: along the straight path to the lane's point on the line, the smallest time margin between the player
-	-- reaching a point and the closest catcher reaching it (catcher speed = its max speed). Higher = safer.
-	local mySpeed = N.runnerSpeed()
-	local catcherSpeed = (N.G.Movement.MaxSpeed or 33.6) * (N.G.Movement.CatcherSpeedMultiplier or 1.1)
-	local function laneMargin(target)
-		local margin = 10
-		if #ahead == 0 then
-			return margin
+	local plan = N.runnerPlan({ pos = here, head = head, speed = speed, maxSpeed = N.runnerSpeed(), hunters = hunters, others = others, F = F, goalZ = R.goalZ, lane = R.lane, grid = N.navGrid() })
+	local forward = Vector3.new(0, 0, if R.goalZ > here.Z then 1 else -1)
+	local inStart = math.abs(here.Z - F.zc) > F.lineZ + 0.5 and (here.Z - F.zc) * (R.goalZ - F.zc) < 0
+	if inStart and not R.going then
+		local endsAt = N.sattr("EndsAt")
+		local left = if type(endsAt) == "number" then endsAt - N.serverTime() else 30 - (os.clock() - R.startedAt)
+		local need = if R.tactic == "patient" then 0.8 elseif R.tactic == "bold" then 0.5 else 0
+		local why = nil
+		local waited = os.clock() - R.startedAt
+		R.maxP = math.max(R.maxP or 0, plan.P)
+		if plan.P >= need then
+			why = string.format("odds %.0f%%", plan.P * 100)
+		elseif waited > 2 and plan.P >= 0.35 and plan.P < R.maxP - 0.12 then
+			-- The best window of this wait is closing: take what is left of it.
+			why = string.format("window closing (odds %.0f%%, best was %.0f%%)", plan.P * 100, R.maxP * 100)
+		elseif waited > 6 and plan.P >= 0.4 then
+			why = string.format("waited %.0fs, odds %.0f%%", waited, plan.P * 100)
+		elseif left < plan.eta + 3 then
+			why = string.format("clock %.0fs left", left)
 		end
-		local path = target - here
-		local len = path.Magnitude
-		local steps = math.max(math.floor(len / 12), 1)
-		for i = 1, steps do
-			local p = here + path * (i / steps)
-			if math.abs(p.Z - F.zc) < F.lineZ then
-				local tMe = (p - here).Magnitude / mySpeed
-				for _, t in ipairs(ahead) do
-					local to = p - t.pos
-					local tThem = math.max(to.Magnitude - 3.5, 0) / catcherSpeed
-					-- A catcher running the other way first has to turn and brake (about 0.6 s for a full turn).
-					if t.vel.Magnitude > 3 and to.Magnitude > 0.1 then
-						tThem += (1 - N.unit(t.vel):Dot(to / to.Magnitude)) / 2 * 0.6
-					end
-					margin = math.min(margin, tThem - tMe)
-				end
+		if why then
+			R.going = true
+			R.goAt = os.clock()
+			log("RUN go", "lane=" .. math.floor(plan.lane), string.format("odds=%.0f%% margin=%.2f", plan.P * 100, math.min(plan.margin, 9.99)), "after " .. string.format("%.1fs", os.clock() - R.startedAt), why)
+		else
+			-- Safe behind the line: face the field and side-step toward the best lane (no turning on the spot).
+			R.lane = plan.lane
+			local dx = plan.lane - here.X
+			if math.abs(dx) > 6 then
+				N.steer(N.Wd(Vector3.new(dx, 0, 0)), false, "opening", false, N.Wd(forward))
+			else
+				N.steer(N.Wd(forward), false, "opening", true)
 			end
+			N.Rec.action = "wait"
+			return string.format("Waiting behind the line for a gap (best lane %.0f%% safe, %.0fs left)", plan.P * 100, left)
 		end
-		return margin
 	end
-	local bestX, bestScore = math.clamp(pos.X, F.xMin + 10, F.xMax - 10), nil
-	local x = F.xMin + 10
-	while x <= F.xMax - 10 do
-		local score = laneMargin(Vector3.new(x, 0, R.goalZ)) - math.abs(x - pos.X) * 0.004
-		if R.laneX and math.abs(x - R.laneX) < 7 then
-			score += 0.25
-		end
-		if not bestScore or score > bestScore then
-			bestX, bestScore = x, score
-		end
-		x += 6
+	if R.lane == nil or plan.switched then
+		N.Steer.lanes += 1
 	end
-	R.laneX = bestX
-	R.margin = bestScore
-	-- Still behind the start line (safe) and every lane runs into a catcher: wait for the catchers to commit to other
-	-- runners, up to 16 s of the 30 s run (a crossing takes about 7 s).
-	local inStart = math.abs(pos.Z - F.zc) > F.lineZ + 0.5 and (pos.Z - F.zc) * (R.goalZ - F.zc) < 0
-	if R.tactic == "wait" and inStart and bestScore < -0.4 and os.clock() - R.startedAt < 16 then
-		-- Never frozen: shuffle along the line toward the best lane (a standing runner is an easy read).
-		local side = bestX - pos.X
-		if math.abs(side) < 6 then
-			side = if math.floor(os.clock() / 1.5) % 2 == 0 then 8 else -8
-		end
-		N.steer(Vector3.new(side, 0, 0), false, "opening")
-		return string.format("Waiting behind the line for an opening (best lane margin %.1f s)", bestScore)
+	R.lane = plan.lane
+	if math.abs(here.Z - F.zc) < F.lineZ then
+		R.minMargin = math.min(R.minMargin or 99, plan.margin)
 	end
-	local goal = Vector3.new(bestX, 0, R.goalZ)
-	local gem = N.pickGem(pos, goal, threats)
+	R.hunters = math.max(R.hunters or 0, #hunters)
+	N.Gem.risk = 1 - plan.P
+	local goal = plan.target
+	local threats = N.threats(pos)
+	local gem = if plan.margin > 1 then N.pickGem(pos, goal, threats) else nil
 	local aim = if gem then N.gemAim(gem, here, goal) else goal
 	if gem and R.gem ~= gem.id then
 		R.gem = gem.id
 	end
 	N.gemProbeTrack(here, gem)
-	-- Around obstacles (Barn hay, Hometown fountain): grid path with the catchers' danger as extra cost.
-	local navVec = N.navDir(here, aim, function(c)
+	-- Around obstacles (Barn hay, Hometown fountain): grid path with the catchers' reach as extra cost.
+	local dir = N.navDir(N.flat(pos), N.W(aim), function(c)
 		local extra = 0
-		for _, t in ipairs(ahead) do
-			local d = (c - t.ahead).Magnitude
+		local lc = N.L(c)
+		for _, h in ipairs(hunters) do
+			local d = (lc - h.pos).Magnitude
 			if d < 24 then
 				extra += (24 - d) * 1.5
 			end
 		end
 		return extra
 	end)
-	local dir = N.unit(navVec)
-	local push = Vector3.new(0, 0, 0)
-	local nearest = threats[1]
-	-- Close catchers: sidestep (the push is mostly sideways, so the run keeps its pace toward the line).
-	for _, t in ipairs(threats) do
-		local away = here - t.ahead
-		local d = away.Magnitude
-		if d < 32 and d > 0.01 then
-			local lateral = away - forward * away:Dot(forward)
-			if lateral.Magnitude < 0.5 then
-				-- Head-on: break toward the open side (more field), never into the side line.
-				lateral = Vector3.new(if pos.X < (F.xMin + F.xMax) / 2 then 1 else -1, 0, 0)
-			end
-			local w = ((32 - d) / 32) ^ 2 * 3
-			push += N.unit(lateral) * w
-			if away:Dot(forward) > 0 then
-				-- Behind: run on, a little extra forward.
-				push += forward * w * 0.5
-			end
-		end
-	end
-	if pos.X < F.xMin + 10 then
-		push += Vector3.new((F.xMin + 10 - pos.X) / 4, 0, 0)
-	elseif pos.X > F.xMax - 10 then
-		push -= Vector3.new((pos.X - (F.xMax - 10)) / 4, 0, 0)
-	end
-	local steerDir = dir + push
-	if steerDir:Dot(forward) < 0.2 then
-		steerDir += forward * (0.2 - steerDir:Dot(forward))
-	end
-	N.steer(steerDir, nearest ~= nil and nearest.dist < 10, "line z=" .. math.floor(R.goalZ))
-	local text = string.format("Escaping to z=%.0f (%.0f studs left)", R.goalZ, math.abs(R.goalZ - pos.Z))
-	if nearest then
-		text ..= string.format(", catcher %.0f studs", nearest.dist)
+	N.steer(dir, plan.urgent, "lane x=" .. math.floor(plan.lane))
+	N.Rec.action = string.format("lane %d p%.0f", math.floor(plan.lane), plan.P * 100)
+	N.steerLog(plan, N.Move.head)
+	local text = string.format("Escaping to z=%.0f (%.0f studs left), lane %.0f%% safe", R.goalZ, math.abs(R.goalZ - here.Z), plan.P * 100)
+	if threats[1] then
+		text ..= string.format(", catcher %.0f studs", threats[1].dist)
 	end
 	if gem then
 		text ..= ", gem +" .. gem.amount
@@ -33756,6 +34039,7 @@ function N.dodgeStep()
 		return
 	end
 	local here = N.flat(pos)
+	N.oppTick()
 	local C = N.G.Contact
 	local reach = C.ReachDistance or 12
 	local cosHalf = math.cos(math.rad(C.ReachHalfAngle or 75))
@@ -33763,14 +34047,15 @@ function N.dodgeStep()
 	local serverNow = N.serverTime()
 	for _, p in ipairs(N.participants()) do
 		if p.root and p.attr("GameRole") == "Catcher" and p.attr("RunState") == "Active" then
-			local cpos = N.flat(p.root.Position)
+			-- Where he is NOW (drawn ~ping late) plus our input delay: the dash starts early by the latency.
+			local cpos, cvel = N.oppAhead(p)
 			local to = here - cpos
 			local d = to.Magnitude
 			local look = N.flat(p.root.CFrame.LookVector)
 			if d <= reach and d > 0.01 and look.Magnitude > 0.01 and N.unit(look):Dot(to / d) >= cosHalf then
 				local cchar = p.root.Parent
 				local reachAt = cchar and cchar:GetAttribute("ReachStartedAt")
-				local closing = math.max(N.velocity(p.root):Dot(to / d), 0)
+				local closing = math.max(cvel:Dot(to / d), 0)
 				local why = nil
 				if type(reachAt) == "number" then
 					D.sawReach = true
@@ -33788,12 +34073,15 @@ function N.dodgeStep()
 				if why then
 					-- Juke: while the hub steers, turn 60+ degrees off the catcher's line the same frame (the game's
 					-- "Redirect" dash needs a >= 35 deg input change).
-					if N.Move.dir then
+					-- Juke: 45 degree side input away from his facing for 0.3 s (keys only, the heading and the camera
+					-- stay; the game's Redirect dash needs a >= 35 deg input change).
+					if N.Move.dir and N.Move.head then
 						local side = Vector3.new(-look.Z, 0, look.X)
 						if side:Dot(to) < 0 then
 							side = -side
 						end
-						N.steer(N.unit(side) + N.Move.dir * 0.4, true, "juke")
+						local h = N.Move.head
+						N.juke(side:Dot(Vector3.new(-h.Z, 0, h.X)))
 					end
 					if N.dash() then
 						D.dashAt = now
@@ -33816,7 +34104,7 @@ end
 -- meeting point lies past his goal line (he is safe before we arrive). The current target is kept unless another one
 -- is clearly better; a target whose distance does not shrink for 3.5 s is dropped for 5 s (unreachable).
 -- No runner on the field: guard the middle of the field in front of the runners' start side (never idle).
-N.Catch = { meleeAt = -1e9, diveAt = -1e9, target = nil, pending = {}, hits = 0, misses = 0, banned = {}, chase = nil, logAt = -1e9, tactic = nil }
+N.Catch = { dives = {}, diveHits = 0, diveMisses = 0, meleeAt = -1e9, diveAt = -1e9, target = nil, pending = {}, hits = 0, misses = 0, banned = {}, chase = nil, logAt = -1e9, tactic = nil }
 N.onEvent("Game.MeleeEvent", function(id, accepted, reason)
 	local p = N.Catch.pending[id]
 	if p then
@@ -33881,6 +34169,25 @@ function N.meleeGap()
 	local c = N.G.Contact
 	return (c.Windup or 0.12) + (c.ActiveDuration or 0.18) + (c.Recovery or 0.55)
 end
+-- Dive geometry (pure): our dive covers DiveTravel studs along our facing in 0.4 s; hit when the runner's predicted
+-- spot at the end lies within reach of that line.
+N.DiveTravel = 7 * 1.2 * 1.45
+function N.diveCheck(here, look, speed, tpos, tvel, style)
+	if style ~= "straight" then
+		return false, "juker"
+	end
+	if speed < N.catcherSpeed() * 0.8 then
+		return false, "slow"
+	end
+	local pred = tpos + tvel * 0.4
+	local rel = pred - here
+	local along = rel:Dot(look)
+	local side = (rel - look * along).Magnitude
+	if along > 0 and along <= N.DiveTravel + 5 and side <= 4 then
+		return true, string.format("pred=%.1f side=%.1f", along, side)
+	end
+	return false, "off line"
+end
 function N.catcherSpeed()
 	return (N.G.Movement.MaxSpeed or 33.6) * (N.G.Movement.CatcherSpeedMultiplier or 1.1)
 end
@@ -33917,16 +34224,16 @@ function N.pickRunner(here, look, F, now)
 	local catchers = {}
 	for _, p in ipairs(N.participants()) do
 		if p.root and p.attr("GameRole") == "Catcher" and p.attr("RunState") == "Active" then
-			table.insert(catchers, N.flat(p.root.Position))
+			table.insert(catchers, N.L(p.root.Position))
 		end
 	end
 	local best, bestScore, cur
 	for _, p in ipairs(N.participants()) do
 		if p.root and p.attr("GameRole") == "Runner" and p.attr("RunState") == "Active" and (C.banned[p.name] or 0) < now then
-			local tpos = p.root.Position
+			local ahead, avel = N.oppAhead(p)
+			local tpos = N.L(ahead)
 			if math.abs(tpos.Z - F.zc) < F.lineZ - 0.5 then
-				local rec = N.oppOf(p.name)
-				local tvel = if rec then rec.vel else N.velocity(p.root)
+				local tvel = N.Ld(avel)
 				local style = N.oppStyle(p.name)
 				local meet, t, reachable = N.meetPoint(here, tpos, tvel, speed, style, C.tactic, F)
 				local rel = N.flat(tpos) - here
@@ -33939,11 +34246,16 @@ function N.pickRunner(here, look, F, now)
 				if edge < 12 then
 					score -= 0.3
 				end
-				-- Another catcher is closer to him: leave him to that one.
+				-- No stacking: another catcher meets him clearly sooner -> leave him to that one (his own intercept time
+				-- with the same model); one who meets him about as soon -> the two cover him, small penalty.
+				local ourT = t
 				for _, c in ipairs(catchers) do
-					if (c - N.flat(tpos)).Magnitude < rel.Magnitude - 4 then
-						score += 0.6
+					local ct = N.interceptTime(N.flat(tpos) - c, tvel, speed) or ((c - N.flat(tpos)).Magnitude / speed + 1)
+					if ct < ourT - 0.3 then
+						score += 1.5
 						break
+					elseif ct < ourT + 0.3 then
+						score += 0.3
 					end
 				end
 				if C.target == p.name then
@@ -33965,6 +34277,20 @@ end
 function N.strikeStep()
 	local C = N.Catch
 	local now = os.clock()
+	-- Dive results: hit when the runner is caught within 0.9 s.
+	for name, dv in pairs(C.dives) do
+		local caught = dv.who and dv.who.attr("RunState") == "Caught"
+		if caught or now - dv.at > 0.9 then
+			C.dives[name] = nil
+			if caught then
+				C.diveHits += 1
+				C.hits += 1
+			else
+				C.diveMisses += 1
+			end
+			log("CATCH result=" .. (if caught then "hit" else "miss"), "choice=jump", string.format("dist=%.1f", dv.dist), "target=" .. name)
+		end
+	end
 	-- Results: a claim is a HIT when its runner is caught within 0.7 s, else a MISS.
 	for id, p in pairs(C.pending) do
 		local caught = p.who and p.who.attr("RunState") == "Caught"
@@ -33975,7 +34301,15 @@ function N.strikeStep()
 				log("STAB hit", string.format("dist=%.1f", p.dist), "target=" .. p.name)
 			else
 				C.misses += 1
-				log("STAB miss", string.format("dist=%.1f", p.dist), "target=" .. p.name, "accepted=" .. tostring(p.accepted), "reason=" .. tostring(p.reason or "-"))
+				local reason = p.reason
+				if type(reason) == "table" then
+					local parts = {}
+					for k, v in pairs(reason) do
+						table.insert(parts, tostring(k) .. ":" .. tostring(v))
+					end
+					reason = table.concat(parts, ",")
+				end
+				log("STAB miss", string.format("dist=%.1f", p.dist), "target=" .. p.name, "accepted=" .. tostring(p.accepted), "reason=" .. tostring(reason or "-"))
 			end
 		end
 	end
@@ -33992,11 +34326,17 @@ function N.strikeStep()
 	local F = N.readField()
 	local bestP, bestD
 	for _, p in ipairs(N.participants()) do
-		if p.root and p.attr("GameRole") == "Runner" and p.attr("RunState") == "Active" and math.abs(p.root.Position.Z - F.zc) < F.lineZ - 0.5 then
+		if p.root and p.attr("GameRole") == "Runner" and p.attr("RunState") == "Active" and math.abs(N.fz(p.root.Position)) < F.lineZ - 0.5 then
 			local tpos = p.root.Position
 			if N.inReach(pos, look, tpos, myVel, N.velocity(p.root)) then
 				local d = (N.flat(tpos) - N.flat(pos)).Magnitude
-				if not bestD or d < bestD then
+				-- Live evidence (build 4c1db3d, 11 of 15 stabs missed at 6-9.5 studs although the server accepted the
+				-- swing): the hit is decided when the blade is out (windup 0.12 + active 0.18 s), so the runner must
+				-- still be close THEN. Both bodies are extrapolated by lead + 0.2 s; stab only inside 5 studs.
+				local ahead = N.oppAhead(p, 0.2)
+				local mine = N.flat(pos) + N.flat(myVel) * (N.lead() + 0.2)
+				local later = (ahead - mine).Magnitude
+				if later <= 5 and (not bestD or d < bestD) then
 					bestP, bestD = p, d
 				end
 			end
@@ -34010,7 +34350,7 @@ function N.strikeStep()
 	C.pending[id] = { at = now, dist = bestD, name = bestP.name, who = bestP }
 	if send("Game.MeleeEvent", { id = id, at = N.serverTime(), direction = look, position = pos }) then
 		Session.melee += 1
-		log(if N.wants("AutoCatch") then "CATCH melee" else "HELP stab", bestP.name, string.format("%.1f studs", bestD))
+		log(if N.wants("AutoCatch") then "CATCH choice=stab" else "HELP stab", bestP.name, string.format("dist=%.1f", bestD), "straight=" .. tostring(N.oppStyle(bestP.name) == "straight"))
 		return true
 	end
 	C.pending[id] = nil
@@ -34025,9 +34365,10 @@ function N.catcherStep()
 	local C = N.Catch
 	local now = os.clock()
 	local pos = root.Position
-	local here = N.flat(pos)
 	local F = N.readField()
-	local look = N.lookOf(root)
+	local here = N.L(pos)
+	local look = N.Ld(N.lookOf(root))
+	N.navSense()
 	local runKey = tostring(N.Match.startedAt) .. ":" .. tostring(N.sattr("RunNumber")) .. ":" .. N.phase()
 	if C.runKey ~= runKey then
 		C.runKey = runKey
@@ -34046,7 +34387,7 @@ function N.catcherStep()
 		local sumX, n, side = 0, 0, 0
 		for _, p in ipairs(N.participants()) do
 			if p.root and p.attr("GameRole") == "Runner" and p.attr("RunState") == "Active" then
-				local rp = p.root.Position
+				local rp = N.L(p.root.Position)
 				sumX += rp.X
 				n += 1
 				side += if rp.Z >= F.zc then 1 else -1
@@ -34058,11 +34399,12 @@ function N.catcherStep()
 		end
 		local spot = Vector3.new(math.clamp(sumX / n, F.xMin + 10, F.xMax - 10), 0, F.zc + (if side >= 0 then 1 else -1) * F.lineZ * 0.3)
 		if (spot - here).Magnitude > 4 then
-			N.steer(N.navDir(here, spot), false, "guard")
+			N.steer(N.navDir(N.flat(pos), N.W(spot)), false, "guard")
 		else
 			-- At the spot: face the runners' line so the first stab is ready.
-			N.steer(Vector3.new(0, 0, if side >= 0 then 1 else -1), false, "guard", true)
+			N.steer(N.Wd(Vector3.new(0, 0, if side >= 0 then 1 else -1)), false, "guard", true)
 		end
+		N.Rec.action = "guard"
 		return string.format("Catcher: guarding the middle (%d runners waiting)", n)
 	end
 	-- Unreachable check: distance must shrink by 3 studs within 3.5 s.
@@ -34084,27 +34426,33 @@ function N.catcherStep()
 	local urgent = pick.d < 14
 	if pick.d < 14 then
 		-- Final approach: straight at him (a short lead), so the body (= camera under shift lock) faces him for the stab.
-		aim = N.flat(tpos) + pick.tvel * math.clamp(pick.d / 60, 0.05, 0.2)
+		aim = tpos + pick.tvel * math.clamp(pick.d / 60, 0.05, 0.2)
 	else
 		aim = pick.meet
 	end
-	N.steer(N.navDir(here, aim), urgent, pick.p.name)
+	N.steer(N.navDir(N.flat(pos), N.W(aim)), urgent, pick.p.name)
+	N.Rec.action = "chase " .. string.sub(pick.p.name, 1, 10)
 	if now - C.logAt > 2 then
 		C.logAt = now
 		log("CHASE", "target=" .. pick.p.name, string.format("dist=%.1f predicted=(%.0f,%.0f) t=%.2f", pick.d, pick.meet.X, pick.meet.Z, pick.t), "style=" .. pick.style, "tact=" .. tostring(C.tactic), if pick.reachable then "" else "unreachable")
 	end
 	N.strikeStep()
-	local myVel = N.velocity(root)
+	local myVel = N.Ld(N.velocity(root))
 	local d = pick.d
-	if on("CatchDive") and N.canMelee() and now - C.diveAt > 1.25 and now - C.meleeAt > 0.5 and d > 5 and d < 11 then
+	-- Stab or dive (CoHTackle: Space / E, TackleInputClient 59872; GameConfig.Tackle: 0.4 s, cooldown 1.1 s, Long Dive
+	-- at >= 80 % speed travels 7 x 1.2 x 1.45 studs with a 5.5 stud reach, MaxDistance 15). The stab (strikeStep) wins
+	-- whenever the runner is inside its reach. The dive only when he is beyond it, runs STRAIGHT (opponent model) and
+	-- his predicted spot at the end of the dive (0.4 s) lies on our dive line: a sure catch at range instead of a
+	-- wasted cooldown.
+	if (on("CatchDive") or N.planner()) and N.canMelee() and now - C.diveAt > 1.25 and now - C.meleeAt > 0.5 and d > 5 and d < 16 then
 		local speed = myVel.Magnitude
-		-- Dive only when the runner will still be in front at the end of the dive (his predicted spot 0.3 s ahead).
-		local ahead = N.flat(tpos) + pick.tvel * 0.3
-		if speed >= N.catcherSpeed() * 0.75 and look:Dot(N.unit(ahead - here)) > 0.96 and (ahead - here).Magnitude < 11 then
+		local ok, why = N.diveCheck(here, look, speed, tpos, pick.tvel, pick.style)
+		if ok then
 			C.diveAt = now
 			if N.tapKey("E") then
 				Session.dives += 1
-				log("CATCH dive", pick.p.name, string.format("%.1f studs, speed %.0f", d, speed))
+				C.dives[pick.p.name] = { at = now, dist = d, who = pick.p, name = pick.p.name }
+				log("CATCH choice=jump", pick.p.name, string.format("dist=%.1f speed=%.0f", d, speed), "straight=" .. tostring(pick.style == "straight"), why)
 			end
 		end
 	end
@@ -34228,6 +34576,23 @@ N.onEvent("Presentation.MovementGuardEvent", function(kind, data)
 end)
 -- Match tracking: MATCH lines with the role history and the XP/coins/gems the match paid (ECON measures coins per XP).
 N.Match = { active = false, startedAt = 0, xp = 0, coins = 0, gems = 0, catches = 0, roles = {}, lastRunState = nil, lastRole = nil, endedAt = -1e9, econAsk = nil }
+-- One line per crossing (survival is the objective): result, the worst safety margin seen on the field, the most
+-- catchers at once, the start rule and how long we waited.
+function N.roundLog(result)
+	local R = N.Run
+	if not R.key then
+		return
+	end
+	local F = N.readField()
+	log("ROUND", "result=" .. result, string.format("min_margin=%.2f", math.min(R.minMargin or 99, 9.99)), "hunters=" .. tostring(R.hunters or 0), "tactic=" .. tostring(R.tactic), "map=" .. tostring(F.mapId), string.format("waited=%.1fs", if R.goAt then R.goAt - (R.startedAt or R.goAt) else 0))
+	local st = N.Match.rounds
+	if st then
+		st.n += 1
+		if result == "survived" then
+			st.ok += 1
+		end
+	end
+end
 function N.catchRunEnd()
 	local r = N.Match.catchRun
 	if not r then
@@ -34235,6 +34600,10 @@ function N.catchRunEnd()
 	end
 	N.Match.catchRun = nil
 	local got = N.Catch.hits - r.hits
+	if os.clock() - r.at < 2 then
+		-- A phase blip, not a run.
+		return
+	end
 	N.tactRecord("Catcher", r.tactic, got, string.format("time=%.0fs", os.clock() - r.at))
 end
 N.Econ = { coinPerXp = nil, samples = 0, xpPerMatch = nil, matchSeconds = nil, choice = { Hero = { n = 0, xp = 0 }, Chicken = { n = 0, xp = 0 } } }
@@ -34248,6 +34617,8 @@ function N.matchTick()
 		M.roles = {}
 		M.lastRunState, M.lastRole = nil, nil
 		M.hits0, M.miss0, M.esc0, M.caught0 = N.Catch.hits, N.Catch.misses, Session.escapes, Session.caught
+		M.rounds = { n = 0, ok = 0 }
+		M.gems0 = Session.gems
 		N.navEnsure()
 		log("MATCH start", "role", N.role(), "phase", N.phase(), "map", N.readField().mapId)
 	elseif not inMatch and M.active then
@@ -34259,6 +34630,14 @@ function N.matchTick()
 			Session.wins += wins
 		end
 		N.catchRunEnd()
+		N.steerSummary()
+		N.predLog()
+		N.Gem.matches += 1
+		N.Gem.total += Session.gems - (M.gems0 or Session.gems)
+		log("GEM summary", "matches=" .. N.Gem.matches, string.format("gems/match=%.1f", N.Gem.total / N.Gem.matches), "this=" .. (Session.gems - (M.gems0 or Session.gems)))
+		if M.rounds and M.rounds.n > 0 then
+			log("ROUND summary", string.format("survived=%d/%d (%.0f%%)", M.rounds.ok, M.rounds.n, 100 * M.rounds.ok / M.rounds.n))
+		end
 		-- Hub-measured play quality of the match (STAB hit/miss lines, RUN lines).
 		local hits, misses = N.Catch.hits - (M.hits0 or 0), N.Catch.misses - (M.miss0 or 0)
 		M.catchesGained = math.max(N.stat("Catches") - M.catches, hits, 0)
@@ -34300,6 +34679,7 @@ function N.matchTick()
 					Session.heroRuns += 1
 				end
 				log("RUN escaped", "phase", N.phase(), "xp now", N.xp())
+				N.roundLog("survived")
 				if N.Run.tactic then
 					N.tactRecord("Runner", N.Run.tactic, 1, "escaped")
 					N.Run.tactic = nil
@@ -34311,6 +34691,21 @@ function N.matchTick()
 					Session.heroRuns += 1
 				end
 				log("RUN caught", "phase", N.phase())
+				N.roundLog("caught")
+				-- Who caught us: the nearest catchers at that moment (replay analysis).
+				pcall(function()
+					local me = N.myPos()
+					local near = {}
+					for _, p in ipairs(N.participants()) do
+						if me and p.root and p.attr("GameRole") == "Catcher" then
+							table.insert(near, { n = string.sub(p.name, 1, 10), d = math.floor(N.flat(p.root.Position - me).Magnitude * 10 + 0.5) / 10 })
+						end
+					end
+					table.sort(near, function(a, b)
+						return a.d < b.d
+					end)
+					N.recEvent("caught", { by = near[1] and near[1].n, d = near[1] and near[1].d, hunters = #near, near = { near[1], near[2], near[3] }, tactic = N.Run.tactic, lane = N.Run.lane })
+				end)
 				if N.Run.tactic then
 					N.tactRecord("Runner", N.Run.tactic, 0, "caught")
 					N.Run.tactic = nil
@@ -34368,11 +34763,11 @@ do
 		if Nav.data then
 			return Nav.data
 		end
-		Nav.data = { placeVersion = tostring(game.PlaceVersion), maps = {} }
+		Nav.data = { placeVersion = tostring(game.PlaceVersion), format = 2, maps = {} }
 		pcall(function()
 			if type(isfile) == "function" and isfile(Nav.file) then
 				local d = Http:JSONDecode(readfile(Nav.file))
-				if type(d) == "table" and d.placeVersion == Nav.data.placeVersion and type(d.maps) == "table" then
+				if type(d) == "table" and d.placeVersion == Nav.data.placeVersion and d.format == 2 and type(d.maps) == "table" then
 					Nav.data = d
 				end
 			end
@@ -34385,7 +34780,7 @@ do
 		end
 		local d = loadFile()
 		for id, g in pairs(Nav.grids) do
-			if g.done then
+			if g.done and g.built then
 				local bits = table.create(g.w * g.h, "0")
 				for i in pairs(g.blocked) do
 					bits[i] = "1"
@@ -34397,13 +34792,11 @@ do
 			writefile(Nav.file, Http:JSONEncode(d))
 		end)
 	end
+	-- The grid of the active map, also while it is still being built or only sensed online (partial knowledge is
+	-- better than none: the controller never waits for a map).
 	function N.navGrid()
 		local F = N.readField()
-		local g = Nav.grids[F.mapId]
-		if g and g.done then
-			return g
-		end
-		return nil
+		return Nav.grids[F.mapId]
 	end
 	local function index(g, cx, cz)
 		if cx < 1 or cz < 1 or cx > g.w or cz > g.h then
@@ -34429,7 +34822,8 @@ do
 		local c = center(g, cx, cz)
 		local y = (N.Field.groundY or 30) + 3
 		local ok, parts = pcall(function()
-			return workspace:GetPartBoundsInBox(CFrame.new(c.X, y, c.Z), Vector3.new(g.cell * 0.8, 3.5, g.cell * 0.8), params)
+			-- Cell + 1 stud: the body is ~2.5 studs wide, a wall 0.5 stud into the next cell still blocks this one.
+			return workspace:GetPartBoundsInBox(CFrame.new(c.X, y, c.Z), Vector3.new(g.cell + 1, 3.5, g.cell + 1), params)
 		end)
 		if not ok or type(parts) ~= "table" then
 			return false
@@ -34448,27 +34842,38 @@ do
 		end
 		return false
 	end
+	-- World-aligned grid over the field + both safe zones (+8 studs), any map rotation.
 	local function newGrid(F)
 		local cell = Nav.cell
-		local x0 = F.xMin - 8
-		local z0 = F.zc - F.lineZ - 24
-		local w = math.ceil((F.xMax + 8 - x0) / cell)
-		local h = math.ceil((F.zc + F.lineZ + 24 - z0) / cell)
-		return { id = F.mapId, x0 = x0, z0 = z0, w = w, h = h, cell = cell, blocked = {}, marks = {}, done = false }
+		local reachZ = F.lineZ + (F.depth or 12) + 8
+		local x0, z0, x1, z1 = math.huge, math.huge, -math.huge, -math.huge
+		for _, lx in ipairs({ F.xMin - 8, F.xMax + 8 }) do
+			for _, lz in ipairs({ F.zc - reachZ, F.zc + reachZ }) do
+				local w = N.W(Vector3.new(lx, 0, lz))
+				x0, z0, x1, z1 = math.min(x0, w.X), math.min(z0, w.Z), math.max(x1, w.X), math.max(z1, w.Z)
+			end
+		end
+		local w = math.ceil((x1 - x0) / cell)
+		local h = math.ceil((z1 - z0) / cell)
+		return { id = F.mapId, x0 = x0, z0 = z0, w = w, h = h, cell = cell, blocked = {}, marks = {}, seen = {}, seenN = 0, freed = {}, done = false }
 	end
 	-- Starts (once per map) loading or building the grid; the build runs 150 cells a frame.
 	function N.navEnsure()
 		local F = N.readField()
-		if not F.found or Nav.grids[F.mapId] or Nav.building then
+		local g = Nav.grids[F.mapId]
+		if not F.found or Nav.building or (g and g.built) then
 			return
 		end
-		local g = newGrid(F)
-		Nav.grids[F.mapId] = g
+		if not g then
+			g = newGrid(F)
+			Nav.grids[F.mapId] = g
+		end
+		g.built = true
 		local saved = loadFile().maps[F.mapId]
 		if type(saved) == "table" and saved.w == g.w and saved.h == g.h and type(saved.bits) == "string" and #saved.bits == g.w * g.h then
 			local n = 0
 			for i = 1, #saved.bits do
-				if string.byte(saved.bits, i) == 49 then
+				if string.byte(saved.bits, i) == 49 and not g.freed[i] then
 					g.blocked[i] = true
 					n += 1
 				end
@@ -34504,8 +34909,9 @@ do
 			local n, budget = 0, 0
 			for cz = 1, g.h do
 				for cx = 1, g.w do
-					if testCell(g, cx, cz, params) then
-						g.blocked[index(g, cx, cz)] = true
+					local i = index(g, cx, cz)
+					if not g.freed[i] and testCell(g, cx, cz, params) then
+						g.blocked[i] = true
 						n += 1
 					end
 					budget += 1
@@ -34520,6 +34926,150 @@ do
 			log("MAP learned", "id=" .. g.id, "cells=" .. g.w * g.h, "blocked=" .. n, string.format("t=%.1fs", os.clock() - started))
 			saveFile()
 		end)
+	end
+	-- Stuck (the body does not follow the input): the 3 cells ahead along the heading are a barrier (invisible walls
+	-- included), remembered in the map file. Returns the number of new cells.
+	function N.navStuck(pos, dir)
+		local g = N.navGrid()
+		if not g or not dir or dir.Magnitude < 0.01 then
+			return 0
+		end
+		local n = 0
+		local here = N.flat(pos)
+		for k = 1, 3 do
+			local ahead = here + N.unit(N.flat(dir)) * (g.cell * (k - 0.25))
+			local i = index(g, cellOf(g, ahead))
+			if i and not g.blocked[i] then
+				g.blocked[i] = true
+				g.freed[i] = nil
+				n += 1
+			end
+		end
+		Nav.path = nil
+		if n > 0 then
+			log("NAV barrier learned", "map=" .. g.id, string.format("at=(%.0f,%.0f)", here.X, here.Z), "cells=" .. n, "(stuck)")
+			saveFile()
+		end
+		return n
+	end
+	-- Occupancy: a cell a player or bot stands in is free (gates that were closed while the grid was built, cells
+	-- inflated next to a wall). Called from the opponent model 10 times a second.
+	function N.navOccupied(pos)
+		local g = N.navGrid()
+		if not g then
+			return
+		end
+		local i = index(g, cellOf(g, pos))
+		if i and g.blocked[i] then
+			g.blocked[i] = nil
+			g.freed[i] = true
+			g.freedN = (g.freedN or 0) + 1
+		end
+	end
+	-- Online sensing: 16 horizontal rays (25 studs) around the character every 0.1 s, collidable parts only (invisible
+	-- ones included), characters ignored. Every hit is a barrier cell in the map's grid (saved), every cell a ray
+	-- crosses counts as seen (coverage). Works with zero prior knowledge: a map without a grid gets one right away.
+	N.Sense = { at = -1e9, params = nil, paramsAt = -1e9, logAt = -1e9, newHits = 0, barrierLogAt = -1e9 }
+	function N.navSense()
+		local S = N.Sense
+		local now = os.clock()
+		if now - S.at < 0.1 then
+			return
+		end
+		S.at = now
+		-- No field read (unknown map): the defaults still give a grid to learn into.
+		local F = N.readField()
+		local g = Nav.grids[F.mapId]
+		if not g then
+			g = newGrid(F)
+			g.done = true
+			Nav.grids[F.mapId] = g
+		end
+		local root = N.root()
+		if not root then
+			return
+		end
+		if not S.params or now - S.paramsAt > 2 then
+			S.paramsAt = now
+			pcall(function()
+				local p = RaycastParams.new()
+				p.FilterType = Enum.RaycastFilterType.Exclude
+				local skip = {}
+				for _, pl in ipairs(Players:GetPlayers()) do
+					if pl.Character then
+						table.insert(skip, pl.Character)
+					end
+				end
+				for _, part in ipairs(N.participants()) do
+					if part.root and part.root.Parent then
+						table.insert(skip, part.root.Parent)
+					end
+				end
+				p.FilterDescendantsInstances = skip
+				pcall(function()
+					p.RespectCanCollide = true
+				end)
+				S.params = p
+			end)
+		end
+		local origin = root.Position
+		local fresh = 0
+		local at
+		for k = 0, 15 do
+			local a = k * math.pi / 8
+			local dir = Vector3.new(math.cos(a), 0, math.sin(a))
+			local ok, hit = pcall(function()
+				return workspace:Raycast(origin, dir * 25, S.params)
+			end)
+			local len = 25
+			if ok and hit and hit.Position then
+				local solid = true
+				pcall(function()
+					solid = hit.Instance == nil or hit.Instance.CanCollide ~= false
+				end)
+				if solid then
+					len = (N.flat(hit.Position) - N.flat(origin)).Magnitude
+					local i = index(g, cellOf(g, N.flat(hit.Position) + dir * 0.5))
+					if i and not g.blocked[i] and not g.freed[i] then
+						g.blocked[i] = true
+						fresh += 1
+						at = hit.Position
+					end
+				end
+			end
+			-- Seen cells along the ray.
+			local step = g.cell
+			local d = 0
+			while d <= len do
+				local i = index(g, cellOf(g, N.flat(origin) + dir * d))
+				if i and not g.seen[i] then
+					g.seen[i] = true
+					g.seenN += 1
+				end
+				d += step
+			end
+		end
+		if fresh > 0 then
+			S.newHits += fresh
+			Nav.path = nil
+			if now - S.barrierLogAt > 1 then
+				S.barrierLogAt = now
+				log("NAV barrier learned", "map=" .. g.id, string.format("at=(%.0f,%.0f)", at.X, at.Z), "cells=" .. S.newHits, "(sensed)")
+				S.newHits = 0
+				saveFile()
+			end
+		end
+		if now - S.logAt > 30 then
+			N.navSenseLog()
+		end
+	end
+	function N.navSenseLog()
+		local g = N.navGrid()
+		if not g then
+			return
+		end
+		N.Sense.logAt = os.clock()
+		log("MAP online", "id=" .. g.id, "cells=" .. g.seenN, string.format("coverage=%.0f%%", 100 * g.seenN / math.max(g.w * g.h, 1)), "freed=" .. (g.freedN or 0))
 	end
 	-- Live learning: blocked twice in the same cell = an obstacle for good.
 	function N.navBlocked(pos, dir)
@@ -34699,38 +35249,124 @@ do
 		return pick - here, true
 	end
 end
--- Opponent model: every participant's smoothed velocity, turn rate and style, sampled 10 times a second by the
--- match loop. straight = keeps a heading (bot-like, predictable: full lead), juker = turns a lot (lead halved).
-N.Opp = { list = {}, at = -1e9 }
+-- Opponent model (prediction): every participant's velocity from his POSITION change (the replicated
+-- AssemblyLinearVelocity of other characters can read ~0 on the client under server authority, which made every
+-- "predicted" point equal the current one), smoothed, plus acceleration and turn rate, sampled up to 30 times a
+-- second. N.oppPredict(rec, t) = p + v t + a t^2 / 2 (the acceleration part only for the first 0.4 s, speed capped at
+-- 40). Every 0.1 s each player's 0.3 s and 0.6 s predictions are stored and later compared with where he really
+-- was: `PRED err0.3= err0.6=` (studs, vs `naive` = assuming he stands still) once per match.
+-- Latency: others are drawn where they were ~ping ago and our input lands a frame later, so every decision uses
+-- them extrapolated by N.lead() = one-way ping + 0.05 s.
+N.Opp = { list = {}, at = -1e9, predAt = -1e9, err = { e3 = 0, e6 = 0, n3 = 0, n6 = 0, z3 = 0, z6 = 0 }, ping = 0.05, pingAt = -1e9 }
+function N.lead()
+	local O = N.Opp
+	if os.clock() - O.pingAt > 2 then
+		O.pingAt = os.clock()
+		pcall(function()
+			O.ping = math.clamp(LocalPlayer:GetNetworkPing(), 0, 0.4)
+		end)
+	end
+	return math.min(O.ping + 0.05, 0.3)
+end
+function N.oppPredict(rec, t)
+	local acc = rec.acc or Vector3.new(0, 0, 0)
+	local ta = math.min(t, 0.4)
+	local v = rec.vel + acc * ta
+	if v.Magnitude > 40 then
+		v = v.Unit * 40
+	end
+	return rec.pos + (rec.vel + v) / 2 * ta + v * (t - ta)
+end
 function N.oppTick()
 	local now = os.clock()
 	local O = N.Opp
-	if now - O.at < 0.09 then
+	if now - O.at < 0.03 then
 		return
 	end
 	local dt = now - O.at
 	O.at = now
+	local me = N.myPos()
+	if me then
+		N.navOccupied(N.flat(me))
+	end
+	local storePred = now - O.predAt >= 0.1
+	if storePred then
+		O.predAt = now
+	end
+	local E = O.err
 	for _, p in ipairs(N.participants()) do
 		if p.root then
 			local key = p.name
 			local rec = O.list[key]
 			local pos = N.flat(p.root.Position)
-			local vel = N.velocity(p.root)
-			if not rec or dt > 1 then
-				O.list[key] = { pos = pos, vel = vel, turn = 0, at = now, isBot = p.isBot }
+			N.navOccupied(pos)
+			if not rec or dt > 1 or now - rec.at > 1 then
+				O.list[key] = { pos = pos, vel = N.velocity(p.root), acc = Vector3.new(0, 0, 0), turn = 0, at = now, isBot = p.isBot, preds = {} }
 			else
-				local a = 0.45
+				local step = math.max(now - rec.at, 1e-3)
+				local fd = (pos - rec.pos) / step
+				if fd.Magnitude > 60 then
+					-- A respawn / reset: start over.
+					fd = Vector3.new(0, 0, 0)
+				end
+				local rep = N.velocity(p.root)
+				local raw = if rep.Magnitude > 1 then (rep + fd) / 2 else fd
 				local prev = rec.vel
-				rec.vel = prev * (1 - a) + vel * a
-				if prev.Magnitude > 4 and vel.Magnitude > 4 then
-					local ang = math.deg(math.acos(math.clamp(N.unit(prev):Dot(N.unit(vel)), -1, 1))) / math.max(dt, 0.05)
-					rec.turn = rec.turn * 0.85 + ang * 0.15
+				rec.vel = prev * 0.4 + raw * 0.6
+				local acc = (rec.vel - prev) / step
+				if acc.Magnitude > 120 then
+					acc = acc.Unit * 120
+				end
+				rec.acc = rec.acc * 0.7 + acc * 0.3
+				if prev.Magnitude > 4 and rec.vel.Magnitude > 4 then
+					local ang = math.deg(math.acos(math.clamp(N.unit(prev):Dot(N.unit(rec.vel)), -1, 1))) / step
+					rec.turn = rec.turn * 0.9 + ang * 0.1
 				end
 				rec.pos = pos
 				rec.at = now
+				-- Prediction check.
+				local keep = {}
+				for _, q in ipairs(rec.preds) do
+					local age = now - q.at
+					if not q.d3 and age >= 0.3 then
+						q.d3 = true
+						E.e3 += (pos - q.p3).Magnitude
+						E.z3 += (pos - q.p0).Magnitude
+						E.n3 += 1
+					end
+					if not q.d6 and age >= 0.6 then
+						q.d6 = true
+						E.e6 += (pos - q.p6).Magnitude
+						E.z6 += (pos - q.p0).Magnitude
+						E.n6 += 1
+					end
+					if not q.d6 then
+						table.insert(keep, q)
+					end
+				end
+				rec.preds = keep
+				if storePred then
+					table.insert(rec.preds, { at = now, p0 = pos, p3 = N.oppPredict(rec, 0.3), p6 = N.oppPredict(rec, 0.6) })
+				end
 			end
 		end
 	end
+end
+function N.predLog()
+	local E = N.Opp.err
+	if E.n3 < 5 then
+		return
+	end
+	log("PRED", string.format("err0.3=%.1f err0.6=%.1f naive0.3=%.1f naive0.6=%.1f n=%d", E.e3 / E.n3, E.e6 / math.max(E.n6, 1), E.z3 / E.n3, E.z6 / math.max(E.n6, 1), E.n3))
+	N.Opp.err = { e3 = 0, e6 = 0, n3 = 0, n6 = 0, z3 = 0, z6 = 0 }
+end
+-- A participant's position now + lead (field use: world flat).
+function N.oppAhead(p, extra)
+	local rec = N.Opp.list[p.name]
+	if not rec or os.clock() - rec.at > 0.3 then
+		return N.flat(p.root.Position), N.velocity(p.root)
+	end
+	return N.oppPredict(rec, N.lead() + (extra or 0)), rec.vel
 end
 function N.oppOf(name)
 	return N.Opp.list[name]
@@ -34825,6 +35461,356 @@ function N.tactRecord(role, choice, result, extra)
 	rec.sum += result
 	N.memoSave()
 	log("TACT", "role=" .. role, "choice=" .. choice, "result=" .. tostring(result), "map=" .. tostring(F.mapId), string.format("avg=%.2f n=%d", rec.sum / rec.n, rec.n), extra or "")
+end
+-- Match recorder (owner only, like the debug log; no UI): while in a match, every 0.25 s one compact JSON line in
+-- the workspace file Corvus_HUSS_replay_<yyyymmdd>_<n>.jsonl with us (position, velocity, heading, camera heading,
+-- role, state, action) and EVERY other participant (short name, role, state, position, velocity, facing, distance),
+-- plus event lines (stab/dive/dodge/caught/escaped/stuck/match result: every log line with those tags). Positions are
+-- world studs rounded to 0.1. Buffered, one appendfile every 2 s; a file is closed at 20 MB and the next one starts.
+-- tools/huss_replay.py reads them (why we were caught, stuck spots, stats per map/role/tactic, opponent replays).
+N.Rec = { buf = {}, at = -1e9, flushAt = os.clock(), part = 1, size = 0, matchId = nil, action = "-", ok = type(appendfile) == "function" }
+do
+	local R = N.Rec
+	local Http = game:GetService("HttpService")
+	local function r1(x)
+		return math.floor(x * 10 + 0.5) / 10
+	end
+	local function deg(v)
+		return math.floor(math.deg(math.atan2(v.X, -v.Z)) % 360 + 0.5)
+	end
+	local function fileName()
+		return "Corvus_HUSS_replay_" .. os.date("%Y%m%d") .. "_" .. R.part .. ".jsonl"
+	end
+	local function push(t)
+		local ok, line = pcall(Http.JSONEncode, Http, t)
+		if ok then
+			table.insert(R.buf, line)
+		end
+	end
+	function N.recFlush(force)
+		if #R.buf == 0 or not R.ok then
+			return
+		end
+		if not force and os.clock() - R.flushAt < 2 then
+			return
+		end
+		R.flushAt = os.clock()
+		local chunk = table.concat(R.buf, "\n") .. "\n"
+		table.clear(R.buf)
+		if R.size + #chunk > 20e6 then
+			R.part += 1
+			R.size = 0
+		end
+		R.size += #chunk
+		local name = fileName()
+		pcall(function()
+			if type(appendfile) == "function" and type(isfile) == "function" and isfile(name) then
+				appendfile(name, chunk)
+			elseif type(writefile) == "function" then
+				writefile(name, chunk)
+			end
+		end)
+	end
+	-- Event lines: the log lines that describe play.
+	local Tags = { "RUN ", "PROBE dodge", "CATCH", "STAB", "NAV barrier", "NAV slide", "MATCH", "TACT", "STEER summary", "CHASE", "FIELD", "MAP ", "BUILD", "ROUND", "GEM", "PRED", "LAT" }
+	N.logHook = function(line)
+		if not R.ok or not N.inMatch or not N.inMatch() then
+			return
+		end
+		local text = string.gsub(line, "^%[%s*[%d%.]+%]%s*", "")
+		for _, tag in ipairs(Tags) do
+			if string.sub(text, 1, #tag) == tag then
+				push({ t = r1(N.serverTime()), m = R.matchId, ev = text })
+				return
+			end
+		end
+	end
+	function N.recEvent(kind, data)
+		if not R.ok then
+			return
+		end
+		data = data or {}
+		data.t = r1(N.serverTime())
+		data.m = R.matchId
+		data.ev = kind
+		push(data)
+	end
+	local RoleShort = { Runner = "R", Catcher = "C", Lobby = "L" }
+	function N.recTick()
+		if not R.ok then
+			return
+		end
+		local now = os.clock()
+		if now - R.at < 0.25 then
+			N.recFlush(false)
+			return
+		end
+		R.at = now
+		if not N.inMatch() then
+			if R.matchId then
+				R.matchId = nil
+				N.recFlush(true)
+			end
+			return
+		end
+		local F = N.readField()
+		if not R.matchId then
+			R.matchId = string.sub(tostring(game.JobId), 1, 6) .. "-" .. math.floor(N.serverTime())
+			push({ t = r1(N.serverTime()), m = R.matchId, ev = "start", map = F.mapId, axis = deg(F.u), zc = r1(F.zc), lz = r1(F.lineZ), x0 = r1(F.xMin), x1 = r1(F.xMax), cx = r1(F.cx), c = { r1(F.c.X), r1(F.c.Z) }, place = game.PlaceVersion })
+		end
+		local root = N.root()
+		local me = nil
+		local mePos = root and root.Position
+		if root then
+			local v = N.velocity(root)
+			me = { p = { r1(mePos.X), r1(mePos.Z) }, v = { r1(v.X), r1(v.Z) }, h = if N.Move.head then deg(N.Move.head) else deg(N.lookOf(root)), c = deg(N.camLook()), r = RoleShort[N.role()] or N.role(), s = N.runState(), a = R.action }
+		end
+		local others = {}
+		for _, p in ipairs(N.participants()) do
+			if p.root then
+				local pos = p.root.Position
+				local v = N.velocity(p.root)
+				local char = p.root.Parent
+				local st = p.attr("RunState")
+				if char and char:GetAttribute("TackleActive") then
+					st = "dive"
+				elseif char and type(char:GetAttribute("ReachStartedAt")) == "number" and N.serverTime() - char:GetAttribute("ReachStartedAt") < 0.3 then
+					st = "stab"
+				elseif char and char:GetAttribute("MovementState") == "Dashing" then
+					st = "dodge"
+				end
+				table.insert(others, {
+					n = string.sub(p.name, 1, 10),
+					r = RoleShort[p.attr("GameRole")] or tostring(p.attr("GameRole")),
+					s = st,
+					p = { r1(pos.X), r1(pos.Z) },
+					v = { r1(v.X), r1(v.Z) },
+					f = deg(N.lookOf(p.root)),
+					d = if mePos then r1(N.flat(pos - mePos).Magnitude) else nil,
+					b = if p.isBot then 1 else nil,
+				})
+			end
+		end
+		push({ t = r1(N.serverTime()), m = R.matchId, ph = N.phase(), me = me, o = others })
+		N.recFlush(false)
+	end
+end
+-- Runner controller: ONE heading chosen from the whole field, not a reaction per catcher.
+-- Every lane = a straight line from here to a point on the goal line (every 8 studs across the field). For each lane
+-- the hub predicts its own arrival time at points along it (the turn from the current heading costs speed:
+-- RunnerTurnRetention90 0.72 and the capped heading turn; then Acceleration 36 x 1.42 back up to the cap) and, for
+-- every active catcher, the earliest time he can be within stab reach of that point (his max speed x1.1, his turn
+-- 300 deg/s, ContactCatch reach, the recovery left on his last stab). margin = his time - my time (s) at the worst
+-- point. A catcher chases the runner nearest to him, so his threat is weighted by how much nearer we are than every
+-- other runner on the field (attention w = (1/d_me) / sum(1/d_runner)): the gap timing - catchers busy with the
+-- crowd leave lanes open. Lane escape probability = product over catchers of 1 - w x (1 - 1 / (1 + e^(-margin /
+-- N.Steer.scale))). Score = probability
+-- minus a little for a longer trip and a bigger turn. The current lane is kept unless another one is better by 0.05
+-- (hysteresis: no flip-flopping between two similar lanes). The dodge dash (Auto Perfect Dodge) handles the last
+-- metres; the controller never turns per catcher.
+N.Steer = { logAt = -1e9, lanes = 0, switches = 0, lastLane = nil, scale = 0.6 }
+function N.sigmoid(x)
+	return 1 / (1 + math.exp(-x))
+end
+-- Active catchers as the controller sees them (smoothed velocity from the opponent model).
+function N.hunters()
+	local list = {}
+	local serverNow = N.serverTime()
+	local gap = N.meleeGap()
+	local speed = N.catcherSpeed()
+	for _, p in ipairs(N.participants()) do
+		if p.root and p.attr("GameRole") == "Catcher" and p.attr("RunState") == "Active" then
+			local ahead, vel = N.oppAhead(p)
+			local char = p.root.Parent
+			local reachAt = char and char:GetAttribute("ReachStartedAt")
+			local ready = 0
+			if type(reachAt) == "number" and serverNow - reachAt < gap then
+				ready = gap - (serverNow - reachAt)
+			end
+			table.insert(list, {
+				name = p.name,
+				pos = N.L(ahead),
+				vel = N.Ld(vel),
+				look = N.Ld(N.lookOf(p.root)),
+				speed = speed,
+				reach = 7,
+				ready = ready,
+			})
+		end
+	end
+	return list
+end
+-- Earliest time the catcher can be within reach of point p (pure).
+function N.hunterTime(h, p)
+	local to = p - h.pos
+	local d = to.Magnitude
+	local t = math.max(d - (h.reach or 7), 0) / h.speed
+	if d > 0.1 then
+		local face = if h.vel.Magnitude > 3 then N.unit(h.vel) else h.look
+		-- Turning toward the point: 300 deg/s (180 deg = 0.6 s).
+		t += (1 - face:Dot(to / d)) / 2 * 0.6
+	end
+	return math.max(t, h.ready or 0)
+end
+-- One lane (pure). st = { pos, head, speed, maxSpeed, hunters, F, goalZ }.
+function N.laneEval(st, target)
+	local F = st.F
+	local to = target - st.pos
+	local len = to.Magnitude
+	local dir = if len > 0.01 then to / len else Vector3.new(0, 0, if st.goalZ > st.pos.Z then 1 else -1)
+	local ang = math.deg(math.acos(math.clamp(st.head:Dot(dir), -1, 1)))
+	local v0 = math.max(st.speed * 0.72 ^ (ang / 90), 4)
+	local vmax = st.maxSpeed
+	local accel = 36 * 1.42
+	local rate = N.turnRate(st.speed, false, false)
+	local delay = ang / rate * 0.5
+	local sAcc = math.max((vmax * vmax - v0 * v0) / (2 * accel), 0)
+	local function tAt(s)
+		if s <= sAcc then
+			return delay + (-v0 + math.sqrt(v0 * v0 + 2 * accel * s)) / accel
+		end
+		return delay + (vmax - v0) / accel + (s - sAcc) / vmax
+	end
+	local P, worst = 1, 99
+	local step = 10
+	for k, h in ipairs(st.near) do
+		local w = st.weight[k]
+		local m = 99
+		local s = 0
+		while s <= len + 0.01 do
+			local p = st.pos + dir * s
+			if math.abs(p.Z - F.zc) < F.lineZ then
+				local mm = N.hunterTime(h, p) - tAt(s)
+				if mm < m then
+					m = mm
+				end
+			end
+			s += step
+		end
+		if m < 99 then
+			P *= 1 - w * (1 - N.sigmoid(m / N.Steer.scale))
+			if m < worst then
+				worst = m
+			end
+		end
+	end
+	-- Trip to the line (where the run is won).
+	local lineZ = F.zc + (if st.goalZ > F.zc then F.lineZ else -F.lineZ)
+	local toLine = if math.abs(dir.Z) > 0.05 then math.max((lineZ - st.pos.Z) / dir.Z, 0) else len
+	local eta = tAt(math.min(toLine, len))
+	local score = P - 0.004 * eta - 0.0006 * ang
+	-- Obstacles (grid in world coordinates): a lane through a wall costs a detour, a lane ending in a wall is dropped.
+	if st.grid then
+		local a, b = N.W(st.pos), N.W(target)
+		if not N.navFree(st.grid, b) then
+			score -= 1
+		elseif not N.navClear(st.grid, a, b) then
+			score -= 0.15
+		end
+	end
+	return { dir = dir, P = P, margin = worst, eta = eta, turn = ang, score = score, target = target }
+end
+-- The whole plan (pure): best lane with hysteresis. st.lane = the lane X currently followed (or nil).
+-- Cost (frame budget): the 8 nearest catchers, each with its attention weight computed once; lanes every 16 studs,
+-- then +-8 around the best one, plus the current lane: ~14 lanes x 8 catchers x ~25 points per plan.
+function N.runnerPlan(st)
+	local F = st.F
+	local list = {}
+	for _, h in ipairs(st.hunters) do
+		table.insert(list, { h = h, d = (h.pos - st.pos).Magnitude })
+	end
+	table.sort(list, function(a, b)
+		return a.d < b.d
+	end)
+	st.near, st.weight = {}, {}
+	for k = 1, math.min(#list, 8) do
+		local h = list[k].h
+		local inv = 1 / math.max(list[k].d, 1)
+		local sum = inv
+		for _, r in ipairs(st.others or {}) do
+			sum += 1 / math.max((h.pos - r).Magnitude, 1)
+		end
+		st.near[k] = h
+		st.weight[k] = inv / sum
+	end
+	local best, cur
+	local n = 0
+	local lo, hi = F.xMin + 6, F.xMax - 6
+	local function try(x)
+		x = math.clamp(x, lo, hi)
+		local e = N.laneEval(st, Vector3.new(x, 0, st.goalZ))
+		e.lane = x
+		n += 1
+		if st.lane and math.abs(x - st.lane) < 4 and (not cur or math.abs(x - st.lane) < math.abs(cur.lane - st.lane)) then
+			cur = e
+		end
+		if not best or e.score > best.score then
+			best = e
+		end
+	end
+	local x = lo
+	while x <= hi + 1e-6 do
+		try(x)
+		x += 16
+	end
+	local center = best.lane
+	try(center - 8)
+	try(center + 8)
+	if st.lane then
+		try(st.lane)
+	end
+	local switched = false
+	if cur and best ~= cur then
+		if best.score < cur.score + 0.05 then
+			best = cur
+		else
+			switched = true
+		end
+	end
+	best.switched = switched
+	best.lanes = n
+	best.urgent = best.margin < 0.35
+	return best
+end
+-- STEER log (at most twice a second) and the per-match summary.
+function N.steerLog(plan, head)
+	local S = N.Steer
+	if plan.switched then
+		S.switches += 1
+	end
+	if os.clock() - S.logAt < 0.5 then
+		return
+	end
+	S.logAt = os.clock()
+	local h = head or plan.dir
+	log("STEER", string.format("heading=%.0f lane=%.0f risk=%.2f margin=%.2f turn=%.0f", math.deg(math.atan2(h.X, -h.Z)) % 360, plan.lane or -1, 1 - plan.P, math.min(plan.margin, 9.99), plan.turn), if plan.switched then "switch" else "")
+end
+-- Latency: decision time per tick and the loop interval (`LAT` every 10 s).
+N.Lat = { n = 0, sum = 0, max = 0, last = nil, gap = 0, at = os.clock() }
+function N.latSample(dt)
+	local L = N.Lat
+	local now = os.clock()
+	if L.last then
+		L.gap += now - L.last
+	end
+	L.last = now
+	L.n += 1
+	L.sum += dt
+	L.max = math.max(L.max, dt)
+	if now - L.at >= 10 and L.n > 1 then
+		log("LAT", string.format("loop=%.0fms decide=%.2fms max=%.2fms input_delay=%.0fms ping=%.0fms", 1000 * L.gap / (L.n - 1), 1000 * L.sum / L.n, 1000 * L.max, 1000 / 60, 1000 * (N.Opp.ping or 0)))
+		N.Lat = { n = 0, sum = 0, max = 0, last = nil, gap = 0, at = now }
+	end
+end
+function N.steerSummary()
+	local sp = N.Move.spin
+	if sp.time < 1 then
+		return
+	end
+	log("STEER summary", string.format("spin=%.0f deg/s max=%.0f deg/s steered=%.0fs lanes=%d switches=%d", sp.deg / sp.time, math.max(sp.maxWin, if sp.winT > 0 then sp.win / sp.winT else 0), sp.time, N.Steer.lanes, N.Steer.switches))
+	N.spinReset()
+	N.Steer.switches = 0
+	N.Steer.lanes = 0
 end
 -- Rewards: daily quests, event quest knives, the Valley Journey free track, the daily wheel spin, the one-time Like
 -- reward and admin awards. Each one uses the same remote and arguments as the game's own button, at the game's pace.
@@ -36709,6 +37695,7 @@ do
 			return
 		end
 		N.matchTick()
+		pcall(N.recTick)
 		if not N.alive() then
 			N.steer(nil)
 			if anyAutoOn() then
@@ -36721,6 +37708,7 @@ do
 			N.choiceStep()
 		end
 		local moving = false
+		local t0 = os.clock()
 		if N.myRun() and N.gateReason() == nil and not typing() then
 			local role = N.role()
 			if role == "Runner" and N.wants("AutoEscape") then
@@ -36732,7 +37720,13 @@ do
 			end
 		end
 		if moving then
+			N.latSample(os.clock() - t0)
+		end
+		if moving then
 			N.moveProbe()
+			-- Decisions ~30 times a second while the hub steers (the heading itself turns every frame).
+			task.wait(0.03)
+			return
 		else
 			if N.Move.dir then
 				N.steer(nil)
