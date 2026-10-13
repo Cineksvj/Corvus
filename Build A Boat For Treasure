@@ -1764,9 +1764,25 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
     
     local FetchIcons = false
     local Icons: IconModule | nil = nil
-    
+    -- First run without the Lucide cache: while the download runs, GetIcon hands out a placeholder (Pending) and
+    -- ApplyLucideIcon remembers every image it was applied to (Users: image -> icon name); SetIconModule fills them in
+    local IconState = { Pending = false, Users = setmetatable({}, { __mode = "k" }), LoadBase = function() end }
+
+    function Library:IconsReady(): boolean
+        return FetchIcons and Icons ~= nil
+    end
+
     function Library:GetIcon(IconName: string)
         if not FetchIcons or not Icons then
+            if IconState.Pending and typeof(IconName) == "string" and IconName ~= "" then
+                return {
+                    Url = "",
+                    ImageRectOffset = Vector2.zero,
+                    ImageRectSize = Vector2.zero,
+                    IconName = IconName,
+                    Pending = true,
+                }
+            end
             return
         end
     
@@ -1841,7 +1857,19 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         if not (ImageGui:IsA("ImageLabel") or ImageGui:IsA("ImageButton")) then
             return
         end
-    
+
+        if Icon.Pending then
+            local Real = if FetchIcons and Icons then Library:GetIcon(Icon.IconName) else nil
+            if Real then
+                Icon = Real
+            elseif not (FetchIcons and Icons) then
+                IconState.Users[ImageGui] = Icon.IconName
+            end
+        end
+        if not Icon.Pending then
+            IconState.Users[ImageGui] = nil
+        end
+
         ImageGui.Image = Icon.Url or ImageGui.Image
         ImageGui.ImageRectOffset = Icon.ImageRectOffset or ImageGui.ImageRectOffset
         ImageGui.ImageRectSize = Icon.ImageRectSize or ImageGui.ImageRectSize
@@ -2382,10 +2410,7 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
     
     local CheckIcon, ArrowIcon, ResizeIcon, KeyIcon, MoveIcon, PopOutIcon, CloseIcon
     local ExpandIcon, CopyIcon, BellIcon, BellOffIcon, MinusIcon, PlusIcon, TrashIcon
-    function Library:SetIconModule(module: IconModule)
-        FetchIcons = true
-        Icons = module
-    
+    function IconState.LoadBase()
         CheckIcon = Library:GetIcon("check")
         ArrowIcon = Library:GetIcon("chevron-up")
         ResizeIcon = Library:GetIcon("move-diagonal-2")
@@ -2401,9 +2426,26 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
         PlusIcon = Library:GetIcon("plus")
         TrashIcon = Library:GetIcon("trash-2")
     end
-    
+    function Library:SetIconModule(module: IconModule)
+        FetchIcons = true
+        Icons = module
+        IconState.Pending = false
+        IconState.LoadBase()
+        -- images that asked for an icon before the module arrived (tabs, checks, arrows, buttons...) get it now
+        local Users = IconState.Users
+        IconState.Users = setmetatable({}, { __mode = "k" })
+        for ImageGui, Name in Users do
+            local Icon = Library:GetIcon(Name)
+            if Icon then
+                pcall(Library.ApplyLucideIcon, Library, ImageGui, Icon)
+            end
+        end
+    end
+
     -- Lucide icons: a cached copy loads from disk at once, the download only refreshes the cache in the background
-	-- (a synchronous download here held the whole start on slow executors)
+	-- (a synchronous download here held the whole start on slow executors). Without a usable cache (first run on an
+	-- executor) the download starts here, Library:CreateWindow waits for it up to 4 s from now, and anything that asks
+	-- for an icon earlier or later gets a placeholder that SetIconModule fills in. LOAD shows icons=cache|net|late|none.
 	do
 		local LucideUrl = "https://raw.githubusercontent.com/mstudio45/lucide-roblox-direct/refs/heads/main/source.lua"
 		local LucideFile = "Corvus/lucide.lua"
@@ -2428,24 +2470,55 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
 			end
 		end)
 		local UsedCache = ApplyIcons(Cached)
+		local Settled, WaitOver = UsedCache, false
 		CorvusLoadTimes.icons = os.clock() - IconsT0
+		CorvusLoadTimes.iconsState = if UsedCache then "cache" else "none"
+		if not UsedCache then
+			IconState.Pending = true
+			IconState.LoadBase()
+		end
 		task.spawn(function()
 			local Ok, Source = pcall(game.HttpGet, game, LucideUrl)
-			if not Ok or typeof(Source) ~= "string" or #Source < 1000 or Source == Cached then
+			local Fresh = Ok and typeof(Source) == "string" and #Source >= 1000 and Source ~= Cached
+			if Fresh then
+				pcall(function()
+					if isfolder and makefolder and not isfolder("Corvus") then
+						makefolder("Corvus")
+					end
+					if writefile then
+						writefile(LucideFile, Source)
+					end
+				end)
+			end
+			if not UsedCache then
+				if Fresh and not Library.Unloaded and ApplyIcons(Source) then
+					CorvusLoadTimes.iconsState = string.format(if WaitOver then "late(%.1fs)" else "net(%.1fs)", os.clock() - IconsT0)
+				else
+					IconState.Pending = false
+					IconState.LoadBase()
+					CorvusLoadTimes.iconsState = "none"
+				end
+			end
+			Settled = true
+		end)
+		-- called by CreateWindow before the UI is built: no cache -> wait for the download, at most Limit s after its start
+		function Library:WaitForIcons(Limit: number?)
+			if Settled or WaitOver then
 				return
 			end
-			pcall(function()
-				if isfolder and makefolder and not isfolder("Corvus") then
-					makefolder("Corvus")
+			local T0 = os.clock()
+			local Deadline = IconsT0 + (Limit or 4)
+			while not Settled and not Library.Unloaded and os.clock() < Deadline do
+				if not pcall(task.wait, 0.05) then
+					break
 				end
-				if writefile then
-					writefile(LucideFile, Source)
-				end
-			end)
-			if not UsedCache and not Library.Unloaded then
-				ApplyIcons(Source)
 			end
-		end)
+			CorvusLoadTimes.icons = (CorvusLoadTimes.icons or 0) + (os.clock() - T0)
+			if not Settled then
+				WaitOver = true
+				CorvusLoadTimes.iconsState = "late(pending)"
+			end
+		end
 	end
     
     Library.Cursor = {}
@@ -13619,7 +13692,10 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             ImageProperties.ImageRectSize = Icon.ImageRectSize
     
             local ImageLabel = New("ImageLabel", ImageProperties)
-    
+            if Icon.Pending then
+                Library:ApplyLucideIcon(ImageLabel, Icon)
+            end
+
             function Image:SetHeight(Height: number)
                 assert(Height > 0, "Height must be greater than 0.")
     
@@ -17842,6 +17918,9 @@ local AddonsUrl = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main
             end
             Visit(Library.Toggles)
             Visit(Library.Options)
+            if typeof(Library.SyncMirrors) == "function" then
+                pcall(Library.SyncMirrors, Library)
+            end
             return true, Applied
         end
     
@@ -19315,7 +19394,10 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                 ZIndex = 6,
                 Parent = Holder,
             })
-    
+            if CloseIcon and CloseIcon.Pending then
+                Library:ApplyLucideIcon(CloseButton, CloseIcon)
+            end
+
             CloseButton.MouseEnter:Connect(function()
                 TweenService:Create(CloseButton, Library.TweenInfo, {
                     ImageTransparency = 0,
@@ -25681,7 +25763,7 @@ CorvusLoadTimes.community = CorvusLoadTimes.community or (os.clock() - Community
                 return Count > 0 and Now - LastChange >= 0.45
             end
             Steps[3].Ready = function()
-                return Library:GetIcon("check") ~= nil
+                return Library:IconsReady()
             end
             Steps[4].Ready = function()
                 return InfiniteYield.Loaded or not InfiniteYield.Loading
@@ -26233,6 +26315,7 @@ end)
                 { Name = "Steal ASMR", PlaceId = 82081400078378 },
                 { Name = "Steal Animal Egg", PlaceId = 99679692310083 },
                 { Name = "Steal From The Rich", PlaceId = 120475074479690 },
+                { Name = "Tap Simulator Reborn", PlaceId = 72858262610964 },
                 { Name = "Tongue Escape", PlaceId = 122245938604556 },
                 { Name = "Welcome to Bloxburg", PlaceId = 185655149 },
             }
@@ -31314,13 +31397,13 @@ end
     			PendingCount = 0
     			setStatus("Off, nothing is sent")
     		else
-    			setStatus("On, first send within a minute")
+    			setStatus("On, first send within 10 minutes")
     		end
     	end
     	function Library:GetDiagnostics()
     		return DiagOn
     	end
-    	setStatus(if DiagOn then "On, first send within a minute" else "Off, nothing is sent")
+    	setStatus(if DiagOn then "On, first send within 10 minutes" else "Off, nothing is sent")
     	-- every hub writes its status log with writefile/appendfile to Corvus_<GAME>_log.txt: read the new lines there
     	local env = getgenv()
     	local function isLog(name)
@@ -31348,7 +31431,7 @@ end
     	end
     	task.spawn(function()
     		while not Library.Unloaded do
-    			task.wait(60)
+    			task.wait(600)
     			pcall(flush)
     		end
     	end)
@@ -31435,12 +31518,13 @@ end
 		local Total = if T.shown and typeof(Loader.begin) == "number" then T.shown - Loader.begin elseif T.shown then T.shown - CorvusLoadT0 else nil
 		return string.format(
 			"LOAD fetch=%s compile=%s boot=%s lib=%s icons=%s ui=%s addons=%s community=%s discord=%s game=%s total=%s",
-			F(Loader.fetch), F(Loader.compile), F(BootTime), F(T.lib), F(T.icons), F(T.ui), F(T.addons), F(T.community), F(T.discord), F(GameTime), F(Total)
+			F(Loader.fetch), F(Loader.compile), F(BootTime), F(T.lib), if typeof(T.iconsState) == "string" then T.iconsState else F(T.icons), F(T.ui), F(T.addons), F(T.community), F(T.discord), F(GameTime), F(Total)
 		)
 	end
 	do
 		local BaseCreateWindow = Library.CreateWindow
 		function Library:CreateWindow(...)
+			Library:WaitForIcons()
 			local T0 = os.clock()
 			local Window = BaseCreateWindow(self, ...)
 			if CorvusLoadTimes.shown == nil then
@@ -31512,6 +31596,9 @@ end
 			return
 		end
 		Library.AutoloadFired = true
+		if typeof(Library.SyncMirrors) == "function" then
+			pcall(Library.SyncMirrors, Library)
+		end
 		Library:LogStart()
 		local Hook = Library.OnAutoload
 		if Hook == false then
@@ -31542,8 +31629,24 @@ end
 			return Window
 		end
 	end
-	-- Quick Start rule: a second control for an existing toggle in another groupbox. Both stay in sync both ways,
-	-- the original keeps the only callback and the only config key (the mirror is not in Library.Toggles).
+	-- CORVUS-MIRROR (Quick Start rule): a second control for an existing toggle in another groupbox. Both stay in sync
+	-- both ways, the original keeps the only callback and the only config key (the mirror is not in Library.Toggles).
+	-- The mirror shows the original's value from every source: it is repainted before the original's callback runs (a
+	-- callback that waits or errors never leaves it stale), after every config load, share code and reset
+	-- (Library:SyncMirrors) and by a 0.5 s check that only repaints mirrors (it never changes an original).
+	Library.MirrorSyncs = {}
+	function Library:SyncMirrors(): number
+		local Fixed = 0
+		for Index = #Library.MirrorSyncs, 1, -1 do
+			local Ok, Alive, Changed = pcall(Library.MirrorSyncs[Index])
+			if Ok and Alive == false then
+				table.remove(Library.MirrorSyncs, Index)
+			elseif Ok and Changed then
+				Fixed += 1
+			end
+		end
+		return Fixed
+	end
 	function Library:MirrorToggle(Idx: string, Box: any, Opts: any?)
 		Opts = if typeof(Opts) == "table" then Opts else {}
 		local Original = Library.Toggles[Idx]
@@ -31566,20 +31669,38 @@ end
 		Mirror.MirrorOf = Idx
 		local ShowValue = Mirror.SetValue
 		local Syncing = false
-		local function Sync()
-			if Syncing or Mirror.Destroyed then
-				return
+		-- repaints only the mirror (no callback of the original); true = it showed something else
+		local function Paint(Value: any): boolean
+			if Syncing or Mirror.Destroyed or Mirror.Value == Value then
+				return false
 			end
 			Syncing = true
-			if Mirror.Value ~= Original.Value then
-				pcall(ShowValue, Mirror, Original.Value)
-			end
+			pcall(ShowValue, Mirror, Value)
 			Syncing = false
+			return true
+		end
+		-- alive (false = mirror destroyed, drop it), changed
+		local function Sync(): (boolean, boolean)
+			if Mirror.Destroyed then
+				return false, false
+			end
+			return true, Paint(Original.Value)
 		end
 		local BaseSet = Original.SetValue
 		Original.SetValue = function(Self, Value)
+			Paint(Value)
 			BaseSet(Self, Value)
 			Sync()
+		end
+		table.insert(Library.MirrorSyncs, Sync)
+		if not Library.MirrorWatch then
+			Library.MirrorWatch = true
+			task.spawn(function()
+				while not Library.Unloaded do
+					task.wait(0.5)
+					Library:SyncMirrors()
+				end
+			end)
 		end
 		local BaseDisabled = Original.SetDisabled
 		if typeof(BaseDisabled) == "function" then
@@ -31593,7 +31714,7 @@ end
 				pcall(Mirror.SetDisabled, Mirror, true)
 			end
 		end
-		-- the mirror's own switch (click, quick bar) drives the original; Sync then repaints the mirror
+		-- the mirror's own switch (click, quick bar) drives the original, whose SetValue repaints the mirror
 		Mirror.SetValue = function(_, Value)
 			Original:SetValue(Value)
 		end
@@ -31613,6 +31734,7 @@ end
 		end
 		return Mirror
 	end
+	-- CORVUS-MIRROR-END
 	-- CORVUS-CONFIGLOAD (player feedback 2026-10-07: "after I loaded the config none of the settings were active").
 	-- The Obsidian SaveManager is fetched live from GitHub: it applies saved values one by one with task.defer, drops a
 	-- value whose control does not exist yet and a dropdown value whose list is filled later (tower lists, eggs...).
@@ -31738,6 +31860,10 @@ end
 			end
 		end
 		Library.ConfigLoadedName = Name
+		-- Quick Start mirrors show the loaded values (CORVUS-MIRROR)
+		if typeof(Library.SyncMirrors) == "function" then
+			pcall(Library.SyncMirrors, Library)
+		end
 		Library:CorvusLog(string.format("CONFIG loaded %s controls=%d on=%s%s", Name, Applied, ConfigOnList(), if #Later > 0 then " later=" .. #Later else ""))
 		if #Later > 0 then
 			local Token = {}
@@ -31754,6 +31880,9 @@ end
 						end
 					end
 					if #Still < #Later then
+						if typeof(Library.SyncMirrors) == "function" then
+							pcall(Library.SyncMirrors, Library)
+						end
 						Library:CorvusLog(string.format("CONFIG late %s applied=%d waiting=%d on=%s", Name, #Later - #Still, #Still, ConfigOnList()))
 					end
 					Later = Still
