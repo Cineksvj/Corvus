@@ -33925,78 +33925,153 @@ do
 		-- 1352 pass 3 M3): the server's own WalkSpeed is the limit, so no fixed cap below it.
 		return math.clamp(speed, 16, 1000)
 	end
-	-- Fast boost (blatant.md 1352 pass 3 M2): the % of your WalkSpeed Fast travels at. Carrying legs never go above 110 %
-	-- (a pull-back while carrying sends the animals back); empty legs start at the slider and climb 5 % after every 20 clean
-	-- empty legs (no anti-cheat line, no pull-back) up to 150 %; the first SPEED line or pull-back steps 10 % back and
-	-- freezes it. Remembered per PlaceVersion (Corvus/BSE_probes_<pv>.txt, move_boost=<n> or <n>f when frozen).
-	N.BoostCap, N.BoostCarry = 150, 110
-	local function boostState()
+	-- Fast boost per area (live search 2026-10-14 on PlaceVersion 1360, WalkSpeed 132.6, empty tween): zone legs were clean
+	-- up to 162-165 % of WalkSpeed and pulled back at 171 % after ~3.5 s; inside the base/plot area (SafeZone, own plot) 205 %
+	-- was clean. Fast runs under those: zones 160 %, base 200 %, carrying an animal 10 % under the area value (a pull-back
+	-- with an animal sends it back). A trip counts as base only when it starts and ends there. The move_boost probe is a
+	-- bisection under that cap: one long empty leg per step; a pull-back sets the ceiling, the next legs run at the last
+	-- clean value, 60 s later the half step between them is retested once (never two pull-backs in a row); a pull-back at
+	-- the retest freezes the area at the last clean value. Any anti-cheat Notify line aborts the search for the session.
+	-- Remembered per PlaceVersion (Corvus/BSE_probes_<pv>.txt, move_boost_area=zone:<value>:<clean>:<pulled>[f];base:...).
+	N.BoostArea, N.BoostLegMin, N.BoostStep, N.BoostCarryCut = { zone = 160, base = 200 }, { zone = 400, base = 200 }, 10, 0.9
+	local function inArea(part, position)
+		local p = part.CFrame:PointToObjectSpace(position)
+		local half = part.Size / 2
+		return math.abs(p.X) <= half.X + 4 and math.abs(p.Z) <= half.Z + 4
+	end
+	function N.areaOf(position)
+		if not position then
+			return "zone"
+		end
+		for _, part in ipairs({ N.safeZonePart(), N.plotHitbox() }) do
+			if part and inArea(part, position) then
+				return "base"
+			end
+		end
+		return "zone"
+	end
+	function N.legArea()
+		return N.Moves.legArea or "zone"
+	end
+	local function saveBoost()
+		local B = N.Moves.boost
+		if not N.ProbeMem then
+			return
+		end
+		local parts = {}
+		for _, name in ipairs({ "zone", "base" }) do
+			local S = B[name]
+			if S then
+				table.insert(parts, string.format("%s:%d:%s:%s%s", name, S.value, tostring(S.lo or ""), tostring(S.hi or ""), if S.frozen then "f" else ""))
+			end
+		end
+		N.ProbeMem.set("move_boost_area", table.concat(parts, ";"))
+	end
+	local function areaState(area)
 		local B = N.Moves.boost
 		if not B.loaded and N.ProbeMem then
 			B.loaded = true
-			local saved = tostring(N.ProbeMem.get("move_boost") or "")
-			local n, f = string.match(saved, "^(%d+)(f?)$")
-			if tonumber(n) then
-				B.value, B.frozen = math.clamp(tonumber(n), 100, N.BoostCap), f == "f"
-				log(string.format("PROBE move_boost loaded boost=%d frozen=%s", B.value, tostring(B.frozen)))
+			local saved = tostring(N.ProbeMem.get("move_boost_area") or "")
+			for name, v, lo, hi, f in string.gmatch(saved, "(%a+):(%d+):(%d*):(%d*)(f?)") do
+				local cap = N.BoostArea[name]
+				if cap then
+					B[name] = { value = math.clamp(tonumber(v) or cap, 100, cap), lo = tonumber(lo), hi = tonumber(hi), frozen = f == "f" }
+					log(string.format("PROBE move_boost loaded area=%s boost=%d clean=%s pulled=%s frozen=%s", name, B[name].value, lo ~= "" and lo or "-", hi ~= "" and hi or "-", tostring(f == "f")))
+				end
 			end
 		end
-		return B
+		area = if N.BoostArea[area] then area else "zone"
+		if not B[area] then
+			B[area] = { value = N.BoostArea[area] }
+		end
+		return B[area], area
 	end
-	function N.fastBoost(carrying)
-		local base = math.clamp(optionNumber("FastBoost", 110), 100, 300)
+	N.boostArea = areaState
+	function N.fastBoost(carrying, area)
 		if carrying == nil then
 			carrying = N.carrying()
 		end
+		local S
+		S, area = areaState(area or N.legArea())
+		local pct = math.min(S.value, N.BoostArea[area], math.clamp(optionNumber("FastBoostMax", 200), 100, 200))
 		if carrying then
-			return math.min(base, N.BoostCarry)
+			pct = math.min(math.floor(pct * N.BoostCarryCut), S.carryMax or math.huge)
 		end
-		local B = boostState()
-		return math.max(base, B.value or base)
+		return math.max(pct, 100)
 	end
-	local function saveBoost(B)
-		if N.ProbeMem then
-			N.ProbeMem.set("move_boost", tostring(B.value) .. (if B.frozen then "f" else ""))
-		end
-	end
-	local function boostReject(why)
-		local B = boostState()
-		local base = math.clamp(optionNumber("FastBoost", 110), 100, 300)
-		local now = B.value or base
-		if (B.frozen and now <= base) or os.clock() - (B.rejAt or -1e9) < 3 then
+	-- A pull-back (or anti-cheat speed line) at the current area value.
+	local function boostReject(why, carrying)
+		local S, area = areaState(N.Moves.legArea or N.Moves.lastArea or "zone")
+		local now = os.clock()
+		if now - (S.rejAt or -1e9) < 3 then
 			return
 		end
-		B.rejAt = os.clock()
-		B.value = math.max(now - 10, 100)
-		B.frozen, B.clean = true, 0
-		saveBoost(B)
-		log(string.format("PROBE move_boost result=rejected gain=+%d%% boost=%d reason=%s", math.max(B.value - 110, 0), B.value, why))
+		S.rejAt = now
+		if carrying then
+			local was = N.fastBoost(true, area)
+			S.carryMax = math.max(was - N.BoostStep, 100)
+			log(string.format("PROBE move_boost carrying pulled back at %d%% area=%s -> carrying %d%% reason=%s", was, area, S.carryMax, why))
+			return
+		end
+		local was = S.value
+		S.snapAt = now
+		if S.frozen then
+			-- pulled back at a value found earlier: half a step lower, still frozen
+			S.hi, S.value = was, math.max(was - N.BoostStep // 2, 100)
+			S.lo = S.value
+			log(string.format("PROBE move_boost result=rejected area=%s pulled=%d -> boost=%d frozen reason=%s", area, was, S.value, why))
+			saveBoost()
+			return
+		end
+		S.hi = was
+		S.lo = math.min(S.lo or (was - N.BoostStep), was - 1)
+		if S.retested or N.Moves.boost.aborted or S.hi - S.lo <= 4 then
+			S.frozen, S.pending = true, false
+			S.value = math.max(S.lo, 100)
+			log(string.format("PROBE move_boost result=rejected area=%s pulled=%d -> boost=%d frozen reason=%s", area, was, S.value, why))
+		else
+			S.value, S.pending = math.max(S.lo, 100), true
+			log(string.format("PROBE move_boost pulled back at %d%% area=%s -> %d%% (last clean), retest %d%% in 60 s reason=%s", was, area, S.value, math.floor((S.lo + S.hi) / 2), why))
+		end
+		saveBoost()
 	end
 	N.boostReject = boostReject
-	local function boostLegDone(legStart)
-		local B = boostState()
-		if B.frozen or (B.value or 0) >= N.BoostCap then
+	-- Any anti-cheat line: stop searching for this session, keep the last clean value.
+	local function boostAbort(text)
+		local B = N.Moves.boost
+		if B.aborted then
 			return
 		end
-		if not B.started then
-			B.started = true
-			log(string.format("PROBE move_boost start boost=%d cap=%d (empty legs >= 200 studs, +5%% per 20 clean legs)", N.fastBoost(false), N.BoostCap))
+		B.aborted = true
+		log(string.format("PROBE move_boost aborted (anti-cheat line %q) zone=%d base=%d", tostring(text), areaState("zone").value, areaState("base").value))
+	end
+	local function boostLegDone(legStart, walked, area)
+		local S
+		S, area = areaState(area)
+		if S.frozen or N.Moves.boost.aborted or (walked or 0) < N.BoostLegMin[area] then
+			return
 		end
+		local tried = S.value
 		task.delay(3, function()
-			if N.Moves.acAt >= legStart or N.Moves.snapAt >= legStart or B.frozen then
+			if N.Moves.acAt >= legStart or N.Moves.snapAt >= legStart or S.frozen or S.value ~= tried or N.Moves.boost.aborted then
 				return
 			end
-			B.clean += 1
-			if B.clean % 5 == 0 and B.clean < 20 then
-				log(string.format("PROBE move_boost legs=%d/20 boost=%d", B.clean, N.fastBoost(false)))
+			S.lo = math.max(S.lo or 0, tried)
+			if S.retested then
+				S.frozen = true
+				log(string.format("PROBE move_boost result=accepted area=%s boost=%d gain=+%d%% (retest clean, pulled at %s)", area, tried, tried - 110, tostring(S.hi or "-")))
+			elseif not S.hi and tried >= N.BoostArea[area] then
+				S.frozen = true
+				log(string.format("PROBE move_boost result=accepted area=%s boost=%d gain=+%d%% (clean at the area cap)", area, tried, tried - 110))
+			elseif S.pending and S.hi and os.clock() - (S.snapAt or -1e9) >= 60 then
+				S.pending, S.retested = false, true
+				S.value = math.floor((S.lo + S.hi) / 2)
+				log(string.format("PROBE move_boost clean at %d%% area=%s -> retest %d%% once", tried, area, S.value))
+			elseif not S.hi then
+				S.value = math.min(tried + N.BoostStep, N.BoostArea[area])
+				log(string.format("PROBE move_boost clean at %d%% area=%s -> next %d%%", tried, area, S.value))
 			end
-			if B.clean >= 20 then
-				local base = math.clamp(optionNumber("FastBoost", 110), 100, 300)
-				B.value = math.min(math.max(B.value or base, base) + 5, N.BoostCap)
-				B.clean = 0
-				saveBoost(B)
-				log(string.format("PROBE move_boost result=accepted gain=+%d%% boost=%d legs=20", B.value - 110, B.value))
-			end
+			saveBoost()
 		end)
 	end
 	-- Empty legs only: is a full teleport accepted (no pull-back, no TELEPORT line)? 3 tries once per PlaceVersion
@@ -34063,8 +34138,8 @@ do
 	local function noteSnap(distance, why)
 		N.Moves.snaps += 1
 		N.Moves.snapAt = os.clock()
-		if not N.carrying() and N.moveMode() == "Fast" and N.fastBoost(false) > N.BoostCarry then
-			boostReject(why or "pull-back")
+		if N.moveMode() == "Fast" then
+			boostReject(why or "pull-back", N.carrying())
 		end
 		N.Moves.slowUntil = os.clock() + 45
 		N.Moves.slowFactor = math.max((N.Moves.slowFactor or 1) * 0.95, 0.85)
@@ -34130,8 +34205,9 @@ do
 			tpReject("anti-cheat teleport line")
 			return
 		end
-		if string.find(low, "speed") and not carrying then
-			boostReject("anti-cheat speed line")
+		boostAbort(text)
+		if string.find(low, "speed") or string.find(low, "too fast") then
+			boostReject("anti-cheat speed line", carrying)
 		end
 		if string.find(low, "exploded") then
 			local L = N.Moves.ladder
@@ -34356,6 +34432,8 @@ do
 			return N.modeSpeed(opts.mode or N.moveMode(), carrying)
 		end
 		local startPos, startAt = root.Position, os.clock()
+		local area = if N.areaOf(root.Position) == "base" and N.areaOf(target) == "base" then "base" else "zone"
+		N.Moves.legArea, N.Moves.lastArea = area, area
 		Noclip.travel = mode == "Walk" or on("TravelNoclip")
 		local ok = true
 		for _, point in ipairs(planPath(root.Position, target)) do
@@ -34370,6 +34448,7 @@ do
 			end
 		end
 		Noclip.travel = false
+		N.Moves.legArea = nil
 		if ok and opts.look then
 			placeRoot(target, opts.look)
 		end
@@ -34377,10 +34456,12 @@ do
 		local walked = if after then flat(startPos, after.Position) else 0
 		if walked > 30 then
 			local took = math.max(os.clock() - startAt, 0.01)
-			log(string.format("MOVE %s %d studs in %.1fs = %d/s (WalkSpeed %d, boost %d%%, carrying %d)", mode, walked, took, walked / took, N.walkSpeed(), if mode == "Fast" then N.fastPct(carrying) else 97, if carrying then 1 else 0))
+			N.Moves.legArea = area
+			log(string.format("MOVE %s %d studs in %.1fs = %d/s (WalkSpeed %d, boost %d%%, area %s, carrying %d)", mode, walked, took, walked / took, N.walkSpeed(), if mode == "Fast" then N.fastPct(carrying) else 97, area, if carrying then 1 else 0))
+			N.Moves.legArea = nil
 		end
-		if ok and mode == "Fast" and not carrying and walked >= 200 then
-			boostLegDone(startAt)
+		if ok and mode == "Fast" and not carrying then
+			boostLegDone(startAt, walked, area)
 		end
 		return ok
 	end
@@ -39443,7 +39524,7 @@ do
 			Default = "Fast",
 			Tooltip = "Fast = the fastest the server accepts (measured, steps back after a pull-back). Walk = your own speed. Teleport = instant without an animal only, the game blocks banking after one",
 		})
-		MoveBox:AddSlider("FastBoost", { Text = "Fast Speed (start)", Default = 110, Min = 100, Max = 300, Rounding = 0, Suffix = "% of your speed", Tooltip = "Where Fast starts; it raises itself while the server accepts it" })
+		MoveBox:AddSlider("FastBoostMax", { Text = "Fast Speed (max)", Default = 200, Min = 100, Max = 200, Rounding = 0, Suffix = "% of your speed", Tooltip = "Upper limit for Fast. Corvus runs 160 % in zones and 200 % around the bases (measured server limits), 10 % less with an animal" })
 		MoveBox:AddToggle("TeleportSpeedCheck", {
 			Text = "Speed Check With Teleport",
 			Default = false,
