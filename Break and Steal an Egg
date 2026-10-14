@@ -33017,6 +33017,7 @@ do
 			Log.statusAt = now
 		end
 		Status = text
+		Log.statusSetAt = os.clock()
 	end
 	Log.context = function()
 		return Status
@@ -34252,7 +34253,11 @@ do
 				local drift = (root.Position - expected).Magnitude
 				if drift > 12 then
 					N.Moves.pushes += 1
-					if (root.Position - target).Magnitude > (expected - target).Magnitude + 8 then
+					if os.clock() < (N.Moves.graceUntil or 0) then
+						-- our own reposition (the game moves you off the treadmill when the session ends), not a pull-back
+						log("MOVE drift ignored", math.floor(drift) .. " studs", tostring(N.Moves.graceWhy or "own reposition"))
+						N.Moves.graceUntil = 0
+					elseif (root.Position - target).Magnitude > (expected - target).Magnitude + 8 then
 						noteSnap(drift)
 						task.wait(0.4)
 						checkAt, checkDistance = os.clock(), (target - root.Position).Magnitude
@@ -38305,6 +38310,9 @@ do
 		if T.session then
 			fire("TreadmillSessionRemote")
 			T.session = false
+			-- the game drops you off the belt when the session ends; that jump is not a server pull-back (live 2026-10-14:
+			-- it froze the zone boost at 150 % and slowed every leg to 105 % for 3 min)
+			N.Moves.graceUntil, N.Moves.graceWhy = os.clock() + 2, "left the treadmill"
 		end
 	end
 	-- Admin Treadmill (admin event, PublicTreadmillConfig): a public treadmill model "Admin Treadmill" in the workspace
@@ -40748,8 +40756,40 @@ do
 		return on("AutoFarm") or on("StealPickups") or on("AutoTrain") or on("AutoSell") or on("AutoPlace") or on("AutoHell")
 	end
 	N.anyAutoOn = anyAutoOn
+	-- Status when no step wrote one this pass: what is true now, never the last activity (owner 2026-10-14: "Breaking ..."
+	-- stayed after Auto Farm was turned off).
+	function N.idleStatus()
+		local parts = {}
+		if on("AutoFarm") or on("StealPickups") then
+			table.insert(parts, "looking for the next egg or animal")
+		end
+		if on("AutoTrain") and not N.Train.startedAt then
+			table.insert(parts, "Auto Train waits until more speed pays")
+		end
+		if on("AutoPlace") then
+			table.insert(parts, "Auto Place has nothing to place")
+		end
+		if on("AutoSell") or on("AutoSellSurplus") then
+			table.insert(parts, "nothing to sell")
+		end
+		if on("AutoHell") then
+			table.insert(parts, "Hell Boss: " .. tostring(N.hellStatusText()))
+		end
+		if on("AutoFuse") then
+			table.insert(parts, "Fuse: " .. tostring(N.Fuse.status))
+		end
+		if on("AutoMergeEggs") or on("AutoMergePets") then
+			table.insert(parts, "Merge: " .. tostring(N.MergePets.status))
+		end
+		if #parts == 0 then
+			return "Idle, nothing is enabled"
+		end
+		local text = table.concat(parts, "  \u{00B7}  ")
+		return string.upper(string.sub(text, 1, 1)) .. string.sub(text, 2)
+	end
 	task.spawn(function()
 		while alive() do
+			local passAt = os.clock()
 			local ok, err = xpcall(function()
 				if N.manualRunning() then
 					return
@@ -40825,7 +40865,9 @@ do
 				end
 				if not anyAutoOn() then
 					N.holdAt(nil)
-					setStatus("Idle")
+				end
+				if (Log.statusSetAt or -1e9) < passAt then
+					setStatus(N.idleStatus())
 				end
 				task.wait(0.4)
 			end, debug.traceback)
@@ -40965,20 +41007,20 @@ do
 						table.insert(lines, "<b>Rewards</b>: " .. N.Rewards.upNextText())
 					end
 					if on("AutoFarm") then
-						table.insert(lines, string.format("<b>Break Eggs</b>: zone %d, %s%s", N.bestZone(), string.lower(optionText("EggPriority", "Best value per second")), if P.zoneNote then " (" .. tostring(P.zoneNote) .. ")" else ""))
+						table.insert(lines, string.format("<b>Break Eggs</b>: zone %s, %s%s", tostring(N.farmZoneTarget() or "-"), string.lower(optionText("EggPriority", "Best value per second")), if P.zoneNote then " (" .. tostring(P.zoneNote) .. ")" else ""))
 					end
 					if N.buyingOn() or on("AutoPickaxe") or on("AutoTrail") then
 						local top = P.valid and P.valid[1]
 						table.insert(lines, "<b>Upgrades</b>: " .. (if top then string.format("next %s for $%s %s, pays back in %s", tostring(top.label), formatNumber(top.cost), if (top.eta or 0) <= 0 then "now" else "in " .. P.formatSeconds(math.min(top.eta, 1e7)), P.formatSeconds(math.min(top.payback or 0, 1e7))) else P.shortNoBuy()))
 					end
 					if on("StealPickups") then
-						table.insert(lines, "<b>Steal Animals</b>: takes animals that beat your weakest pet")
+						table.insert(lines, "<b>Steal Animals</b>: " .. (if on("OnlyBetter") then "takes animals that beat your weakest pet" else "takes every animal that passes the filters"))
 					end
 					if on("AutoPlace") then
 						table.insert(lines, string.format("<b>Auto Place</b>: %d placed, %d in backpack, %d placed this session", #N.placedAnimals(), N.backpackCount(), Session.placed))
 					end
 					if on("AutoTrain") then
-						table.insert(lines, "<b>Auto Train</b>: " .. (if N.Train.startedAt then "on the treadmill now" .. (if P.trainTarget then ", goal " .. formatNumber(P.trainTarget) .. " speed" else "") elseif P.activity == "train" then "going to the treadmill" else "farming first, speed does not pay more yet"))
+						table.insert(lines, "<b>Auto Train</b>: " .. (if N.Train.startedAt then "on the treadmill now" .. (if P.trainTarget then ", goal " .. formatNumber(P.trainTarget) .. " speed" else "") elseif P.activity == "train" then "going to the treadmill" elseif on("AutoFarm") then "farming first, speed does not pay more yet" else "waits, speed does not pay more yet"))
 					end
 					if on("AutoSellSurplus") or on("AutoSell") then
 						table.insert(lines, string.format("<b>Selling</b>: sold %d, protected %s", Session.sold, table.concat(N.protectText(), ", ")))
@@ -41070,7 +41112,7 @@ do
 						tostring(N.plotAttr("TreadmillLevel", "?")),
 						tostring(mult),
 						formatNumber(trailMult),
-						if N.Train.startedAt then '<font color="#60d696">Training now</font>' elseif optionText("TrainMode", "Profit plan") == "Profit plan" then "Plan: " .. N.Plan.activity else "Phase: " .. N.Train.phase
+						if N.Train.startedAt then '<font color="#60d696">Training now</font>' elseif optionText("TrainMode", "Profit plan") == "Profit plan" then (if N.Plan.activity == "train" then "Training pays more now, going to the treadmill" else "Farming pays more now, training later") else "Alternate: " .. (if N.Train.phase == "train" then "training phase" else "farming phase")
 					)
 					else '<font color="#fab428">Treadmill is locked</font>, turn on the treadmill upgrade in Upgrades or buy it at your plot'
 				local shopLines = {}
