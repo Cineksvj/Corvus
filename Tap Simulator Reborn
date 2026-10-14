@@ -40958,7 +40958,7 @@ do
 	-- ColosseumRelicConfig L366818-366917, current relic Data.Colosseum.Relic); the reward replaces the relic only when it
 	-- scores higher. Afterwards the wave HUD is closed (L33354-33370). OpponentReachedEnd and the absent
 	-- ChooseColosseumUpgrade are never sent. =====
-	N.Arena = { active = false, opponents = {}, charge = 0, lastCrit = -1e9, waves = 0, last = "", nextAt = 0, offerAt = nil, cadence = 0.13, waveLogged = false }
+	N.Arena = { active = false, opponents = {}, charge = 0, lastCrit = -1e9, waves = 0, last = "", nextAt = 0, offerAt = nil, cadence = 0.13, waveLogged = false, progressAt = 0 }
 	local Arena = N.Arena
 	local WaveCfg = N.tableOr(N.safeRequire("Shared.Minigames.WaveDefenseConfig"))
 	local RelicCfg = N.tableOr(N.safeRequire("Shared.Minigames.ColosseumRelicConfig"))
@@ -40969,11 +40969,13 @@ do
 		end
 	end
 	N.onEvent("ColosseumService.RE.WaveDefenseOpponentSpawned", function(p)
+		Arena.progressAt = os.clock()
 		if type(p) == "table" and p.Id ~= nil then
 			Arena.opponents[tostring(p.Id)] = { id = p.Id, arrival = tonumber(p.ArrivalTime) or math.huge, spawn = tonumber(p.SpawnTime) or 0, ability = p.Ability, shield = p.Shield }
 		end
 	end)
 	N.onEvent("ColosseumService.RE.WaveDefenseOpponentDefeated", function(p)
+		Arena.progressAt = os.clock()
 		local id = if type(p) == "table" then p.OpponentId else p
 		if id ~= nil and Arena.opponents[tostring(id)] then
 			Arena.opponents[tostring(id)] = nil
@@ -40981,13 +40983,18 @@ do
 		end
 	end)
 	N.onEvent("ColosseumService.RE.WaveDefenseHeartLost", function(p)
+		Arena.progressAt = os.clock()
 		if type(p) == "table" and p.OpponentId ~= nil then
 			Arena.opponents[tostring(p.OpponentId)] = nil
 		end
 	end)
 	N.onEvent("ColosseumService.RE.WaveDefenseWaveComplete", function(p)
+		Arena.progressAt = os.clock()
 		if type(p) == "table" then
 			Arena.waves = math.max(Arena.waves, tonumber(p.WaveCompleted) or 0)
+			if Arena.active and Arena.waves % 5 == 0 then
+				log("ARENA wave=" .. Arena.waves .. " t=" .. string.format("%.0f", os.clock() - (Arena.startedAt or os.clock())) .. "s hearts=" .. tostring(p.Hearts))
+			end
 			local offers = {}
 			if type(p.Offers) == "table" then
 				for _, o in ipairs(p.Offers) do
@@ -41004,7 +41011,16 @@ do
 			end
 		end
 	end)
-	N.onEvent("ColosseumService.RE.WaveDefenseWaveStarting", function()
+	N.onEvent("ColosseumService.RE.WaveDefenseWaveStarting", function(p)
+		Arena.progressAt = os.clock()
+		-- the real client reads the whole spawn list of the wave here (PendingSpawns), so do we
+		if type(p) == "table" and type(p.PendingSpawns) == "table" then
+			for _, s in ipairs(p.PendingSpawns) do
+				if type(s) == "table" and s.Id ~= nil and not Arena.opponents[tostring(s.Id)] then
+					Arena.opponents[tostring(s.Id)] = { id = s.Id, arrival = tonumber(s.ArrivalTime) or math.huge, spawn = tonumber(s.SpawnTime) or 0, ability = s.Ability, shield = s.Shield }
+				end
+			end
+		end
 		if Arena.offerAt and N.probeState("colosseum_offers") == "untested" then
 			N.probeResult("colosseum_offers", "accepted", "gain=the run goes on after the offers (wave " .. Arena.waves .. ")")
 		end
@@ -41181,12 +41197,32 @@ do
 			end
 		end
 		Arena.active = true
-		local stopAt = os.clock() + 420
+		Arena.startedAt = os.clock()
+		Arena.progressAt = os.clock()
+		-- Relic quality is decided by the wave reached (RelicTierWeights: Gold/Platinum/Diamond from wave 30). Live 4006: both
+		-- runs hit the old 420 s cap at wave 29 (one wave short of the tier) and lost 7 minutes of hatching each. Stop as soon as
+		-- the next tier boundary (first tier start >= 20, fallback 30) is cleared, hard cap 600 s.
+		local goalWave = 30
+		for _, tier in ipairs(N.tableOr(WaveCfg.RelicTierWeights)) do
+			if type(tier) == "table" and type(tier.Waves) == "table" and (tonumber(tier.Waves[1]) or 0) >= 20 then
+				goalWave = tonumber(tier.Waves[1])
+				break
+			end
+		end
+		local stopAt = os.clock() + 600
 		local attacks, accepted, crits, critHits, streak, side = 0, 0, 0, 0, 0, 1
 		local inFlight, critFlight, critMiss = 0, false, 0
 		local nextAttack, lastStep = os.clock(), os.clock()
 		N.loopStatus("Main", "Pet Defense: attacking")
 		while Arena.active and os.clock() < stopAt and alive() do
+			if Arena.waves >= goalWave and not Arena.offerAt then
+				log("DEFENSE goal wave " .. goalWave .. " cleared after " .. string.format("%.0f", os.clock() - Arena.startedAt) .. "s")
+				break
+			end
+			if os.clock() - Arena.progressAt > 60 then
+				log("DEFENSE stalled wave=" .. Arena.waves .. " reason=no payload 60 s")
+				break
+			end
 			if Arena.offerAt and os.clock() - Arena.offerAt > 6 then
 				-- The run waits on an upgrade offer that this game version cannot answer: end it, the relic is kept.
 				if N.probeState("colosseum_offers") == "untested" then
@@ -41244,6 +41280,7 @@ do
 					inFlight -= 1
 					if type(r) == "table" then
 						accepted += 1
+						Arena.progressAt = os.clock()
 						streak += 1
 						Arena.charge = math.min(Arena.charge + 7, 100)
 						if tonumber(r.NewArrivalTime) then
@@ -41283,13 +41320,22 @@ do
 		local state = N.probeState("colosseum_cadence")
 		if attacks >= 200 and tonumber(state) == nil then
 			local share = accepted / math.max(attacks, 1)
-			N.probeResult("colosseum_cadence", if share >= 0.97 then "accepted" else "rejected", string.format("gain=%.1f attacks/s at=%.3f (%d/%d accepted, criticals %d/%d)", accepted / math.max(os.clock() - (stopAt - 420), 1), Arena.cadence, accepted, attacks, critHits, crits), string.format("%.3f", Arena.cadence))
+			N.probeResult("colosseum_cadence", if share >= 0.97 then "accepted" else "rejected", string.format("gain=%.1f attacks/s at=%.3f (%d/%d accepted, criticals %d/%d)", accepted / math.max(os.clock() - Arena.startedAt, 1), Arena.cadence, accepted, attacks, critHits, crits), string.format("%.3f", Arena.cadence))
 		end
+		-- End the run on the server (it builds the reward then; the old cap path skipped this and the reward showed up only at
+		-- the next start as "Claim your previous reward first"), give the GameOver event a moment, then leave the arena.
+		if Arena.active then
+			invoke("ColosseumService.RF.EndWaveDefense")
+			waitFor(function()
+				return not Arena.active
+			end, 2)
+		end
+		Arena.active = false
 		invoke("ColosseumService.RF.ReturnFromArena")
 		-- The reward: replace the relic only when the new one scores higher.
 		local pending = waitFor(function()
 			return type(N.sub(N.sub(N.data(), "Colosseum"), "PendingReward").NewRelic) == "table"
-		end, 3) and N.sub(N.sub(N.data(), "Colosseum"), "PendingReward")
+		end, 5) and N.sub(N.sub(N.data(), "Colosseum"), "PendingReward")
 		local choice, newScore, oldScore, relicName = "keep", 0, 0, "?"
 		if pending then
 			local relic, cur = N.currentRelic()
