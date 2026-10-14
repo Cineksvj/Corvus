@@ -44645,6 +44645,27 @@ do
 		end
 		return sum
 	end
+	-- Player filter (empty = no filter): pet rarity AND variant must be selected. The dropdown says Rainbow, the game's tier Shiny.
+	local VariantTier = { Normal = "Normal", Golden = "Golden", Diamond = "Diamond", Rainbow = "Shiny" }
+	function N.indexFilter()
+		local rar, var = {}, {}
+		local nr, nv = 0, 0
+		for _, r in ipairs(picked(Options.IndexHuntRarities)) do
+			rar[r] = true
+			nr += 1
+		end
+		for _, v in ipairs(picked(Options.IndexHuntVariants)) do
+			if VariantTier[v] then
+				var[VariantTier[v]] = true
+				nv += 1
+			end
+		end
+		return (if nr > 0 then rar else nil), (if nv > 0 then var else nil)
+	end
+	function N.indexFilterText()
+		local r, v = picked(Options.IndexHuntRarities), picked(Options.IndexHuntVariants)
+		return string.format("rarities=%s variants=%s", if #r > 0 then table.concat(r, "/") else "all", if #v > 0 then table.concat(v, "/") else "all")
+	end
 	local function indexEggs()
 		local list = N.G.Index and N.G.Index.Eggs
 		if type(list) == "table" and #list > 0 then
@@ -44776,6 +44797,19 @@ do
 		local income, coins = N.income(), N.coins()
 		local minP, secrets = N.indexOdds()
 		local own, pods = copies(), pendingRainbows()
+		local fRar, fVar = N.indexFilter()
+		local tiers = Tiers
+		if fVar then
+			tiers = {}
+			for _, t in ipairs(Tiers) do
+				if fVar[t] then
+					table.insert(tiers, t)
+				end
+			end
+		end
+		local function rarityOk(pet)
+			return fRar == nil or fRar[N.rarityOf({ Name = pet })] == true
+		end
 		local plan = { best = nil, all = {}, blocked = 0, left = 0 }
 		for _, e in ipairs(eggsByPrice()) do
 			local egg = e.egg
@@ -44805,15 +44839,15 @@ do
 				if total > 0 then
 					for pet, w in pairs(N.tableOr(cfg.Pets)) do
 						local p = (tonumber(w) or 0) / total
-						if p >= minP and not skipped(pet) then
-							add(tostring(pet), p, Tiers)
+						if p >= minP and not skipped(pet) and rarityOk(pet) then
+							add(tostring(pet), p, tiers)
 						end
 					end
 				end
 				if secrets then
 					for pet, oneIn in pairs(N.tableOr(cfg.Secrets)) do
 						local p = 1 / math.max(tonumber(oneIn) or math.huge, 1)
-						if p >= minP and not skipped(pet) then
+						if p >= minP and not skipped(pet) and rarityOk(pet) and (fVar == nil or fVar.Normal) then
 							add(tostring(pet), p, { "Normal" })
 						end
 					end
@@ -44914,6 +44948,10 @@ do
 			if not I.target or I.target.egg ~= pick.egg then
 				if I.target then
 					log(string.format("INDEX egg %s done or paused, next egg %s", I.target.egg, pick.egg))
+				end
+				if not I.filterLogged then
+					I.filterLogged = true
+					log("INDEX hunt filter " .. N.indexFilterText())
 				end
 				log(string.format("INDEX hunt egg=%s new=%d eta=%ds hatches=%s coins=%s (%s; %s)", pick.egg, pick.new, math.min(math.floor(pick.eta), 1e9), formatNumber(math.floor(pick.hatches)), formatNumber(pick.cost), names(pick.targets, 4), collectorText()))
 			end
@@ -46910,6 +46948,41 @@ do
 			Values = { "1 in 100", "1 in 1,000", "Secrets too" },
 			Default = "1 in 1,000",
 			Tooltip = "1 in 100: the quick ones. 1 in 1,000: every normal pet (the rarest normal pets are 1 in 1,000). Secrets too: also the secret pets (1 in 500K to 4M: very long)",
+		})
+		local rarOrder = { "Common", "Rare", "Epic", "Legendary", "Mythical", "Godly", "Exclusive", "Leaderboard" }
+		local rarSeen, rarVals = {}, {}
+		for _, cfg in pairs(N.tableOr(N.G.PetCfg)) do
+			if type(cfg) == "table" and type(cfg.Rarity) == "string" then
+				rarSeen[cfg.Rarity] = true
+			end
+		end
+		for _, r in ipairs(rarOrder) do
+			rarSeen[r] = nil
+			table.insert(rarVals, r)
+		end
+		local rarExtra = {}
+		for r in pairs(rarSeen) do
+			table.insert(rarExtra, r)
+		end
+		table.sort(rarExtra)
+		for _, r in ipairs(rarExtra) do
+			table.insert(rarVals, r)
+		end
+		IndexBox:AddDropdown("IndexHuntRarities", {
+			Text = "Only these rarities",
+			Values = rarVals,
+			Default = {},
+			Multi = true,
+			AllowNull = true,
+			Tooltip = "Index Hunter only targets pets of the picked rarities. Empty = all rarities",
+		})
+		IndexBox:AddDropdown("IndexHuntVariants", {
+			Text = "Only these variants",
+			Values = { "Normal", "Golden", "Diamond", "Rainbow" },
+			Default = {},
+			Multi = true,
+			AllowNull = true,
+			Tooltip = "Index Hunter only hunts the picked variants. Empty = all four",
 		})
 		Labels.Index = IndexBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
