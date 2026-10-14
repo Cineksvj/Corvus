@@ -32581,7 +32581,7 @@ do
 		pcall(function()
 			executor = table.concat({ identifyexecutor() }, " ")
 		end)
-		log("BOOT", GameName, "place", game.PlaceId, "job", string.sub(tostring(game.JobId), 1, 8), "executor", executor)
+		log("BOOT", GameName, "place", game.PlaceId, "version", game.PlaceVersion, "built on 1352", "job", string.sub(tostring(game.JobId), 1, 8), "executor", executor)
 	end
 	Perf = { frames = 0, time = 0, worst = 0, hitches = 0, freezes = 0, work = {}, hitchLogAt = 0, last = nil }
 	Library:GiveSignal(RunService.Heartbeat:Connect(function(dt)
@@ -32618,17 +32618,60 @@ do
 		DropCarriedRemote = true,
 		MergeMachineRemote = true,
 		DemonEventRequest = true,
+		-- 1352: Fuse Machine (FuseMachineConfig.RemoteName): Sync / Deposit name+instance / Return name / Fuse (bc 15444-15663).
+		FuseMachineRequest = true,
+		-- 1352: Hell event join (HellPortalController 25685) and boss swings (BatController 5998). BatHitRequest only while
+		-- the player is InHell (no player is a valid target there, BatTargeting 85936); outside Hell it would be PvP.
+		HellJoinRemote = true,
+		BatHitRequest = true,
+		-- free index zone bats (IndexBatRewards bc 66250-66422) and the community reward ladder (DiscordRewardController
+		-- bc 10190-10346, only under its own toggle)
+		BatUnlockRemote = true,
+		DiscordRewardRemote = true,
 	}
 	local AllowedInvoke = { BackpackSellRemote = true }
-	local Quiet = { EggHitRequest = true }
+	-- Cash/token purchases (owner incident 2026-10-13: $600T went on a pickaxe and the log had no BUY line). A purchase
+	-- remote fires only (1) right after N.buyIntent logged `BUY <item> $<price> payback <h>` for that remote and (2) while
+	-- the toggle that owns it is on (the Smart Planner counts through on()). Anything else is BLOCKED and logged.
+	local PurchaseToggles = {
+		PickaxeShopRequest = { "AutoPickaxe" },
+		TrailShopRequest = { "AutoTrail" },
+		UpgradePlotRequest = { "AutoPlotUpgrade" },
+		UnlockTreadmillRequest = { "AutoTreadmill", "AutoPlotUpgrade" },
+		UpgradeTreadmillRequest = { "AutoTreadmill" },
+		DemonEventRequest = { "AutoDemonShop", "AutoDemonEgg" },
+	}
+	local function isPurchase(name, first)
+		if not PurchaseToggles[name] then
+			return false
+		end
+		if name == "PickaxeShopRequest" or name == "TrailShopRequest" then
+			return first == "Buy"
+		end
+		if name == "DemonEventRequest" then
+			return first == "BuyEgg" or first == "BuyPotion"
+		end
+		return true
+	end
+	N.isPurchase = isPurchase
+	N.PurchaseToggles = PurchaseToggles
+	local Quiet = { EggHitRequest = true, BatHitRequest = true }
 	function N.remote(name)
 		local remote = ReplicatedStorage:FindFirstChild(name)
 		return remote
 	end
 	function fire(name, ...)
-		if not Allowed[name] then
+		if not Allowed[name] or (name == "BatHitRequest" and LocalPlayer:GetAttribute("InHell") ~= true) then
 			log("BLOCKED", name)
 			return false
+		end
+		if isPurchase(name, (...)) then
+			local intent = N.BuyIntent
+			if not (intent and intent.remote == name and os.clock() - intent.at < 10 and N.purchaseToggleOn(name)) then
+				log("BLOCKED purchase", name, "reason=no BUY intent or its toggle is off")
+				logProblem("Purchase blocked: " .. name .. " fired without its toggle")
+				return false
+			end
 		end
 		local remote = N.remote(name)
 		if not (remote and remote:IsA("RemoteEvent")) then
@@ -32761,6 +32804,21 @@ do
 	N.G.Rewards = N.tableOr(safeRequire("Shared.EggRewards"))
 N.G.BackpackSell = N.tableOr(safeRequire("Shared.BackpackSellConfig"))
 	N.G.Shop = N.tableOr(safeRequire("Shared.RobuxShopConfig"))
+	-- 1352: Fuse Machine recipe/odds and the egg types it and the demon shop give (EggTypeConfig.Types).
+	N.G.Fuse = N.tableOr(safeRequire("Shared.FuseMachineConfig"))
+	N.G.EggTypes = N.tableOr(safeRequire("Shared.EggTypeConfig"))
+	-- 1352 code pass: merge machine (growth, variant odds, cooldown attribute) and the demon furnace gate.
+	N.G.Merge = N.tableOr(safeRequire("Shared.MergeConfig"))
+	N.G.Demon = N.tableOr(safeRequire("Shared.DemonEventConfig"))
+	-- state-verified rewards (p06_rewards): index reward amounts, zone bats, group and community reward configs;
+	-- egg growth clock (planted egg ready time) and lucky eggs (egg picker value)
+	N.G.Index = N.tableOr(safeRequire("Shared.IndexConfig"))
+	N.G.BatUnlock = N.tableOr(safeRequire("Shared.BatUnlock"))
+	N.G.Bat = N.tableOr(safeRequire("Shared.BatConfig"))
+	N.G.Group = N.tableOr(safeRequire("Shared.GroupRewardConfig"))
+	N.G.Discord = N.tableOr(safeRequire("Shared.DiscordRewardConfig"))
+	N.G.Growth = N.tableOr(safeRequire("Shared.EggGrowthClock"))
+	N.G.Lucky = N.tableOr(safeRequire("Shared.LuckyEggConfig"))
 end
 local formatNumber, clockText, character, rootPart, humanoid, allows, selected, on, optionNumber, optionText, count
 local flat, Status, setStatus, picked
@@ -32862,11 +32920,16 @@ do
 		AutoPlotUpgrade = true,
 		AutoTreadmill = true,
 		AutoSatchel = true,
-		AutoDemonShop = true,
-		AutoSellSurplus = true,
+		-- OWNER_RULES 20/21: the planner alone never spends Fallen Tokens on potions/eggs, never fuses or merges animals
+		-- and never runs the broad Sell Surplus / Auto Sell rules: AutoDemonShop, AutoDemonEgg, AutoSellSurplus, AutoSell,
+		-- AutoFuse and AutoMergePets run only under their own toggles. Its own strict surplus sale (plot full, weaker than
+		-- the weakest placed animal, never Secret/locked/protected, one filler kept) is N.surplusPlan(true) in p05.
 		AutoMergeEggs = true,
+		-- free claims, every one confirmed by the game's own State answer (p06_rewards): index cash + speed and the
+		-- zone bats, offline cash, the group reward. The community reward is not here (it needs the player's own step).
 		AutoIndex = true,
 		AutoOffline = true,
+		AutoGroup = true,
 	}
 	N.PlannerChoice = { ZoneMode = "Best zone", EggPriority = "Best value per second", TrainMode = "Profit plan" }
 	function N.planOn()
@@ -33035,7 +33098,7 @@ do
 	-- The game's swing gap = PickaxeConfig.SwingCooldown / RobuxShopConfig.SwingMultiplierFor(player), and that
 	-- multiplier = FastSwing gamepass x Swing potion (PotionEndsAt_Swing, x1.25) x global Swing boost
 	-- (workspace GlobalBoostMult_Swing while GlobalBoostEndsAt_Swing). The server floor scales the same way
-	-- (EggConfig.HitCooldownFactor 0.92), so the potion the hub buys really speeds the hits up.
+	-- (EggConfig.HitCooldownFactor, 0.92 up to 1322, 0.8 since 1352), so the potion the hub buys really speeds the hits up.
 	local SwingCache = { at = -1e9, mult = 1, key = "" }
 	function N.swingMult()
 		if os.clock() - SwingCache.at < 2 then
@@ -33068,7 +33131,7 @@ do
 	function N.swingGap()
 		return N.swingCooldown() / N.swingMult()
 	end
-	N.RarityOrder = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine", "Cosmic", "Secret", "Celestial", "Inferno" }
+	N.RarityOrder = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine", "Cosmic", "Secret", "Celestial", "Inferno", "Void", "Omega" }
 	N.RarityColors = {
 		Common = "#b4b4be",
 		Uncommon = "#5ac864",
@@ -33081,6 +33144,8 @@ do
 		Secret = "#ff78c8",
 		Celestial = "#ffe27a",
 		Inferno = "#ff7a2e",
+		Void = "#8a5cff",
+		Omega = "#ff4fd8",
 	}
 	function N.rarityColor(rarity)
 		return N.RarityColors[rarity] or "#dddddd"
@@ -33130,6 +33195,7 @@ do
 			{ Id = "Zone7", Rarity = "Divine", RequiredPower = 1000000000, GuardSpeed = 55 },
 			{ Id = "Zone8", Rarity = "Cosmic", RequiredPower = 5000000000, GuardSpeed = 60 },
 			{ Id = "Zone9", Rarity = "Secret", RequiredPower = 25000000000, GuardSpeed = 65 },
+			{ Id = "Zone10", Rarity = "Celestial", RequiredPower = 100000000000, GuardSpeed = 70 },
 		}
 	end
 	for index, zone in ipairs(list) do
@@ -33309,6 +33375,9 @@ do
 			bracket = tostring(part:GetAttribute("WeightBracket") or ""),
 			-- The Titanic event egg (every 30 min, 10x HP, 30x luck) and eggs that rolled the TITANIC weight bracket.
 			titanic = part:GetAttribute("Titanic") == true or N.hasTag(part, "TitanicEgg"),
+			-- Lucky eggs (LuckyEggConfig: tag LuckyEgg, attribute Lucky; pet luck already in Luck, plus size luck x1.2-1.35
+			-- and mutation luck x1.5-2): valued higher by the egg picker (P.luckyFactor, measured on their hatches)
+			lucky = part:GetAttribute("Lucky") == true or N.hasTag(part, "LuckyEgg"),
 			luck = tonumber(part:GetAttribute("HatchLuck")) or tonumber(part:GetAttribute("Luck")) or 1,
 			hits = math.ceil(hp / N.damage()),
 			position = part.Position,
@@ -33380,7 +33449,9 @@ do
 			if prompt:IsA("ProximityPrompt") and prompt.Name == "StealPrompt" and prompt.Enabled then
 				local holder = prompt.Parent
 				if holder and holder:IsA("BasePart") then
-					local d = boxDistance(info.model, holder.Position)
+					-- several anchors can sit inside one pickup's box when animals land close together: the one nearest
+					-- to the model's own centre is its prompt (live/soak: "STEAL took Cheap instead of Rich")
+					local d = boxDistance(info.model, holder.Position) + 0.05 * (holder.Position - info.position).Magnitude
 					if d < bestDistance then
 						best, bestDistance = prompt, d
 					end
@@ -33601,7 +33672,9 @@ do
 	function N.worstPlaced()
 		local placed = N.placedAnimals()
 		local maxAnimals = tonumber(N.plotAttr("MaxAnimals", 0)) or 0
-		if maxAnimals <= 0 or #placed < maxAnimals then
+		-- the game counts AnimalsPlaced (planted eggs may take a slot, PROBE egg_slot), the same count the place step uses
+		local used = math.max(tonumber(N.plotAttr("AnimalsPlaced", 0)) or 0, #placed)
+		if maxAnimals <= 0 or used < maxAnimals or #placed == 0 then
 			return 0, nil
 		end
 		local worst, worstInfo
@@ -34070,11 +34143,22 @@ do
 		F.rejects += 1
 		Session.rejects += 1
 		F.backoffUntil = os.clock() + 0.4
+		local first = false
 		if typeof(part) == "Instance" and F.target and F.target.part == part then
 			F.targetRejects = (F.targetRejects or 0) + 1
-			if (F.targetHits or 0) <= 1 then
+			local opener = F.burstN or 1
+			if (F.targetHits or 0) <= opener then
 				F.firstRejects = (F.firstRejects or 0) + 1
+				first = true
+				-- hits 2..3 of the opening burst: the server's burst bucket said no (the first one is position lag)
+				if opener > 1 and (F.targetHits or 0) >= 2 then
+					N.Burst.note()
+				end
 			end
+		end
+		-- First hits after a walk are a position lag (hitSettle), not the pace: only later rejects step the pace up.
+		if not first and N.hitSpeedPick() == "Fast" then
+			N.HitTune.note()
 		end
 	end)
 	-- The server checks the hit against where IT sees the character, which trails the client by the ping. The game's
@@ -34112,28 +34196,136 @@ do
 			pcall(N.Events.caught)
 		end
 	end)
-	N.onRemote("AnimalBankedRemote", function(...)
-		log("BANKED event", ...)
+	N.onRemote("AnimalBankedRemote", function(list, ...)
+		log("BANKED event", list, ...)
+		-- a species banked for the first time turns its index entry Ready: the reward loop asks the index State again
+		-- (p06_rewards); species already in the index change nothing
+		local R = N.Rewards
+		if R and type(list) == "table" then
+			for _, item in pairs(list) do
+				local name = type(item) == "table" and item.Name
+				if type(name) == "string" and not (R.st.index and R.st.index[name] ~= nil) then
+					R.dirty.index = true
+				end
+			end
+		end
 	end)
-	-- Protect list of every seller (Sell Surplus, Auto Sell, the Smart Planner): Keep Mutated and Never Sell rarities.
+	-- Protect list of every seller and machine (Sell Surplus, Auto Sell, Auto Fuse, Auto Merge Pets): Keep Mutated and Never Sell rarities.
 	function N.protected(entry)
 		if on("SellKeepMutated") and entry.mutation then
 			return true
 		end
 		return selected(Options.SellProtect, entry.rarity)
 	end
-	-- Hit Speed: the server takes one hit per 0.92 x the swing gap (EggConfig.HitCooldownFactor, PickaxeConfig
-	-- SwingCooldown 0.5 = 0.46 s at base, burst 2). Fast sits just above that floor (0.935-0.96 x gap = 0.468-0.48 s), so
-	-- no hit is rejected (anything faster is dropped by the server, so it is not offered); Normal is the game's own swing.
+	-- Hit Speed: the server takes one hit per HitCooldownFactor x the swing gap (EggConfig, read live: 0.92 up to 1322,
+	-- 0.8 since 1352 = 0.40 s at base, burst 3). Fast sits just above that floor (factor + 0.015 .. + 0.04), so no hit is
+	-- rejected; Normal is the game's own swing. Rejected later hits (3 in 60 s) step Fast up by 0.03 x gap
+	-- (HIT fallback), the faster pace is tried again after 10 minutes (HIT retry). Self-measured: PROBE hit_floor.
 	function N.hitSpeedPick()
 		return if optionText("HitSpeed", "Fast") == "Normal" then "Normal" else "Fast"
 	end
+	N.HitTune = { extra = 0, stamps = {}, retryAt = nil, probeHits = 0, probeRejects = 0, probeSaid = false }
+	function N.hitFactor()
+		local f = tonumber(N.G.Egg.HitCooldownFactor)
+		return if f and f > 0.3 and f <= 1 then f else 0.92
+	end
+	function N.HitTune.note()
+		local H = N.HitTune
+		local now = os.clock()
+		H.probeRejects += 1
+		table.insert(H.stamps, now)
+		while H.stamps[1] and now - H.stamps[1] > 60 do
+			table.remove(H.stamps, 1)
+		end
+		if #H.stamps >= 3 and H.extra < 0.15 then
+			local before = N.hitFactor() + H.extra
+			H.extra = math.min(H.extra + 0.03, 0.15)
+			table.clear(H.stamps)
+			H.retryAt = now + 600
+			log(string.format("HIT fallback pace x%.3f -> x%.3f of the swing gap reason=rejected hits", before + 0.015, N.hitFactor() + H.extra + 0.015))
+		end
+	end
+	function N.HitTune.tick()
+		local H = N.HitTune
+		if H.extra > 0 and H.retryAt and os.clock() >= H.retryAt then
+			H.extra = math.max(H.extra - 0.03, 0)
+			H.retryAt = if H.extra > 0 then os.clock() + 600 else nil
+			log(string.format("HIT retry pace x%.3f of the swing gap", N.hitFactor() + H.extra + 0.015))
+		end
+		-- One measured verdict per session once 200 Fast hits ran at the live floor.
+		if not H.probeSaid and H.probeHits >= 200 then
+			H.probeSaid = true
+			local old = 0.92 + 0.0275
+			local now = N.hitFactor() + H.extra + 0.0275
+			local rate = H.probeRejects / math.max(H.probeHits, 1)
+			N.ProbeMem.set("hit_floor", if rate < 0.05 then "accepted" else "rejected")
+			log(string.format("PROBE hit_floor result=%s gain=%+.0f%% hits/s factor=%.2f rejected=%d/%d", if rate < 0.05 then "accepted" else "rejected", (old / now - 1) * 100, N.hitFactor(), H.probeRejects, H.probeHits))
+		end
+	end
+	-- Opening burst (1352 code pass gem 3): EggConfig HitBurst 3 / HitBurstMax 20 / HitLagBurstFactor 3.5 (bc 86641) let
+	-- the server take up to 3 hits at once after a pause (a walk to the next egg refills the bucket), but the game's own
+	-- swing never uses it (one hit per 0.5/mult s, PickaxeController 36055). Fast fires the first min(3, HitBurst) hits
+	-- 0.1 s apart, then the floor pace. 2 rejected opener hits in 60 s -> single hits for 10 min (HIT fallback burst).
+	N.Burst = { offUntil = 0, stamps = {}, eggs = 0, rejects = 0, said = false, probeSaid = false }
+	function N.Burst.note()
+		local B = N.Burst
+		local now = os.clock()
+		B.rejects += 1
+		table.insert(B.stamps, now)
+		while B.stamps[1] and now - B.stamps[1] > 60 do
+			table.remove(B.stamps, 1)
+		end
+		if #B.stamps >= 2 and now >= B.offUntil then
+			B.offUntil = now + 600
+			table.clear(B.stamps)
+			log("HIT fallback burst=" .. N.burstMax() .. " -> 1 reason=rejected opener hits, again in 10 min")
+		end
+	end
+	function N.burstMax()
+		local b = math.floor(tonumber(N.G.Egg.HitBurst) or 1)
+		return math.clamp(b, 1, 3)
+	end
+	function N.burstSize()
+		local B = N.Burst
+		if N.hitSpeedPick() ~= "Fast" then
+			return 1
+		end
+		-- remembered per PlaceVersion: a burst the server rejected on this version stays off
+		local mem = N.ProbeMem and N.ProbeMem.get("hit_burst")
+		if mem == "rejected" then
+			return 1
+		elseif mem == "accepted" then
+			B.probeSaid = true
+		end
+		if B.offUntil > 0 then
+			if os.clock() < B.offUntil then
+				return 1
+			end
+			B.offUntil = 0
+			log("HIT retry burst=" .. N.burstMax())
+		end
+		return N.burstMax()
+	end
 	function N.hitRange()
 		local base = N.swingGap()
-		local range = ({
-			Fast = { base * 0.935, base * 0.96 },
-		})[N.hitSpeedPick()] or { base, base + 0.06 }
-		return range[1], range[2]
+		-- remembered per PlaceVersion (Corvus/BSE_probes_<pv>.txt): a floor that was rejected on this version starts one step up
+		local H = N.HitTune
+		if not H.memRead and N.ProbeMem then
+			H.memRead = true
+			local mem = N.ProbeMem.get("hit_floor")
+			if mem == "rejected" then
+				H.extra = math.max(H.extra, 0.03)
+				H.retryAt = os.clock() + 600
+				log("HIT pace from memory: floor rejected on this version, starting one step up")
+			elseif mem == "accepted" then
+				H.probeSaid = true
+			end
+		end
+		if N.hitSpeedPick() == "Fast" then
+			local f = N.hitFactor() + N.HitTune.extra
+			return base * math.min(f + 0.015, 0.99), base * math.min(f + 0.04, 1)
+		end
+		return base, base + 0.06
 	end
 	function N.hitPace()
 		local lo, hi = N.hitRange()
@@ -34223,6 +34415,12 @@ do
 		-- Eggs in your zones that only fail the hit limit: when nothing else fits, the fewest-hits one is broken anyway,
 		-- so the last zone is never skipped just because its eggs are tough.
 		local tough, toughHits = nil, math.huge
+		-- Plot full (Smart Planner or Only Better): an egg whose best expected animal cannot beat the weakest placed one is
+		-- skipped (live 2026-10-13: a 1298-stud walk for a Sea Egg, animal $6.8M/s vs weakest $324M/s; Bamboo eggs giving
+		-- Tanuki $13K-$26K/s). If no egg in reach is worth it, the best one is still broken (nothing better to do there).
+		local worthless = nil
+		local worst = if N.planOn() or on("OnlyBetter") then (N.worstPlaced()) else 0
+		local fallback, fallbackScore
 		N.EggSeen = 0
 		for _, info in ipairs(N.eggs()) do
 			if tutorialPick and not tutorialPick[info.kind] then
@@ -34252,12 +34450,28 @@ do
 				and not (not event and on("AvoidPlayers") and othersNear(others, info.position, 10))
 			then
 				local score = N.eggScore(info, origin) + (if event then 2e15 elseif special then 1e15 else 0)
-				if not bestScore or score > bestScore then
+				local top = if worst > 0 and not special then N.Plan.eggTop(info.zone, info.luck, info.lucky) else math.huge
+				if top < worst then
+					worthless = worthless or { zone = info.zone, top = top }
+					if not fallbackScore or score > fallbackScore then
+						fallback, fallbackScore = info, score
+					end
+				elseif not bestScore or score > bestScore then
 					best, bestScore = info, score
 				end
 			end
 		end
-		return best or tough
+		if worthless and os.clock() - (F.worthlessSaidAt or -1e9) > 120 then
+			F.worthlessSaidAt = os.clock()
+			log(string.format("EGG skip worthless zone=%d best animal $%s/s < weakest placed $%s/s%s", worthless.zone, formatNumber(math.floor(worthless.top)), formatNumber(math.floor(worst)), if best then "" else " (nothing better in reach, breaking the best one anyway)"))
+		end
+		local pick = best or tough or fallback
+		if pick and pick.lucky and os.clock() - (F.luckySaidAt or -1e9) > 300 then
+			F.luckySaidAt = os.clock()
+			local factor, source = N.Plan.luckyFactor(pick.zone)
+			log(string.format("LUCKY egg picked zone=%d %s luck x%.2f value x%.2f (%s)", pick.zone, tostring(pick.kind), pick.luck, factor, source))
+		end
+		return pick
 	end
 	-- The game only streams in eggs near you, so a far zone looks empty until you go there.
 	function N.farmZoneTarget()
@@ -34391,9 +34605,16 @@ do
 		end)
 		if ok then
 			F.carryZone = info.zone
-			F.carryValue = math.max(if before > 0 then F.carryValue or 0 else 0, N.cashValue(info))
+			-- Prompts of pickups lying on the same spot overlap: the game's Carrying attribute says which animal was taken.
+			local carried = LocalPlayer:GetAttribute("Carrying")
+			local took = info
+			if type(carried) == "string" and carried ~= info.name and info.model.Parent ~= nil then
+				took = { name = carried, size = 1 }
+				log("STEAL took", carried, "instead of", info.name, "(overlapping prompts), the target stays")
+			end
+			F.carryValue = math.max(if before > 0 then F.carryValue or 0 else 0, N.cashValue(took))
 			Session.stolen += 1
-			log("STOLE", info.rarity, info.name, info.kg .. "kg", "zone", info.zone)
+			log("STOLE", if took == info then info.rarity else "-", took.name, info.kg .. "kg", "zone", info.zone)
 			if N.Events.stolen then
 				pcall(N.Events.stolen, info)
 			end
@@ -34545,6 +34766,13 @@ do
 		N.holdAt(stand, 2)
 		task.wait(N.hitSettle())
 		F.targetHits = 0
+		-- the server bucket refills one hit per floor gap: only spend what the pause since our last hit refilled
+		local floorGap = math.max(N.swingGap() * N.hitFactor(), 0.05)
+		F.burstN = math.max(1, math.min(N.burstSize(), math.floor((os.clock() - (F.lastHitAt or -1e9)) / floorGap)))
+		if F.burstN > 1 and not N.Burst.said then
+			N.Burst.said = true
+			log(string.format("HIT burst=%d opener 0.1 s apart, then x%.2f of the swing gap", F.burstN, N.hitFactor()))
+		end
 		local started = os.clock()
 		local budget = info.hits * 1.5 + 20
 		local hits = 0
@@ -34569,6 +34797,12 @@ do
 				local pick = N.Plan.pick
 				if pick and (N.Shop.lastAt[pick.key] or 0) < os.clock() and (tonumber(pick.cost) or math.huge) <= N.cash() and N.buyingOn() then
 					log("EGG paused for a purchase", pick.label)
+					break
+				end
+				-- the plan switched zones and what the new zone adds meanwhile beats this egg's own animal (P.update)
+				if N.Plan.leaveEgg == egg then
+					log("EGG left for zone", tostring(N.Plan.farmZone), "-", tostring(N.Plan.zoneNote))
+					N.Plan.leaveEgg = nil
 					break
 				end
 			end
@@ -34605,20 +34839,38 @@ do
 			-- Same arguments as the game's swing: the egg and a running hit number (EggLocalHits.Announce).
 			F.hitId = (F.hitId or 0) + 1
 			fire("EggHitRequest", egg, F.hitId)
+			F.lastHitAt = os.clock()
 			hits += 1
 			F.targetHits = hits
 			Session.hits += 1
+			if N.hitSpeedPick() == "Fast" then
+				N.HitTune.probeHits += 1
+				if N.HitTune.probeHits % 25 == 0 then
+					N.HitTune.tick()
+				end
+			end
 			local hp = tonumber(egg:GetAttribute("Health")) or 0
 			setStatus(string.format("Breaking %s  %s / %s HP", info.kind, formatNumber(hp), formatNumber(info.max)))
-			task.wait(N.hitPace())
+			task.wait(if hits < (F.burstN or 1) then 0.1 else N.hitPace())
 		end
 		N.holdAt(nil)
 		F.target = nil
+		if (F.burstN or 1) > 1 and hits >= 2 then
+			local B = N.Burst
+			B.eggs += 1
+			if B.eggs >= 30 and not B.probeSaid then
+				B.probeSaid = true
+				N.ProbeMem.set("hit_burst", if B.rejects <= 1 then "accepted" else "rejected")
+				local saved = (F.burstN - 1) * math.max(N.hitPace() - 0.1, 0)
+				log(string.format("PROBE hit_burst result=%s gain=+%.1fs per egg rejected=%d/%d", if B.rejects <= 1 then "accepted" else "rejected", saved, B.rejects, B.eggs * (F.burstN - 1)))
+			end
+		end
+		F.burstN = 1
 		-- An egg that vanished without a single hit of ours was broken by another player: not ours, no hatch to wait for.
 		if egg:GetAttribute("Broken") or egg:GetAttribute("Hatching") or (egg.Parent == nil and hits > 0) then
 			Session.eggs += 1
 			N.Plan.observeEgg(info.zone, info.max)
-			table.insert(F.hatches, { position = info.position, at = os.clock(), zone = info.zone, before = before, kind = info.kind })
+			table.insert(F.hatches, { position = info.position, at = os.clock(), zone = info.zone, before = before, kind = info.kind, lucky = info.lucky })
 			while #F.hatches > 8 do
 				table.remove(F.hatches, 1)
 			end
@@ -34644,6 +34896,8 @@ do
 				end
 				if own then
 					found[own.model] = own
+					-- one sample per hatch for the lucky egg value (P.luckyFactor): lucky vs normal hatches of the zone
+					pcall(N.Plan.hatchSample, hatch.zone, hatch.lucky == true, N.cashValue(own))
 				else
 					table.insert(keep, hatch)
 				end
@@ -34664,18 +34918,62 @@ do
 		end
 		return list
 	end
+	F.grabSaid = setmetatable({}, { __mode = "k" })
 	function N.bestHatched()
 		local worst = if on("OnlyBetter") then (N.worstPlaced()) else 0
 		local pick, pickValue
 		for _, info in ipairs(N.hatchedAnimals()) do
-			if N.wantedPickup(info, true, worst) then
+			local ok, why = N.wantedPickup(info, true, worst)
+			if ok then
 				local value = N.cashValue(info)
 				if not pickValue or value > pickValue then
 					pick, pickValue = info, value
 				end
+			elseif F.grabSaid[info.model] ~= why then
+				F.grabSaid[info.model] = why
+				log(string.format("GRAB skip reason=%s target=%s value=$%s/s", tostring(why), tostring(info.name), formatNumber(N.cashValue(info))))
 			end
 		end
 		return pick, pickValue
+	end
+	-- After an egg breaks its animal appears only after the hatch sequence (EggRewards.HatchSequence 1352: spin 1 s,
+	-- shake 1.75 s, grow 4 s + aura, about 8-10 s; PickupSpawnDelay 0; PickupLifetime 45 s). Live 2026-10-13: the hub
+	-- walked 1977 studs to the next zone 0.08 s after a zone-10 egg broke and its Celestial animal was never seen again.
+	-- The loop is break -> wait for the hatch (or break an egg right next to it) -> grab -> bank -> place.
+	N.HatchWait = 20
+	function N.hatchWorth(zone)
+		if not on("GrabOwnHatch") then
+			return false, "Grab What You Hatch is off"
+		end
+		if on("OnlyBetter") then
+			local worst = N.worstPlaced()
+			if worst > 0 then
+				local top = 0
+				for _, row in ipairs(N.Plan.dist(zone)) do
+					top = math.max(top, row.v)
+				end
+				-- generous: a hatch can be up to 7.5x the base size (EggRewards Size.Hatch.MaxMult)
+				if top > 0 and top * 8 <= worst then
+					return false, string.format("zone %d animals never beat your weakest $%s/s", zone, formatNumber(worst))
+				end
+			end
+		end
+		return true, "ok"
+	end
+	function N.pendingHatch()
+		local now = os.clock()
+		local found
+		for _, hatch in ipairs(F.hatches) do
+			if not hatch.skip then
+				if now - hatch.at <= N.HatchWait then
+					found = found or hatch
+				elseif not hatch.reported then
+					hatch.reported = true
+					log(string.format("GRAB skip reason=not found within %d s egg=%s zone=%d", N.HatchWait, tostring(hatch.kind), hatch.zone or 0))
+				end
+			end
+		end
+		return found
 	end
 	function N.grabHatch()
 		if #F.hatches == 0 and next(F.readyHatched or {}) == nil then
@@ -34689,6 +34987,7 @@ do
 		if wild and N.cashValue(wild) > pickValue then
 			pick = wild
 		end
+		log(string.format("GRAB target=%s value=$%s/s", tostring(pick.name), formatNumber(N.cashValue(pick))))
 		-- The animal stays on the list until the grab worked, so a failed grab is retried (it despawns after 45 s anyway).
 		local ok = N.stealPickup(pick, " from your egg")
 		if ok and F.readyHatched then
@@ -34882,15 +35181,23 @@ do
 	-- Surplus animals: with the plot full, a backpack animal that earns no more than the weakest placed one is never
 	-- placed by Equip Best. The sale price is 60 s of its income (BackpackSellConfig.PetValue), pure gain that feeds the
 	-- upgrades. The best of them stays as filler for the next plot slot.
-	function N.surplusPlan()
+	-- strict = the Smart Planner's own surplus rule (lead decision 2026-10-13, the OWNER_RULES 21 analogue of crafting
+	-- duplicates when storage is full): plot full, the animal earns no more than the weakest placed one (it cannot improve the plot), never Secret, locked,
+	-- held, placed or protected (Keep Mutated, Never Sell). Nothing that could be placed or beats a placed animal.
+	function N.surplusPlan(strict)
 		local worst = N.worstPlaced()
 		if worst <= 0 then
 			return {}
 		end
 		local rows = {}
 		for _, entry in ipairs(N.animalTools()) do
-			if not entry.held and not N.protected(entry) then
+			local allowed = not entry.held and not N.protected(entry)
+			if allowed and strict then
+				allowed = string.sub(tostring(entry.rarity), 1, 6) ~= "Secret" and entry.tool:GetAttribute("Locked") ~= true and entry.tool:GetAttribute("Favorite") ~= true
+			end
+			if allowed then
 				local value = N.cashValue(entry)
+				-- never anything that beats a placed animal: equal or lower cannot improve a full plot
 				if value > 0 and value <= worst then
 					table.insert(rows, { tool = entry.tool, value = value })
 				end
@@ -34923,13 +35230,20 @@ do
 					table.insert(list, tool)
 				end
 			end
+		elseif N.planOn() then
+			for _, tool in ipairs(N.surplusPlan(true)) do
+				if not seen[tool] then
+					table.insert(list, tool)
+				end
+			end
 		end
 		return list
 	end
 	function N.sellStep(force)
-		if not (force or on("AutoSell") or on("AutoSellSurplus")) then
+		if not (force or on("AutoSell") or on("AutoSellSurplus") or N.planOn()) then
 			return false
 		end
+		local plannerOnly = not (force or on("AutoSell") or on("AutoSellSurplus"))
 		if not force and os.clock() - F.lastPlaceAt < 3 then
 			return false
 		end
@@ -34947,7 +35261,7 @@ do
 			table.remove(tools)
 		end
 		local cashBefore = N.cash()
-		setStatus("Selling " .. #tools .. " animals")
+		setStatus(if plannerOnly then "Selling surplus (plot full)" else "Selling " .. #tools .. " animals")
 		local ok = invoke("BackpackSellRemote", 10, tools)
 		task.wait(0.5)
 		local gone = 0
@@ -34969,6 +35283,9 @@ do
 		else
 			F.sellFails = 0
 			log("SOLD", gone, "animals for", gained, "ok", tostring(ok))
+			if plannerOnly then
+				log(string.format("SELL surplus n=%d value=$%s (plot full, each below the weakest placed one)", gone, formatNumber(math.floor(gained))))
+			end
 		end
 		if gone > 0 then
 			N.planSay("sell", string.format("sold %d animals that never beat your weakest placed one (protected: %s)", gone, table.concat(N.protectText(), ", ")))
@@ -35011,6 +35328,30 @@ do
 		if N.grabHatch() then
 			return true
 		end
+		local pending = N.pendingHatch()
+		if pending then
+			local worth, why = N.hatchWorth(pending.zone or 1)
+			if not worth then
+				pending.skip = true
+				log("GRAB skip reason=" .. why .. " egg=" .. tostring(pending.kind))
+			else
+				-- an egg right next to the hatch is broken meanwhile (breakEgg grabs the animal the moment it appears)
+				local near = on("AutoFarm") and N.chooseEgg()
+				if near and (near.position - pending.position).Magnitude <= 60 then
+					return N.breakEgg(near)
+				end
+				if not pending.waitSaid then
+					pending.waitSaid = true
+					log(string.format("GRAB wait hatch egg=%s zone=%d", tostring(pending.kind), pending.zone or 0))
+				end
+				setStatus(string.format("Waiting for the %s to hatch", tostring(pending.kind)))
+				if N.distanceTo(pending.position) > 25 then
+					N.travelNear(pending.position, 10)
+				end
+				task.wait(0.3)
+				return true
+			end
+		end
 		if on("StealPickups") then
 			local info = N.bestPickup(nil, nil)
 			if info then
@@ -35029,6 +35370,950 @@ do
 			return N.goLookForEggs()
 		end
 		return false
+	end
+end
+-- 1352 Fuse Machine (workspace.FuseMachine = the "Sci-Fi Trade-In", SciFiTradeInUIConfig.MACHINE_NAME), real protocol from
+-- the decompiled 1352 client (dump/BreakAndStealAnEgg_Scripts_bc.lua, FuseMachineController 15444-15663, Picker 63792):
+--   client -> server  FuseMachineRequest("Sync") | ("Deposit", animalName, instance) | ("Return", animalName) | ("Fuse")
+--   server -> client  ("State", deposited{[animalName]=info}, recipe{[slot]=animalName}) | ("Fused", text, animal, eggType)
+-- The recipe is rolled per player by the server (FuseMachineConfig.RollRecipe 88378, a fused slot re-rolls to another
+-- name), so it is read from State, never guessed. Inputs are AnimalTools from the Backpack or models from your own
+-- PlacedAnimals (the picker's own candidates). No cash price. Celestial Egg out (EggTypeConfig.Types.Celestial), planted
+-- like a merge egg by mergeStep. Needs SpeedPower >= RequiredSpeedPower (1e11). Runs only under its own toggle
+-- (OWNER_RULES 20/21/23): never Secret, the machine's BlockedRarities, locked, held, protected (Keep Mutated, Never Sell),
+-- placed only with "Also Use Placed Animals", and only when the egg is worth more than the animals it eats.
+-- Probes (remembered per PlaceVersion): fuse_deposit_range (Deposit from where the hub stands, else walk to the machine),
+-- egg_slot (does a planted egg take a plot slot, measured in mergeStep).
+N.ProbeMem = { file = "Corvus/BSE_probes_" .. tostring(game.PlaceVersion) .. ".txt", v = {} }
+do
+	local M = N.ProbeMem
+	pcall(function()
+		if type(isfile) == "function" and isfile(M.file) then
+			for key, value in string.gmatch(tostring(readfile(M.file)), "([%w_]+)=([%w_%.%-]+)") do
+				M.v[key] = value
+			end
+		end
+	end)
+	function M.get(key)
+		return M.v[key]
+	end
+	function M.set(key, value)
+		value = tostring(value)
+		if M.v[key] == value then
+			return
+		end
+		M.v[key] = value
+		pcall(function()
+			if makefolder and isfolder and not isfolder("Corvus") then
+				makefolder("Corvus")
+			end
+			local parts = {}
+			for k, v in pairs(M.v) do
+				table.insert(parts, k .. "=" .. v)
+			end
+			table.sort(parts)
+			writefile(M.file, table.concat(parts, ";"))
+		end)
+	end
+end
+-- Every animal the player owns that a machine may take: backpack tools (held ones flagged) and, on request, placed models.
+function N.ownAnimals(withPlaced)
+	local list = {}
+	for _, entry in ipairs(N.animalTools()) do
+		entry.inst = entry.tool
+		entry.cash = N.cashValue(entry)
+		table.insert(list, entry)
+	end
+	if withPlaced then
+		for _, entry in ipairs(N.placedAnimals()) do
+			entry.inst = entry.model
+			entry.placed = true
+			entry.cash = N.cashValue(entry)
+			table.insert(list, entry)
+		end
+	end
+	return list
+end
+-- Never into a machine: held, Secret (OWNER_RULES 23), the Fuse Machine's BlockedRarities (fuse only), locked/favourite,
+-- protected (Keep Mutated, Never Sell Rarities), placed unless "Also Use Placed Animals" is on.
+function N.consumeExcluded(entry, fuseRules)
+	if entry.held then
+		return "held"
+	end
+	if string.sub(tostring(entry.rarity), 1, 6) == "Secret" then
+		return "Secret"
+	end
+	if fuseRules then
+		local blocked = N.G.Fuse.BlockedRarities
+		if type(blocked) == "table" and blocked[entry.rarity] then
+			return "blocked rarity"
+		end
+	end
+	local inst = entry.inst or entry.tool or entry.model
+	if inst and (inst:GetAttribute("Locked") == true or inst:GetAttribute("Favorite") == true) then
+		return "locked"
+	end
+	if N.protected(entry) then
+		return "protected"
+	end
+	if entry.placed and not on("ConsumePlaced") then
+		return "placed"
+	end
+	return nil
+end
+N.fuseExcluded = function(entry)
+	return N.consumeExcluded(entry, true)
+end
+-- What an animal of x $/s is worth over the planner's horizon: placed income while the plot has room, the gain over
+-- the weakest placed one (which is then worth its sale) when it beats it, else its sale price (60 s of income).
+function N.keepValue(x)
+	x = math.max(tonumber(x) or 0, 0)
+	local H = N.Plan.Horizon or 86400
+	local worst = N.worstPlaced()
+	if worst <= 0 then
+		return x * H
+	end
+	if x > worst then
+		return (x - worst) * H + 60 * worst
+	end
+	return 60 * x
+end
+-- What eating one animal costs: a placed one loses its plot income over the horizon, a backpack one its keep value.
+function N.consumeCost(entry)
+	if entry.placed then
+		return (entry.cash or 0) * (N.Plan.Horizon or 86400)
+	end
+	return N.keepValue(entry.cash or 0)
+end
+-- Expected keep value of an egg type's hatch (EggTypeConfig.Types[type].HatchWeights, base size).
+function N.eggTypeValue(typeName)
+	local types = N.G.EggTypes.Types
+	local def = type(types) == "table" and types[typeName]
+	local weights = type(def) == "table" and def.HatchWeights
+	if type(weights) ~= "table" then
+		return 0, 0
+	end
+	local total = 0
+	for _, weight in pairs(weights) do
+		total += tonumber(weight) or 0
+	end
+	if total <= 0 then
+		return 0, 0
+	end
+	local value, income = 0, 0
+	for name, weight in pairs(weights) do
+		local cash = N.cashValue({ name = name, size = 1 })
+		local p = (tonumber(weight) or 0) / total
+		value += p * N.keepValue(cash)
+		income += p * cash
+	end
+	return value, income
+end
+-- Where a machine stands (its ProximityPrompt holder, else the model pivot) and its prompt.
+function N.machineSpot(name)
+	local model = workspace:FindFirstChild(name)
+	if not model then
+		return nil, nil
+	end
+	local prompt
+	for _, item in ipairs(model:GetDescendants()) do
+		if item:IsA("ProximityPrompt") then
+			prompt = item
+			break
+		end
+	end
+	local holder = prompt and prompt.Parent
+	if holder and holder:IsA("Attachment") then
+		return holder.WorldPosition, prompt
+	elseif holder and holder:IsA("BasePart") then
+		return holder.Position, prompt
+	end
+	local ok, pivot = pcall(model.GetPivot, model)
+	return if ok then pivot.Position else nil, prompt
+end
+function N.fuseMachine()
+	return N.machineSpot("FuseMachine")
+end
+N.Fuse = { nextAt = 0, state = nil, fusedAt = nil, fused = 0, deposited = 0, said = {}, status = "-", offUntil = 0, probed = {}, notes = {} }
+do
+	local Z = N.Fuse
+	local function say(key, text, every)
+		local last = Z.said[key]
+		if last and last.text == text and os.clock() - last.at < (every or 300) then
+			return
+		end
+		Z.said[key] = { text = text, at = os.clock() }
+		log(text)
+	end
+	-- recipe {[slot] = name} -> names in slot order
+	function Z.recipeList(recipe)
+		local slots = {}
+		for slot in pairs(recipe or {}) do
+			if type(slot) == "number" then
+				table.insert(slots, slot)
+			end
+		end
+		table.sort(slots)
+		local names = {}
+		for _, slot in ipairs(slots) do
+			table.insert(names, recipe[slot])
+		end
+		return names
+	end
+	N.onRemote("FuseMachineRequest", function(kind, a, b, c)
+		if kind == "State" then
+			local deposited, recipe = {}, {}
+			if type(a) == "table" then
+				for name, info in pairs(a) do
+					if type(name) == "string" then
+						deposited[name] = info
+					end
+				end
+			end
+			if type(b) == "table" then
+				for slot, name in pairs(b) do
+					if type(name) == "string" then
+						recipe[tonumber(slot) or slot] = name
+					end
+				end
+			end
+			Z.state = { deposited = deposited, recipe = recipe, at = os.clock() }
+			local text = table.concat(Z.recipeList(recipe), ",")
+			local key = text .. "|" .. count(deposited)
+			if key ~= Z.stateKey then
+				Z.stateKey = key
+				log(string.format("FUSE state recipe=%s deposited=%d", text, count(deposited)))
+			end
+		elseif kind == "Fused" then
+			Z.fusedAt = os.clock()
+			Z.fusedEgg = if type(c) == "string" then c elseif type(b) == "string" then b else nil
+			log("FUSE fused event", tostring(a), tostring(b), tostring(c))
+		end
+	end)
+	-- The server's refusals arrive as Notify presets (NotificationConfig Fuse*): only logged, the State answer decides.
+	N.onRemote("Notify", function(text)
+		if type(text) ~= "string" then
+			return
+		end
+		local low = string.lower(text)
+		if string.find(low, "fuse", 1, true) or string.find(low, "went back to your backpack", 1, true) then
+			table.insert(Z.notes, { at = os.clock(), text = text })
+			while #Z.notes > 12 do
+				table.remove(Z.notes, 1)
+			end
+			log("FUSE notify", text)
+		end
+	end)
+	-- Like the client at start (15663): ask for the state, the server answers with State (recipe + deposited).
+	function Z.sync(maxAge)
+		if Z.state and os.clock() - Z.state.at < (maxAge or 30) then
+			return true
+		end
+		local t0 = os.clock()
+		fire("FuseMachineRequest", "Sync")
+		return waitFor(function()
+			return Z.state ~= nil and Z.state.at >= t0
+		end, 2.5)
+	end
+	-- The cheapest allowed animal for every recipe name the machine still needs; already deposited names are sunk.
+	function N.fusePlan()
+		local st = Z.state
+		if not st then
+			return nil, "waiting for the machine's recipe"
+		end
+		local names = Z.recipeList(st.recipe)
+		if #names == 0 then
+			return nil, "the machine sent no recipe"
+		end
+		local pool = N.ownAnimals(on("ConsumePlaced"))
+		local used, picks = {}, {}
+		for _, name in ipairs(names) do
+			if st.deposited[name] == nil then
+				local best
+				for _, entry in ipairs(pool) do
+					if not used[entry.inst] and entry.name == name and not N.consumeExcluded(entry, true) then
+						entry.cost = entry.cost or N.consumeCost(entry)
+						if not best or entry.cost < best.cost then
+							best = entry
+						end
+					end
+				end
+				if not best then
+					return nil, "recipe needs " .. N.displayName(name) .. " (none you may fuse)", nil, nil, nil, names
+				end
+				used[best.inst] = true
+				table.insert(picks, best)
+			end
+		end
+		local egg = tostring(N.G.Fuse.EggType or "Celestial")
+		local value, income = N.eggTypeValue(egg)
+		local cost = 0
+		for _, pick in ipairs(picks) do
+			cost += pick.cost
+		end
+		return picks, nil, value, cost, income, names
+	end
+	local function deposit(pick)
+		local t0 = os.clock()
+		fire("FuseMachineRequest", "Deposit", pick.name, pick.inst)
+		return waitFor(function()
+			local st = Z.state
+			return st ~= nil and st.at >= t0 and st.deposited[pick.name] ~= nil
+		end, 2)
+	end
+	local function returnAll(names)
+		for _, name in ipairs(names) do
+			fire("FuseMachineRequest", "Return", name)
+			task.wait(0.3)
+		end
+		if #names > 0 then
+			log("FUSE returned " .. table.concat(names, "+") .. " to the backpack")
+		end
+	end
+	local function fuseCall()
+		local t0 = os.clock()
+		fire("FuseMachineRequest", "Fuse")
+		return waitFor(function()
+			return Z.fusedAt ~= nil and Z.fusedAt >= t0
+		end, 3)
+	end
+	function N.fuseStep()
+		if not on("AutoFuse") or N.carrying() or os.clock() < Z.nextAt then
+			return false
+		end
+		Z.nextAt = os.clock() + 20
+		if os.clock() < Z.offUntil then
+			Z.status = string.format("Paused after a refusal, again in %dm", math.ceil((Z.offUntil - os.clock()) / 60))
+			return false
+		end
+		local need = tonumber(N.G.Fuse.RequiredSpeedPower) or 1e11
+		if N.power() < need then
+			Z.status = "Opens at " .. formatNumber(need) .. " speed"
+			say("locked", "FUSE locked speed=" .. formatNumber(N.power()) .. " need=" .. formatNumber(need), 1800)
+			Z.nextAt = os.clock() + 60
+			return false
+		end
+		if not Z.sync(30) then
+			Z.status = "The Fuse Machine did not answer"
+			say("skip", "FUSE skip reason=no State answer to Sync", 600)
+			Z.nextAt = os.clock() + 120
+			return false
+		end
+		local picks, why, value, cost, income, names = N.fusePlan()
+		if not picks then
+			Z.status = why
+			say("skip", "FUSE skip reason=" .. tostring(why) .. " recipe=" .. table.concat(names or {}, ","), 600)
+			Z.nextAt = os.clock() + 60
+			return false
+		end
+		if #picks > 0 and value <= cost then
+			Z.status = string.format("Not worth it now: egg $%s vs animals $%s", formatNumber(math.floor(value)), formatNumber(math.floor(cost)))
+			say("skip", string.format("FUSE skip reason=not worth it egg=$%s animals=$%s recipe=%s", formatNumber(math.floor(value)), formatNumber(math.floor(cost)), table.concat(names, ",")), 600)
+			Z.nextAt = os.clock() + 120
+			return false
+		end
+		local spot = N.fuseMachine()
+		local range = N.ProbeMem.get("fuse_deposit_range")
+		local function atMachine()
+			return spot == nil or N.distanceTo(spot) <= 15
+		end
+		local function goThere()
+			if spot and not atMachine() then
+				setStatus("Going to the Fuse Machine")
+				N.travelNear(spot, 10)
+			end
+		end
+		if range == "rejected" then
+			goThere()
+		end
+		local parts = {}
+		for _, pick in ipairs(picks) do
+			table.insert(parts, N.displayName(pick.name) .. (if pick.placed then "(plot)" else "(bag)"))
+		end
+		log(string.format("FUSE plan recipe=%s deposit=%s egg=$%s (avg $%s/s) cost=$%s", table.concat(names, "+"), table.concat(parts, "+"), formatNumber(math.floor(value)), formatNumber(math.floor(income)), formatNumber(math.floor(cost))))
+		setStatus("Fusing " .. table.concat(names, " + "))
+		local mine = {}
+		for _, pick in ipairs(picks) do
+			local far = not atMachine()
+			local ok = deposit(pick)
+			if not ok and far and range ~= "accepted" then
+				goThere()
+				ok = deposit(pick)
+				if ok then
+					N.ProbeMem.set("fuse_deposit_range", "rejected")
+					range = "rejected"
+					log("PROBE fuse_deposit_range result=rejected gain=0 (deposits at the machine)")
+				end
+			elseif ok and far and range == nil then
+				N.ProbeMem.set("fuse_deposit_range", "accepted")
+				range = "accepted"
+				log("PROBE fuse_deposit_range result=accepted gain=no trip to the machine")
+			end
+			if not ok then
+				log(string.format("PROBE fuse_deposit result=rejected name=%s from=%s", pick.name, if pick.placed then "plot" else "backpack"))
+				returnAll(mine)
+				Z.offUntil = os.clock() + 600
+				Z.status = "The game refused a deposit, paused for 10 minutes"
+				log("FUSE off 10 min reason=deposit refused")
+				return true
+			end
+			if not Z.probed.deposit then
+				Z.probed.deposit = true
+				log(string.format("PROBE fuse_deposit result=accepted gain=x%.2f (egg vs animals)", value / math.max(cost, 1)))
+			end
+			table.insert(mine, pick.name)
+			Z.deposited += 1
+			task.wait(0.3)
+		end
+		local ok = fuseCall()
+		if not ok and not atMachine() then
+			goThere()
+			ok = fuseCall()
+		end
+		if not ok then
+			log("PROBE fuse_fuse result=rejected")
+			returnAll(mine)
+			Z.offUntil = os.clock() + 600
+			Z.status = "The game refused the fuse, paused for 10 minutes"
+			log("FUSE off 10 min reason=fuse refused")
+			return true
+		end
+		Z.fused += 1
+		local egg = Z.fusedEgg or tostring(N.G.Fuse.EggType or "Celestial")
+		if not Z.probed.fuse then
+			Z.probed.fuse = true
+			log(string.format("PROBE fuse_fuse result=accepted gain=$%s/s per egg (avg animal)", formatNumber(math.floor(income))))
+		end
+		log(string.format("FUSE recipe=%s deposit=%s done egg=%s n=%d", table.concat(names, "+"), if #parts > 0 then table.concat(parts, "+") else "already in", egg, Z.fused))
+		Z.status = string.format("Fused %d time%s, last %s", Z.fused, if Z.fused == 1 then "" else "s", table.concat(names, " + "))
+		-- the server re-rolls the recipe after a fuse: read it fresh next time
+		if Z.state then
+			Z.state.at = -1e9
+		end
+		Z.nextAt = os.clock() + 2
+		return true
+	end
+end
+-- Hell boss event (decompiled 1352 client): the portal opens hourly (workspace HellJoinable, HellNextAt; HellEventConfig
+-- 89460-89471). Join = touch Build.ZoneBuilds.Zone7.JoinHell.TP and HellJoinRemote() (HellPortalController askToJoin
+-- 25668-25687, server slack JoinRequestSlack 6). Inside (player InHell): while workspace HellGathering the pickaxe breaks
+-- HellEssenceEgg parts (Big 42 / Small 14 essence, HellEssenceConfig 89427-89443, HellLoadout.CanEquip 89521) with the
+-- normal EggHitRequest; then the Demon King (tag HellBoss, model DemonBoss, attribute Health, 12,500 HP, 720 s) is hit
+-- with the Bat: BatHitRequest(nil) (BatController 5931-6003; inside Hell no player is a valid target, BatTargeting 85936),
+-- client cooldown 0.5 s, server 0.45 s (BatConfig 85871), boss within BatHitRadius 32 (HellBossConfig 89236). Reward
+-- 150 + 600 x damage share Fallen Tokens (DemonEventConfig.BossRewardFor 86451). The game's own HellBossHitRemote
+-- (the client reports boss attacks that hit you) is never touched. Own toggle only, default off; BatHitRequest is
+-- blocked by fire() outside Hell (PvP stays excluded).
+N.Hell = { joinAt = -1e9, swings = 0, essenceHits = 0, status = "-", nextSwing = 0, enteredAt = nil, logAt = -1e9, tokensAt = nil, fights = 0, probe = { swings = 0, drops = 0, said = false, pending = {} }, bossSeenAt = nil, retreatUntil = 0 }
+do
+	local H = N.Hell
+	local function tokens()
+		return tonumber(LocalPlayer:GetAttribute("DemonTokens")) or 0
+	end
+	function N.hellPortal()
+		local node = workspace
+		for _, name in ipairs({ "Build", "ZoneBuilds", "Zone7", "JoinHell" }) do
+			node = node and node:FindFirstChild(name)
+		end
+		local tp = node and node:FindFirstChild("TP", true)
+		return if tp and tp:IsA("BasePart") then tp else nil
+	end
+	function N.hellBoss()
+		for _, model in ipairs(N.tagged("HellBoss")) do
+			if model.Parent then
+				return model
+			end
+		end
+		local boss = workspace:FindFirstChild("DemonBoss")
+		if not boss then
+			local map = workspace:FindFirstChild("HellBossFight")
+			boss = map and map:FindFirstChild("DemonBoss", true)
+		end
+		return boss
+	end
+	local function partPosition(model)
+		if model:IsA("BasePart") then
+			return model.Position
+		end
+		local root = model.PrimaryPart or model:FindFirstChild("HumanoidRootPart")
+		if root and root:IsA("BasePart") then
+			return root.Position
+		end
+		local ok, pivot = pcall(model.GetPivot, model)
+		return if ok then pivot.Position else nil
+	end
+	function N.hellEssenceEgg()
+		local root = rootPart()
+		local best, bestScore
+		for _, egg in ipairs(N.tagged("HellEssenceEgg")) do
+			if egg:IsA("BasePart") and egg.Parent and not egg:GetAttribute("Broken") and not egg:GetAttribute("Hatching") then
+				local value = tonumber(egg:GetAttribute("EssenceValue")) or 14
+				local distance = if root then (egg.Position - root.Position).Magnitude else 0
+				-- essence per second of walking: a Big egg (42) is worth a longer walk than a Small one (14)
+				local score = value / (distance / math.max(N.walkSpeed(), 16) + 0.5)
+				if not bestScore or score > bestScore then
+					best, bestScore = egg, score
+				end
+			end
+		end
+		return best
+	end
+	local function equipBat()
+		local char, hum = character(), humanoid()
+		if not (char and hum) then
+			return false
+		end
+		local held = char:FindFirstChild("Bat")
+		if held and held:IsA("Tool") and not N.hasTag(held, "AnimalTool") then
+			return true
+		end
+		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+		local bat = backpack and backpack:FindFirstChild("Bat")
+		if bat and bat:IsA("Tool") and not N.hasTag(bat, "AnimalTool") then
+			pcall(hum.EquipTool, hum, bat)
+			return waitFor(function()
+				local c = character()
+				local t = c and c:FindFirstChild("Bat")
+				return t ~= nil and t:IsA("Tool")
+			end, 1.5)
+		end
+		return false
+	end
+	function N.hellStatusText()
+		if N.inHell() then
+			return H.status
+		end
+		if workspace:GetAttribute("HellJoinable") == true then
+			return "portal open, joining"
+		end
+		local nextAt = tonumber(workspace:GetAttribute("HellNextAt"))
+		if nextAt then
+			local wait = nextAt - N.serverNow()
+			if wait > 0 then
+				return "next Hell in " .. clockText(wait) .. string.format(", %d fights this session", H.fights)
+			end
+		end
+		return string.format("waiting for the portal, %d fights this session", H.fights)
+	end
+	local function report(force)
+		if force or os.clock() - H.logAt > 30 then
+			H.logAt = os.clock()
+			local boss = N.hellBoss()
+			local hp = boss and tonumber(boss:GetAttribute("Health"))
+			log(string.format("HELL hits=%d essence=%d boss=%s tokens=%d", H.swings, H.essenceHits, if hp then formatNumber(hp) else "-", tokens()))
+		end
+	end
+	local function join()
+		if workspace:GetAttribute("HellJoinable") ~= true or N.carrying() or os.clock() - H.joinAt < 5 then
+			return false
+		end
+		local tp = N.hellPortal()
+		if not tp then
+			if os.clock() - (H.noPortalAt or -1e9) > 1800 then
+				H.noPortalAt = os.clock()
+				log("HELL skip reason=no Zone7 JoinHell portal on this map")
+			end
+			return false
+		end
+		H.joinAt = os.clock()
+		H.tokensAt = tokens()
+		setStatus("Going to the Hell portal")
+		log("HELL join going to the portal")
+		N.holdAt(nil)
+		N.travelTo(tp.Position)
+		for _ = 1, 6 do
+			if N.inHell() then
+				break
+			end
+			fire("HellJoinRemote")
+			if waitFor(N.inHell, 1.6) then
+				break
+			end
+		end
+		if N.inHell() then
+			H.enteredAt = os.clock()
+			H.fights += 1
+			log("HELL join ok tokens=" .. tokens())
+		else
+			log("HELL join refused (not inside the portal or the event closed)")
+		end
+		return true
+	end
+	-- One hit on the best essence egg (walks next to it first). False when there is no essence egg.
+	local function hitEssence()
+		local egg = N.hellEssenceEgg()
+		if not egg then
+			return false
+		end
+		do
+			local here = rootPart()
+			local radius = math.max(egg.Size.X, egg.Size.Z) / 2
+			if here and math.max((Vector3.new(here.Position.X - egg.Position.X, 0, here.Position.Z - egg.Position.Z)).Magnitude - radius, 0) > 6 then
+				local stand = egg.Position + (Vector3.new(here.Position.X - egg.Position.X, 0, here.Position.Z - egg.Position.Z).Unit * (radius + 3))
+				N.travelTo(N.standAt(stand), { look = egg.Position })
+				task.wait(N.hitSettle())
+			end
+			if not N.equipPickaxe() then
+				H.status = "gathering, no pickaxe"
+				task.wait(0.5)
+				return true
+			end
+			N.Farm.hitId = (N.Farm.hitId or 0) + 1
+			fire("EggHitRequest", egg, N.Farm.hitId)
+			H.essenceHits += 1
+			H.status = string.format("gathering essence %s/%s", tostring(workspace:GetAttribute("HellEssence") or "?"), tostring(workspace:GetAttribute("HellEssenceGoal") or "?"))
+			setStatus("Hell: " .. H.status)
+			report(false)
+			task.wait(N.hitPace())
+			return true
+		end
+	end
+	-- One short slice of Hell work; the main loop calls it again while the player is in Hell.
+	local function inside()
+		H.enteredAt = H.enteredAt or os.clock()
+		if workspace:GetAttribute("HellGathering") == true then
+			if not hitEssence() then
+				H.status = "gathering, waiting for essence eggs"
+				setStatus("Hell: waiting for essence eggs")
+				task.wait(0.4)
+			end
+			return true
+		end
+		local boss = N.hellBoss()
+		local hp = boss and tonumber(boss:GetAttribute("Health"))
+		local bossAt = boss and partPosition(boss)
+		if boss and hp and hp > 0 and bossAt then
+			H.bossSeenAt = os.clock()
+			-- A shielded boss takes no bat hits (HellBossController.CanBatHit 22744-22747, ShieldsUp > 0): no swings
+			-- until the shields are down (the essence phase above breaks them).
+			if (tonumber(boss:GetAttribute("ShieldsUp")) or 0) > 0 then
+				H.status = "boss shielded, waiting"
+				setStatus("Hell: the Demon King is shielded, waiting")
+				task.wait(0.4)
+				return true
+			end
+			local root, hum = rootPart(), humanoid()
+			if not (root and hum) then
+				return true
+			end
+			-- Low health: step out of reach (most attacks hit within 32 studs) for a moment, then back in.
+			if hum.MaxHealth > 0 and hum.Health / hum.MaxHealth < 0.35 and os.clock() > H.retreatUntil then
+				H.retreatUntil = os.clock() + 3
+			end
+			local away = Vector3.new(root.Position.X - bossAt.X, 0, root.Position.Z - bossAt.Z)
+			local dir = if away.Magnitude > 0.5 then away.Unit else Vector3.new(1, 0, 0)
+			local want = if os.clock() < H.retreatUntil then 45 else 26
+			local spot = N.standAt(Vector3.new(bossAt.X, root.Position.Y, bossAt.Z) + dir * want)
+			if math.abs(away.Magnitude - want) > 5 then
+				N.travelTo(spot, { look = bossAt })
+			end
+			if os.clock() < H.retreatUntil then
+				H.status = "dodging, health low"
+				setStatus("Hell: " .. H.status)
+				task.wait(0.2)
+				return true
+			end
+			if not equipBat() then
+				H.status = "no Bat in the backpack"
+				setStatus("Hell: no Bat to hit the boss with")
+				task.wait(0.5)
+				return true
+			end
+			if os.clock() >= H.nextSwing then
+				-- server cooldown 0.45 s (BatConfig.HellServerCooldown): 0.47-0.50 s stays above it
+				H.nextSwing = os.clock() + 0.47 + math.random() * 0.03
+				fire("BatHitRequest", nil)
+				H.swings += 1
+				local P = H.probe
+				if not P.said then
+					-- accepted = the boss HP dropped within a second after our swings (checked on the next swings)
+					local now = os.clock()
+					for i = #P.pending, 1, -1 do
+						local item = P.pending[i]
+						if now - item.at >= 0.9 then
+							if hp < item.hp then
+								P.drops += 1
+							end
+							table.remove(P.pending, i)
+						end
+					end
+					P.swings += 1
+					table.insert(P.pending, { at = now, hp = hp })
+					if P.swings >= 20 then
+						P.said = true
+						log(string.format("PROBE hell_swing result=%s gain=%.2f swings/s drops=%d/%d", if P.drops >= 5 then "accepted" else "rejected", 1 / 0.485, P.drops, P.swings))
+					end
+				end
+			end
+			H.status = string.format("hitting the Demon King %s HP, %d swings", formatNumber(hp), H.swings)
+			setStatus("Hell: " .. H.status)
+			report(false)
+			task.wait(0.05)
+			return true
+		end
+		-- No gathering and no living boss: the intro, or the fight ended and the game sends everyone back.
+		if H.tokensAt and tokens() > H.tokensAt then
+			log(string.format("HELL reward tokens=+%d now=%d", tokens() - H.tokensAt, tokens()))
+			report(true)
+			H.tokensAt = tokens()
+		end
+		if os.clock() - H.enteredAt > 900 or (H.bossSeenAt and os.clock() - H.bossSeenAt > 30) then
+			H.status = "fight over, leaving"
+			N.leaveHell()
+			return true
+		end
+		H.status = "waiting for the boss"
+		setStatus("Hell: waiting for the boss")
+		task.wait(0.5)
+		return true
+	end
+	function N.hellStep()
+		if not on("AutoHell") then
+			return false
+		end
+		if N.inHell() then
+			return inside()
+		end
+		if H.enteredAt then
+			-- back in the normal world: count the tokens the fight paid
+			H.enteredAt, H.bossSeenAt = nil, nil
+			if H.tokensAt then
+				log(string.format("HELL done reward tokens=+%d now=%d", math.max(tokens() - H.tokensAt, 0), tokens()))
+				H.tokensAt = nil
+			end
+		end
+		local did = join()
+		if not did and not (N.planOn() or on("AutoFarm") or on("StealPickups") or on("AutoTrain") or on("AutoPlace")) then
+			setStatus("Hell Boss: " .. N.hellStatusText())
+		end
+		return did
+	end
+end
+-- Merge Pets (MergeMachineRemote("Merge", {a, b, c}), MergeMachineController 31861-31893, decompiled 1352 client): three
+-- owned animals of the SAME species (AnimalTool in Backpack/Character or a model in your own PlacedAnimals, candidateOwned
+-- 30909) become one "<Animal> Egg" (answer OnClientEvent("Merged", animal, _, variant) 32009). The client shows the outcome
+-- as the same species with WeightKg = the sum (31277-31282); variant odds = the Diamond share, then the Gold share of the
+-- inputs (MergeConfig.VariantOdds 89879). Cash per animal grows faster than linear with weight (EggRewards
+-- CashWeightMult = ratio^1.10..1.29 up to ratio 8, PlacedCashPerSecond 87692), so one merged animal earns +12..37 % more
+-- than the three apart and frees two plot slots. Irreversible: own toggle only (OWNER_RULES 20/21), never the planner
+-- alone; never Secret, locked, held, protected (Keep Mutated, Never Sell), never mutated inputs (the merged mutation is
+-- unknown), placed ones only with "Also Use Placed Animals". The real weight/mutation is measured after the hatch
+-- (MERGE result) and a lighter result than the sum lowers the model (kgFactor). Probe: merge_range (merge from where
+-- the hub stands, else walk to workspace.EggMachine), remembered per PlaceVersion.
+N.MergePets = { nextAt = 0, merged = 0, status = "-", offUntil = 0, pending = {}, event = nil, said = {}, probed = false, kgFactor = 1, results = 0 }
+do
+	local Z = N.MergePets
+	local function say(key, text, every)
+		local last = Z.said[key]
+		if last and last.text == text and os.clock() - last.at < (every or 300) then
+			return
+		end
+		Z.said[key] = { text = text, at = os.clock() }
+		log(text)
+	end
+	N.onRemote("MergeMachineRemote", function(kind, animal, _, variant)
+		if kind == "Merged" and type(animal) == "string" then
+			Z.event = { at = os.clock(), animal = animal, variant = variant }
+			log("MERGE merged event", animal, tostring(variant))
+		end
+	end)
+	-- MergeConfig.GrowthSeconds (89914): 10 s x (kg/150)^0.88 above the pivot x rarity mult, capped at 7 days.
+	function N.mergeGrowSeconds(kg, rarity)
+		local M = N.G.Merge
+		local base = tonumber(M.BaseGrowthSeconds) or 10
+		local pivot = tonumber(M.GrowthKgPivot) or 150
+		local expo = tonumber(M.GrowthKgExponent) or 0.88
+		local cap = tonumber(M.MaxGrowthSeconds) or 604800
+		local mults = type(M.GrowthRarityMultipliers) == "table" and M.GrowthRarityMultipliers or {}
+		local scale = if kg > pivot then (kg / pivot) ^ expo else 1
+		return math.min(base * scale * (tonumber(mults[rarity]) or 1), cap)
+	end
+	-- MergeConfig.VariantOdds: share of Diamond inputs, then of Gold inputs among the rest; the remainder keeps no variant.
+	function N.mergeVariantOdds(variants)
+		local odds, left = {}, 1
+		local seen = 0
+		for _, tier in ipairs({ "Diamond", "Gold" }) do
+			for i = 1, 3 do
+				if variants[i] == tier then
+					seen += 1
+				end
+			end
+			local p = left * math.min(seen / 3, 1)
+			if p > 0 then
+				odds[tier] = p
+				left -= p
+			end
+		end
+		return odds, math.max(left, 0)
+	end
+	-- Expected $/s of the merged animal: same species, kg = sum (x the measured kgFactor), variant by the odds.
+	function N.mergedCash(name, parts)
+		local kg, variants = 0, {}
+		for i, part in ipairs(parts) do
+			kg += tonumber(part.kg) or 0
+			variants[i] = part.variant
+		end
+		local raw = kg
+		kg *= Z.kgFactor
+		local odds, none = N.mergeVariantOdds(variants)
+		local cash = none * N.cashValue({ name = name, kg = kg })
+		for tier, p in pairs(odds) do
+			cash += p * N.cashValue({ name = name, kg = kg, variant = tier })
+		end
+		return cash, kg, raw
+	end
+	-- The best triple: per species the three weakest allowed copies; gain = merged value - parts - income lost while the
+	-- egg grows. Only gains > 0.
+	function N.mergePlan()
+		local groups = {}
+		for _, entry in ipairs(N.ownAnimals(on("ConsumePlaced"))) do
+			if entry.mutation == nil and not N.consumeExcluded(entry, false) and (tonumber(entry.kg) or 0) > 0 then
+				groups[entry.name] = groups[entry.name] or {}
+				table.insert(groups[entry.name], entry)
+			end
+		end
+		local H = N.Plan.Horizon or 86400
+		local best, why = nil, "no species with three free copies"
+		for name, list in pairs(groups) do
+			if #list >= 3 then
+				table.sort(list, function(a, b)
+					return a.cash < b.cash
+				end)
+				local parts = { list[1], list[2], list[3] }
+				local merged, kg, raw = N.mergedCash(name, parts)
+				local partCash, cost, anyPlaced = 0, 0, false
+				for _, part in ipairs(parts) do
+					partCash += part.cash
+					cost += N.consumeCost(part)
+					anyPlaced = anyPlaced or part.placed == true
+				end
+				local grow = N.mergeGrowSeconds(kg, parts[1].rarity)
+				local value = (if anyPlaced then merged * H else N.keepValue(merged)) - merged * grow
+				-- a growing egg that takes a plot slot (PROBE egg_slot) keeps the weakest animal off the plot meanwhile
+				if N.ProbeMem.get("egg_slot") == "takes" then
+					value -= N.worstPlaced() * grow
+				end
+				local gain = value - cost
+				if gain > 0 and (not best or gain > best.gain) then
+					best = { name = name, parts = parts, merged = merged, kg = kg, raw = raw, partCash = partCash, grow = grow, gain = gain, value = value, cost = cost }
+				elseif gain <= 0 and not best then
+					why = string.format("%s x3 not worth it ($%s/s merged vs $%s/s apart)", N.displayName(name), formatNumber(math.floor(merged)), formatNumber(math.floor(partCash)))
+				end
+			end
+		end
+		return best, why
+	end
+	local function snapshot(name)
+		local seen = setmetatable({}, { __mode = "k" })
+		for _, entry in ipairs(N.ownAnimals(true)) do
+			if entry.name == name then
+				seen[entry.inst] = true
+			end
+		end
+		return seen
+	end
+	-- After a merge egg of that species hatches, the new animal is read and compared with the model (MERGE result).
+	function Z.checkResults()
+		for name, pend in pairs(Z.pending) do
+			if os.clock() - pend.at > 86400 then
+				Z.pending[name] = nil
+			else
+				for _, entry in ipairs(N.ownAnimals(true)) do
+					if entry.name == name and not pend.seen[entry.inst] then
+						Z.pending[name] = nil
+						Z.results += 1
+						local kg = tonumber(entry.kg) or 0
+						if pend.raw > 0 and kg > 0 then
+							Z.kgFactor = math.clamp(kg / pend.raw, 0.5, 1.5)
+						end
+						log(string.format("MERGE result=%s kg=%s expected=%s mut=%s variant=%s cash=$%s/s expected=$%s/s", name, tostring(math.floor(kg * 100) / 100), tostring(math.floor(pend.raw * 100) / 100), tostring(entry.mutation), tostring(entry.variant), formatNumber(math.floor(entry.cash or 0)), formatNumber(math.floor(pend.cash))))
+						break
+					end
+				end
+			end
+		end
+	end
+	local function mergeCall(parts)
+		local t0 = os.clock()
+		local list = {}
+		for _, part in ipairs(parts) do
+			table.insert(list, part.inst)
+		end
+		fire("MergeMachineRemote", "Merge", list)
+		return waitFor(function()
+			return Z.event ~= nil and Z.event.at >= t0
+		end, 3)
+	end
+	function N.mergePetsStep()
+		if not on("AutoMergePets") then
+			return false
+		end
+		pcall(Z.checkResults)
+		if N.carrying() or os.clock() < Z.nextAt then
+			return false
+		end
+		Z.nextAt = os.clock() + 10
+		if os.clock() < Z.offUntil then
+			Z.status = string.format("Paused after a refusal, again in %dm", math.ceil((Z.offUntil - os.clock()) / 60))
+			return false
+		end
+		local cooldown = tonumber(LocalPlayer:GetAttribute(N.G.Merge.CooldownAttribute or "MergeCooldownEndsAt"))
+		if cooldown and cooldown > N.serverNow() then
+			Z.status = "Merge machine cooling down"
+			return false
+		end
+		local plan, why = N.mergePlan()
+		if not plan then
+			Z.status = why
+			say("skip", "MERGE skip reason=" .. tostring(why), 900)
+			Z.nextAt = os.clock() + 30
+			return false
+		end
+		local kgs = {}
+		for _, part in ipairs(plan.parts) do
+			table.insert(kgs, tostring(math.floor((tonumber(part.kg) or 0) * 10) / 10) .. (if part.placed then "(plot)" else ""))
+		end
+		log(string.format("MERGE plan %s x3 kg=%s -> %.1f kg $%s/s (apart $%s/s) grow=%ds gain=$%s", plan.name, table.concat(kgs, "+"), plan.kg, formatNumber(math.floor(plan.merged)), formatNumber(math.floor(plan.partCash)), math.floor(plan.grow), formatNumber(math.floor(plan.gain))))
+		setStatus("Merging three " .. N.displayName(plan.name))
+		local seen = snapshot(plan.name)
+		local range = N.ProbeMem.get("merge_range")
+		local spot = N.machineSpot("EggMachine")
+		local function far()
+			return spot ~= nil and N.distanceTo(spot) > 15
+		end
+		if range == "rejected" and far() then
+			N.travelNear(spot, 10)
+		end
+		local wasFar = far()
+		local ok = mergeCall(plan.parts)
+		if not ok and wasFar and range ~= "accepted" then
+			setStatus("Going to the merge machine")
+			N.travelNear(spot, 10)
+			ok = mergeCall(plan.parts)
+			if ok then
+				N.ProbeMem.set("merge_range", "rejected")
+				log("PROBE merge_range result=rejected gain=0 (merges at the machine)")
+			end
+		elseif ok and wasFar and range == nil then
+			N.ProbeMem.set("merge_range", "accepted")
+			log("PROBE merge_range result=accepted gain=no trip to the merge machine")
+		end
+		if not ok then
+			log("PROBE merge_pets result=rejected name=" .. plan.name)
+			Z.offUntil = os.clock() + 600
+			Z.status = "The game refused the merge, paused for 10 minutes"
+			return true
+		end
+		Z.merged += 1
+		if not Z.probed then
+			Z.probed = true
+			log(string.format("PROBE merge_pets result=accepted gain=+$%s/s slots=+2", formatNumber(math.floor(plan.merged - plan.partCash))))
+		end
+		Z.pending[plan.name] = { at = os.clock(), raw = plan.raw, cash = plan.merged, seen = seen }
+		Z.status = string.format("Merged %d time%s, last three %s", Z.merged, if Z.merged == 1 then "" else "s", N.displayName(plan.name))
+		log(string.format("MERGE pets done %s n=%d egg=%s", plan.name, Z.merged, tostring(Z.event and Z.event.variant or "-")))
+		Z.nextAt = os.clock() + 3
+		return true
 	end
 end
 -- Profit engine v2 (CLAUDE.md.txt 8.00). One planner ranks every way to spend cash and time on one scale.
@@ -35068,6 +36353,27 @@ do
 		return old + (new - old) * weight
 	end
 	P.ema = ema
+	-- Session averages per zone (live 2026-10-13: zone values swung +$4.25B -> +$924M -> +$1.36B per h between PLAN
+	-- lines because egg HP/luck and animal size came from an EMA over whatever was in view at that moment, re-adding the
+	-- same eggs every 4 s). Every egg and pickup now counts ONCE, into a running mean seeded with `seedWeight` samples
+	-- of the config value (EggConfig HP x ZoneHealthMult, luck 1, size ratio 1 = the pool Cash at base size); the
+	-- size ratio is averaged in log space (cash grows with weight^1.1-1.29, one Titanic must not move the zone).
+	P.acc = { hp = {}, luck = {}, size = {}, seen = {} }
+	P.counted = setmetatable({}, { __mode = "k" })
+	local function addSample(kind, zone, value, seed, seedWeight, logSpace)
+		local acc = P.acc[kind]
+		local row = acc[zone]
+		if not row then
+			local s = if logSpace then math.log(math.max(seed, 1e-9)) else seed
+			row = { sum = s * seedWeight, n = seedWeight }
+			acc[zone] = row
+		end
+		row.sum += if logSpace then math.log(math.max(value, 1e-9)) else value
+		row.n += 1
+		local mean = row.sum / row.n
+		return if logSpace then math.exp(mean) else mean
+	end
+	P.addSample = addSample
 	-- Rolling horizon: always the next 24 h from now (the hub farms forever, nothing counts down).
 	function P.horizon()
 		return P.Horizon
@@ -35082,7 +36388,19 @@ do
 		local p = math.max(power or base, base)
 		return math.clamp(math.log10(p / base) / math.log10(top / base), 0, 1) * 290 + 10
 	end
+	-- The game's own SpeedConfig.SpeedPowerToWalkSpeed when it is there (1352 moved the cap 150 -> 240 and the
+	-- overdrive steps), the 1322 formula otherwise.
+	P.walkCache = {}
 	function P.walkSpeedFor(power)
+		local key = math.floor(math.log10(math.max(tonumber(power) or 10, 1)) * 50)
+		local cached = P.walkCache[key]
+		if cached == nil then
+			cached = tonumber(isolated(N.G.Speed.SpeedPowerToWalkSpeed, power)) or false
+			P.walkCache[key] = cached
+		end
+		if cached then
+			return cached
+		end
 		local base = speedConst("DefaultSpeedPower", 10)
 		local top = speedConst("MaxSpeedPower", 1e9)
 		local over = speedConst("OverdriveMaxSpeedPower", 1e12)
@@ -35340,6 +36658,11 @@ do
 		if slots <= 0 then
 			slots = math.max(#placed, 8)
 		end
+		-- slots held by something else than an animal (the game's AnimalsPlaced counts planted eggs when they take a slot)
+		local used = tonumber(N.plotAttr("AnimalsPlaced", 0)) or 0
+		if used > #placed and #placed > 0 then
+			slots = math.max(slots - (used - #placed), #placed)
+		end
 		return {
 			damage = N.damage(),
 			capacity = N.capacity(),
@@ -35360,7 +36683,7 @@ do
 	end
 	-- Best schedule over t seconds: for every target power (now, each locked zone, one decade more for walk speed)
 	-- train first, then farm the zone with the highest value.
-	function P.evaluate(state, horizon)
+	function P.evaluate(state, horizon, maxTarget)
 		local best = { value = 0, zone = nil, target = state.power, train = 0, F = 0, rate = 0 }
 		if not state.canFarm then
 			return best
@@ -35369,11 +36692,11 @@ do
 		if state.canTrain and state.unlocked and state.trainMult > 0 then
 			for zone in ipairs(N.Cat.zones) do
 				local need = P.zoneNeed(zone)
-				if need > state.power then
+				if need > state.power and (not maxTarget or need <= maxTarget) then
 					table.insert(targets, need)
 				end
 			end
-			if P.walkSpeedFor(state.power * 10) > P.walkSpeedFor(state.power) + 0.5 then
+			if P.walkSpeedFor(state.power * 10) > P.walkSpeedFor(state.power) + 0.5 and (not maxTarget or state.power * 10 <= maxTarget) then
 				table.insert(targets, state.power * 10)
 			end
 		end
@@ -35382,6 +36705,8 @@ do
 			placedSum += value
 		end
 		local worst = if #state.placed < state.slots then 0 else (state.placed[#state.placed] or 0)
+		-- every zone's value when farming now (no training): for the zone hysteresis and the PLAN line
+		best.zones = {}
 		for _, target in ipairs(targets) do
 			local trainTime = 0
 			if target > state.power then
@@ -35401,8 +36726,11 @@ do
 						if worst > 0 and state.canSell then
 							value += rate * P.sellGain(dist, worst) * left
 						end
+						if target == state.power then
+							best.zones[zone] = { value = value, rate = rate, F = F, gain = P.gain(dist, worst) }
+						end
 						if value > best.value then
-							best = { value = value, zone = zone, target = target, train = trainTime, F = F, rate = rate }
+							best = { value = value, zone = zone, target = target, train = trainTime, F = F, rate = rate, zones = best.zones }
 						end
 					end
 				end
@@ -35494,6 +36822,10 @@ do
 			local price = N.satchelPrice(tier)
 			if price and N.satchelStation() then
 				add("satchel", "Satchel tier " .. (tier + 1), price, P.copy(state, { capacity = P.satchelCapacityAfter(tier, state.capacity) }), 0, N.buySatchel)
+			elseif price and os.clock() - (P.satchelSaid or -1e9) > 1800 then
+				-- the satchel is sold only at tagged world stations (SatchelConfig.StationTag); the 1352 map dump has none
+				P.satchelSaid = os.clock()
+				log(string.format("SATCHEL no upgrade station on this map (tag SatchelUpgrade), tier %d carries %d, next tier $%s", tier, N.capacity(), formatNumber(price)))
 			end
 		end
 		return list
@@ -35548,9 +36880,12 @@ do
 	function P.observe()
 		local now = os.clock()
 		for _, info in ipairs(N.eggs()) do
-			if not info.titanic then
-				P.hp[info.zone] = ema(P.hp[info.zone], info.max, 0.05)
-				P.luck[info.zone] = ema(P.luck[info.zone], math.max(info.luck, 1), 0.05)
+			if not info.titanic and info.part and not P.counted[info.part] then
+				P.counted[info.part] = true
+				local mults = N.G.Egg.ZoneHealthMult
+				local seedHp = (tonumber(N.G.Egg.MaxHealth) or 5) * (type(mults) == "table" and tonumber(mults[info.zone]) or 20 ^ (info.zone - 1))
+				P.hp[info.zone] = addSample("hp", info.zone, info.max, seedHp, 3, true)
+				P.luck[info.zone] = addSample("luck", info.zone, math.max(info.luck, 1), 1, 3, false)
 			end
 		end
 		if next(P.poolCash) == nil then
@@ -35560,12 +36895,13 @@ do
 		end
 		for _, info in ipairs(N.pickups()) do
 			local value = N.cashValue(info)
-			if value > 0 then
+			if value > 0 and info.model and not P.counted[info.model] then
+				P.counted[info.model] = true
 				local cash = P.poolCash[info.name]
 				if cash and cash > 0 then
-					P.size[info.zone] = ema(P.size[info.zone], math.clamp(value / cash, 0.05, 50), 0.05)
+					P.size[info.zone] = addSample("size", info.zone, math.clamp(value / cash, 0.05, 50), 1, 10, true)
 				end
-				P.seen[info.zone] = ema(P.seen[info.zone], value, 0.05)
+				P.seen[info.zone] = addSample("seen", info.zone, value, value, 0, true)
 			end
 		end
 		if N.planOn() then
@@ -35636,8 +36972,58 @@ do
 			end
 			local saved = math.min(span, base.train) / 2
 			return base.F * saved * (horizon - base.train)
+		elseif id == "EggGrowth" then
+			-- x2 growth for the potion's time: each of your growing eggs is ready min(left / 2, span) s sooner, worth its
+			-- animal's income over that time (the gain over the weakest placed one when the plot is full)
+			local worst = if #state.placed < state.slots then 0 else (state.placed[#state.placed] or 0)
+			local total = 0
+			for _, egg in ipairs(N.tagged("MergeEggPlaced")) do
+				if egg:GetAttribute("OwnerUserId") == LocalPlayer.UserId and not N.eggGrown(egg) then
+					local left = math.max((tonumber(egg:GetAttribute("ReadyAtServerTime")) or 0) - N.serverNow(), 0)
+					local name = egg:GetAttribute("AnimalName")
+					if type(name) == "string" and left > 0 then
+						local value = N.cashValue({ name = name, kg = tonumber(egg:GetAttribute("WeightKg")) or tonumber(egg:GetAttribute("MergedKg")), variant = egg:GetAttribute("Variant") })
+						total += math.max(value - worst, 0) * math.min(left / 2, span)
+					end
+				end
+			end
+			return total
 		end
-		return 1
+		return 0
+	end
+	-- Lucky eggs (LuckyEggConfig: SizeLuck x1.2-1.35, MutationLuck x1.5-2; the pet luck is in the egg's Luck attribute):
+	-- their hatches are worth more than a normal egg of the zone. Measured: the animal found at every own hatch is a sample
+	-- (log value, lucky or not, per zone); with 3+ of each the factor is the measured ratio, before that the config's size
+	-- luck midpoint (1.275). Clamped 0.8-5.
+	P.hatchAcc = {}
+	function P.hatchSample(zone, lucky, value)
+		if not (zone and value and value > 0) then
+			return
+		end
+		local row = P.hatchAcc[zone] or { l = { s = 0, n = 0 }, o = { s = 0, n = 0 } }
+		P.hatchAcc[zone] = row
+		local acc = if lucky then row.l else row.o
+		acc.s += math.log(value)
+		acc.n += 1
+	end
+	function P.luckyFactor(zone)
+		local row = P.hatchAcc[zone]
+		if row and row.l.n >= 3 and row.o.n >= 3 then
+			return math.clamp(math.exp(row.l.s / row.l.n - row.o.s / row.o.n), 0.8, 5), "measured"
+		end
+		local size = N.G.Lucky.SizeLuck
+		local lo = type(size) == "table" and tonumber(size.Min) or 1.2
+		local hi = type(size) == "table" and tonumber(size.Max) or 1.35
+		return (lo + hi) / 2, "config"
+	end
+	-- The best animal an egg of this zone can be expected to give: the top row of the zone's hatch table (pool Cash x the
+	-- session size ratio, luck tilt) x the variant odds (EggRewards.PoolVariantHatchChance Gold 1 % x2, Diamond 0.25 % x4).
+	function P.eggTop(zone, luck, lucky)
+		local top = 0
+		for _, row in ipairs(P.dist(zone, luck)) do
+			top = math.max(top, row.v)
+		end
+		return top * (1 + 0.01 * 1 + 0.0025 * 3) * (if lucky then (P.luckyFactor(zone)) else 1)
 	end
 	-- Value per second of breaking one egg: expected gain of its animal over the time it takes (egg choice by zone and luck).
 	function P.eggRate(info, distance)
@@ -35648,9 +37034,76 @@ do
 		local worst = if #state.placed < state.slots then 0 else (state.placed[#state.placed] or 0)
 		local dist = P.dist(info.zone, info.luck)
 		local g = P.gain(dist, worst) + P.mean(dist) * 1e-6
+		if info.lucky then
+			-- a bigger hatch: every row of the zone table times the lucky factor, priced against the weakest placed one
+			local factor = P.luckyFactor(info.zone)
+			local lucky = 0
+			for _, row in ipairs(dist) do
+				lucky += row.p * math.max(row.v * factor - worst, 0)
+			end
+			g = lucky + P.mean(dist) * factor * 1e-6
+		end
 		local walk = if state.teleport then 1e6 else math.max(N.modeSpeed(), 1)
 		local seconds = info.hits * state.pace + P.EggGap + (distance or 0) / walk
 		return math.min(g / math.max(seconds, 0.1), 1e14)
+	end
+	-- Why nothing is on the buy list: every upgrade maxed, or the best one that does not pay back inside the horizon.
+	-- Zone hysteresis: (zone to farm, note for the PLAN line, egg part to leave). A switch needs +15 % value; an egg in
+	-- progress in the current zone is finished unless what the new zone adds during the rest of it beats its own animal.
+	function P.zoneSwitch(zones, current, wanted, egg, state)
+		if not (current and wanted and current ~= wanted and zones[current] and zones[wanted]) then
+			return wanted, nil, nil
+		end
+		local cur, new = zones[current], zones[wanted]
+		local left
+		if egg and egg.zone == current and egg.part and egg.part.Parent then
+			local hp = tonumber(egg.part:GetAttribute("Health")) or 0
+			local max = math.max(tonumber(egg.max) or hp, 1)
+			left = { done = 1 - hp / max, seconds = math.ceil(hp / math.max(state.damage, 1)) * state.pace }
+		end
+		if new.value < cur.value * 1.15 then
+			return current, string.format("staying in zone %d: zone %d is only %+.0f%% (a switch needs +15%%)", current, wanted, (new.value / math.max(cur.value, 1e-9) - 1) * 100), nil
+		end
+		if left and new.F * left.seconds <= cur.gain then
+			return current, string.format("finishing the current egg %d%% before zone %d", math.floor(left.done * 100), wanted), nil
+		end
+		if left then
+			return wanted, string.format("leaving the current egg (%d%% done): zone %d adds more in its remaining %s", math.floor(left.done * 100), wanted, P.formatSeconds(left.seconds)), egg.part
+		end
+		return wanted, nil, nil
+	end
+	function P.noBuyText()
+		local list = P.lastOptions or {}
+		if #list == 0 then
+			local pickMax = N.pickaxeData(N.pickaxeTier() + 1) == nil
+			local level = tonumber(N.plotAttr("PlotLevel", 1)) or 1
+			local plotMax = level >= (tonumber(N.G.Plot.MaxLevel) or 9) or not (type(N.G.Plot.Costs) == "table" and tonumber(N.G.Plot.Costs[level]))
+			local tLevel = tonumber(N.plotAttr("TreadmillLevel", 1)) or 1
+			local tRow = type(N.G.Treadmill.Levels) == "table" and N.G.Treadmill.Levels[tLevel]
+			local treadMax = N.treadmillUnlocked() and not (tRow and tonumber(tRow.UpgradeCost))
+			if pickMax and plotMax and treadMax then
+				return "all upgrades maxed (pickaxe, plot, treadmill), farming for income"
+			end
+			return "no upgrade on offer right now, farming for income"
+		end
+		local top
+		for _, option in ipairs(list) do
+			if not top or (option.gain or 0) / math.max(option.cost, 1) > (top.gain or 0) / math.max(top.cost, 1) then
+				top = option
+			end
+		end
+		if top and (top.gain or 0) > 0 then
+			return string.format("nothing pays back within 24 h (best: %s $%s, pays back in %s), farming for income", top.label, formatNumber(top.cost), P.formatSeconds(math.min(top.cost / top.gain, 1e7)))
+		end
+		return string.format("nothing pays back within 24 h (%s adds nothing now), farming for income", top and top.label or "-")
+	end
+	-- the same verdict in a few words for the Up next box
+	function P.shortNoBuy()
+		local text = P.noBuyText()
+		if string.find(text, "all upgrades maxed", 1, true) then
+			return "every upgrade bought"
+		end
+		return "no upgrade pays back within 24 h"
 	end
 	function P.formatSeconds(seconds)
 		seconds = math.max(math.floor(seconds), 0)
@@ -35672,6 +37125,27 @@ do
 		local state = P.state()
 		P.lastState = state
 		local base = P.evaluate(state, horizon)
+		-- Staged training (review 2026-10-13, soak: the 24 h schedule chose "train 13 h to zone 4", so money first kept
+		-- farming a saturated zone 1 for plot levels and zone 2, 12 minutes of training away, opened 3 minutes after the
+		-- player-like Alternate schedule). Training is one path upward: the way to a far zone passes every locked zone
+		-- below it. When the best schedule trains past the next locked zone and training to that zone alone already beats
+		-- farming now, the first stage is that zone: the train target and the money-first comparison use the stage.
+		if base.train > 0 and state.canTrain then
+			local nextNeed
+			for zone in ipairs(N.Cat.zones) do
+				local need = P.zoneNeed(zone)
+				if need > state.power and (not nextNeed or need < nextNeed) then
+					nextNeed = need
+				end
+			end
+			if nextNeed and base.target > nextNeed then
+				local stage = P.evaluate(state, horizon, nextNeed)
+				if stage.train > 0 then
+					stage.final = base.target
+					base = stage
+				end
+			end
+		end
 		P.base = base
 		P.modelRate = base.rate
 		-- Time: train when the best schedule starts on the treadmill. A started training run keeps going to its target
@@ -35728,28 +37202,72 @@ do
 			end
 		end
 		P.farmZone = if base.train <= 0 then base.zone else nil
+		-- Zone hysteresis (live 2026-10-13: the PLAN flipped zone 6 <-> zone 10 every 10-60 s while one zone-10 egg took
+		-- 11 minutes). The zone values come from live averages (egg HP/luck of the eggs in view, animal sizes of the pickups
+		-- in view), so two close zones cross back and forth. A switch needs +15 % value, and an egg in progress is finished
+		-- unless what the new zone adds during the rest of that egg beats the egg's own animal.
+		P.zoneNote, P.leaveEgg = nil, nil
+		local zones = base.zones or {}
+		local keepZone, note, leave = P.zoneSwitch(zones, P.zoneCur, P.farmZone, N.Farm and N.Farm.target, state)
+		P.zoneNote, P.leaveEgg = note, leave
+		if keepZone and keepZone ~= P.farmZone then
+			local cur = zones[keepZone]
+			P.farmZone = keepZone
+			base.zone, base.rate, base.F, base.value = keepZone, cur.rate, cur.F, cur.value
+		end
+		if P.farmZone then
+			P.zoneCur = P.farmZone
+		end
 		local pick, valid
 		if moneyFirst then
 			pick, valid = fPick, fValid
 		else
-			pick, valid = P.choose(P.options(state, horizon, base), cash, income, horizon)
+			P.lastOptions = P.options(state, horizon, base)
+			pick, valid = P.choose(P.lastOptions, cash, income, horizon)
 		end
 		P.pick, P.valid = pick, valid
+		if pick then
+			P.lastPick = pick
+		end
 		local best = valid[1]
 		P.summary = if best
 			then string.format("Plan: %s $%s%s", best.label, formatNumber(best.cost), if best.eta > 0 then string.format(" in %s", P.formatSeconds(math.min(best.eta, 1e7))) else " now")
-			else "Plan: nothing pays back in 24 h, saving"
+			else "Plan: " .. P.noBuyText()
 		local doing = if P.activity == "train" then string.format("train->%s", formatNumber(P.trainTarget or 0)) else "farm z" .. tostring(base.zone or "-")
 		local key = tostring(best and best.label) .. "|" .. tostring(pick and pick.label) .. "|" .. doing
 		if N.planOn() and (key ~= P.logKey or os.clock() - P.logAt > 60 or force) then
 			P.logKey = key
 			P.logAt = os.clock()
-			local now = if P.activity == "train"
-				then string.format("training to %s speed", formatNumber(P.trainTarget or 0))
-				else string.format("farming zone %s (%.3g animals/s)", tostring(base.zone or "-"), base.rate or 0)
+			local now
+			if P.activity == "train" then
+				now = string.format("training to %s speed", formatNumber(P.trainTarget or 0))
+			else
+				-- the farmed zone and the runner-up with what they add: income per hour (new $/s each hour) and animals per hour
+				local rows = {}
+				for zone, row in pairs(zones) do
+					table.insert(rows, { zone = zone, row = row })
+				end
+				table.sort(rows, function(a, b)
+					return a.row.value > b.row.value
+				end)
+				local function zoneText(zone, row)
+					return string.format("zone %s +$%s/s per h (%.3g animals/h)", tostring(zone), formatNumber(math.floor(row.F * 3600)), row.rate * 3600)
+				end
+				local cur = zones[base.zone]
+				now = "farming " .. (if cur then zoneText(base.zone, cur) else "zone " .. tostring(base.zone or "-"))
+				for _, item in ipairs(rows) do
+					if item.zone ~= base.zone then
+						now ..= " vs " .. zoneText(item.zone, item.row)
+						break
+					end
+				end
+				if P.zoneNote then
+					now ..= ", " .. P.zoneNote
+				end
+			end
 			local nextBuy = if best
 				then string.format("next buy %s for $%s %s, pays back in %s", best.label, formatNumber(best.cost), if best.eta > 0 then "in " .. P.formatSeconds(math.min(best.eta, 1e7)) else "now", P.formatSeconds(math.min(best.payback or 0, 1e7)))
-				else "nothing pays back within 24 h, saving"
+				else P.noBuyText()
 			local after = {}
 			for i = 2, math.min(#valid, 3) do
 				table.insert(after, valid[i].label)
@@ -35764,6 +37282,580 @@ do
 				if best then best.ratio else 0
 			))
 		end
+	end
+end
+-- Free rewards, claimed through the game's own remotes and confirmed by the game's own answers (decompiled 1352 client,
+-- dump/BreakAndStealAnEgg_Scripts_bc.lua). Each of these remotes pushes a "State" table that the game paints into its
+-- menus; the hub keeps the same table and logs a claim "ok" only when the next answer shows it claimed, otherwise
+-- "FAILED answer=<what the game said>" (OWNER_RULES 24: a hub log line alone is not proof). Nothing here spends
+-- anything or moves the character.
+--   Index         IndexRemote ("Get", nil) / ("ClaimAll", nil) -> ("State", {[animal] = "Ready" | "Claimed"})   bc 28506-28553
+--   Index bats    BatUnlockRemote ("Get", nil, seq) / ("Claim", zone, seq) / ("Equip", tier, seq)
+--                 -> ("State", {Owned = {tiers}, Equipped = tier, Ack = seq}); a bat per completed index zone    bc 66250-66422
+--   Offline cash  OfflineRewardRemote ("Get") / ("Claim") -> ("State", {Cash}) / ("Claimed", {Cash})            bc 34090-34139
+--   Group reward  GroupRewardRemote ("Get") / ("Claim") / ("Refresh") -> ("State", {InGroup, Claimed, LikeAsked,
+--                 LikeWait}); in the group the first Claim asks for the like (10 s wait), the next one pays      bc 17088-17442
+--   Community     DiscordRewardRemote ("Get") / ("Verify", username) -> ("State", {Claimed, Asked, Wait}); the game
+--                 asks the player to join its community server first, so it runs only under its own toggle    bc 10190-10346
+N.Rewards = {
+	st = {},
+	at = {},
+	pend = {},
+	nextAt = {},
+	said = {},
+	notes = {},
+	dirty = {},
+	batFailAt = {},
+	seq = 0,
+	batAck = 0,
+	done = { index = 0, indexCash = 0, indexSpeed = 0, bats = 0, offlineCash = 0 },
+}
+do
+	local R = N.Rewards
+	local Timeout = 6
+	local function sayOnce(key, text, every)
+		local last = R.said[key]
+		if last and last.text == text and os.clock() - last.at < (every or 600) then
+			return
+		end
+		R.said[key] = { text = text, at = os.clock() }
+		log(text)
+	end
+	R.sayOnce = sayOnce
+	local function due(key, seconds)
+		if os.clock() >= (R.nextAt[key] or 0) then
+			R.nextAt[key] = os.clock() + seconds
+			return true
+		end
+		return false
+	end
+	-- "Get" for a State that never came: 3 asks at the normal pace, then one every 30 minutes (one log line), so a
+	-- remote the server answers only at join does not fill the log.
+	R.asks = {}
+	local function ask(key, seconds, send)
+		local n = R.asks[key] or 0
+		if not due(key, if n >= 3 then 1800 else seconds) then
+			return false
+		end
+		R.asks[key] = n + 1
+		if n == 3 then
+			log(string.format("REWARD %s: no answer to 3 requests, asking every 30 min", key))
+		end
+		send()
+		return true
+	end
+	-- The game's notifications (Notify: message, kind, NotificationController 33764) of the last seconds, quoted in the
+	-- FAILED lines ("Join the group first!", "Try again in 8 seconds!", ...).
+	N.onRemote("Notify", function(text, kind)
+		if type(text) == "string" then
+			table.insert(R.notes, { at = os.clock(), text = (string.gsub(string.gsub(text, "{%a+:", ""), "[{}]", "")), kind = tostring(kind or "") })
+			while #R.notes > 10 do
+				table.remove(R.notes, 1)
+			end
+		end
+	end)
+	function R.noteSince(t0)
+		local list = {}
+		for _, note in ipairs(R.notes) do
+			if note.at >= t0 - 0.05 then
+				table.insert(list, note.text)
+			end
+		end
+		return if #list > 0 then "game said: " .. table.concat(list, " | ") else "no notification"
+	end
+	local function names(list, limit)
+		local out = {}
+		for i, name in ipairs(list) do
+			if i > (limit or 6) then
+				table.insert(out, "+" .. (#list - (limit or 6)) .. " more")
+				break
+			end
+			table.insert(out, N.displayName(name))
+		end
+		return table.concat(out, ", ")
+	end
+
+	-- Index ------------------------------------------------------------------------------------------------------------
+	function R.readyNames()
+		local list = {}
+		for name, value in pairs(R.st.index or {}) do
+			if value == "Ready" then
+				table.insert(list, name)
+			end
+		end
+		table.sort(list)
+		return list
+	end
+	-- IndexConfig.Reward(rarity, name) = {Cash, Speed}, the amount the game's own claim popup shows (28537-28550).
+	function R.indexReward(name)
+		local fn = N.G.Index.Reward
+		if type(fn) ~= "function" then
+			return 0, 0
+		end
+		local reward = isolated(fn, N.rarityOfAnimal(name), name)
+		if type(reward) == "table" then
+			return tonumber(reward.Cash) or 0, tonumber(reward.Speed) or 0
+		end
+		return 0, 0
+	end
+	N.onRemote("IndexRemote", function(kind, data)
+		if kind ~= "State" or type(data) ~= "table" then
+			return
+		end
+		local copy = {}
+		for name, value in pairs(data) do
+			if type(name) == "string" then
+				copy[name] = value
+			end
+		end
+		R.st.index = copy
+		R.at.index = os.clock()
+		R.asks.indexGet = 0
+		local p = R.pend.index
+		if not p then
+			return
+		end
+		local claimed, left = {}, 0
+		for _, name in ipairs(p.names) do
+			if copy[name] == "Claimed" then
+				table.insert(claimed, name)
+			elseif copy[name] == "Ready" then
+				left += 1
+			end
+		end
+		if #claimed == 0 then
+			return
+		end
+		local cash, speed = 0, 0
+		for _, name in ipairs(claimed) do
+			local c, s = R.indexReward(name)
+			cash += c
+			speed += s
+		end
+		R.pend.index = nil
+		R.done.index += #claimed
+		R.done.indexCash += cash
+		R.done.indexSpeed += speed
+		log(string.format("INDEX claimed n=%d cash=+$%s speed=+%s ok (%s)%s", #claimed, formatNumber(cash), formatNumber(speed), names(claimed), if left > 0 then string.format(", %d still Ready", left) else ""))
+	end)
+	function R.indexStep(force)
+		if not (force or on("AutoIndex")) then
+			return false
+		end
+		local p = R.pend.index
+		if p then
+			if os.clock() - p.at > Timeout then
+				R.pend.index = nil
+				local left = #R.readyNames()
+				log(string.format("INDEX claim FAILED answer=%s, %d still Ready (%s)", if (R.at.index or -1e9) >= p.at then "the State still shows them Ready" else "no State reply", left, R.noteSince(p.at)))
+				R.nextAt.index = os.clock() + 120
+				R.dirty.index = true
+			end
+			return false
+		end
+		-- The game answers "Get" with the whole State (its own client asks when the menu loads); a newly banked species
+		-- (BANKED event, p05) or a 10 minute old copy asks again.
+		if not R.st.index or R.dirty.index or os.clock() - (R.at.index or -1e9) > 600 then
+			ask("indexGet", if R.st.index then 30 else 15, function()
+				R.dirty.index = nil
+				fire("IndexRemote", "Get", nil)
+			end)
+			if not R.st.index then
+				return false
+			end
+		end
+		local ready = R.readyNames()
+		if #ready == 0 or (not force and os.clock() < (R.nextAt.index or 0)) then
+			return false
+		end
+		R.pend.index = { at = os.clock(), names = ready }
+		R.nextAt.index = os.clock() + 5
+		fire("IndexRemote", "ClaimAll", nil)
+		return true
+	end
+
+	-- Index zone bats -----------------------------------------------------------------------------------------------------
+	function R.batName(tier)
+		local tiers = N.G.Bat.Tiers
+		local row = type(tiers) == "table" and tiers[tier]
+		return if type(row) == "table" and row.Name then tostring(row.Name) else "tier " .. tostring(tier)
+	end
+	-- Requests carry a sequence number the server echoes as Ack (the game's client drops older answers): the hub
+	-- continues after the last Ack it saw, so it never runs behind the game's own requests.
+	function R.batSend(verb, arg)
+		R.seq = math.max(R.seq, R.batAck or 0) + 1
+		return fire("BatUnlockRemote", verb, arg, R.seq)
+	end
+	N.onRemote("BatUnlockRemote", function(kind, data)
+		if kind ~= "State" or type(data) ~= "table" then
+			return
+		end
+		local ack = tonumber(data.Ack)
+		if ack then
+			R.batAck = math.max(R.batAck or 0, ack)
+		end
+		local owned = { [tonumber(N.G.Bat.DefaultTier) or 1] = true }
+		for _, tier in ipairs(type(data.Owned) == "table" and data.Owned or {}) do
+			if type(tier) == "number" then
+				owned[tier] = true
+			end
+		end
+		R.st.bat = { owned = owned, equipped = tonumber(data.Equipped) or tonumber(N.G.Bat.DefaultTier) or 1 }
+		R.at.bat = os.clock()
+		R.asks.batGet = 0
+		local p = R.pend.bat
+		if p and owned[p.tier] then
+			R.pend.bat = nil
+			R.done.bats += 1
+			log(string.format("BAT claimed zone=%d %s ok, equipped %s", p.zone, R.batName(p.tier), R.batName(R.st.bat.equipped)))
+			-- the game's own Claim click equips the new bat too (66373-66376); a better bat you already had stays on
+			if p.before and p.before > p.tier and owned[p.before] and R.st.bat.equipped ~= p.before then
+				R.batSend("Equip", p.before)
+				log("BAT kept " .. R.batName(p.before) .. " equipped (better than the new one)")
+			end
+		end
+	end)
+	function R.zoneTier(zone)
+		local fn = N.G.BatUnlock.TierForZone
+		return if type(fn) == "function" then tonumber(isolated(fn, zone)) else nil
+	end
+	function R.zoneComplete(zone)
+		local fn = N.G.BatUnlock.IsZoneComplete
+		return type(fn) == "function" and R.st.index ~= nil and isolated(fn, R.st.index, zone) == true
+	end
+	-- Zones -> bat tiers, complete or not, owned or not: recomputed only when the index or bat State changed (and once a
+	-- minute for a failed zone's pause), not every second.
+	function R.batScan()
+		local key = tostring(R.at.index) .. "|" .. tostring(R.at.bat)
+		local cache = R.batCache
+		if cache and cache.key == key and os.clock() < cache.untilAt then
+			return cache
+		end
+		local scan = { key = key, untilAt = os.clock() + 60, complete = 0, owned = 0, total = 0, claim = nil }
+		for zone = 1, #N.Cat.zones do
+			local tier = R.zoneTier(zone)
+			if tier then
+				scan.total += 1
+				local done = R.zoneComplete(zone)
+				local have = R.st.bat ~= nil and R.st.bat.owned[tier] == true
+				scan.complete += if done then 1 else 0
+				scan.owned += if have then 1 else 0
+				if done and not have and not scan.claim and (R.batFailAt[zone] or 0) < os.clock() then
+					scan.claim = { zone = zone, tier = tier }
+				end
+			end
+		end
+		R.batCache = scan
+		return scan
+	end
+	function R.batStep(force)
+		if not (force or on("AutoIndex")) or type(N.G.BatUnlock.IsZoneComplete) ~= "function" or not R.st.index then
+			return false
+		end
+		local p = R.pend.bat
+		if p then
+			if os.clock() - p.at > Timeout then
+				R.pend.bat = nil
+				R.batCache = nil
+				log(string.format("BAT claim FAILED zone=%d answer=%s (%s)", p.zone, if (R.at.bat or -1e9) >= p.at then "the State still does not list it" else "no State reply", R.noteSince(p.at)))
+				R.batFailAt[p.zone] = os.clock() + 1800
+			end
+			return false
+		end
+		if not R.st.bat then
+			ask("batGet", 60, function()
+				R.batSend("Get", nil)
+			end)
+			return false
+		end
+		local claim = R.batScan().claim
+		if claim then
+			R.pend.bat = { at = os.clock(), zone = claim.zone, tier = claim.tier, before = R.st.bat.equipped }
+			R.batCache = nil
+			R.batSend("Claim", claim.zone)
+			return true
+		end
+		return false
+	end
+
+	-- Offline cash --------------------------------------------------------------------------------------------------------
+	N.onRemote("OfflineRewardRemote", function(kind, data)
+		if type(data) ~= "table" then
+			return
+		end
+		if kind == "State" then
+			R.st.offline = { cash = tonumber(data.Cash) or 0 }
+			R.at.offline = os.clock()
+			R.asks.offlineGet = 0
+			local p = R.pend.offline
+			if p and R.st.offline.cash <= 0 then
+				R.pend.offline = nil
+				R.done.offlineCash += p.cash
+				log(string.format("OFFLINE claimed $%s ok (nothing left waiting)", formatNumber(p.cash)))
+			end
+		elseif kind == "Claimed" then
+			local cash = tonumber(data.Cash) or 0
+			R.st.offline = { cash = 0 }
+			R.at.offline = os.clock()
+			if R.pend.offline then
+				R.pend.offline = nil
+				R.done.offlineCash += cash
+				log(string.format("OFFLINE claimed $%s ok", formatNumber(cash)))
+			end
+		end
+	end)
+	function R.offlineStep(force)
+		if not (force or on("AutoOffline")) then
+			return false
+		end
+		local p = R.pend.offline
+		if p then
+			if os.clock() - p.at > Timeout then
+				R.pend.offline = nil
+				log(string.format("OFFLINE claim FAILED answer=%s (%s)", if R.st.offline and R.st.offline.cash > 0 then "still $" .. formatNumber(R.st.offline.cash) .. " waiting" else "no reply", R.noteSince(p.at)))
+				R.nextAt.offline = os.clock() + 300
+			end
+			return false
+		end
+		-- the game's own client asks once at start (34139); the cash only builds up while you are offline
+		if not R.st.offline then
+			ask("offlineGet", 60, function()
+				fire("OfflineRewardRemote", "Get")
+			end)
+			return false
+		end
+		if R.st.offline.cash > 0 and (force or os.clock() >= (R.nextAt.offline or 0)) then
+			R.pend.offline = { at = os.clock(), cash = R.st.offline.cash }
+			fire("OfflineRewardRemote", "Claim")
+			return true
+		end
+		return false
+	end
+
+	-- Group reward ----------------------------------------------------------------------------------------------------
+	N.onRemote("GroupRewardRemote", function(kind, data)
+		if kind ~= "State" or type(data) ~= "table" then
+			return
+		end
+		local wait = math.max(tonumber(data.LikeWait) or 0, 0)
+		R.st.group = { inGroup = data.InGroup == true, claimed = data.Claimed == true, likeAsked = data.LikeAsked == true, readyAt = os.clock() + wait }
+		R.at.group = os.clock()
+		R.asks.groupGet = 0
+		local p = R.pend.group
+		if not p then
+			return
+		end
+		if R.st.group.claimed then
+			R.pend.group = nil
+			log(string.format("GROUP claimed +%s speed ok", formatNumber(tonumber(N.G.Group.RewardSpeed) or 10000)))
+		elseif p.stage == "like" and R.st.group.likeAsked then
+			R.pend.group = nil
+			log(string.format("GROUP like step ok, the reward can be claimed in %ds", math.ceil(wait)))
+		end
+	end)
+	function R.groupStep(force)
+		if not (force or on("AutoGroup")) then
+			return false
+		end
+		local p = R.pend.group
+		if p then
+			if os.clock() - p.at > Timeout then
+				R.pend.group = nil
+				log(string.format("GROUP claim FAILED step=%s answer=%s (%s)", p.stage, if (R.at.group or -1e9) >= p.at then "the State is unchanged" else "no State reply", R.noteSince(p.at)))
+				R.nextAt.group = os.clock() + 300
+			end
+			return false
+		end
+		local g = R.st.group
+		if not g then
+			ask("groupGet", 60, function()
+				fire("GroupRewardRemote", "Get")
+			end)
+			return false
+		end
+		if g.claimed then
+			sayOnce("group", "GROUP reward already claimed", 1e9)
+			return false
+		end
+		if not g.inGroup then
+			sayOnce("group", string.format("GROUP not claimable: the reward (+%s speed) needs the game's group (id %s), join it once and Corvus claims it", formatNumber(tonumber(N.G.Group.RewardSpeed) or 10000), tostring(N.G.Group.GroupId or "?")), 3600)
+			-- the server re-checks the membership on "Refresh" (the game's own panel sends it when it opens, 17315)
+			if due("groupRefresh", 600) then
+				fire("GroupRewardRemote", "Refresh")
+			end
+			return false
+		end
+		if (not force and os.clock() < (R.nextAt.group or 0)) or (g.likeAsked and os.clock() < g.readyAt) then
+			return false
+		end
+		R.pend.group = { at = os.clock(), stage = if g.likeAsked then "claim" else "like" }
+		R.nextAt.group = os.clock() + 2
+		fire("GroupRewardRemote", "Claim")
+		return true
+	end
+
+	-- Community reward (own toggle) ------------------------------------------------------------------------------------
+	N.onRemote("DiscordRewardRemote", function(kind, data)
+		if kind ~= "State" or type(data) ~= "table" then
+			return
+		end
+		local wait = math.max(tonumber(data.Wait) or 0, 0)
+		R.st.community = { claimed = data.Claimed == true, asked = data.Asked == true, readyAt = os.clock() + wait }
+		R.at.community = os.clock()
+		R.asks.communityGet = 0
+		local p = R.pend.community
+		if not p then
+			return
+		end
+		if R.st.community.claimed then
+			R.pend.community = nil
+			log(string.format("COMMUNITY claimed %s ok", tostring(N.G.Discord.RewardName or "Sabertooth Egg")))
+		elseif p.stage == "ask" and R.st.community.asked then
+			R.pend.community = nil
+			log(string.format("COMMUNITY verify step ok, verifying again in %ds", math.ceil(wait)))
+		end
+	end)
+	function R.communityStep()
+		if not on("AutoCommunity") then
+			return false
+		end
+		local p = R.pend.community
+		if p then
+			if os.clock() - p.at > Timeout then
+				R.pend.community = nil
+				log(string.format("COMMUNITY claim FAILED step=%s answer=%s (%s)", p.stage, if (R.at.community or -1e9) >= p.at then "the State is unchanged" else "no State reply", R.noteSince(p.at)))
+				R.nextAt.community = os.clock() + 300
+			end
+			return false
+		end
+		local c = R.st.community
+		if not c then
+			ask("communityGet", 60, function()
+				fire("DiscordRewardRemote", "Get")
+			end)
+			return false
+		end
+		if c.claimed then
+			sayOnce("community", "COMMUNITY reward already claimed", 1e9)
+			return false
+		end
+		if os.clock() < (R.nextAt.community or 0) or (c.asked and os.clock() < c.readyAt) then
+			return false
+		end
+		R.pend.community = { at = os.clock(), stage = if c.asked then "verify" else "ask" }
+		R.nextAt.community = os.clock() + 2
+		-- the game's own Verify button sends the @username typed in its box (10206-10213)
+		fire("DiscordRewardRemote", "Verify", LocalPlayer.Name)
+		return true
+	end
+
+	-- One pass over every reward (its own loop in p13, never waits, never moves the character).
+	local Steps = { "indexStep", "batStep", "offlineStep", "groupStep", "communityStep" }
+	function R.step(force)
+		local did = false
+		for _, key in ipairs(Steps) do
+			local ok, result = pcall(R[key], force)
+			if not ok then
+				if os.clock() - (R.errAt or -1e9) > 60 then
+					R.errAt = os.clock()
+					logProblem("rewards " .. key .. ": " .. tostring(result))
+				end
+			elseif result then
+				did = true
+			end
+		end
+		return did
+	end
+	-- "Claim All Now": every State asked again, then everything claimable claimed; the notice reports what the game answered.
+	function R.claimAllNow()
+		for key in pairs(R.nextAt) do
+			R.nextAt[key] = 0
+		end
+		table.clear(R.batFailAt)
+		R.dirty.index = true
+		local before = { index = R.done.index, bats = R.done.bats, cash = R.done.offlineCash, group = R.st.group and R.st.group.claimed }
+		R.step(true)
+		task.wait(1.5)
+		R.step(true)
+		task.wait(Timeout + 0.5)
+		R.step(true)
+		local parts = {}
+		if R.done.index > before.index then
+			table.insert(parts, string.format("index %d claimed", R.done.index - before.index))
+		end
+		if R.done.bats > before.bats then
+			table.insert(parts, string.format("%d bat%s", R.done.bats - before.bats, if R.done.bats - before.bats == 1 then "" else "s"))
+		end
+		if R.done.offlineCash > before.cash then
+			table.insert(parts, "offline $" .. formatNumber(R.done.offlineCash - before.cash))
+		end
+		if R.st.group and R.st.group.claimed and not before.group then
+			table.insert(parts, "group reward")
+		end
+		notify("Rewards", if #parts > 0 then "Claimed: " .. table.concat(parts, ", ") else "Nothing new to claim, details in the Rewards box", 5)
+	end
+	-- One line for Up next: what is waiting, from the game's own answers.
+	function R.upNextText()
+		local parts = {}
+		local ready = if R.st.index then #R.readyNames() else 0
+		if ready > 0 then
+			table.insert(parts, ready .. " index rewards to claim")
+		end
+		if R.st.offline and R.st.offline.cash > 0 then
+			table.insert(parts, "offline $" .. formatNumber(R.st.offline.cash))
+		end
+		if R.st.group and R.st.group.inGroup and not R.st.group.claimed then
+			table.insert(parts, "group reward")
+		end
+		if #parts > 0 then
+			return "claiming " .. table.concat(parts, ", ")
+		end
+		if not (R.st.index or R.st.offline or R.st.group) then
+			return "asking the game what is claimable"
+		end
+		return string.format("nothing waiting, %d claimed this session", R.done.index + R.done.bats + (if R.done.offlineCash > 0 then 1 else 0))
+	end
+	-- Rewards box: what the game's own answers say right now.
+	function R.panelText()
+		local lines = {}
+		local dim = '<font transparency="0.4">%s</font>'
+		if R.st.index then
+			local ready, total = #R.readyNames(), 0
+			for _ in pairs(R.st.index) do
+				total += 1
+			end
+			local line = if ready > 0 then string.format("Index: <b>%d</b> ready to claim", ready) else string.format("Index: all <b>%d</b> found animals claimed", total)
+			if R.done.index > 0 then
+				line ..= string.format(" (%d this session, +$%s, +%s speed)", R.done.index, formatNumber(R.done.indexCash), formatNumber(R.done.indexSpeed))
+			end
+			table.insert(lines, line)
+		else
+			table.insert(lines, string.format(dim, "Index: waiting for the game's answer (Claim Index Rewards or Smart Planner on)"))
+		end
+		if R.st.bat and R.st.index then
+			local scan = R.batScan()
+			table.insert(lines, string.format("Zone bats: <b>%d</b> of %d owned, %d index zones complete, using %s", scan.owned, scan.total, scan.complete, R.batName(R.st.bat.equipped)))
+		end
+		if R.st.offline then
+			table.insert(lines, if R.st.offline.cash > 0 then string.format("Offline cash: <b>$%s</b> waiting", formatNumber(R.st.offline.cash)) else string.format("Offline cash: nothing waiting%s", if R.done.offlineCash > 0 then " (claimed $" .. formatNumber(R.done.offlineCash) .. ")" else ""))
+		end
+		local g = R.st.group
+		if g then
+			local speed = formatNumber(tonumber(N.G.Group.RewardSpeed) or 10000)
+			table.insert(lines, if g.claimed then "Group reward: <b>claimed</b>" elseif not g.inGroup then string.format('Group reward: <font color="#fab428">join the game\'s group for +%s speed</font>', speed) elseif on("AutoGroup") then string.format("Group reward: +%s speed, claiming", speed) else string.format("Group reward: +%s speed waiting (Claim Group Reward is off)", speed))
+		end
+		local c = R.st.community
+		local egg = tostring(N.G.Discord.RewardName or "Sabertooth Egg")
+		if c and c.claimed then
+			table.insert(lines, "Community reward (" .. egg .. "): <b>claimed</b>")
+		elseif c and on("AutoCommunity") then
+			table.insert(lines, "Community reward (" .. egg .. "): verifying with the game")
+		else
+			table.insert(lines, string.format(dim, "Community reward (" .. egg .. "): not claimed, join the game's community server, then turn on Claim Community Reward"))
+		end
+		local boost = LocalPlayer:GetAttribute("FriendBoostPercent")
+		table.insert(lines, string.format("Friend boost: <b>+%d%%</b>", math.floor((tonumber(boost) or 0) + 0.5)))
+		return table.concat(lines, "\n")
 	end
 end
 N.Train = { session = false, startedAt = nil, phase = "farm", phaseSince = os.clock(), unlockAskedAt = -1e9 }
@@ -35858,7 +37950,7 @@ do
 		end
 		if not N.treadmillUnlocked() then
 			local cost = tonumber(N.G.TreadmillUnlock.Cost) or 100
-			if on("AutoTreadmill") and N.cash() >= cost and os.clock() - T.unlockAskedAt > 10 then
+			if on("AutoTreadmill") and N.cash() >= cost and os.clock() - T.unlockAskedAt > 10 and N.buyIntent("UnlockTreadmillRequest", "Treadmill unlock", cost, nil) then
 				T.unlockAskedAt = os.clock()
 				fire("UnlockTreadmillRequest")
 				task.wait(1)
@@ -35919,6 +38011,26 @@ do
 		end
 		return T.phase == "train"
 	end
+	-- purchase guard helpers (the check itself sits in fire(), p01): toggle on + BUY line before the remote
+	function N.purchaseToggleOn(name)
+		for _, toggle in ipairs(N.PurchaseToggles[name] or {}) do
+			if on(toggle) then
+				return true
+			end
+		end
+		return false
+	end
+	-- Logs the purchase and opens a 10 s window for exactly this remote. payback = seconds or nil.
+	function N.buyIntent(remote, item, price, payback)
+		if not N.purchaseToggleOn(remote) then
+			log(string.format("BUY refused %s $%s reason=its toggle is off", tostring(item), formatNumber(price or 0)))
+			N.BuyIntent = nil
+			return false
+		end
+		N.BuyIntent = { remote = remote, at = os.clock() }
+		log(string.format("BUY %s $%s payback %s", tostring(item), formatNumber(math.floor(tonumber(price) or 0)), if payback then string.format("%.1fh", payback / 3600) else "-"))
+		return true
+	end
 	local function shopNote(text)
 		table.insert(N.Shop.log, 1, os.date("%H:%M") .. "  " .. text)
 		while #N.Shop.log > 5 do
@@ -35926,6 +38038,12 @@ do
 		end
 		log("SHOP", text)
 	end
+	-- payback of the item the planner picked (seconds), for the BUY line
+	local function plannedPayback(key)
+		local pick = N.Plan and (N.Plan.pick or N.Plan.lastPick)
+		return if pick and pick.key == key then pick.payback else nil
+	end
+	N.plannedPayback = plannedPayback
 	local function buyThenCheck(key, remote, args, changed, boothName)
 		fire(remote, table.unpack(args))
 		if waitFor(changed, 2.5) then
@@ -36000,6 +38118,9 @@ do
 			return false
 		end
 		local current = N.pickaxeTier()
+		if not N.buyIntent("PickaxeShopRequest", tostring(data.Name), tonumber(data.Price), plannedPayback("pickaxe")) then
+			return false
+		end
 		local ok = buyThenCheck("pickaxe", "PickaxeShopRequest", { "Buy", tier }, function()
 			return N.ownedList("OwnedPickaxes")[tier] == true or N.pickaxeTier() >= tier
 		end, "Pickaxe Shop")
@@ -36017,6 +38138,9 @@ do
 	end
 	function N.buyTrail(trail)
 		if N.cash() < (tonumber(trail.Price) or math.huge) then
+			return false
+		end
+		if not N.buyIntent("TrailShopRequest", tostring(trail.Name), tonumber(trail.Price), plannedPayback("trail")) then
 			return false
 		end
 		local ok = buyThenCheck("trail", "TrailShopRequest", { "Buy", trail.Id }, function()
@@ -36048,6 +38172,9 @@ do
 		end
 		local function upgraded()
 			return (tonumber(N.plotAttr("PlotLevel", 1)) or 1) > level
+		end
+		if not N.buyIntent("UpgradePlotRequest", "Plot level " .. (level + 1), cost, plannedPayback("plot")) then
+			return false
 		end
 		fire("UpgradePlotRequest")
 		local ok = waitFor(upgraded, 2.5)
@@ -36081,6 +38208,9 @@ do
 		if N.treadmillUnlocked() or N.cash() < cost then
 			return false
 		end
+		if not N.buyIntent("UnlockTreadmillRequest", "Treadmill unlock", cost, plannedPayback("treadmill")) then
+			return false
+		end
 		fire("UnlockTreadmillRequest")
 		local ok = waitFor(N.treadmillUnlocked, 2.5)
 		if not ok then
@@ -36111,6 +38241,9 @@ do
 		local data = type(levels) == "table" and levels[level]
 		local cost = data and tonumber(data.UpgradeCost)
 		if not cost or N.cash() < cost then
+			return false
+		end
+		if not N.buyIntent("UpgradeTreadmillRequest", "Treadmill level " .. (level + 1), cost, plannedPayback("treadmill")) then
 			return false
 		end
 		fire("UpgradeTreadmillRequest")
@@ -36174,6 +38307,15 @@ do
 			N.Shop.lastAt.satchel = os.clock() + 120
 			return false
 		end
+		-- the satchel is bought through the station prompt, not a remote: same rule (toggle on, BUY line first)
+		if not on("AutoSatchel") then
+			log(string.format("BUY refused Satchel tier %d $%s reason=its toggle is off", tier + 1, formatNumber(price)))
+			return false
+		end
+		log(string.format("BUY Satchel tier %d $%s payback %s", tier + 1, formatNumber(price), (function()
+			local pb = plannedPayback("satchel")
+			return if pb then string.format("%.1fh", pb / 3600) else "-"
+		end)()))
 		local function done()
 			return (tonumber(LocalPlayer:GetAttribute("SatchelTier")) or 1) > tier
 		end
@@ -36196,18 +38338,64 @@ do
 		{ id = "WalkSpeed", price = 150 },
 		{ id = "Treadmill", price = 250 },
 		{ id = "EggGrowth", price = 325, need = function()
-			return #N.tagged("MergeEggPlaced") > 0
+			for _, egg in ipairs(N.tagged("MergeEggPlaced")) do
+				if egg:GetAttribute("OwnerUserId") == LocalPlayer.UserId and not N.eggGrown(egg) then
+					return true
+				end
+			end
+			return false
 		end },
 	}
-	N.Demon = { at = {}, bought = 0 }
+	-- prices from the live DemonEventConfig.PotionOffers / Eggs when the game has them (1352: the same numbers)
+	do
+		local offers = N.G.Demon.PotionOffers
+		for _, potion in ipairs(N.DemonPotions) do
+			for _, offer in ipairs(type(offers) == "table" and offers or {}) do
+				if type(offer) == "table" and offer.PotionId == potion.id and tonumber(offer.Price) then
+					potion.price = tonumber(offer.Price)
+				end
+			end
+		end
+	end
+	-- Demon Egg (DemonEventConfig.Eggs: 500 tokens, EggTypeConfig.Types.Demon: HellAnky 50, HellTrike 32,
+	-- HellMegalodon 14.4, HellTRex 3, HellDragon 0.5, HellHydra 0.1), planted on the plot like a merge egg. Bought with
+	-- DemonEventRequest("BuyEgg", "Demon") like DemonEggShop (dump 1322 34884), only under its own toggle, and only when
+	-- the expected animal is worth more per token than the best potion. Not for accounts the game restricts
+	-- (PaidRandomItemsRestricted, PaidRandomItemsConfig.RestrictTokenEggs).
+	N.DemonEggPrice = tonumber(type(N.G.Demon.Eggs) == "table" and type(N.G.Demon.Eggs.Demon) == "table" and N.G.Demon.Eggs.Demon.Price) or 500
+	N.Demon = { at = {}, bought = 0, eggs = 0, lockedSaid = -1e9, failed = 0 }
+	-- The demon furnace (shop) opens with FurnaceUnlocked or SpeedPower >= DemonEventConfig.RequiredSpeedPower (7.5e8,
+	-- isFurnaceUnlocked bc 9885-9891): below that every purchase is a wasted reject.
+	function N.demonFurnaceOpen()
+		if LocalPlayer:GetAttribute(N.G.Demon.FurnaceUnlockedAttribute or "FurnaceUnlocked") == true then
+			return true
+		end
+		local need = tonumber(N.G.Demon.RequiredSpeedPower) or 7.5e8
+		return N.power() >= need, need
+	end
 	function N.demonStep()
 		local tokens = tonumber(LocalPlayer:GetAttribute("DemonTokens")) or 0
 		if tokens <= 0 then
 			return false
 		end
+		local open, need = N.demonFurnaceOpen()
+		if not open then
+			if os.clock() - N.Demon.lockedSaid > 1800 then
+				N.Demon.lockedSaid = os.clock()
+				log("DEMON locked speed=" .. formatNumber(N.power()) .. " need=" .. formatNumber(need or 7.5e8))
+			end
+			return false
+		end
 		local now = N.serverNow()
 		local best, bestScore
-		for _, potion in ipairs(N.DemonPotions) do
+		if on("AutoDemonEgg") and tokens >= N.DemonEggPrice and LocalPlayer:GetAttribute("PaidRandomItemsRestricted") ~= true and os.clock() - (N.Demon.at.egg or -1e9) > 30 then
+			local ok, value = pcall(N.eggTypeValue, "Demon")
+			local score = (if ok and type(value) == "number" then value else 0) / N.DemonEggPrice
+			if score > 0 then
+				best, bestScore = { id = "egg", price = N.DemonEggPrice, egg = true }, score
+			end
+		end
+		for _, potion in ipairs(if on("AutoDemonShop") then N.DemonPotions else {}) do
 			if tokens >= potion.price and (not potion.need or potion.need()) then
 				local ends = tonumber(LocalPlayer:GetAttribute("PotionEndsAt_" .. potion.id)) or 0
 				if ends <= now + 20 and os.clock() - (N.Demon.at[potion.id] or -1e9) > 30 then
@@ -36223,16 +38411,47 @@ do
 			return false
 		end
 		N.Demon.at[best.id] = os.clock()
-		fire("DemonEventRequest", "BuyPotion", best.id)
-		N.Demon.bought += 1
-		shopNote(string.format("Fallen Tokens: %s potion (worth $%s per token)", best.id, formatNumber(math.floor(bestScore))))
-		N.planSay("potion", string.format("drink the %s potion, worth $%s per Fallen Token, the most of every potion now", best.id, formatNumber(math.floor(bestScore))))
-		task.wait(0.5)
+		local item = if best.egg then "Demon Egg" else (tostring(best.id) .. " potion")
+		if not N.buyIntent("DemonEventRequest", item, best.price, nil) then
+			return false
+		end
+		-- The shop has no answer event (DemonEventShop 58687, DemonPotionShop 58825): the purchase counts only when the
+		-- server took the tokens (DemonTokens attribute), a potion also moves its PotionEndsAt_<Id>.
+		local t0 = os.clock()
+		local endsBefore = tonumber(LocalPlayer:GetAttribute("PotionEndsAt_" .. tostring(best.id))) or 0
+		if best.egg then
+			fire("DemonEventRequest", "BuyEgg", "Demon")
+		else
+			fire("DemonEventRequest", "BuyPotion", best.id)
+		end
+		local paid = waitFor(function()
+			return (tonumber(LocalPlayer:GetAttribute("DemonTokens")) or 0) <= tokens - best.price
+		end, 3)
+		local after = tonumber(LocalPlayer:GetAttribute("DemonTokens")) or 0
+		if not paid then
+			N.Demon.failed += 1
+			N.Shop.lastAt.demon = os.clock() + 600
+			log(string.format("DEMON %s FAILED answer=tokens %d -> %d (%s), next try in 10 min", item, tokens, after, if N.Rewards then N.Rewards.noteSince(t0) else "-"))
+			return true
+		end
+		if best.egg then
+			N.Demon.eggs += 1
+			shopNote(string.format("Fallen Tokens: Demon Egg (worth $%s per token)", formatNumber(math.floor(bestScore))))
+			log(string.format("DEMON egg bought ok value=$%s per token tokens %d -> %d", formatNumber(math.floor(bestScore)), tokens, after))
+		else
+			N.Demon.bought += 1
+			waitFor(function()
+				return (tonumber(LocalPlayer:GetAttribute("PotionEndsAt_" .. tostring(best.id))) or 0) > endsBefore
+			end, 1.5)
+			local ends = tonumber(LocalPlayer:GetAttribute("PotionEndsAt_" .. tostring(best.id))) or 0
+			shopNote(string.format("Fallen Tokens: %s potion (worth $%s per token)", best.id, formatNumber(math.floor(bestScore))))
+			log(string.format("DEMON %s potion bought ok value=$%s per token tokens %d -> %d, runs %s more", tostring(best.id), formatNumber(math.floor(bestScore)), tokens, after, N.longTime(math.max(ends - math.max(endsBefore, N.serverNow()), 0))))
+		end
 		return true
 	end
 	-- The planner only runs while a toggle needs it (Smart Planner or a buy toggle); it writes PLAN lines only while
 	-- Smart Planner is on.
-	N.BuyToggles = { "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill", "AutoSatchel", "AutoDemonShop" }
+	N.BuyToggles = { "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill", "AutoSatchel", "AutoDemonShop", "AutoDemonEgg" }
 	function N.buyingOn()
 		for _, name in ipairs(N.BuyToggles) do
 			if on(name) then
@@ -36299,7 +38518,7 @@ do
 				return true
 			end
 		end
-		if on("AutoDemonShop") and (N.Shop.lastAt.demon or 0) < os.clock() then
+		if (on("AutoDemonShop") or on("AutoDemonEgg")) and (N.Shop.lastAt.demon or 0) < os.clock() then
 			local ok, did = pcall(N.demonStep)
 			if ok and did then
 				return true
@@ -36308,21 +38527,65 @@ do
 		return false
 	end
 	-- Merge machine eggs: placing on the plot and hatching when grown repeat forever, so they are automated.
-	-- Merging pets into an egg uses up pets and stays manual.
-	N.Merge = { hatchAt = {}, placeAt = -1e9, hatched = 0, placed = 0 }
+	-- Merging pets (AutoMergePets, p06_merge), Fuse Machine (Celestial) and Demon eggs are planted the same way ("Plant
+	-- it on your plot to hatch it", NotificationConfig.FuseEggGranted) while their toggles run. The first planted egg
+	-- measures whether a growing egg takes a plot slot (PROBE egg_slot, remembered per PlaceVersion).
+	N.Merge = { hatchAt = {}, placeAt = -1e9, hatched = 0, placed = 0, pend = {} }
+	-- A hatch is "ok" only when the game answers: MergeMachineRemote ("HatchAnim", egg, animal, kg, ownerUserId, variant)
+	-- (MergeEggController 29570-29606) or the egg leaves the plot; otherwise "MERGE hatch FAILED" and a retry later.
+	N.onRemote("MergeMachineRemote", function(kind, egg, animal, kg, owner, variant)
+		if kind ~= "HatchAnim" or owner ~= LocalPlayer.UserId then
+			return
+		end
+		local M = N.Merge
+		for id, p in pairs(M.pend) do
+			if p.egg == egg then
+				M.pend[id] = nil
+				M.hatched += 1
+				log(string.format("MERGE hatch ok egg=%s animal=%s kg=%s%s", tostring(id), tostring(animal), formatNumber(math.floor((tonumber(kg) or 0) * 10) / 10), if type(variant) == "string" then " variant=" .. variant else ""))
+			end
+		end
+	end)
+	-- Grown like the game's own egg view (MergeEggController.readEgg 29385-29388): the Ready attribute, or the growth clock
+	-- (EggGrowthClock.RemainingOf: ReadyAtServerTime at the egg's growth rate) at zero.
+	function N.eggGrown(egg)
+		if egg:GetAttribute("Ready") == true then
+			return true
+		end
+		local fn = N.G.Growth.RemainingOf
+		if egg:GetAttribute("ReadyAtServerTime") == nil then
+			return false
+		end
+		local left = if type(fn) == "function" then tonumber(isolated(fn, egg)) else nil
+		if left == nil then
+			left = (tonumber(egg:GetAttribute("ReadyAtServerTime")) or math.huge) - N.serverNow()
+		end
+		return left <= 0
+	end
 	function N.mergeStep()
-		if not on("AutoMergeEggs") or N.carrying() then
+		if not (on("AutoMergeEggs") or on("AutoFuse") or on("AutoDemonEgg") or on("AutoMergePets")) or N.carrying() then
 			return false
 		end
 		local M = N.Merge
 		local did = false
+		for id, p in pairs(M.pend) do
+			if p.egg.Parent == nil or not N.hasTag(p.egg, "MergeEggPlaced") then
+				M.pend[id] = nil
+				M.hatched += 1
+				log(string.format("MERGE hatch ok egg=%s (the egg left the plot)", tostring(id)))
+			elseif os.clock() - p.at > 12 then
+				M.pend[id] = nil
+				M.hatchAt[id] = os.clock() + 120
+				log(string.format("MERGE hatch FAILED egg=%s answer=still on the plot, Ready=%s (%s)", tostring(id), tostring(p.egg:GetAttribute("Ready")), if N.Rewards then N.Rewards.noteSince(p.at) else "-"))
+			end
+		end
 		for _, egg in ipairs(N.tagged("MergeEggPlaced")) do
-			if egg:GetAttribute("OwnerUserId") == LocalPlayer.UserId and egg:GetAttribute("Ready") == true then
+			if egg:GetAttribute("OwnerUserId") == LocalPlayer.UserId and N.eggGrown(egg) then
 				local id = egg:GetAttribute("EggId")
-				if id ~= nil and os.clock() - (M.hatchAt[id] or -1e9) > 8 then
+				if id ~= nil and not M.pend[id] and os.clock() - (M.hatchAt[id] or -1e9) > 8 then
 					M.hatchAt[id] = os.clock()
+					M.pend[id] = { egg = egg, at = os.clock() }
 					fire("MergeMachineRemote", "HatchEgg", id)
-					M.hatched += 1
 					did = true
 				end
 			end
@@ -36332,8 +38595,12 @@ do
 		end
 		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
 		local tool
+		-- OWNER_RULES 20/21: egg tools with an EggType attribute (Fuse Machine Celestial, Demon shop, community Sabertooth) are
+		-- planted while the player's own switch for them is on (Auto Place And Hatch Eggs, Auto Fuse or Demon Eggs, not the
+		-- planner); the planner alone plants merge machine eggs (MergeEggTool) only.
+		local typedEggs = (Toggles.AutoMergeEggs and Toggles.AutoMergeEggs.Value == true) or (Toggles.AutoFuse and Toggles.AutoFuse.Value == true) or (Toggles.AutoDemonEgg and Toggles.AutoDemonEgg.Value == true)
 		for _, item in ipairs(backpack and backpack:GetChildren() or {}) do
-			if item:IsA("Tool") and N.hasTag(item, "MergeEggTool") then
+			if item:IsA("Tool") and (N.hasTag(item, "MergeEggTool") or (typedEggs and type(item:GetAttribute("EggType")) == "string" and not N.hasTag(item, "AnimalTool"))) then
 				tool = item
 				break
 			end
@@ -36344,46 +38611,35 @@ do
 		end
 		M.placeAt = os.clock()
 		if not N.atHome() then
-			N.goHome("Taking a merge egg home")
+			N.goHome("Taking an egg home to plant it")
 		end
 		local half = hitbox.Size / 2
 		local spot = hitbox.CFrame:PointToWorldSpace(Vector3.new((math.random() - 0.5) * half.X, 0, (math.random() - 0.5) * half.Z))
 		local ground = N.groundAt(spot.X, spot.Z, hitbox.Position.Y + half.Y)
 		spot = Vector3.new(spot.X, ground or (hitbox.Position.Y - half.Y), spot.Z)
-		setStatus("Placing a merge egg on your plot")
+		setStatus("Planting an egg on your plot")
+		local plot = N.plot()
+		local slotsBefore = plot and tonumber(plot:GetAttribute("AnimalsPlaced"))
 		fire("MergeMachineRemote", "PlaceEgg", tool, spot)
-		if waitFor(function()
+		local placedOk = waitFor(function()
 			return tool.Parent == nil or not tool:IsDescendantOf(LocalPlayer)
-		end, 2) then
+		end, 2)
+		if placedOk then
 			M.placed += 1
+			if slotsBefore and N.ProbeMem.get("egg_slot") == nil then
+				task.wait(1)
+				local after = tonumber(plot:GetAttribute("AnimalsPlaced")) or slotsBefore
+				local takes = after > slotsBefore
+				N.ProbeMem.set("egg_slot", if takes then "takes" else "free")
+				log(string.format("PROBE egg_slot result=%s placed=%d->%d", if takes then "takes a slot" else "free", slotsBefore, after))
+			end
+		else
+			M.placeAt = os.clock() + 54
 		end
+		log("MERGE place egg type=" .. tostring(tool:GetAttribute("EggType") or tool.Name), if placedOk then "ok" else "refused")
 		return true
 	end
-	local RewardAt = {}
-	local function due(key, seconds)
-		if os.clock() >= (RewardAt[key] or 0) then
-			RewardAt[key] = os.clock() + seconds
-			return true
-		end
-		return false
-	end
-	function N.rewardStep()
-		if on("AutoIndex") then
-			if due("index", 600) then
-				fire("IndexRemote", "ClaimAll", nil)
-				RewardAt.indexLogged = nil
-			elseif not RewardAt.indexLogged then
-				RewardAt.indexLogged = true
-				log("INDEX claim skipped reason=cooldown")
-			end
-		end
-		if on("AutoOffline") and due("offline", 300) then
-			fire("OfflineRewardRemote", "Claim")
-		end
-		if on("AutoGroup") and due("group", 300) then
-			fire("GroupRewardRemote", "Claim")
-		end
-	end
+	-- Index, zone bats, offline cash, group and community rewards: p06_rewards (state-verified, own loop in p13).
 end
 N.Esp = { items = {}, container = nil, want = {} }
 do
@@ -36619,7 +38875,7 @@ do
 	Tabs.Base = Tabs.Farm
 	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Pickaxes, trails, plot, satchel, tokens, selling and merge eggs")
 	Tabs.Items = Tabs.Upgrades
-	Tabs.Rewards = N.addTab("Rewards", "gift", "Index, offline cash and group rewards")
+	Tabs.Rewards = N.addTab("Rewards", "gift", "Index cash and bats, offline cash, group and community rewards, friends")
 	Tabs.Player = N.addTab("Player", "user", "Travel, noclip and ESP")
 	Tabs.Movement = Tabs.Player
 	Tabs.Visuals = Tabs.Player
@@ -36655,7 +38911,7 @@ do
 		QuickBox:AddToggle("SmartPlanner", {
 			Text = "Smart Planner",
 			Default = false,
-			Tooltip = "Runs the whole farm by real game odds: picks the zone and the egg, farm or steal, train or not, places the best animals, buys the upgrade that pays back fastest, drinks potions and sells animals that never beat your weakest one (Keep Mutated and Never Sell stay protected). Your other switches stay as they are",
+			Tooltip = "Runs the whole farm by real game odds: picks the zone and the egg (lucky eggs count more), farm or steal, train or not, places the best animals, buys the upgrade that pays back fastest, plants and hatches merge machine eggs, claims the free rewards (index cash and bats, offline cash, group reward) and, only when the plot is full, sells surplus animals that earn no more than your weakest placed one (never Secret, locked, Keep Mutated or Never Sell ones). It never fuses, merges, sells anything else or spends Fallen Tokens by itself: those run only under their own toggles. Your other switches stay as they are",
 		})
 		StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
@@ -36721,7 +38977,7 @@ do
 			Text = "Hit Speed",
 			Values = N.HitSpeeds,
 			Default = "Fast",
-			Tooltip = "Fast hits right at the server limit (one hit per 0.92 swing gaps), the fastest the server takes. Normal is the game\'s own swing. Faster hits are dropped by the server, so they are not offered",
+			Tooltip = "Fast hits right at the server limit (read from the game, 0.8 swing gaps since the October update), the fastest the server takes. Normal is the game\'s own swing. Faster hits are dropped by the server, so they are not offered",
 		})
 		EggBox:AddToggle("AvoidPlayers", {
 			Text = "Skip Eggs Other Players Hit",
@@ -36837,7 +39093,7 @@ do
 		BuyBox:AddToggle("AutoSatchel", {
 			Text = "Satchel Upgrades",
 			Default = false,
-			Tooltip = "Every satchel tier carries one more animal per trip. Walks to the satchel station when the profit plan ranks it best per dollar",
+			Tooltip = "Every satchel tier carries one more animal per trip. The game sells it only at satchel stations in the world: Corvus walks there when the profit plan ranks it best per dollar. The box below says when this map has no station",
 		})
 		BuyBox:AddToggle("ShopTravel", {
 			Text = "Walk To Shop If Needed",
@@ -36846,19 +39102,34 @@ do
 		})
 		Labels.Shop = BuyBox:AddLabel({ Text = "-", DoesWrap = true })
 		local TokenBox = Tabs.Upgrades:AddRightGroupbox("Fallen Tokens", "coins")
+		TokenBox:AddToggle("AutoHell", {
+			Text = "Fight The Hell Boss",
+			Default = false,
+			Tooltip = "When the hourly Hell portal in zone 7 opens, Corvus walks in, breaks essence eggs, then hits the Demon King with the bat just above the server's swing limit. Pays 150 to 750 Fallen Tokens by your share of the damage. Steps back when your health is low",
+		})
+		Labels.Hell = TokenBox:AddLabel({ Text = "-", DoesWrap = true })
 		TokenBox:AddToggle("AutoDemonShop", {
 			Text = "Buy Potions With Fallen Tokens",
 			Default = false,
 			Tooltip = "Spends the Fallen Tokens you own in the demon shop on 15 minute potions, the one worth the most cash per token first. Buys again when a potion ends",
 		})
+		TokenBox:AddToggle("AutoDemonEgg", {
+			Text = "Buy Demon Eggs With Fallen Tokens",
+			Default = false,
+			Tooltip = "A Demon Egg costs 500 tokens and hatches a Hell animal on your plot. Bought only when its expected animal is worth more per token than the best potion",
+		})
 		TokenBox:AddLabel({
-			Text = '<font transparency="0.35">Tokens drop from the Hell boss. Needs the demon furnace unlocked in the game.</font>',
+			Text = '<font transparency="0.35">The demon shop opens at 750M speed (or once the game unlocks the furnace).</font>',
 			DoesWrap = true,
 		})
 	end
 	do
 		local RewardBox = Tabs.Rewards:AddLeftGroupbox("Rewards", "gift")
-		RewardBox:AddToggle("AutoIndex", { Text = "Claim Index Rewards", Default = false, Tooltip = "Cash and speed for every new animal you bank" })
+		RewardBox:AddToggle("AutoIndex", {
+			Text = "Claim Index Rewards",
+			Default = false,
+			Tooltip = "Cash and speed for every new animal you bank, plus the free bat of every index zone you complete. Corvus reads the game's own index list and only counts a claim the game confirmed",
+		})
 		do
 			local FPlayers = game:GetService("Players")
 			local FTeleport = game:GetService("TeleportService")
@@ -36953,17 +39224,21 @@ do
 				end,
 			})
 		end
-		RewardBox:AddToggle("AutoOffline", { Text = "Claim Offline Cash", Default = false })
-		RewardBox:AddToggle("AutoGroup", { Text = "Claim Group Reward", Default = false, Tooltip = "Works after you join the game's group and like the game" })
+		RewardBox:AddToggle("AutoOffline", { Text = "Claim Offline Cash", Default = false, Tooltip = "The cash your animals made while you were offline, claimed as soon as the game shows it" })
+		RewardBox:AddToggle("AutoGroup", {
+			Text = "Claim Group Reward",
+			Default = false,
+			Tooltip = "+10,000 speed once for members of the game's group. Corvus does the like step and its short wait for you; if you are not in the group it says so in the box below",
+		})
+		RewardBox:AddToggle("AutoCommunity", {
+			Text = "Claim Community Reward",
+			Default = false,
+			Tooltip = "A free Sabertooth Egg once, for players who joined the game's community server (link on the game page). Join it first, then turn this on: Corvus presses the game's Verify button with your username, waits the game's 30 s and verifies again",
+		})
 		RewardBox:AddButton({
 			Text = "Claim All Now",
 			Func = function()
-				task.spawn(function()
-					fire("IndexRemote", "ClaimAll", nil)
-					fire("OfflineRewardRemote", "Claim")
-					fire("GroupRewardRemote", "Claim")
-					notify("Rewards", "Asked for every reward", 3)
-				end)
+				task.spawn(N.Rewards.claimAllNow)
 			end,
 		})
 		Labels.Next = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
@@ -36996,14 +39271,14 @@ do
 			Suffix = " kg",
 			Tooltip = "0 sells any weight",
 		})
-		SellBox:AddToggle("SellKeepMutated", { Text = "Keep Mutated Animals", Default = true, Tooltip = "No seller (Sell Surplus, Auto Sell, Smart Planner) ever sells a mutated animal" })
+		SellBox:AddToggle("SellKeepMutated", { Text = "Keep Mutated Animals", Default = true, Tooltip = "No seller (Sell Surplus, Auto Sell) and no machine (Auto Fuse, Auto Merge Pets) ever takes a mutated animal" })
 		SellBox:AddDropdown("SellProtect", {
 			Text = "Never Sell Rarities",
 			Values = N.RarityOrder,
 			Default = {},
 			Multi = true,
 			AllowNull = true,
-			Tooltip = "Protect list for every seller, the Smart Planner included",
+			Tooltip = "Protect list for Sell Surplus, Auto Sell, Auto Fuse and Auto Merge Pets",
 		})
 		SellBox:AddButton({
 			Text = "Sell Now",
@@ -37014,13 +39289,30 @@ do
 			end,
 		})
 		Labels.Sell = SellBox:AddLabel({ Text = "-", DoesWrap = true })
-		local MergeBox = Tabs.Items:AddRightGroupbox("Merge Eggs", "egg")
+		local MergeBox = Tabs.Items:AddRightGroupbox("Eggs And Merging", "egg")
 		MergeBox:AddToggle("AutoMergeEggs", {
-			Text = "Auto Place And Hatch Merge Eggs",
+			Text = "Auto Place And Hatch Eggs",
 			Default = false,
-			Tooltip = "Puts eggs from the merge machine on your plot and hatches them when they are grown. Merging pets stays manual",
+			Tooltip = "Plants every egg you own on your plot (merge machine, Fuse Machine, Demon shop, community reward) and hatches it the moment it is grown. A hatch counts only when the game opened the egg",
+		})
+		MergeBox:AddToggle("AutoMergePets", {
+			Text = "Auto Merge Pets",
+			Default = false,
+			Tooltip = "Merges three animals of the same species into one heavier animal (weight = the sum) when it earns more than the three apart, which also frees two plot slots. Uses the three weakest copies, never Secret, locked, mutated or Never Sell animals. The merge egg is planted and hatched for you",
 		})
 		Labels.Merge = MergeBox:AddLabel({ Text = "-", DoesWrap = true })
+		local FuseBox = Tabs.Items:AddRightGroupbox("Fuse Machine", "atom")
+		FuseBox:AddToggle("AutoFuse", {
+			Text = "Auto Fuse Into Celestial Eggs",
+			Default = false,
+			Tooltip = "Reads the recipe the Fuse Machine gives you, feeds it the cheapest fitting animals and plants the Celestial Egg it gives. Only when the egg is worth more than the animals. Never Secret, locked, mutated (Keep Mutated) or Never Sell animals. Opens at 100B speed",
+		})
+		FuseBox:AddToggle("ConsumePlaced", {
+			Text = "Also Use Placed Animals",
+			Default = false,
+			Tooltip = "Lets Auto Fuse and Auto Merge Pets take animals standing on your plot too (their income is counted as the cost). Off = backpack animals only",
+		})
+		Labels.Fuse = FuseBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
 		local MoveBox = Tabs.Player:AddLeftGroupbox("Movement", "route")
@@ -37041,7 +39333,7 @@ do
 		MoveBox:AddToggle("LeaveHell", {
 			Text = "Leave Hell Event",
 			Default = true,
-			Tooltip = "While a farm toggle runs and you end up in the Hell boss map, Corvus walks out through the exit and goes back to farming. The farm also keeps away from the Hell portal in zone 7",
+			Tooltip = "While a farm toggle runs and you end up in the Hell boss map, Corvus walks out through the exit and goes back to farming (Fight The Hell Boss stays in until the fight ends). The farm also keeps away from the Hell portal in zone 7",
 		})
 		MoveBox:AddToggle("FallRescue", {
 			Text = "Rescue If Under The Map",
@@ -37272,10 +39564,15 @@ N.AllAutoToggles = {
 	"AutoTreadmill",
 	"AutoSatchel",
 	"AutoDemonShop",
+	"AutoDemonEgg",
 	"AutoMergeEggs",
+	"AutoMergePets",
+	"AutoFuse",
+	"AutoHell",
 	"AutoIndex",
 	"AutoOffline",
 	"AutoGroup",
+	"AutoCommunity",
 	"AutoFriend",
 }
 do
@@ -37586,7 +39883,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 			HookBox:AddDropdown("WebhookRarities", {
 				Text = "Animal rarities",
 				Values = N.RarityOrder,
-				Default = { "Mythic", "Divine", "Cosmic", "Secret", "Celestial", "Inferno" },
+				Default = { "Mythic", "Divine", "Cosmic", "Secret", "Celestial", "Inferno", "Void", "Omega" },
 				Multi = true,
 				AllowNull = true,
 			})
@@ -37819,10 +40116,29 @@ do
 			writefile(SetupFlag, "1")
 		end)
 	end
+	-- The wizard is for a first run only (live 2026-10-13: it opened on the owner's main although his saved config had
+	-- just autoloaded 29 toggles). A saved config (the SaveManager autoload file) counts as "seen" and writes the flag.
 	function N.setupDone()
 		local ok, done = pcall(function()
-			return isfile(SetupFlag)
+			if isfile(SetupFlag) then
+				return true
+			end
+			local folders = { "BreakAndStealAnEgg", "Corvus/BreakAndStealAnEgg" }
+			if SaveManager and type(SaveManager.Folder) == "string" then
+				table.insert(folders, 1, SaveManager.Folder)
+			end
+			for _, folder in ipairs(folders) do
+				if isfile(folder .. "/settings/autoload.txt") then
+					return "config"
+				end
+			end
+			return false
 		end)
+		if ok and done == "config" then
+			log("SETUP wizard skipped: a saved config exists")
+			N.markSetupDone()
+			return true
+		end
 		return not ok or done == true
 	end
 	function N.openWizard()
@@ -37841,13 +40157,13 @@ do
 					Required = true,
 					Default = {},
 					Choices = {
-						{ Id = "planner", Title = "Smart Planner", Description = "Plans everything by real game odds: zones, eggs, stealing, placing, training, upgrades, potions, surplus sales", Icon = "brain", Color = "#60d696" },
+						{ Id = "planner", Title = "Smart Planner", Description = "Plans the farm by real game odds: zones, eggs, stealing, placing, training, upgrades, merge eggs, free rewards", Icon = "brain", Color = "#60d696" },
 						{ Id = "eggs", Title = "Break eggs", Description = "Breaks eggs in the best zone you can escape and brings the animals home", Icon = "egg", Color = "#fab428" },
 						{ Id = "wild", Title = "Steal animals", Description = "Steals animals lying in the zones that make more money than your weakest pet", Icon = "hand", Color = "#3ccf91" },
 						{ Id = "train", Title = "Train speed", Description = "Uses your treadmill between egg runs, speed opens new zones", Icon = "footprints", Color = "#5fb8ff" },
 						{ Id = "place", Title = "Place animals", Description = "Places every animal you bring home on your plot", Icon = "layout-grid", Color = "#c77dff" },
 						{ Id = "upgrades", Title = "Buy upgrades", Description = "Best pickaxe, trail, plot and treadmill when you can afford them", Icon = "arrow-big-up", Color = "#ff9a3c" },
-						{ Id = "rewards", Title = "Claim rewards", Description = "Index rewards and offline cash", Icon = "gift", Color = "#ff5d8f" },
+						{ Id = "rewards", Title = "Claim rewards", Description = "Index cash and bats, offline cash, group reward", Icon = "gift", Color = "#ff5d8f" },
 					},
 				},
 				{
@@ -37874,7 +40190,7 @@ do
 					train = { "AutoTrain" },
 					place = { "AutoPlace" },
 					upgrades = { "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill" },
-					rewards = { "AutoIndex", "AutoOffline" },
+					rewards = { "AutoIndex", "AutoOffline", "AutoGroup" },
 				}
 				for id, names in pairs(groups) do
 					setToggles(names, { if chosen[id] then "on" else "off" })
@@ -38023,7 +40339,7 @@ do
 	end
 	-- Nothing moves the character unless the player turned an automation on (Leave Hell and the fall rescue included).
 	local function anyAutoOn()
-		return on("SmartPlanner") or on("AutoFarm") or on("StealPickups") or on("AutoTrain") or on("AutoSell") or on("AutoPlace")
+		return on("SmartPlanner") or on("AutoFarm") or on("StealPickups") or on("AutoTrain") or on("AutoSell") or on("AutoPlace") or on("AutoHell")
 	end
 	N.anyAutoOn = anyAutoOn
 	task.spawn(function()
@@ -38046,23 +40362,36 @@ do
 					task.wait(0.5)
 					return
 				end
-				-- Inside the Hell event every zone is out of reach: walk out through LeaveHell first.
+				-- Inside the Hell event every zone is out of reach: Fight The Hell Boss plays the fight, otherwise walk out
+				-- through LeaveHell first.
+				if N.inHell() and on("AutoHell") then
+					N.hellStep()
+					return
+				end
 				if N.inHell() and anyAutoOn() then
 					N.holdAt(nil)
 					N.leaveHell()
 					return
 				end
-				N.rewardStep()
+				if on("AutoHell") and choreDue("hell", 2) and N.hellStep() then
+					return
+				end
 				if choreDue("place", 2) then
 					N.placeStep(false)
 				end
-				if (on("AutoSell") or on("AutoSellSurplus")) and choreDue("sell", 10) and N.sellStep(false) then
+				if (on("AutoSell") or on("AutoSellSurplus") or N.planOn()) and choreDue("sell", 10) and N.sellStep(false) then
 					return
 				end
 				if choreDue("shop", 4) and N.shopStep() then
 					return
 				end
 				if choreDue("merge", 3) and N.mergeStep() then
+					return
+				end
+				if choreDue("fuse", 5) and N.fuseStep() then
+					return
+				end
+				if choreDue("mergepets", 5) and N.mergePetsStep() then
 					return
 				end
 				local farmOn = on("AutoFarm") or on("StealPickups")
@@ -38096,6 +40425,16 @@ do
 				task.wait(1)
 			end
 			task.wait(0.05)
+		end
+	end)
+	-- Free rewards (p06_rewards): index cash + speed, zone bats, offline cash, group and community rewards. Their own loop:
+	-- the claims never wait on the farm (Hell, guards, treadmill) and the farm never waits on the game's answers.
+	task.spawn(function()
+		while alive() do
+			if not N.manualRunning() then
+				N.Rewards.step(false)
+			end
+			task.wait(1)
 		end
 	end)
 	task.spawn(function()
@@ -38214,7 +40553,10 @@ do
 					local lines = {}
 					if N.planOn() then
 						local top = P.valid and P.valid[1]
-						table.insert(lines, "<b>Smart Planner</b>: " .. (if P.activity == "train" then "training to " .. formatNumber(P.trainTarget or 0) .. " speed" else "farming zone " .. tostring(P.farmZone or N.bestZone())) .. (if top then string.format(", next buy %s for $%s %s", tostring(top.label), formatNumber(top.cost), if (top.eta or 0) <= 0 then "now" else "in " .. P.formatSeconds(math.min(top.eta, 1e7))) else ", saving up"))
+						table.insert(lines, "<b>Smart Planner</b>: " .. (if P.activity == "train" then "training to " .. formatNumber(P.trainTarget or 0) .. " speed" else "farming zone " .. tostring(P.farmZone or N.bestZone())) .. (if top then string.format(", next buy %s for $%s %s", tostring(top.label), formatNumber(top.cost), if (top.eta or 0) <= 0 then "now" else "in " .. P.formatSeconds(math.min(top.eta, 1e7))) else ", " .. P.shortNoBuy()))
+					end
+					if on("AutoIndex") or on("AutoOffline") or on("AutoGroup") or on("AutoCommunity") then
+						table.insert(lines, "<b>Rewards</b>: " .. N.Rewards.upNextText())
 					end
 					if on("AutoFarm") then
 						table.insert(lines, string.format("<b>Break Eggs</b>: zone %d, %s", N.bestZone(), optionText("EggPriority", "Best value per second")))
@@ -38230,6 +40572,15 @@ do
 					end
 					if on("AutoSellSurplus") or on("AutoSell") then
 						table.insert(lines, string.format("<b>Selling</b>: sold %d, protected %s", Session.sold, table.concat(N.protectText(), ", ")))
+					end
+					if on("AutoFuse") then
+						table.insert(lines, "<b>Fuse Machine</b>: " .. tostring(N.Fuse.status))
+					end
+					if on("AutoMergePets") then
+						table.insert(lines, "<b>Merge Pets</b>: " .. tostring(N.MergePets.status))
+					end
+					if on("AutoHell") then
+						table.insert(lines, "<b>Hell Boss</b>: " .. N.hellStatusText())
 					end
 					if #lines == 0 then
 						table.insert(lines, '<font transparency="0.4">Nothing is on. Turn on Smart Planner or any toggle on the left.</font>')
@@ -38328,15 +40679,19 @@ do
 					shopLines,
 					if not unlocked then "Treadmill unlock $" .. formatNumber(tonumber(N.G.TreadmillUnlock.Cost) or 100) elseif tData and tData.UpgradeCost then "Next treadmill $" .. formatNumber(tData.UpgradeCost) else "Treadmill is maxed"
 				)
+				do
+					local satTier = tonumber(LocalPlayer:GetAttribute("SatchelTier")) or 1
+					local satPrice = N.satchelPrice(satTier)
+					table.insert(
+						shopLines,
+						if not satPrice then "Satchel is maxed" elseif N.satchelStation() then string.format("Next satchel $%s (carries %d now)", formatNumber(satPrice), N.capacity()) else string.format('Satchel carries %d, <font color="#fab428">no satchel station on this map</font>', N.capacity())
+					)
+				end
 				for _, line in ipairs(N.Shop.log) do
 					table.insert(shopLines, '<font transparency="0.35">' .. line .. "</font>")
 				end
 				I.shop = table.concat(shopLines, "\n")
-				I.next = string.format(
-					"Index, offline and group rewards are claimed on a timer.\nSatchel holds <b>%d</b> animal%s.",
-					N.capacity(),
-					if N.capacity() == 1 then "" else "s"
-				)
+				I.next = N.Rewards.panelText()
 				local growing, ready = 0, 0
 				for _, egg in ipairs(N.tagged("MergeEggPlaced")) do
 					if egg:GetAttribute("OwnerUserId") == LocalPlayer.UserId then
@@ -38346,7 +40701,20 @@ do
 						end
 					end
 				end
-				I.merge = string.format("<b>%d</b> merge eggs on your plot, <b>%d</b> ready\nPlaced <b>%d</b>  \u{00B7}  hatched <b>%d</b>", growing, ready, N.Merge.placed, N.Merge.hatched)
+				I.merge = string.format("<b>%d</b> eggs on your plot, <b>%d</b> ready\nPlaced <b>%d</b>  \u{00B7}  hatched <b>%d</b>  \u{00B7}  pets merged <b>%d</b>\n%s", growing, ready, N.Merge.placed, N.Merge.hatched, N.MergePets.merged, tostring(N.MergePets.status))
+				I.hell = string.format("%s\nTokens <b>%d</b>  \u{00B7}  boss swings <b>%d</b>  \u{00B7}  essence eggs <b>%d</b>", N.hellStatusText(), tonumber(LocalPlayer:GetAttribute("DemonTokens")) or 0, N.Hell.swings, N.Hell.essenceHits)
+				do
+					local need = tonumber(N.G.Fuse.RequiredSpeedPower) or 1e11
+					local eggValue, eggIncome = N.eggTypeValue(tostring(N.G.Fuse.EggType or "Celestial"))
+					I.fuse = string.format(
+						"%s\nCelestial Egg: avg animal <b>$%s/s</b>, worth <b>$%s</b> to you\nFused <b>%d</b>  \u{00B7}  %s",
+						if N.power() >= need then '<font color="#60d696">Open for your speed</font>' else '<font color="#fab428">Opens at ' .. formatNumber(need) .. " speed</font>",
+						formatNumber(math.floor(eggIncome)),
+						formatNumber(math.floor(eggValue)),
+						N.Fuse.fused,
+						tostring(N.Fuse.status)
+					)
+				end
 				I.move = string.format(
 					"Speed now <b>%s</b> studs/s%s%s\nSnapbacks <b>%d</b>  \u{00B7}  blocked <b>%d</b>",
 					if N.moveMode() == "Teleport" then "\u{221E}" else formatNumber(math.floor(N.modeSpeed())),
@@ -38415,11 +40783,13 @@ do
 					group(function()
 						Labels.Sell:SetText(I.sell or "-")
 						Labels.Merge:SetText(I.merge or "-")
+						Labels.Fuse:SetText(I.fuse or "-")
 					end)
 				end
 				if shown(Tabs.Upgrades) then
 					group(function()
 						Labels.Shop:SetText(I.shop or "-")
+						Labels.Hell:SetText(I.hell or "-")
 					end)
 				end
 				if shown(Tabs.Rewards) then
