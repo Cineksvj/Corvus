@@ -32906,42 +32906,21 @@ do
 		end
 		return list
 	end
-	-- Smart Planner (one toggle on Main, default off): while it is on it runs these loops through their own code and
-	-- picks the zone, the egg and farm vs train itself. It never changes the other toggles, their switches stay as the
-	-- player left them; filters and protect lists (Only Better, guards, Keep Mutated, Never Sell) keep working.
-	N.PlannerRuns = {
-		AutoFarm = true,
-		GrabOwnHatch = true,
-		StealPickups = true,
-		AutoPlace = true,
-		AutoTrain = true,
-		AutoPickaxe = true,
-		AutoTrail = true,
-		AutoPlotUpgrade = true,
-		AutoTreadmill = true,
-		AutoSatchel = true,
-		-- OWNER_RULES 20/21: the planner alone never spends Fallen Tokens on potions/eggs, never fuses or merges animals
-		-- and never runs the broad Sell Surplus / Auto Sell rules: AutoDemonShop, AutoDemonEgg, AutoSellSurplus, AutoSell,
-		-- AutoFuse and AutoMergePets run only under their own toggles. Its own strict surplus sale (plot full, weaker than
-		-- the weakest placed animal, never Secret/locked/protected, one filler kept) is N.surplusPlan(true) in p05.
-		AutoMergeEggs = true,
-		-- free claims, every one confirmed by the game's own State answer (p06_rewards): index cash + speed and the
-		-- zone bats, offline cash, the group reward. The community reward is not here (it needs the player's own step).
-		AutoIndex = true,
-		AutoOffline = true,
-		AutoGroup = true,
-	}
-	N.PlannerChoice = { ZoneMode = "Best zone", EggPriority = "Best value per second", TrainMode = "Profit plan" }
-	function N.planOn()
-		local t = Toggles.SmartPlanner
-		return t ~= nil and t.Value == true
-	end
+	-- No Smart Planner toggle any more (owner 2026-10-14): every decision the planner made lives in the normal toggles
+	-- (Break Eggs In Best Zone = zone $/h + hysteresis, Buy toggles = payback, Auto Train = staged training, Sell Surplus
+	-- Animals = the strict surplus rule). The profit engine (p06_plan) runs while one of them is on and writes DECIDE lines.
+	N.DecideToggles = { "AutoFarm", "StealPickups", "AutoTrain", "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill", "AutoSatchel" }
 	function on(name)
 		local t = Toggles[name]
-		if t ~= nil and t.Value == true then
-			return true
+		return t ~= nil and t.Value == true
+	end
+	function N.decideOn()
+		for _, name in ipairs(N.DecideToggles) do
+			if on(name) then
+				return true
+			end
 		end
-		return N.PlannerRuns[name] == true and N.planOn()
+		return false
 	end
 	function optionNumber(name, default)
 		local option = Options[name]
@@ -32962,18 +32941,15 @@ do
 		return N.parseMoney(option and option.Value)
 	end
 	function optionText(name, default)
-		if N.PlannerChoice[name] and N.planOn() then
-			return N.PlannerChoice[name]
-		end
 		local option = Options[name]
 		local value = option and option.Value
 		return if type(value) == "string" and value ~= "" then value else default
 	end
-	-- Plain-words planner decisions, only while Smart Planner is on: a line when the decision changes, the same one
-	-- again after a minute at most.
+	-- Plain-words decisions of the running toggles: a line when the decision changes, the same one again after a minute
+	-- at most.
 	local PlanSaid = {}
 	function N.planSay(key, text, every)
-		if not N.planOn() then
+		if not N.decideOn() then
 			return
 		end
 		local last = PlanSaid[key]
@@ -32985,7 +32961,7 @@ do
 			return
 		end
 		PlanSaid[key] = { text = text, at = now }
-		log("PLAN " .. text)
+		log("DECIDE " .. text)
 	end
 	function count(t)
 		local n = 0
@@ -33701,7 +33677,7 @@ do
 		return worst or 0, worstInfo
 	end
 end
-N.Moves = { snaps = 0, pushes = 0, blocked = 0, last = nil, slowUntil = 0, slowFactor = 1, hold = nil, flungUntil = 0, rescues = 0, rescueAt = -1e9, ladder = { chosen = nil, current = nil, retryAt = 0, snaps = {} } }
+N.Moves = { snaps = 0, pushes = 0, blocked = 0, ac = 0, acAt = -1e9, snapAt = -1e9, boost = { loaded = false, value = nil, frozen = false, clean = 0 }, tp = { result = nil, tries = 0, ok = 0, lastAt = -1e9, gain = 0 }, last = nil, slowUntil = 0, slowFactor = 1, hold = nil, flungUntil = 0, rescues = 0, rescueAt = -1e9, ladder = { chosen = nil, current = nil, retryAt = 0, snaps = {}, step = 0 }, notify = { text = nil, at = -1e9 } }
 local Noclip = { travel = false, saved = setmetatable({}, { __mode = "k" }), active = false }
 do
 	-- A guard catch flings the character with real physics. While that runs the hub must not move it or turn
@@ -33917,42 +33893,183 @@ do
 		local L = N.Moves.ladder
 		local chosen = N.chosenMoveMode()
 		if L.chosen ~= chosen then
-			L.chosen, L.current, L.retryAt, L.snaps = chosen, chosen, 0, {}
+			L.chosen, L.current, L.retryAt, L.snaps, L.step = chosen, chosen, 0, {}, 0
 		end
-		if L.current ~= chosen and os.clock() >= L.retryAt then
-			local up = ModeOrder[math.min(ModeRank[L.current] + 1, ModeRank[chosen])]
-			log("MOVE retry", L.current, "->", up)
-			L.current, L.snaps = up, {}
-			L.retryAt = if up ~= chosen then os.clock() + 600 else 0
+		-- one rung faster every 3 minutes: Walk -> Fast 90 % -> 100 % -> 105 % -> full boost -> Teleport (if chosen)
+		if (L.current ~= chosen or (L.current == "Fast" and L.step > 0)) and os.clock() >= L.retryAt then
+			if L.current == "Fast" and L.step > 0 then
+				local before = N.fastPct(false)
+				L.step -= 1
+				log(string.format("MOVE retry boost %d->%d", before, N.fastPct(false)))
+			else
+				local up = ModeOrder[math.min(ModeRank[L.current] + 1, ModeRank[chosen])]
+				log("MOVE retry", L.current, "->", up)
+				L.current = up
+				if up == "Fast" and L.step == 0 and ModeRank[chosen] >= ModeRank.Fast then
+					L.step = 3
+				end
+			end
+			L.snaps = {}
+			L.retryAt = if L.current ~= chosen or L.step > 0 then os.clock() + 180 else 0
 		end
 		return L.current
 	end
 	function N.moveFallback()
 		local L = N.Moves.ladder
-		return L.current ~= nil and L.current ~= L.chosen, math.max(L.retryAt - os.clock(), 0)
+		return L.current ~= nil and (L.current ~= L.chosen or (L.current == "Fast" and L.step > 0)), math.max(L.retryAt - os.clock(), 0)
 	end
 	function N.walkSpeed()
 		local hum = humanoid()
 		local speed = hum and tonumber(hum.WalkSpeed) or 16
-		return math.clamp(speed, 16, 200)
+		-- the game goes past 200 (overdrive to 240 at SpeedPower 1e19, x1.25 WalkSpeed potion, global boosts; blatant.md
+		-- 1352 pass 3 M3): the server's own WalkSpeed is the limit, so no fixed cap below it.
+		return math.clamp(speed, 16, 1000)
 	end
-	function N.modeSpeed(mode)
+	-- Fast boost (blatant.md 1352 pass 3 M2): the % of your WalkSpeed Fast travels at. Carrying legs never go above 110 %
+	-- (a pull-back while carrying sends the animals back); empty legs start at the slider and climb 5 % after every 20 clean
+	-- empty legs (no anti-cheat line, no pull-back) up to 150 %; the first SPEED line or pull-back steps 10 % back and
+	-- freezes it. Remembered per PlaceVersion (Corvus/BSE_probes_<pv>.txt, move_boost=<n> or <n>f when frozen).
+	N.BoostCap, N.BoostCarry = 150, 110
+	local function boostState()
+		local B = N.Moves.boost
+		if not B.loaded and N.ProbeMem then
+			B.loaded = true
+			local saved = tostring(N.ProbeMem.get("move_boost") or "")
+			local n, f = string.match(saved, "^(%d+)(f?)$")
+			if tonumber(n) then
+				B.value, B.frozen = math.clamp(tonumber(n), 100, N.BoostCap), f == "f"
+				log(string.format("PROBE move_boost loaded boost=%d frozen=%s", B.value, tostring(B.frozen)))
+			end
+		end
+		return B
+	end
+	function N.fastBoost(carrying)
+		local base = math.clamp(optionNumber("FastBoost", 110), 100, 300)
+		if carrying == nil then
+			carrying = N.carrying()
+		end
+		if carrying then
+			return math.min(base, N.BoostCarry)
+		end
+		local B = boostState()
+		return math.max(base, B.value or base)
+	end
+	local function saveBoost(B)
+		if N.ProbeMem then
+			N.ProbeMem.set("move_boost", tostring(B.value) .. (if B.frozen then "f" else ""))
+		end
+	end
+	local function boostReject(why)
+		local B = boostState()
+		local base = math.clamp(optionNumber("FastBoost", 110), 100, 300)
+		local now = B.value or base
+		if (B.frozen and now <= base) or os.clock() - (B.rejAt or -1e9) < 3 then
+			return
+		end
+		B.rejAt = os.clock()
+		B.value = math.max(now - 10, 100)
+		B.frozen, B.clean = true, 0
+		saveBoost(B)
+		log(string.format("PROBE move_boost result=rejected gain=+%d%% boost=%d reason=%s", math.max(B.value - 110, 0), B.value, why))
+	end
+	N.boostReject = boostReject
+	local function boostLegDone(legStart)
+		local B = boostState()
+		if B.frozen or (B.value or 0) >= N.BoostCap then
+			return
+		end
+		if not B.started then
+			B.started = true
+			log(string.format("PROBE move_boost start boost=%d cap=%d (empty legs >= 200 studs, +5%% per 20 clean legs)", N.fastBoost(false), N.BoostCap))
+		end
+		task.delay(3, function()
+			if N.Moves.acAt >= legStart or N.Moves.snapAt >= legStart or B.frozen then
+				return
+			end
+			B.clean += 1
+			if B.clean % 5 == 0 and B.clean < 20 then
+				log(string.format("PROBE move_boost legs=%d/20 boost=%d", B.clean, N.fastBoost(false)))
+			end
+			if B.clean >= 20 then
+				local base = math.clamp(optionNumber("FastBoost", 110), 100, 300)
+				B.value = math.min(math.max(B.value or base, base) + 5, N.BoostCap)
+				B.clean = 0
+				saveBoost(B)
+				log(string.format("PROBE move_boost result=accepted gain=+%d%% boost=%d legs=20", B.value - 110, B.value))
+			end
+		end)
+	end
+	-- Empty legs only: is a full teleport accepted (no pull-back, no TELEPORT line)? 3 tries once per PlaceVersion
+	-- (blatant.md 1352 pass 3 M5), expected rejected. Accepted = Fast teleports its empty legs >= 200 studs.
+	local function tpState()
+		local T = N.Moves.tp
+		if T.result == nil and N.ProbeMem then
+			T.result = N.ProbeMem.get("move_teleport") or "unknown"
+		end
+		return T.result or "unknown"
+	end
+	function N.emptyTeleport()
+		return N.moveMode() == "Teleport" or (N.moveMode() == "Fast" and tpState() == "accepted")
+	end
+	local function tpReject(why)
+		local T = N.Moves.tp
+		if T.result == "rejected" then
+			return
+		end
+		T.result = "rejected"
+		if N.ProbeMem then
+			N.ProbeMem.set("move_teleport", "rejected")
+		end
+		log(string.format("PROBE move_teleport result=rejected gain=0 tries=%d reason=%s", T.tries, why))
+	end
+	-- Speed of a round trip (empty leg out, carrying leg home) for the profit engine, from a WalkSpeed.
+	function N.roundTripSpeed(walkSpeed)
+		local mode = N.moveMode()
+		if mode == "Walk" then
+			return walkSpeed * 0.97
+		end
+		local carry = walkSpeed * N.fastBoost(true) / 100
+		if N.emptyTeleport() then
+			return 2 * carry
+		end
+		local empty = walkSpeed * N.fastBoost(false) / 100
+		return 2 / (1 / empty + 1 / carry)
+	end
+	-- Fast steps after snapbacks (owner 2026-10-14: a smaller step, never straight to Walk): 1 = 105 %, 2 = 100 %, 3 = 90 %.
+	N.FastStepCap = { 105, 100, 90 }
+	function N.fastPct(carrying)
+		local pct = N.fastBoost(carrying)
+		local step = N.Moves.ladder.step or 0
+		if step > 0 then
+			pct = math.min(pct, N.FastStepCap[step])
+		end
+		return pct
+	end
+	function N.modeSpeed(mode, carrying)
 		mode = mode or N.moveMode()
 		local factor = if os.clock() < N.Moves.slowUntil then N.Moves.slowFactor else 1
+		if mode == "Teleport" and (if carrying == nil then N.carrying() else carrying) then
+			mode = "Fast"
+		end
 		if mode == "Fast" then
-			-- Fast = your server WalkSpeed plus a margin the lag forgiveness covers; snapbacks step it down to Walk.
-			return math.max(N.walkSpeed() * math.clamp(optionNumber("FastBoost", 110), 100, 300) / 100, 18) * factor
+			-- Fast = your server WalkSpeed times the measured boost; snapbacks step it down to Walk.
+			return math.max(N.walkSpeed() * N.fastPct(carrying) / 100, 18) * factor
 		elseif mode == "Teleport" then
 			return math.huge
 		end
 		-- Walk = the WalkSpeed the server gives you from your speed stat, a hair under it so the anticheat never trips.
 		return math.max(N.walkSpeed() * 0.97, 16) * factor
 	end
-	local function noteSnap(distance)
+	local function noteSnap(distance, why)
 		N.Moves.snaps += 1
+		N.Moves.snapAt = os.clock()
+		if not N.carrying() and N.moveMode() == "Fast" and N.fastBoost(false) > N.BoostCarry then
+			boostReject(why or "pull-back")
+		end
 		N.Moves.slowUntil = os.clock() + 45
-		N.Moves.slowFactor = math.max((N.Moves.slowFactor or 1) * 0.8, 0.4)
-		log("MOVE snapback", math.floor(distance) .. " studs, slowing down to", math.floor(N.Moves.slowFactor * 100) .. "%")
+		N.Moves.slowFactor = math.max((N.Moves.slowFactor or 1) * 0.95, 0.85)
+		local note = N.Moves.notify
+		log("MOVE snapback", math.floor(distance) .. " studs, slowing down to", math.floor(N.Moves.slowFactor * 100) .. "%", why and ("(" .. why .. ")") or "", "notify=" .. (if note.text and os.clock() - note.at < 5 then string.format("%q", note.text) else "none"))
 		local current = N.moveMode()
 		local L, now = N.Moves.ladder, os.clock()
 		table.insert(L.snaps, now)
@@ -33960,15 +34077,74 @@ do
 			table.remove(L.snaps, 1)
 		end
 		if #L.snaps >= 2 and ModeRank[current] > 1 then
-			local down = ModeOrder[ModeRank[current] - 1]
-			log("MOVE fallback", current, "->", down, "(" .. #L.snaps .. " snapbacks in 60 s, retry in 10 min)")
-			L.current, L.retryAt, L.snaps = down, now + 600, {}
+			if current == "Fast" and L.step < #N.FastStepCap then
+				-- smaller step first: 110 -> 105 -> 100 -> 90 % of WalkSpeed, Walk only after the slowest step snaps back too
+				local before = N.fastPct(false)
+				L.step += 1
+				while L.step < #N.FastStepCap and N.fastPct(false) >= before do
+					L.step += 1
+				end
+				log(string.format("MOVE fallback boost %d->%d (%d snapbacks in 60 s, retry in 3 min)", before, N.fastPct(false), #L.snaps))
+			else
+				local down = ModeOrder[ModeRank[current] - 1]
+				log("MOVE fallback", current, "->", down, "(" .. #L.snaps .. " snapbacks in 60 s, retry in 3 min)")
+				L.current = down
+				if down == "Fast" then
+					L.step = 0
+				end
+			end
+			L.retryAt, L.snaps = now + 180, {}
 		end
 		if on("SnapNotify") then
 			notify("Movement", "The server pulled you back, Corvus slows down for a bit", 4)
 		end
 	end
 	N.noteSnap = noteSnap
+	-- The server's own anti-cheat lines arrive as plain text on Notify (NotificationConfig, blatant.md 1352 pass 3 M1):
+	-- SPEED / TELEPORT / FLY pull-backs, "forgiven as lag" strikes, blocked banking after a teleport, explosions. Each one is
+	-- logged (AC ...) and feeds the movement ladder; forgiven strikes still step the Fast boost back.
+	N.onRemote("Notify", function(text)
+		text = tostring(text or "")
+		N.Moves.notify.text, N.Moves.notify.at = text, os.clock()
+		local low = string.lower(text)
+		if not (string.find(low, "anti%-cheat") or string.find(low, "cheating") or string.find(low, "anticheat")) then
+			return
+		end
+		local now = os.clock()
+		local carrying = N.carrying()
+		N.Moves.ac += 1
+		N.Moves.acAt = now
+		local mode = N.moveMode()
+		local speed = N.modeSpeed(mode, carrying)
+		log(string.format("AC %s mode=%s speed=%s carrying=%d", text, mode, if speed == math.huge then "inf" else tostring(math.floor(speed)), if carrying then 1 else 0))
+		local T = N.Moves.tp
+		local probing = now - T.lastAt < 3
+		if string.find(low, "banking") then
+			log("BANK blocked after teleport")
+			if tpState() == "accepted" then
+				tpReject("banking blocked")
+			end
+			return
+		end
+		if string.find(low, "teleport") and probing then
+			tpReject("anti-cheat teleport line")
+			return
+		end
+		if string.find(low, "speed") and not carrying then
+			boostReject("anti-cheat speed line")
+		end
+		if string.find(low, "exploded") then
+			local L = N.Moves.ladder
+			if L.current ~= "Walk" then
+				log("MOVE fallback", tostring(L.current), "-> Walk (anti-cheat explosion, retry in 10 min)")
+				L.current, L.retryAt, L.snaps, L.step = "Walk", now + 600, {}, 0
+			end
+			return
+		end
+		if not string.find(low, "forgiven") and (string.find(low, "speed") or string.find(low, "teleport") or string.find(low, "fly")) then
+			noteSnap(0, "anti-cheat")
+		end
+	end)
 	local function glideTo(target, speedFn, keepGoing)
 		local last = os.clock()
 		local expected
@@ -34107,7 +34283,56 @@ do
 		end
 		N.holdAt(nil)
 		local mode = opts.mode or N.moveMode()
+		local carrying = N.carrying()
+		-- M4: a teleport with an animal blocks banking ("Anti-cheat blocked banking - you teleported!"), so carrying legs
+		-- always glide.
+		if mode == "Teleport" and carrying and (target - root.Position).Magnitude >= 0.5 then
+			mode = "Fast"
+			if not N.Moves.carrySaid then
+				N.Moves.carrySaid = true
+				log("MOVE carry rung=Fast (teleport blocks banking)")
+			end
+		end
 		N.Moves.trip = (N.Moves.trip or 0) + 1
+		-- M5: empty legs >= 200 studs try a full teleport (probe: 3 tries once per PlaceVersion; accepted = used from then on).
+		if mode == "Fast" and not carrying and not opts.mode and flat(root.Position, target) >= 200 then
+			local T, state = N.Moves.tp, tpState()
+			if state == "accepted" or (state == "unknown" and T.tries < 3 and os.clock() - T.lastAt > 30) then
+				local probing = state == "unknown"
+				local from = root.Position
+				local saved = flat(from, target) / math.max(N.modeSpeed("Fast", false), 1)
+				if probing then
+					T.tries += 1
+				end
+				T.lastAt = os.clock()
+				local acBefore = N.Moves.acAt
+				Noclip.travel = true
+				placeRoot(target, opts.look)
+				task.wait(if probing then 1.5 else 0.6)
+				Noclip.travel = false
+				local now = rootPart()
+				local held = now ~= nil and (now.Position - target).Magnitude <= 12 and N.Moves.acAt == acBefore
+				if not held then
+					tpReject(if N.Moves.acAt ~= acBefore then "anti-cheat line" else "pulled back")
+					root = rootPart()
+					if not root then
+						return false
+					end
+				else
+					if probing then
+						T.ok += 1
+						if T.ok >= 3 then
+							T.result = "accepted"
+							if N.ProbeMem then
+								N.ProbeMem.set("move_teleport", "accepted")
+							end
+							log(string.format("PROBE move_teleport result=accepted gain=-%.1fs per leg tries=%d", saved, T.tries))
+						end
+					end
+					return true
+				end
+			end
+		end
 		if mode == "Teleport" or (target - root.Position).Magnitude < 0.5 then
 			local far = (target - root.Position).Magnitude > 20
 			Noclip.travel = true
@@ -34128,7 +34353,7 @@ do
 		end
 		-- Humanoid:MoveTo runs far below your speed in this game, so Walk glides along the ground at your own WalkSpeed.
 		local speedFn = function()
-			return N.modeSpeed(opts.mode or N.moveMode())
+			return N.modeSpeed(opts.mode or N.moveMode(), carrying)
 		end
 		local startPos, startAt = root.Position, os.clock()
 		Noclip.travel = mode == "Walk" or on("TravelNoclip")
@@ -34152,7 +34377,10 @@ do
 		local walked = if after then flat(startPos, after.Position) else 0
 		if walked > 30 then
 			local took = math.max(os.clock() - startAt, 0.01)
-			log(string.format("MOVE %s %d studs in %.1fs = %d/s (WalkSpeed %d)", mode, walked, took, walked / took, N.walkSpeed()))
+			log(string.format("MOVE %s %d studs in %.1fs = %d/s (WalkSpeed %d, boost %d%%, carrying %d)", mode, walked, took, walked / took, N.walkSpeed(), if mode == "Fast" then N.fastPct(carrying) else 97, if carrying then 1 else 0))
+		end
+		if ok and mode == "Fast" and not carrying and walked >= 200 then
+			boostLegDone(startAt)
 		end
 		return ok
 	end
@@ -34235,8 +34463,6 @@ do
 			return
 		end
 		Session.caught += 1
-		if N.moveMode() == "Teleport" then
-		end
 		F.caughtAt = os.clock()
 		if F.carryZone and not on("IgnoreGuards") then
 			N.ZonePenalty[F.carryZone] = os.clock() + 600
@@ -34458,7 +34684,7 @@ do
 		local titanicFirst = on("TitanicFirst")
 		if optionText("ZoneMode", "Best zone") == "Picked zones" and not F.zonePickSaid then
 			F.zonePickSaid = true
-			log("ZONE picked " .. table.concat(picked(Options.ZonePick), ", ") .. " (Titanic and the planner stay inside the picked zones)")
+			log("ZONE picked " .. table.concat(picked(Options.ZonePick), ", ") .. " (Titanic and the zone valuation stay inside the picked zones)")
 		end
 		local others = if on("AvoidPlayers") then otherPositions() else {}
 		local best, bestScore
@@ -34472,12 +34698,13 @@ do
 		-- Eggs in your zones that only fail the hit limit: when nothing else fits, the fewest-hits one is broken anyway,
 		-- so the last zone is never skipped just because its eggs are tough.
 		local tough, toughHits = nil, math.huge
-		-- Plot full (Smart Planner or Only Better): an egg whose best expected animal cannot beat the weakest placed one is
+		-- Plot full (Only Better): an egg whose best expected animal cannot beat the weakest placed one is
 		-- skipped (live 2026-10-13: a 1298-stud walk for a Sea Egg, animal $6.8M/s vs weakest $324M/s; Bamboo eggs giving
 		-- Tanuki $13K-$26K/s). If no egg in reach is worth it, the best one is still broken (nothing better to do there).
 		local worthless = nil
-		local worst = if N.planOn() or on("OnlyBetter") then (N.worstPlaced()) else 0
+		local worst = if on("OnlyBetter") then (N.worstPlaced()) else 0
 		local fallback, fallbackScore
+		local hatchOk = {}
 		N.EggSeen = 0
 		for _, info in ipairs(N.eggs()) do
 			if tutorialPick and not tutorialPick[info.kind] then
@@ -34508,6 +34735,18 @@ do
 			then
 				local score = N.eggScore(info, origin) + (if event then 2e15 elseif special then 1e15 else 0)
 				local top = if worst > 0 and not special then N.Plan.eggTop(info.zone, info.luck, info.lucky) else math.huge
+				-- live 2026-10-14: 2577-stud walks to zone 5 for 1-hit eggs whose hatch the grab rule then skipped ("zone 5
+				-- animals never beat your weakest"): an egg whose hatch would not be grabbed is worthless here too.
+				if worst > 0 and not special and on("GrabOwnHatch") then
+					local okZone = hatchOk[info.zone]
+					if okZone == nil then
+						okZone = (N.hatchWorth(info.zone)) == true
+						hatchOk[info.zone] = okZone
+					end
+					if not okZone then
+						top = 0
+					end
+				end
 				if top < worst then
 					worthless = worthless or { zone = info.zone, top = top }
 					if not fallbackScore or score > fallbackScore then
@@ -35067,11 +35306,46 @@ do
 		end
 		log(string.format("GRAB target=%s value=$%s/s", tostring(pick.name), formatNumber(N.cashValue(pick))))
 		-- The animal stays on the list until the grab worked, so a failed grab is retried (it despawns after 45 s anyway).
+		local caught = Session.caught
 		local ok = N.stealPickup(pick, " from your egg")
+		-- live 2026-10-14: a guard flung the character during the grab of a Secret $1.38B/s hatch, the 15 s retry ban sent
+		-- the hub 2500 studs away and the animal despawned. A grab lost to a catch is retried right after getting up.
+		for try = 1, 2 do
+			if ok or Session.caught == caught or pick.model.Parent == nil or not on("GrabOwnHatch") then
+				break
+			end
+			caught = Session.caught
+			waitFor(function()
+				return not N.flung()
+			end, 4)
+			F.failedPickups[pick.model] = nil
+			log(string.format("GRAB retry %d after a guard catch target=%s", try, tostring(pick.name)))
+			ok = N.stealPickup(pick, " from your egg (retry)")
+		end
 		if ok and F.readyHatched then
 			F.readyHatched[pick.model] = nil
 		end
 		return ok
+	end
+	-- Farm work that must never wait for the treadmill (player report 2026-10-14: Auto Train held the loop, nothing was
+	-- broken, grabbed or placed): an animal in the hands, an own hatch about to appear or lying there, a wanted pickup.
+	function N.farmUrgent()
+		if N.carrying() then
+			return "carrying an animal"
+		end
+		if #F.hatches > 0 or next(F.readyHatched or {}) ~= nil then
+			if N.bestHatched() then
+				return "own hatch to grab"
+			end
+			local pending = N.pendingHatch()
+			if pending and N.hatchWorth(pending.zone or 1) then
+				return "own egg hatching"
+			end
+		end
+		if on("StealPickups") and N.bestPickup(nil, nil) then
+			return "animal to steal"
+		end
+		return nil
 	end
 	-- Placing works like the game's own place click (dump: AnimalToolController.PlaceAt, GamepadPlaceController
 	-- .findPlaceSpot): the animal tool is held, PlaceAnimalRemote:FireServer(tool, worldPos, seq) with a spot inside the
@@ -35259,7 +35533,7 @@ do
 	-- Surplus animals: with the plot full, a backpack animal that earns no more than the weakest placed one is never
 	-- placed by Equip Best. The sale price is 60 s of its income (BackpackSellConfig.PetValue), pure gain that feeds the
 	-- upgrades. The best of them stays as filler for the next plot slot.
-	-- strict = the Smart Planner's own surplus rule (lead decision 2026-10-13, the OWNER_RULES 21 analogue of crafting
+	-- strict = the surplus rule of Sell Surplus Animals (lead decision 2026-10-13, the OWNER_RULES 21 analogue of crafting
 	-- duplicates when storage is full): plot full, the animal earns no more than the weakest placed one (it cannot improve the plot), never Secret, locked,
 	-- held, placed or protected (Keep Mutated, Never Sell). Nothing that could be placed or beats a placed animal.
 	function N.surplusPlan(strict)
@@ -35303,12 +35577,6 @@ do
 			end
 		end
 		if on("AutoSellSurplus") then
-			for _, tool in ipairs(N.surplusPlan()) do
-				if not seen[tool] then
-					table.insert(list, tool)
-				end
-			end
-		elseif N.planOn() then
 			for _, tool in ipairs(N.surplusPlan(true)) do
 				if not seen[tool] then
 					table.insert(list, tool)
@@ -35318,10 +35586,10 @@ do
 		return list
 	end
 	function N.sellStep(force)
-		if not (force or on("AutoSell") or on("AutoSellSurplus") or N.planOn()) then
+		if not (force or on("AutoSell") or on("AutoSellSurplus")) then
 			return false
 		end
-		local plannerOnly = not (force or on("AutoSell") or on("AutoSellSurplus"))
+		local surplusOnly = not (force or on("AutoSell"))
 		if not force and os.clock() - F.lastPlaceAt < 3 then
 			return false
 		end
@@ -35339,7 +35607,7 @@ do
 			table.remove(tools)
 		end
 		local cashBefore = N.cash()
-		setStatus(if plannerOnly then "Selling surplus (plot full)" else "Selling " .. #tools .. " animals")
+		setStatus(if surplusOnly then "Selling surplus (plot full)" else "Selling " .. #tools .. " animals")
 		local ok = invoke("BackpackSellRemote", 10, tools)
 		task.wait(0.5)
 		local gone = 0
@@ -35361,7 +35629,7 @@ do
 		else
 			F.sellFails = 0
 			log("SOLD", gone, "animals for", gained, "ok", tostring(ok))
-			if plannerOnly then
+			if surplusOnly then
 				log(string.format("SELL surplus n=%d value=$%s (plot full, each below the weakest placed one)", gone, formatNumber(math.floor(gained))))
 			end
 		end
@@ -36161,7 +36429,7 @@ do
 			end
 		end
 		local did = join()
-		if not did and not (N.planOn() or on("AutoFarm") or on("StealPickups") or on("AutoTrain") or on("AutoPlace")) then
+		if not did and not (on("AutoFarm") or on("StealPickups") or on("AutoTrain") or on("AutoPlace")) then
 			setStatus("Hell Boss: " .. N.hellStatusText())
 		end
 		return did
@@ -36755,7 +37023,7 @@ do
 			canTrain = on("AutoTrain"),
 			canFarm = on("AutoFarm"),
 			walkBoost = P.wsRatio,
-			teleport = N.moveMode() == "Teleport",
+			teleport = N.emptyTeleport(),
 			canSell = on("AutoSellSurplus") or on("AutoSell"),
 		}
 	end
@@ -36793,7 +37061,7 @@ do
 			end
 			local left = horizon - trainTime
 			if left > 0 then
-				local walk = if state.teleport then 1e6 else P.walkSpeedFor(target) * state.walkBoost * 0.97
+				local walk = N.roundTripSpeed(P.walkSpeedFor(target) * state.walkBoost)
 				for zone in ipairs(N.Cat.zones) do
 					if P.zoneNeed(zone) <= target and not N.zonePenalized(zone) then
 						local rate = P.animalRate(zone, state, walk)
@@ -36982,7 +37250,7 @@ do
 				P.seen[info.zone] = addSample("seen", info.zone, value, value, 0, true)
 			end
 		end
-		if N.planOn() then
+		if N.decideOn() then
 			for _, id in ipairs({ "Cash", "Swing", "WalkSpeed", "Treadmill", "EggGrowth" }) do
 				local mult, left = P.globalMult(id)
 				local key = string.format("%g", mult)
@@ -37121,12 +37389,12 @@ do
 			end
 			g = lucky + P.mean(dist) * factor * 1e-6
 		end
-		local walk = if state.teleport then 1e6 else math.max(N.modeSpeed(), 1)
+		local walk = if state.teleport then 1e6 else math.max(N.modeSpeed(nil, false), 1)
 		local seconds = info.hits * state.pace + P.EggGap + (distance or 0) / walk
 		return math.min(g / math.max(seconds, 0.1), 1e14)
 	end
 	-- Why nothing is on the buy list: every upgrade maxed, or the best one that does not pay back inside the horizon.
-	-- Zone hysteresis: (zone to farm, note for the PLAN line, egg part to leave). A switch needs +15 % value; an egg in
+	-- Zone hysteresis: (zone to farm, note for the DECIDE line, egg part to leave). A switch needs +15 % value; an egg in
 	-- progress in the current zone is finished unless what the new zone adds during the rest of it beats its own animal.
 	function P.zoneSwitch(zones, current, wanted, egg, state)
 		if not (current and wanted and current ~= wanted and zones[current] and zones[wanted]) then
@@ -37251,8 +37519,8 @@ do
 			local topLabel = if fValid[1] then fValid[1].label else "first income"
 			if P.activity == "train" or P.moneyFirstKey ~= topLabel then
 				P.moneyFirstKey = topLabel
-				if N.planOn() then
-					log(if fValid[1] then string.format("PLAN money first: farm zone %s for %s ($%s, pays back in %s) before training (%s)", tostring(fBase.zone), topLabel, formatNumber(fValid[1].cost), P.formatSeconds(fValid[1].payback), P.formatSeconds(base.train)) else string.format("PLAN money first: farm zone %s until the first animal earns, before training (%s)", tostring(fBase.zone), P.formatSeconds(base.train)))
+				if N.decideOn() then
+					log(if fValid[1] then string.format("DECIDE money first: farm zone %s for %s ($%s, pays back in %s) before training (%s)", tostring(fBase.zone), topLabel, formatNumber(fValid[1].cost), P.formatSeconds(fValid[1].payback), P.formatSeconds(base.train)) else string.format("DECIDE money first: farm zone %s until the first animal earns, before training (%s)", tostring(fBase.zone), P.formatSeconds(base.train)))
 				end
 			end
 			P.activity = "farm"
@@ -37268,8 +37536,8 @@ do
 			-- nothing: farming is already set above
 		elseif not committed then
 			if base.train > 0 and state.canTrain then
-				if P.activity ~= "train" and N.planOn() then
-					log(string.format("PLAN train on the treadmill to %s speed (%s), then farm zone %s: more speed earns more in 24 h than farming now", formatNumber(base.target), P.formatSeconds(base.train), tostring(base.zone)))
+				if P.activity ~= "train" and N.decideOn() then
+					log(string.format("DECIDE train on the treadmill to %s speed (%s), then farm zone %s: more speed earns more in 24 h than farming now", formatNumber(base.target), P.formatSeconds(base.train), tostring(base.zone)))
 				end
 				P.activity = "train"
 				P.trainTarget = base.target
@@ -37313,7 +37581,7 @@ do
 			else "Plan: " .. P.noBuyText()
 		local doing = if P.activity == "train" then string.format("train->%s", formatNumber(P.trainTarget or 0)) else "farm z" .. tostring(base.zone or "-")
 		local key = tostring(best and best.label) .. "|" .. tostring(pick and pick.label) .. "|" .. doing
-		if N.planOn() and (key ~= P.logKey or os.clock() - P.logAt > 60 or force) then
+		if N.decideOn() and (key ~= P.logKey or os.clock() - P.logAt > 60 or force) then
 			P.logKey = key
 			P.logAt = os.clock()
 			local now
@@ -37351,7 +37619,7 @@ do
 				table.insert(after, valid[i].label)
 			end
 			log(string.format(
-				"PLAN %s; %s%s%s (calib %.2f, gain/$=%.3g)",
+				"DECIDE %s; %s%s%s (calib %.2f, gain/$=%.3g)",
 				now,
 				nextBuy,
 				if #after > 0 then "; then " .. table.concat(after, ", ") else "",
@@ -37908,7 +38176,7 @@ do
 			end
 			table.insert(lines, line)
 		else
-			table.insert(lines, string.format(dim, "Index: waiting for the game's answer (Claim Index Rewards or Smart Planner on)"))
+			table.insert(lines, string.format(dim, "Index: waiting for the game's answer (Claim Index Rewards on)"))
 		end
 		if R.st.bat and R.st.index then
 			local scan = R.batScan()
@@ -38088,6 +38356,89 @@ do
 			log("SCHEDULE", T.phase)
 		end
 		return T.phase == "train"
+	end
+	-- Training never blocks the farm (player report 2026-10-14: with Auto Train on the plan held the character on the
+	-- treadmill for minutes, 0 eggs, 0 grabbed, 0 banked). Training runs in bouts BETWEEN egg trips: a plan bout (speed to
+	-- the next locked zone pays more than farming, P.update) lasts at most 60 s and is followed by at least one broken egg
+	-- (its grab, bank and place); an idle bout (nothing to farm in reach for 8 s) lasts 30 s. Anything urgent (animal in
+	-- the hands, own hatch, wanted pickup) ends a bout at once. Each bout logs TRAIN reason=.
+	T.boutUntil, T.tripMark, T.tripSince, T.idleSince = nil, nil, 0, nil
+	function N.startTrainBout(seconds, reason)
+		T.boutUntil = os.clock() + seconds
+		T.tripMark = nil
+		T.idleSince = nil
+		log(string.format("TRAIN reason=%s bout=%ds speed=%s", reason, seconds, formatNumber(N.power())))
+		return true
+	end
+	function N.trainBoutActive()
+		return T.boutUntil ~= nil and os.clock() < T.boutUntil
+	end
+	function N.trainGate()
+		local now = os.clock()
+		local stage = N.tutorialStage()
+		if (stage == "UseTreadmill" or stage == "EarnPickaxeCash") and N.treadmillUnlocked() and N.anyAutoOn and N.anyAutoOn() then
+			return true
+		end
+		if not on("AutoTrain") or N.carrying() then
+			T.boutUntil = nil
+			return false
+		end
+		if not (on("AutoFarm") or on("StealPickups")) then
+			return true
+		end
+		local urgent = N.farmUrgent()
+		if urgent then
+			if T.boutUntil then
+				T.boutUntil = nil
+				T.tripMark, T.tripSince = Session.eggs, now
+				log("TRAIN bout cut reason=" .. urgent)
+			end
+			return false
+		end
+		if T.boutUntil then
+			if now < T.boutUntil then
+				return true
+			end
+			T.boutUntil = nil
+			T.tripMark, T.tripSince = Session.eggs, now
+			log(string.format("TRAIN bout done speed=%s, one egg trip next", formatNumber(N.power())))
+			return false
+		end
+		local mode = optionText("TrainMode", "Profit plan")
+		if mode == "When nothing to farm" then
+			return false
+		end
+		if mode == "Alternate" then
+			local limit = if T.phase == "farm" then optionNumber("FarmMinutes", 10) else optionNumber("TrainMinutes", 5)
+			if now - T.phaseSince >= limit * 60 then
+				T.phase = if T.phase == "farm" then "train" else "farm"
+				T.phaseSince = now
+				log("SCHEDULE", T.phase)
+			end
+			return T.phase == "train"
+		end
+		N.Plan.update(false)
+		if N.Plan.activity ~= "train" then
+			return false
+		end
+		-- one egg trip between two plan bouts (max 5 min, so a zone without eggs does not stop training for good)
+		if T.tripMark and Session.eggs <= T.tripMark and now - T.tripSince < 300 then
+			return false
+		end
+		return N.startTrainBout(60, string.format("plan: %s speed pays more than farming now", formatNumber(N.Plan.trainTarget or 0)))
+	end
+	-- Farm had nothing to do: train only after 8 s without farm work, for a 30 s bout.
+	function N.trainIdle()
+		if not on("AutoTrain") or N.carrying() then
+			T.idleSince = nil
+			return false
+		end
+		local now = os.clock()
+		T.idleSince = T.idleSince or now
+		if now - T.idleSince < 8 then
+			return false
+		end
+		return N.startTrainBout(30, "nothing to farm in reach")
 	end
 	-- purchase guard helpers (the check itself sits in fire(), p01): toggle on + BUY line before the remote
 	function N.purchaseToggleOn(name)
@@ -38527,8 +38878,7 @@ do
 		end
 		return true
 	end
-	-- The planner only runs while a toggle needs it (Smart Planner or a buy toggle); it writes PLAN lines only while
-	-- Smart Planner is on.
+	-- The profit engine only runs while a toggle needs it (a buy toggle, Break Eggs, Auto Train); DECIDE lines likewise.
 	N.BuyToggles = { "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill", "AutoSatchel", "AutoDemonShop", "AutoDemonEgg" }
 	function N.buyingOn()
 		for _, name in ipairs(N.BuyToggles) do
@@ -38589,9 +38939,7 @@ do
 			N.Plan.pick = nil
 			local ok, did = pcall(pick.act)
 			if ok and did then
-				if N.planOn() then
-					log(string.format("PLAN bought %s for $%s, it pays back in %s (gain per $ %.3g)", pick.label, formatNumber(pick.cost), N.Plan.formatSeconds(pick.payback or 0), pick.ratio))
-				end
+				log(string.format("DECIDE bought %s for $%s, it pays back in %s (gain per $ %.3g)", pick.label, formatNumber(pick.cost), N.Plan.formatSeconds(pick.payback or 0), pick.ratio))
 				N.Plan.at = -1e9
 				return true
 			end
@@ -38674,8 +39022,7 @@ do
 		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
 		local tool
 		-- OWNER_RULES 20/21: egg tools with an EggType attribute (Fuse Machine Celestial, Demon shop, community Sabertooth) are
-		-- planted while the player's own switch for them is on (Auto Place And Hatch Eggs, Auto Fuse or Demon Eggs, not the
-		-- planner); the planner alone plants merge machine eggs (MergeEggTool) only.
+		-- planted while the player's own switch for them is on (Auto Place And Hatch Eggs, Auto Fuse or Demon Eggs).
 		local typedEggs = (Toggles.AutoMergeEggs and Toggles.AutoMergeEggs.Value == true) or (Toggles.AutoFuse and Toggles.AutoFuse.Value == true) or (Toggles.AutoDemonEgg and Toggles.AutoDemonEgg.Value == true)
 		for _, item in ipairs(backpack and backpack:GetChildren() or {}) do
 			if item:IsA("Tool") and (N.hasTag(item, "MergeEggTool") or (typedEggs and type(item:GetAttribute("EggType")) == "string" and not N.hasTag(item, "AnimalTool"))) then
@@ -38947,18 +39294,15 @@ do
 			})
 		end)
 	end
-	Tabs.Main = N.addTab("Main", "house", "Quick start and what Corvus is doing")
-	Tabs.Farm = N.addTab("Farm", "egg", "Eggs, animals, guards, placing and the treadmill")
-	Tabs.Plot = Tabs.Farm
-	Tabs.Base = Tabs.Farm
-	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Pickaxes, trails, plot, satchel, tokens, selling and merge eggs")
-	Tabs.Items = Tabs.Upgrades
+	Tabs.Main = N.addTab("Main", "house", "Quick Start, Status and what runs next")
+	Tabs.Farm = N.addTab("Farm", "egg", "Eggs, zones, hits, the treadmill, movement and guards")
+	Tabs.Animals = N.addTab("Animals", "paw-print", "Grab, steal, place and sell animals, filters and protect lists")
+	Tabs.Events = N.addTab("Events", "flame", "Hell boss, Demon shop, Fuse Machine and merging")
+	Tabs.Upgrades = N.addTab("Upgrades", "trending-up", "Pickaxes, trails, plot, treadmill and satchel, bought by payback")
 	Tabs.Rewards = N.addTab("Rewards", "gift", "Index cash and bats, offline cash, group and community rewards, friends")
-	Tabs.Player = N.addTab("Player", "user", "Travel, noclip and ESP")
-	Tabs.Movement = Tabs.Player
-	Tabs.Visuals = Tabs.Player
-	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress, rates and Discord posts")
-	Tabs.Webhook = Tabs.Stats
+	Tabs.Player = N.addTab("Player", "user", "Noclip, travel and ESP")
+	Tabs.Stats = N.addTab("Stats", "chart-column", "Session progress and rates")
+	Tabs.Webhook = N.addTab("Webhook", "webhook", "Discord posts for rare animals, upgrades and reports")
 	if Window.AddMiscTab then
 		pcall(function()
 			Tabs.Misc = Window:AddMiscTab({ Description = "Performance, AFK and connection", RejoinScript = LoaderScript })
@@ -38982,39 +39326,38 @@ do
 	end
 	N.HitSpeeds = { "Normal", "Fast" }
 	do
-				-- Quick Start (CLAUDE.md "Main = Quick Start"): Smart Planner plus the main loop toggles mirrored from their tabs
-		-- (MirrorToggle keeps both switches in sync, one config key), then Stop Everything and Reset Hub Options.
+		-- Main = Quick Start (the core loop toggles mirrored from their tabs, one config key each), Stop Everything and
+		-- Reset Hub Options on the left; Status and Up next on the right. No planner toggle: every decision lives in the
+		-- normal toggles (owner 2026-10-14).
 		local QuickBox = Tabs.Main:AddLeftGroupbox("Quick Start", "sparkles")
 		N.QuickBox = QuickBox
-		QuickBox:AddToggle("SmartPlanner", {
-			Text = "Smart Planner",
-			Default = false,
-			Tooltip = "Runs the whole farm by real game odds: picks the zone and the egg (lucky eggs count more), farm or steal, train or not, places the best animals, buys the upgrade that pays back fastest, plants and hatches merge machine eggs, claims the free rewards (index cash and bats, offline cash, group reward) and, only when the plot is full, sells surplus animals that earn no more than your weakest placed one (never Secret, locked, Keep Mutated or Never Sell ones). It never fuses, merges, sells anything else or spends Fallen Tokens by itself: those run only under their own toggles. Your other switches stay as they are",
-		})
 		StatusBox = Tabs.Main:AddRightGroupbox("Status", "activity")
 		Labels.Status = StatusBox:AddLabel({ Text = "Idle", DoesWrap = true })
 		Labels.Info = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
-		local NextBox = Tabs.Main:AddRightGroupbox("Up next", "list-todo")
-		Labels.UpNext = NextBox:AddLabel({ Text = "-", DoesWrap = true })
 		StatusBox:AddButton({
 			Text = "Go Home",
+			Tooltip = "Walks back to your plot",
 			Func = function()
 				task.spawn(N.runManual, function()
 					N.goHome("Going home")
 				end)
 			end,
 		})
-		local EggBox = Tabs.Farm:AddLeftGroupbox("Eggs", "egg")
+		local NextBox = Tabs.Main:AddRightGroupbox("Up Next", "list-todo")
+		Labels.UpNext = NextBox:AddLabel({ Text = "-", DoesWrap = true })
+
+		-- Farm tab: eggs and zones, treadmill (left); movement and guards (right).
+		local EggBox = Tabs.Farm:AddLeftGroupbox("Eggs And Zones", "egg")
 		EggBox:AddToggle("AutoFarm", {
 			Text = "Break Eggs In Best Zone",
 			Default = false,
-			Tooltip = "Breaks eggs in the best zone your speed can escape and grabs the animal. Change the zone below if you want",
+			Tooltip = "Breaks eggs in the zone that adds the most income per hour (switches only for +15 %) and brings the animal home",
 		})
 		EggBox:AddDropdown("ZoneMode", {
 			Text = "Zones",
 			Values = { "Best zone", "All I can escape", "Picked zones" },
 			Default = "Best zone",
-			Tooltip = "Guards chase you while you carry an animal. Escape means your speed beats the zone's requirement",
+			Tooltip = "Best zone = the highest income per hour your speed can escape. Picked zones = only the zones below",
 		})
 		EggBox:AddDropdown("ZonePick", {
 			Text = "Picked Zones",
@@ -39022,17 +39365,13 @@ do
 			Default = {},
 			Multi = true,
 			AllowNull = true,
-		})
-		EggBox:AddToggle("TitanicFirst", {
-			Text = "Titanic Eggs First",
-			Default = true,
-			Tooltip = "Goes for the Titanic event egg (30x luck) and TITANIC weight eggs before anything else, and steals TITANIC animals first. Only in zones your speed can escape",
+			Tooltip = "Used when Zones is set to Picked zones",
 		})
 		EggBox:AddDropdown("EggPriority", {
 			Text = "Egg Priority",
 			Values = { "Best value per second", "Fewest hits", "Heaviest", "Luckiest", "Nearest" },
 			Default = "Best value per second",
-			Tooltip = "Best value per second weighs the expected animal (zone odds, egg luck, your weakest pet) against the hits and the walk. Heaviest eggs hatch bigger animals, luckiest ones roll rarer animals",
+			Tooltip = "Best value per second weighs the expected animal (zone odds, egg luck, your weakest pet) against the hits and the trip",
 		})
 		EggBox:AddDropdown("EggPick", {
 			Text = "Egg Types (none = all)",
@@ -39041,6 +39380,12 @@ do
 			Multi = true,
 			AllowNull = true,
 			Searchable = true,
+			Tooltip = "Only these eggs are broken. Empty = every egg",
+		})
+		EggBox:AddToggle("TitanicFirst", {
+			Text = "Titanic Eggs First",
+			Default = true,
+			Tooltip = "The Titanic event egg (30x luck), TITANIC eggs and TITANIC animals go first, in zones your speed can escape",
 		})
 		EggBox:AddSlider("MaxHits", {
 			Text = "Skip Eggs Over",
@@ -39049,53 +39394,65 @@ do
 			Max = 1000,
 			Rounding = 0,
 			Suffix = " hits",
-			Tooltip = "Eggs that need more hits are left for later. When nothing else fits, the easiest one is broken anyway",
+			Tooltip = "For the other priorities: tougher eggs wait. When nothing else fits, the easiest one is broken anyway",
 		})
 		EggBox:AddDropdown("HitSpeed", {
 			Text = "Hit Speed",
 			Values = N.HitSpeeds,
 			Default = "Fast",
-			Tooltip = "Fast hits right at the server limit (read from the game, 0.8 swing gaps since the October update), the fastest the server takes. Normal is the game\'s own swing. Faster hits are dropped by the server, so they are not offered",
+			Tooltip = "Fast = the server's swing limit read from the game (0.8 s). Normal = the game's own swing",
 		})
 		EggBox:AddToggle("AvoidPlayers", {
 			Text = "Skip Eggs Other Players Hit",
 			Default = true,
 			Tooltip = "Leaves an egg alone when another player stands next to it",
 		})
-		local AnimalBox = Tabs.Farm:AddRightGroupbox("Animals", "paw-print")
-		AnimalBox:AddToggle("GrabOwnHatch", {
-			Text = "Grab What You Hatch",
-			Default = true,
-			Tooltip = "Picks up the animal from the egg you just broke and brings it home",
-		})
-		AnimalBox:AddToggle("StealPickups", {
-			Text = "Steal Animals",
+		local TrainBox = Tabs.Farm:AddLeftGroupbox("Treadmill", "footprints")
+		TrainBox:AddToggle("AutoTrain", {
+			Text = "Auto Train",
 			Default = false,
-			Tooltip = "Steals the animals lying around the zones, the ones that make the most money first",
+			Tooltip = "Trains on your treadmill when more speed earns more in 24 h than farming now, one locked zone at a time",
 		})
-		AnimalBox:AddToggle("OnlyBetter", {
-			Text = "Only Better Than My Worst Pet",
-			Default = true,
-			Tooltip = "Takes an animal only when it makes more money per second than the weakest one on your plot. While the plot has free room, everything counts",
+		TrainBox:AddDropdown("TrainMode", {
+			Text = "With Break Eggs On",
+			Values = { "Profit plan", "Alternate", "When nothing to farm" },
+			Default = "Profit plan",
+			Tooltip = "Profit plan = train only when it pays more than farming. Alternate = the minutes below",
 		})
-		Labels.Worst = AnimalBox:AddLabel({ Text = "-", DoesWrap = true })
-		AnimalBox:AddDropdown("StealRarities", {
-			Text = "Rarities (none = all)",
-			Values = N.RarityOrder,
-			Default = {},
-			Multi = true,
-			AllowNull = true,
+		TrainBox:AddSlider("FarmMinutes", { Text = "Alternate: Farm For", Default = 10, Min = 1, Max = 120, Rounding = 0, Suffix = " min" })
+		TrainBox:AddSlider("TrainMinutes", { Text = "Alternate: Train For", Default = 5, Min = 1, Max = 120, Rounding = 0, Suffix = " min" })
+		TrainBox:AddButton({
+			Text = "Go To Treadmill",
+			Tooltip = "Travels to your own treadmill",
+			Func = function()
+				task.spawn(N.runManual, function()
+					local _, hitbox = N.treadmill()
+					if hitbox then
+						N.travelTo(N.standAt(hitbox.Position))
+					else
+						notify("Treadmill", "Unlock your treadmill first", 3)
+					end
+				end)
+			end,
 		})
-		AnimalBox:AddInput("StealMinCash", {
-			Text = "Min Money/s",
-			Default = "",
-			Placeholder = "10B",
-			Finished = true,
-			Tooltip = "Only steal or grab animals that make at least this much per second. Plain numbers or K/M/B/T/Qa, empty or 0 = off",
+		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
+		local MoveBox = Tabs.Farm:AddRightGroupbox("Movement", "route")
+		MoveBox:AddDropdown("MoveMode", {
+			Text = "Movement Type",
+			Values = { "Fast", "Walk", "Teleport" },
+			Default = "Fast",
+			Tooltip = "Fast = the fastest the server accepts (measured, steps back after a pull-back). Walk = your own speed. Teleport = instant without an animal only, the game blocks banking after one",
 		})
-		AnimalBox:AddSlider("StealMinKg", { Text = "Min Weight", Default = 0, Min = 0, Max = 5000, Rounding = 0, Suffix = " kg" })
-		AnimalBox:AddSlider("StealRange", { Text = "Max Distance", Default = 600, Min = 50, Max = 3000, Rounding = 0, Suffix = " studs" })
-		local GuardBox = Tabs.Farm:AddLeftGroupbox("Guards", "shield-alert")
+		MoveBox:AddSlider("FastBoost", { Text = "Fast Speed (start)", Default = 110, Min = 100, Max = 300, Rounding = 0, Suffix = "% of your speed", Tooltip = "Where Fast starts; it raises itself while the server accepts it" })
+		MoveBox:AddToggle("TeleportSpeedCheck", {
+			Text = "Speed Check With Teleport",
+			Default = false,
+			Tooltip = "Also keeps to zones your speed can escape while teleporting. Off = the highest zone you can break eggs in",
+		})
+		MoveBox:AddToggle("TravelNoclip", { Text = "Noclip While Travelling", Default = true, Tooltip = "Fast travel passes through walls" })
+		MoveBox:AddToggle("SnapNotify", { Text = "Notify On Snapback", Default = true, Tooltip = "Tells you when the server pulls you back; Corvus slows down on its own" })
+		Labels.Move = MoveBox:AddLabel({ Text = "-", DoesWrap = true })
+		local GuardBox = Tabs.Farm:AddRightGroupbox("Guards", "shield-alert")
 		GuardBox:AddSlider("EscapeMargin", {
 			Text = "Speed Safety Margin",
 			Default = 100,
@@ -39109,30 +39466,65 @@ do
 			Text = "Speed Needed",
 			Values = { "Zone speed", "Zone speed + rare bonus" },
 			Default = "Zone speed",
-			Tooltip = "Zone speed = the recommended speed of the zone. The rare bonus asks up to 2x more for the rarest and biggest animals, like the game does for its guard",
+			Tooltip = "The rare bonus asks up to 2x more for the rarest and biggest animals, like the game's guard",
 		})
 		GuardBox:AddToggle("AvoidGuards", {
 			Text = "Skip Animals Next To The Guard",
 			Default = true,
 			Tooltip = "Leaves an animal when the zone guard stands close to it, unless your speed is 1.2x the zone speed",
 		})
-		GuardBox:AddSlider("GuardDistance", { Text = "Guard Distance", Default = 40, Min = 10, Max = 150, Rounding = 0, Suffix = " studs" })
+		GuardBox:AddSlider("GuardDistance", { Text = "Guard Distance", Default = 40, Min = 10, Max = 150, Rounding = 0, Suffix = " studs", Tooltip = "How close the guard may stand" })
 		GuardBox:AddToggle("IgnoreGuards", {
 			Text = "Ignore Guards",
 			Default = false,
-			Tooltip = "Goes for zones and animals above your speed, the guard will often catch you and you drop the animal",
+			Tooltip = "Goes for zones and animals above your speed; the guard often catches you and you drop the animal",
 		})
 		Labels.Guards = GuardBox:AddLabel({ Text = "-", DoesWrap = true })
-	end
-	do
-		local PlaceBox = Tabs.Plot:AddLeftGroupbox("Placing", "layout-grid")
+
+		-- Animals tab: grab/steal with filters, placing (left); selling and the protect list (right).
+		local AnimalBox = Tabs.Animals:AddLeftGroupbox("Grab And Steal", "hand")
+		AnimalBox:AddToggle("GrabOwnHatch", {
+			Text = "Grab What You Hatch",
+			Default = true,
+			Tooltip = "Picks up the animal from the egg you just broke and brings it home",
+		})
+		AnimalBox:AddToggle("StealPickups", {
+			Text = "Steal Animals",
+			Default = false,
+			Tooltip = "Steals the animals lying around the zones, the ones that make the most money first",
+		})
+		AnimalBox:AddToggle("OnlyBetter", {
+			Text = "Only Better Than My Worst Pet",
+			Default = true,
+			Tooltip = "Takes an animal only when it earns more than the weakest one on your plot. With free room, everything counts",
+		})
+		AnimalBox:AddDropdown("StealRarities", {
+			Text = "Rarities (none = all)",
+			Values = N.RarityOrder,
+			Default = {},
+			Multi = true,
+			AllowNull = true,
+			Tooltip = "Only these rarities are stolen or grabbed. Empty = every rarity",
+		})
+		AnimalBox:AddInput("StealMinCash", {
+			Text = "Min Money/s",
+			Default = "",
+			Placeholder = "10B",
+			Finished = true,
+			Tooltip = "Only animals that make at least this per second. K/M/B/T/Qa, empty or 0 = off",
+		})
+		AnimalBox:AddSlider("StealMinKg", { Text = "Min Weight", Default = 0, Min = 0, Max = 5000, Rounding = 0, Suffix = " kg", Tooltip = "0 = any weight" })
+		AnimalBox:AddSlider("StealRange", { Text = "Max Distance", Default = 600, Min = 50, Max = 3000, Rounding = 0, Suffix = " studs", Tooltip = "Animals further away are left" })
+		Labels.Worst = AnimalBox:AddLabel({ Text = "-", DoesWrap = true })
+		local PlaceBox = Tabs.Animals:AddLeftGroupbox("Placing", "layout-grid")
 		PlaceBox:AddToggle("AutoPlace", {
 			Text = "Auto Place Animals",
 			Default = false,
-			Tooltip = "Places every animal you bring home on your plot, like the game's own place click. When the plot is full a better animal takes the weakest one's spot",
+			Tooltip = "Places every animal you bring home; with a full plot a better animal takes the weakest one's spot",
 		})
 		PlaceBox:AddButton({
 			Text = "Place Best Now",
+			Tooltip = "Places your best backpack animals once",
 			Func = function()
 				task.spawn(N.runManual, function()
 					N.placeStep(true)
@@ -39140,73 +39532,126 @@ do
 			end,
 		})
 		Labels.Plot = PlaceBox:AddLabel({ Text = "-", DoesWrap = true })
-		local TrainBox = Tabs.Plot:AddRightGroupbox("Treadmill", "footprints")
-		TrainBox:AddToggle("AutoTrain", {
-			Text = "Auto Train",
+		local SellBox = Tabs.Animals:AddRightGroupbox("Selling", "coins")
+		SellBox:AddToggle("AutoSellSurplus", {
+			Text = "Sell Surplus Animals",
 			Default = false,
-			Tooltip = "Stands on your own treadmill to gain speed, speed opens new zones",
+			Tooltip = "Plot full: sells backpack animals that earn no more than your weakest placed one (60 s of income each). Never Secret, locked, favorite or protected; keeps the best one for the next slot",
 		})
-		TrainBox:AddDropdown("TrainMode", {
-			Text = "With Egg Farm On",
-			Values = { "Profit plan", "Alternate", "When nothing to farm" },
-			Default = "Profit plan",
-			Tooltip = "Profit plan trains only when more speed (a new zone or faster walking) earns more in 24 h than farming now. Alternate follows the minutes below",
+		SellBox:AddToggle("AutoSell", {
+			Text = "Auto Sell By Rarity",
+			Default = false,
+			Tooltip = "Sells backpack animals of the rarities you pick below (never protected ones)",
 		})
-		TrainBox:AddSlider("FarmMinutes", { Text = "Farm For", Default = 10, Min = 1, Max = 120, Rounding = 0, Suffix = " min" })
-		TrainBox:AddSlider("TrainMinutes", { Text = "Then Train For", Default = 5, Min = 1, Max = 120, Rounding = 0, Suffix = " min" })
-		TrainBox:AddButton({
-			Text = "Go To Treadmill",
+		SellBox:AddDropdown("SellRarities", {
+			Text = "Sell Rarities",
+			Values = N.RarityOrder,
+			Default = {},
+			Multi = true,
+			AllowNull = true,
+			Tooltip = "Used by Auto Sell By Rarity",
+		})
+		SellBox:AddSlider("SellMaxKg", {
+			Text = "Only Under Weight",
+			Default = 0,
+			Min = 0,
+			Max = 20000,
+			Rounding = 0,
+			Suffix = " kg",
+			Tooltip = "Auto Sell By Rarity only sells lighter animals. 0 = any weight",
+		})
+		SellBox:AddButton({
+			Text = "Sell Now",
+			Tooltip = "Sells what the settings above match, once",
 			Func = function()
 				task.spawn(N.runManual, function()
-					local _, hitbox = N.treadmill()
-					if hitbox then
-						N.travelTo(N.standAt(hitbox.Position))
-					else
-						notify("Treadmill", "Unlock your treadmill first", 3)
-					end
+					N.sellStep(true)
 				end)
 			end,
 		})
-		Labels.Train = TrainBox:AddLabel({ Text = "-", DoesWrap = true })
-	end
-	do
-		local BuyBox = Tabs.Upgrades:AddLeftGroupbox("Auto Buy", "shopping-cart")
-		BuyBox:AddToggle("AutoPickaxe", { Text = "Best Pickaxe", Default = false, Tooltip = "Buys and equips the best pickaxe you can afford" })
-		BuyBox:AddToggle("AutoTrail", { Text = "Best Trail", Default = false, Tooltip = "Trails multiply the speed you get on the treadmill. Bought when the profit plan says the faster training pays back" })
-		BuyBox:AddToggle("AutoPlotUpgrade", { Text = "Plot Upgrades", Default = false, Tooltip = "Every plot level holds one more animal. Bought when the profit plan ranks it best per dollar" })
-		BuyBox:AddToggle("AutoTreadmill", { Text = "Treadmill Unlock And Upgrades", Default = false, Tooltip = "Unlocks your treadmill and buys its levels when the profit plan says faster training pays back" })
+		Labels.Sell = SellBox:AddLabel({ Text = "-", DoesWrap = true })
+		local ProtectBox = Tabs.Animals:AddRightGroupbox("Protect List", "lock")
+		ProtectBox:AddToggle("SellKeepMutated", { Text = "Keep Mutated Animals", Default = true, Tooltip = "No seller and no machine (Fuse, Merge Pets) ever takes a mutated animal" })
+		ProtectBox:AddDropdown("SellProtect", {
+			Text = "Never Sell Rarities",
+			Values = N.RarityOrder,
+			Default = {},
+			Multi = true,
+			AllowNull = true,
+			Tooltip = "Protected from Sell Surplus, Auto Sell, Auto Fuse and Auto Merge Pets",
+		})
+		ProtectBox:AddToggle("ConsumePlaced", {
+			Text = "Machines May Use Placed Animals",
+			Default = false,
+			Tooltip = "Lets Auto Fuse and Auto Merge Pets take animals standing on your plot (their income counts as the cost). Off = backpack only",
+		})
+
+		-- Upgrades tab: every purchase through the payback engine.
+		local BuyBox = Tabs.Upgrades:AddLeftGroupbox("Buy By Payback", "shopping-cart")
+		BuyBox:AddToggle("AutoPickaxe", { Text = "Best Pickaxe", Default = false, Tooltip = "Buys and equips the best pickaxe when it pays back fastest (more damage = faster eggs)" })
+		BuyBox:AddToggle("AutoPlotUpgrade", { Text = "Plot Upgrades", Default = false, Tooltip = "Every plot level holds one more animal. Bought when it pays back fastest" })
+		BuyBox:AddToggle("AutoTrail", { Text = "Best Trail", Default = false, Tooltip = "Trails multiply treadmill speed. Bought when faster training pays back" })
+		BuyBox:AddToggle("AutoTreadmill", { Text = "Treadmill Unlock And Upgrades", Default = false, Tooltip = "Unlocks your treadmill and buys its levels when faster training pays back" })
 		BuyBox:AddToggle("AutoSatchel", {
 			Text = "Satchel Upgrades",
 			Default = false,
-			Tooltip = "Every satchel tier carries one more animal per trip. The game sells it only at satchel stations in the world: Corvus walks there when the profit plan ranks it best per dollar. The box below says when this map has no station",
+			Tooltip = "Every satchel tier carries one more animal per trip. Bought at a satchel station when it pays back fastest",
 		})
 		BuyBox:AddToggle("ShopTravel", {
-			Text = "Walk To Shop If Needed",
+			Text = "Go To The Shop If Needed",
 			Default = true,
-			Tooltip = "If the game only sells at the booth, Corvus walks there and buys",
+			Tooltip = "If the game only sells at the booth, Corvus goes there and buys",
 		})
-		Labels.Shop = BuyBox:AddLabel({ Text = "-", DoesWrap = true })
-		local TokenBox = Tabs.Upgrades:AddRightGroupbox("Fallen Tokens", "coins")
-		TokenBox:AddToggle("AutoHell", {
+		local PriceBox = Tabs.Upgrades:AddRightGroupbox("Next Prices", "receipt")
+		Labels.Shop = PriceBox:AddLabel({ Text = "-", DoesWrap = true })
+
+		-- Events tab: Hell boss and the Demon shop (left), Fuse Machine and merging (right).
+		local HellBox = Tabs.Events:AddLeftGroupbox("Hell Boss", "flame")
+		HellBox:AddToggle("AutoHell", {
 			Text = "Fight The Hell Boss",
 			Default = false,
-			Tooltip = "When the hourly Hell portal in zone 7 opens, Corvus walks in, breaks essence eggs, then hits the Demon King with the bat just above the server's swing limit. Pays 150 to 750 Fallen Tokens by your share of the damage. Steps back when your health is low",
+			Tooltip = "Hourly Hell portal in zone 7: breaks essence eggs, then hits the Demon King at the swing limit. 150 to 750 Fallen Tokens by damage share; steps back at low health",
 		})
-		Labels.Hell = TokenBox:AddLabel({ Text = "-", DoesWrap = true })
-		TokenBox:AddToggle("AutoDemonShop", {
+		HellBox:AddToggle("LeaveHell", {
+			Text = "Leave Hell Event",
+			Default = true,
+			Tooltip = "With a farm toggle on and Fight The Hell Boss off, walks out of the Hell map and keeps away from the portal",
+		})
+		Labels.Hell = HellBox:AddLabel({ Text = "-", DoesWrap = true })
+		local DemonBox = Tabs.Events:AddLeftGroupbox("Demon Shop", "coins")
+		DemonBox:AddToggle("AutoDemonShop", {
 			Text = "Buy Potions With Fallen Tokens",
 			Default = false,
-			Tooltip = "Spends the Fallen Tokens you own in the demon shop on 15 minute potions, the one worth the most cash per token first. Buys again when a potion ends",
+			Tooltip = "15 minute potions, the one worth the most cash per token first. Buys again when a potion ends",
 		})
-		TokenBox:AddToggle("AutoDemonEgg", {
+		DemonBox:AddToggle("AutoDemonEgg", {
 			Text = "Buy Demon Eggs With Fallen Tokens",
 			Default = false,
-			Tooltip = "A Demon Egg costs 500 tokens and hatches a Hell animal on your plot. Bought only when its expected animal is worth more per token than the best potion",
+			Tooltip = "500 tokens, hatches a Hell animal. Bought only when worth more per token than the best potion",
 		})
-		TokenBox:AddLabel({
+		DemonBox:AddLabel({
 			Text = '<font transparency="0.35">The demon shop opens at 750M speed (or once the game unlocks the furnace).</font>',
 			DoesWrap = true,
 		})
+		local FuseBox = Tabs.Events:AddRightGroupbox("Fuse Machine", "atom")
+		FuseBox:AddToggle("AutoFuse", {
+			Text = "Auto Fuse Into Celestial Eggs",
+			Default = false,
+			Tooltip = "Feeds the Fuse Machine recipe the cheapest fitting animals and plants the Celestial Egg, only when the egg is worth more. Opens at 100B speed",
+		})
+		Labels.Fuse = FuseBox:AddLabel({ Text = "-", DoesWrap = true })
+		local MergeBox = Tabs.Events:AddRightGroupbox("Merging And Eggs", "egg")
+		MergeBox:AddToggle("AutoMergeEggs", {
+			Text = "Auto Place And Hatch Eggs",
+			Default = false,
+			Tooltip = "Plants every egg you own (merge, Fuse, Demon, community) and hatches it when grown",
+		})
+		MergeBox:AddToggle("AutoMergePets", {
+			Text = "Auto Merge Pets",
+			Default = false,
+			Tooltip = "Merges three animals of one species into a heavier one when it earns more than the three apart. Never Secret, locked, mutated or protected",
+		})
+		Labels.Merge = MergeBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
 		local RewardBox = Tabs.Rewards:AddLeftGroupbox("Rewards", "gift")
@@ -39329,106 +39774,17 @@ do
 		Labels.Next = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
 	end
 	do
-		local SellBox = Tabs.Items:AddLeftGroupbox("Selling", "coins")
-		SellBox:AddToggle("AutoSellSurplus", {
-			Text = "Sell Surplus Animals",
-			Default = false,
-			Tooltip = "When your plot is full, sells backpack animals that earn no more than your weakest placed one (they would never be placed). Pays 60 s of their income each. Keeps the best one for the next plot slot",
-		})
-		SellBox:AddToggle("AutoSell", {
-			Text = "Auto Sell By Rarity",
-			Default = false,
-			Tooltip = "Sells backpack animals of the rarities you pick (never the protected ones)",
-		})
-		SellBox:AddDropdown("SellRarities", {
-			Text = "Sell Rarities",
-			Values = N.RarityOrder,
-			Default = {},
-			Multi = true,
-			AllowNull = true,
-		})
-		SellBox:AddSlider("SellMaxKg", {
-			Text = "Only Under Weight",
-			Default = 0,
-			Min = 0,
-			Max = 20000,
-			Rounding = 0,
-			Suffix = " kg",
-			Tooltip = "0 sells any weight",
-		})
-		SellBox:AddToggle("SellKeepMutated", { Text = "Keep Mutated Animals", Default = true, Tooltip = "No seller (Sell Surplus, Auto Sell) and no machine (Auto Fuse, Auto Merge Pets) ever takes a mutated animal" })
-		SellBox:AddDropdown("SellProtect", {
-			Text = "Never Sell Rarities",
-			Values = N.RarityOrder,
-			Default = {},
-			Multi = true,
-			AllowNull = true,
-			Tooltip = "Protect list for Sell Surplus, Auto Sell, Auto Fuse and Auto Merge Pets",
-		})
-		SellBox:AddButton({
-			Text = "Sell Now",
-			Func = function()
-				task.spawn(N.runManual, function()
-					N.sellStep(true)
-				end)
-			end,
-		})
-		Labels.Sell = SellBox:AddLabel({ Text = "-", DoesWrap = true })
-		local MergeBox = Tabs.Items:AddRightGroupbox("Eggs And Merging", "egg")
-		MergeBox:AddToggle("AutoMergeEggs", {
-			Text = "Auto Place And Hatch Eggs",
-			Default = false,
-			Tooltip = "Plants every egg you own on your plot (merge machine, Fuse Machine, Demon shop, community reward) and hatches it the moment it is grown. A hatch counts only when the game opened the egg",
-		})
-		MergeBox:AddToggle("AutoMergePets", {
-			Text = "Auto Merge Pets",
-			Default = false,
-			Tooltip = "Merges three animals of the same species into one heavier animal (weight = the sum) when it earns more than the three apart, which also frees two plot slots. Uses the three weakest copies, never Secret, locked, mutated or Never Sell animals. The merge egg is planted and hatched for you",
-		})
-		Labels.Merge = MergeBox:AddLabel({ Text = "-", DoesWrap = true })
-		local FuseBox = Tabs.Items:AddRightGroupbox("Fuse Machine", "atom")
-		FuseBox:AddToggle("AutoFuse", {
-			Text = "Auto Fuse Into Celestial Eggs",
-			Default = false,
-			Tooltip = "Reads the recipe the Fuse Machine gives you, feeds it the cheapest fitting animals and plants the Celestial Egg it gives. Only when the egg is worth more than the animals. Never Secret, locked, mutated (Keep Mutated) or Never Sell animals. Opens at 100B speed",
-		})
-		FuseBox:AddToggle("ConsumePlaced", {
-			Text = "Also Use Placed Animals",
-			Default = false,
-			Tooltip = "Lets Auto Fuse and Auto Merge Pets take animals standing on your plot too (their income is counted as the cost). Off = backpack animals only",
-		})
-		Labels.Fuse = FuseBox:AddLabel({ Text = "-", DoesWrap = true })
-	end
-	do
-		local MoveBox = Tabs.Player:AddLeftGroupbox("Movement", "route")
-		MoveBox:AddDropdown("MoveMode", {
-			Text = "Movement Type",
-			Values = { "Fast", "Walk", "Teleport" },
-			Default = "Fast",
-			Tooltip = "Fast glides a bit above your own speed and is the default. Walk runs at your own speed. Teleport is instant, but the game blocks banking right after one. If the server pulls you back twice in a minute Corvus drops one mode, then tries the faster one again after 10 minutes",
-		})
-		MoveBox:AddToggle("TeleportSpeedCheck", {
-			Text = "Speed Check With Teleport",
-			Default = false,
-			Tooltip = "Also keeps to zones your speed can escape while teleporting. Off = farms the highest zone you can break eggs in",
-		})
-		MoveBox:AddSlider("FastBoost", { Text = "Fast Speed", Default = 110, Min = 100, Max = 300, Rounding = 0, Suffix = "% of your speed" })
-		MoveBox:AddToggle("Noclip", { Text = "Noclip", Default = false, Tooltip = "Walk through walls. Your run speed stays the one the game gives you" })
-			MoveBox:AddToggle("TravelNoclip", { Text = "Noclip While Travelling", Default = true, Tooltip = "Applies to Fast travel. Walk always passes through walls" })
-		MoveBox:AddToggle("LeaveHell", {
-			Text = "Leave Hell Event",
-			Default = true,
-			Tooltip = "While a farm toggle runs and you end up in the Hell boss map, Corvus walks out through the exit and goes back to farming (Fight The Hell Boss stays in until the fight ends). The farm also keeps away from the Hell portal in zone 7",
-		})
-		MoveBox:AddToggle("FallRescue", {
+		local TravelBox = Tabs.Player:AddLeftGroupbox("Travel", "map-pin")
+		TravelBox:AddToggle("Noclip", { Text = "Noclip", Default = false, Tooltip = "Walk through walls. Your run speed stays the one the game gives you" })
+		TravelBox:AddToggle("FallRescue", {
 			Text = "Rescue If Under The Map",
 			Default = true,
-			Tooltip = "While a farm toggle runs and your character falls through the floor, Corvus puts it back on your plot",
+			Tooltip = "With a farm toggle on, a character that falls through the floor is put back on your plot",
 		})
-		MoveBox:AddToggle("SnapNotify", { Text = "Notify On Snapback", Default = true, Tooltip = "Tells you when the server pulls you back, Corvus also slows down on its own" })
-		MoveBox:AddDropdown("TravelZone", { Text = "Zone", Values = N.Cat.zoneLabels, Default = nil, AllowNull = true })
-		MoveBox:AddButton({
+		TravelBox:AddDropdown("TravelZone", { Text = "Zone", Values = N.Cat.zoneLabels, Default = nil, AllowNull = true, Tooltip = "Pick a zone for Go To Zone" })
+		TravelBox:AddButton({
 			Text = "Go To Zone",
+			Tooltip = "Travels to the zone picked above",
 			Func = function()
 				local index = N.Cat.zoneByLabel[optionText("TravelZone", "")]
 				local model = index and N.zoneModel(index)
@@ -39443,16 +39799,13 @@ do
 				end
 			end,
 		})
-		Labels.Move = MoveBox:AddLabel({ Text = "-", DoesWrap = true })
-		-- WalkSpeed, Fly and Infinite Jump were removed: the game sets WalkSpeed from your speed stat and its server
-		-- anticheat pulls back faster running and flying (notes.md Anticheat), so they could not do what they said.
 		local EspBox = Tabs.Player:AddRightGroupbox("ESP", "eye")
-		EspBox:AddToggle("ESPEggs", { Text = "Egg ESP", Default = false })
-		EspBox:AddToggle("ESPPickups", { Text = "Animal ESP", Default = false })
-		EspBox:AddToggle("ESPGuards", { Text = "Guard ESP", Default = false })
+		EspBox:AddToggle("ESPEggs", { Text = "Egg ESP", Default = false, Tooltip = "Shows eggs through walls" })
+		EspBox:AddToggle("ESPPickups", { Text = "Animal ESP", Default = false, Tooltip = "Shows animals lying around" })
+		EspBox:AddToggle("ESPGuards", { Text = "Guard ESP", Default = false, Tooltip = "Shows the zone guards" })
 		local EspStyle = Tabs.Player:AddRightGroupbox("Style", "palette")
-		EspStyle:AddToggle("ESPHighlight", { Text = "Highlight Models", Default = true })
-		EspStyle:AddToggle("ESPDistanceText", { Text = "Show Distance", Default = true })
+		EspStyle:AddToggle("ESPHighlight", { Text = "Highlight Models", Default = true, Tooltip = "Outlines the models, not only the text" })
+		EspStyle:AddToggle("ESPDistanceText", { Text = "Show Distance", Default = true, Tooltip = "Adds the distance in studs" })
 		EspStyle:AddSlider("ESPDistance", { Text = "Max Distance", Default = 1500, Min = 100, Max = 10000, Rounding = 0, Suffix = " studs" })
 		EspStyle:AddSlider("ESPTextSize", { Text = "Text Size", Default = 13, Min = 9, Max = 22, Rounding = 0 })
 	end
@@ -39463,6 +39816,7 @@ do
 			{ "StealPickups", "Steal Animals" },
 			{ "AutoPlace", "Auto Place Animals" },
 			{ "AutoTrain", "Auto Train" },
+			{ "AutoPlotUpgrade", "Plot Upgrades" },
 			{ "AutoSellSurplus", "Sell Surplus Animals" },
 		}) do
 			if Library.MirrorToggle then
@@ -39576,7 +39930,7 @@ do
 	function Debug.running()
 		local running = {}
 		for name, toggle in pairs(Toggles) do
-			if type(toggle) == "table" and toggle.Value == true and (string.sub(name, 1, 4) == "Auto" or name == "StealPickups" or name == "Noclip" or name == "SmartPlanner") then
+			if type(toggle) == "table" and toggle.Value == true and (string.sub(name, 1, 4) == "Auto" or name == "StealPickups" or name == "Noclip") then
 				table.insert(running, name)
 			end
 		end
@@ -39636,7 +39990,6 @@ do
 	Log.header = Debug.header
 end
 N.AllAutoToggles = {
-	"SmartPlanner",
 	"AutoFarm",
 	"StealPickups",
 	"AutoTrain",
@@ -40008,17 +40361,6 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 	end
 	if Tabs.Info then
 		pcall(function()
-			local StartBox = Tabs.Info:AddLeftGroupbox("Quick Start", "wand-sparkles")
-			StartBox:AddLabel({
-				Text = '<font transparency="0.4">Tell Corvus what to do in a few taps. Everything can be changed later.</font>',
-				DoesWrap = true,
-			})
-			StartBox:AddButton({
-				Text = "Open quick setup",
-				Func = function()
-					pcall(N.openWizard)
-				end,
-			})
 			local FeedbackBox = Tabs.FeedbackBox or Tabs.Info:AddLeftGroupbox("Feedback", "message-square")
 			FeedbackBox:AddDropdown("FeedbackType", { Text = "Type", Values = { "Idea", "Bug", "Question", "Other" }, Default = "Idea" })
 			FeedbackBox:AddInput("FeedbackText", { Text = "Message", Placeholder = "Tell Cinek what to add or fix...", Finished = false, Default = "" })
@@ -40068,7 +40410,6 @@ do
 	end
 	if Library.AddCommand then
 		pcall(function()
-			toggleCommand("planner", { "smart", "plan" }, { "SmartPlanner" }, "Smart Planner")
 			toggleCommand("farm", { "eggs", "autofarm" }, { "AutoFarm" }, "Break Eggs In Best Zone")
 			toggleCommand("steal", { "grab", "animals" }, { "StealPickups" }, "Steal Animals")
 			toggleCommand("train", { "treadmill" }, { "AutoTrain" }, "Auto Train")
@@ -40181,7 +40522,6 @@ do
 	if Library.SetQuickBar then
 		pcall(function()
 			Library:SetQuickBar({
-				{ Toggle = "SmartPlanner", Icon = "brain", Label = "Planner" },
 				{ Toggle = "AutoFarm", Icon = "egg", Label = "Eggs" },
 				{ Toggle = "StealPickups", Icon = "hand", Label = "Steal" },
 				{ Toggle = "AutoTrain", Icon = "footprints", Label = "Train" },
@@ -40191,106 +40531,6 @@ do
 				{ Toggle = "ESPEggs", Icon = "eye", Label = "ESP", Default = false },
 			})
 		end)
-	end
-	local SetupFlag = "Corvus/BSE_setup_done.txt"
-	function N.markSetupDone()
-		pcall(function()
-			if makefolder and isfolder and not isfolder("Corvus") then
-				makefolder("Corvus")
-			end
-			writefile(SetupFlag, "1")
-		end)
-	end
-	-- The wizard is for a first run only (live 2026-10-13: it opened on the owner's main although his saved config had
-	-- just autoloaded 29 toggles). A saved config (the SaveManager autoload file) counts as "seen" and writes the flag.
-	function N.setupDone()
-		local ok, done = pcall(function()
-			if isfile(SetupFlag) then
-				return true
-			end
-			local folders = { "BreakAndStealAnEgg", "Corvus/BreakAndStealAnEgg" }
-			if SaveManager and type(SaveManager.Folder) == "string" then
-				table.insert(folders, 1, SaveManager.Folder)
-			end
-			for _, folder in ipairs(folders) do
-				if isfile(folder .. "/settings/autoload.txt") then
-					return "config"
-				end
-			end
-			return false
-		end)
-		if ok and done == "config" then
-			log("SETUP wizard skipped: a saved config exists")
-			N.markSetupDone()
-			return true
-		end
-		return not ok or done == true
-	end
-	function N.openWizard()
-		if not Library.ShowWizard then
-			return
-		end
-		return Library:ShowWizard({
-			SkipText = "Skip",
-			FinishText = "Start",
-			Steps = {
-				{
-					Id = "tasks",
-					Title = "What should Corvus do for you?",
-					Description = "Pick everything you want running. Tap again to unpick.",
-					Multi = true,
-					Required = true,
-					Default = {},
-					Choices = {
-						{ Id = "planner", Title = "Smart Planner", Description = "Plans the farm by real game odds: zones, eggs, stealing, placing, training, upgrades, merge eggs, free rewards", Icon = "brain", Color = "#60d696" },
-						{ Id = "eggs", Title = "Break eggs", Description = "Breaks eggs in the best zone you can escape and brings the animals home", Icon = "egg", Color = "#fab428" },
-						{ Id = "wild", Title = "Steal animals", Description = "Steals animals lying in the zones that make more money than your weakest pet", Icon = "hand", Color = "#3ccf91" },
-						{ Id = "train", Title = "Train speed", Description = "Uses your treadmill between egg runs, speed opens new zones", Icon = "footprints", Color = "#5fb8ff" },
-						{ Id = "place", Title = "Place animals", Description = "Places every animal you bring home on your plot", Icon = "layout-grid", Color = "#c77dff" },
-						{ Id = "upgrades", Title = "Buy upgrades", Description = "Best pickaxe, trail, plot and treadmill when you can afford them", Icon = "arrow-big-up", Color = "#ff9a3c" },
-						{ Id = "rewards", Title = "Claim rewards", Description = "Index cash and bats, offline cash, group reward", Icon = "gift", Color = "#ff5d8f" },
-					},
-				},
-				{
-					Id = "move",
-					Title = "How should Corvus travel?",
-					Description = "You can change this later in the Player tab.",
-					Default = "Fast",
-					SingleColumn = true,
-					ChoiceHeight = 54,
-					Choices = {
-						{ Id = "Fast", Title = "Fast", Description = "Glides a bit above your own speed, drops to Walk for a while if the server pulls you back", Icon = "wind", Color = "#5fb8ff" },
-						{ Id = "Walk", Title = "Walk", Description = "Runs with your own speed", Icon = "footprints", Color = "#60d696" },
-						{ Id = "Teleport", Title = "Teleport", Description = "Instant, the game blocks banking right after a teleport", Icon = "zap", Color = "#ff5d8f" },
-					},
-				},
-			},
-			Finish = function(values)
-				local chosen = type(values.tasks) == "table" and values.tasks or {}
-
-				local groups = {
-					planner = { "SmartPlanner" },
-					eggs = { "AutoFarm" },
-					wild = { "StealPickups" },
-					train = { "AutoTrain" },
-					place = { "AutoPlace" },
-					upgrades = { "AutoPickaxe", "AutoTrail", "AutoPlotUpgrade", "AutoTreadmill" },
-					rewards = { "AutoIndex", "AutoOffline", "AutoGroup" },
-				}
-				for id, names in pairs(groups) do
-					setToggles(names, { if chosen[id] then "on" else "off" })
-				end
-				if type(values.move) == "string" then
-					pcall(Options.MoveMode.SetValue, Options.MoveMode, values.move)
-				end
-				N.markSetupDone()
-				notify("Quick setup done", "Change anything in the tabs any time", 5)
-			end,
-			Skipped = function()
-				N.markSetupDone()
-				notify("Quick setup", "Skipped. Open it again from the Info tab.", 4)
-			end,
-		})
 	end
 end
 
@@ -40424,7 +40664,7 @@ do
 	end
 	-- Nothing moves the character unless the player turned an automation on (Leave Hell and the fall rescue included).
 	local function anyAutoOn()
-		return on("SmartPlanner") or on("AutoFarm") or on("StealPickups") or on("AutoTrain") or on("AutoSell") or on("AutoPlace") or on("AutoHell")
+		return on("AutoFarm") or on("StealPickups") or on("AutoTrain") or on("AutoSell") or on("AutoPlace") or on("AutoHell")
 	end
 	N.anyAutoOn = anyAutoOn
 	task.spawn(function()
@@ -40464,7 +40704,7 @@ do
 				if choreDue("place", 2) then
 					N.placeStep(false)
 				end
-				if (on("AutoSell") or on("AutoSellSurplus") or N.planOn()) and choreDue("sell", 10) and N.sellStep(false) then
+				if (on("AutoSell") or on("AutoSellSurplus")) and choreDue("sell", 10) and N.sellStep(false) then
 					return
 				end
 				if choreDue("shop", 4) and N.shopStep() then
@@ -40480,18 +40720,22 @@ do
 					return
 				end
 				local farmOn = on("AutoFarm") or on("StealPickups")
-				if not N.carrying() and N.wantTrain(nil) then
+				-- Training only in bouts between egg trips (N.trainGate, p06_train_shop): it never blocks breaking, grabbing,
+				-- banking or placing.
+				if N.trainGate() then
 					if N.trainStep() then
 						return
 					end
+					N.Train.boutUntil = nil
 				else
 					if N.Train.startedAt then
 						N.leaveTreadmill()
 					end
 					if (farmOn or N.carrying()) and N.farmStep() then
+						N.Train.idleSince = nil
 						return
 					end
-					if on("AutoTrain") and not N.carrying() and N.wantTrain(false) and N.trainStep() then
+					if N.trainIdle() and N.trainStep() then
 						return
 					end
 				end
@@ -40533,15 +40777,15 @@ do
 			task.wait(0.4)
 		end
 	end)
-	-- Treadmill watchdog (tester clip 2026-10-07: the character kept running on the treadmill while the planner wanted
-	-- to farm). Planner on and no progress (power, cash, eggs, hits, banked) for 25 s, or the character still on the
+	-- Treadmill watchdog (tester clip 2026-10-07: the character kept running on the treadmill while the profit plan wanted
+	-- to farm). Auto Train with a farm toggle on and no progress (power, cash, eggs, hits, banked) for 25 s, or the character still on the
 	-- treadmill 8 s after the plan switched to farm: stand up, step off, re-plan.
 	task.spawn(function()
 		local W = { sig = nil, since = os.clock(), offSince = nil, recoveredAt = -1e9 }
 		while alive() do
 			task.wait(2)
 			pcall(function()
-				if not (N.planOn() and anyAutoOn()) or N.manualRunning() or N.flung() or N.inHell() or N.tutorial() then
+				if not (on("AutoTrain") and (on("AutoFarm") or on("StealPickups"))) or N.manualRunning() or N.flung() or N.inHell() or N.tutorial() then
 					W.sig, W.since, W.offSince = nil, os.clock(), nil
 					return
 				end
@@ -40554,7 +40798,7 @@ do
 				if sig ~= W.sig then
 					W.sig, W.since = sig, now
 				end
-				local farmPlanned = N.Plan.activity ~= "train" and not N.carrying()
+				local farmPlanned = not N.trainBoutActive() and not (optionText("TrainMode", "Profit plan") == "Alternate" and N.Train.phase == "train") and not N.carrying()
 				local onTreadmill = N.Train.startedAt ~= nil or LocalPlayer:GetAttribute("PublicTreadmillSlot") ~= nil
 				local _, hitbox = N.treadmill()
 				if not onTreadmill and hitbox and (root.Position - hitbox.Position).Magnitude < 5 and farmPlanned then
@@ -40632,19 +40876,19 @@ do
 					if zone then zone.rarity else "?",
 					if nextZone then string.format("\nNext: zone %d at <b>%s</b> speed", nextZone.index, formatNumber(nextZone.power)) else "\nEvery zone is open"
 				) .. (if N.tutorial() then '\n<font color="#fab428">Game tutorial: ' .. tostring(N.tutorialStage() or "running") .. ", Corvus plays it through</font>" else "")
-				-- Up next: what every enabled main toggle is doing, in plain words (raw PLAN lines only go to the log).
+				-- Up next: what every enabled main toggle is doing, in plain words (raw DECIDE lines only go to the log).
 				do
 					local P = N.Plan
 					local lines = {}
-					if N.planOn() then
-						local top = P.valid and P.valid[1]
-						table.insert(lines, "<b>Smart Planner</b>: " .. (if P.activity == "train" then "training to " .. formatNumber(P.trainTarget or 0) .. " speed" else "farming zone " .. tostring(P.farmZone or N.bestZone())) .. (if top then string.format(", next buy %s for $%s %s", tostring(top.label), formatNumber(top.cost), if (top.eta or 0) <= 0 then "now" else "in " .. P.formatSeconds(math.min(top.eta, 1e7))) else ", " .. P.shortNoBuy()))
-					end
 					if on("AutoIndex") or on("AutoOffline") or on("AutoGroup") or on("AutoCommunity") then
 						table.insert(lines, "<b>Rewards</b>: " .. N.Rewards.upNextText())
 					end
 					if on("AutoFarm") then
-						table.insert(lines, string.format("<b>Break Eggs</b>: zone %d, %s", N.bestZone(), optionText("EggPriority", "Best value per second")))
+						table.insert(lines, string.format("<b>Break Eggs</b>: zone %d, %s%s", N.bestZone(), string.lower(optionText("EggPriority", "Best value per second")), if P.zoneNote then " (" .. tostring(P.zoneNote) .. ")" else ""))
+					end
+					if N.buyingOn() or on("AutoPickaxe") or on("AutoTrail") then
+						local top = P.valid and P.valid[1]
+						table.insert(lines, "<b>Upgrades</b>: " .. (if top then string.format("next %s for $%s %s, pays back in %s", tostring(top.label), formatNumber(top.cost), if (top.eta or 0) <= 0 then "now" else "in " .. P.formatSeconds(math.min(top.eta, 1e7)), P.formatSeconds(math.min(top.payback or 0, 1e7))) else P.shortNoBuy()))
 					end
 					if on("StealPickups") then
 						table.insert(lines, "<b>Steal Animals</b>: takes animals that beat your weakest pet")
@@ -40653,7 +40897,7 @@ do
 						table.insert(lines, string.format("<b>Auto Place</b>: %d placed, %d in backpack, %d placed this session", #N.placedAnimals(), N.backpackCount(), Session.placed))
 					end
 					if on("AutoTrain") then
-						table.insert(lines, "<b>Auto Train</b>: " .. (if N.Train.startedAt then "on the treadmill now" else "when the plan says speed pays more"))
+						table.insert(lines, "<b>Auto Train</b>: " .. (if N.Train.startedAt then "on the treadmill now" .. (if P.trainTarget then ", goal " .. formatNumber(P.trainTarget) .. " speed" else "") elseif P.activity == "train" then "going to the treadmill" else "farming first, speed does not pay more yet"))
 					end
 					if on("AutoSellSurplus") or on("AutoSell") then
 						table.insert(lines, string.format("<b>Selling</b>: sold %d, protected %s", Session.sold, table.concat(N.protectText(), ", ")))
@@ -40668,7 +40912,7 @@ do
 						table.insert(lines, "<b>Hell Boss</b>: " .. N.hellStatusText())
 					end
 					if #lines == 0 then
-						table.insert(lines, '<font transparency="0.4">Nothing is on. Turn on Smart Planner or any toggle on the left.</font>')
+						table.insert(lines, '<font transparency="0.4">Nothing is on. Turn on a Quick Start toggle on the left.</font>')
 					end
 					I.upnext = table.concat(lines, "\n")
 				end
@@ -40801,14 +41045,21 @@ do
 					)
 				end
 				I.move = string.format(
-					"Speed now <b>%s</b> studs/s%s%s\nSnapbacks <b>%d</b>  \u{00B7}  blocked <b>%d</b>",
-					if N.moveMode() == "Teleport" then "\u{221E}" else formatNumber(math.floor(N.modeSpeed())),
+					"Speed now <b>%s</b> studs/s  \u{00B7}  Fast boost <b>%d%%</b> (carrying %d%%)%s%s\nEmpty-leg teleport: <b>%s</b>\nSnapbacks <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>  \u{00B7}  blocked <b>%d</b>",
+					if N.moveMode() == "Teleport" and not N.carrying() then "\u{221E}" else formatNumber(math.floor(N.modeSpeed())),
+					N.fastPct(false),
+					N.fastPct(true),
 					if os.clock() < N.Moves.slowUntil then '  <font color="#fab428">(slowed after a snapback)</font>' else "",
 					(function()
 						local fell, wait = N.moveFallback()
-						return if fell then string.format("\n%s after snapbacks, %s again in %dm", N.moveMode(), N.chosenMoveMode(), math.ceil(wait / 60)) else ""
+						return if fell then string.format("\n%s %d%% after snapbacks, one step faster in %dm", N.moveMode(), if N.moveMode() == "Fast" then N.fastPct(false) else 97, math.ceil(wait / 60)) else ""
+					end)(),
+					(function()
+						local r = N.Moves.tp.result
+						return if r == "accepted" then "used" elseif r == "rejected" then "server pulls back, gliding" else "not tested yet"
 					end)(),
 					N.Moves.snaps,
+					N.Moves.ac,
 					N.Moves.blocked
 				)
 			end)
@@ -40855,36 +41106,32 @@ do
 				if shown(Tabs.Farm) then
 					group(function()
 						Labels.Guards:SetText(I.guards or "-")
-						Labels.Worst:SetText(I.worst or "-")
-					end)
-				end
-				if shown(Tabs.Plot) then
-					group(function()
-						Labels.Plot:SetText(I.plot or "-")
 						Labels.Train:SetText(I.train or "-")
+						Labels.Move:SetText(I.move or "-")
 					end)
 				end
-				if shown(Tabs.Items) then
+				if shown(Tabs.Animals) then
 					group(function()
+						Labels.Worst:SetText(I.worst or "-")
+						Labels.Plot:SetText(I.plot or "-")
 						Labels.Sell:SetText(I.sell or "-")
-						Labels.Merge:SetText(I.merge or "-")
-						Labels.Fuse:SetText(I.fuse or "-")
 					end)
 				end
 				if shown(Tabs.Upgrades) then
 					group(function()
 						Labels.Shop:SetText(I.shop or "-")
+					end)
+				end
+				if shown(Tabs.Events) then
+					group(function()
 						Labels.Hell:SetText(I.hell or "-")
+						Labels.Fuse:SetText(I.fuse or "-")
+						Labels.Merge:SetText(I.merge or "-")
 					end)
 				end
 				if shown(Tabs.Rewards) then
 					group(function()
 						Labels.Next:SetText(I.next or "-")
-					end)
-				end
-				if shown(Tabs.Player) then
-					group(function()
-						Labels.Move:SetText(I.move or "-")
 					end)
 				end
 				if shown(Tabs.Stats) then
@@ -40958,17 +41205,6 @@ do
 			if Library.IsMobile then "Loaded and ready. The round Corvus button opens and closes the hub." else "Loaded. Press " .. key .. " to hide or show the menu.",
 			5
 		)
-	end
-	if Library.ShowWizard and not N.setupDone() then
-		task.delay(1.5, function()
-			if anyAutoOn() then
-				N.markSetupDone()
-				return
-			end
-			if alive() then
-				pcall(N.openWizard)
-			end
-		end)
 	end
 end
 end, debug.traceback)
