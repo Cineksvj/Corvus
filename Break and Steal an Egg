@@ -33697,6 +33697,34 @@ do
 	end
 	-- Built once a second: planning a trip raycasts up to 60 times and each build walks every player's character.
 	local RayCache = { params = nil, at = -1e9 }
+	-- Zone 9 Galaxy decor (Stars, black hole models) hangs over the pit and is solid: never ground (player report 2026-10-14).
+	local Decor = { list = {}, at = -1e9 }
+	local function decorExcluded()
+		if os.clock() - Decor.at < 60 then
+			return Decor.list
+		end
+		Decor.at = os.clock()
+		local list = {}
+		pcall(function()
+			local build = workspace:FindFirstChild("Build")
+			local zones = build and build:FindFirstChild("ZoneBuilds")
+			local nine = zones and zones:FindFirstChild("Zone9")
+			if not nine then
+				return
+			end
+			local stars = nine:FindFirstChild("Stars")
+			if stars then
+				table.insert(list, stars)
+			end
+			for _, d in ipairs(nine:GetDescendants()) do
+				if (d:IsA("Model") or d:IsA("Folder")) and string.find(string.lower(d.Name), "black%s*hole") then
+					table.insert(list, d)
+				end
+			end
+		end)
+		Decor.list = list
+		return list
+	end
 	local function rayParams()
 		if RayCache.params and RayCache.char == character() and os.clock() - RayCache.at < 1 then
 			return RayCache.params
@@ -33715,6 +33743,9 @@ do
 				table.insert(list, player.Character)
 			end
 		end
+		for _, item in ipairs(decorExcluded()) do
+			table.insert(list, item)
+		end
 		params.FilterDescendantsInstances = list
 		pcall(function()
 			params.RespectCanCollide = true
@@ -33724,8 +33755,8 @@ do
 		return params
 	end
 	N.rayParams = rayParams
-	local function groundAt(x, z, fromY)
-		local top = (fromY or 200) + 60
+	local function groundAt(x, z, fromY, up)
+		local top = (fromY or 200) + (up or 60)
 		local ok, hit = pcall(function()
 			return workspace:Raycast(Vector3.new(x, top, z), Vector3.new(0, -top - 300, 0), rayParams())
 		end)
@@ -33742,8 +33773,8 @@ do
 		local half = root and root.Size.Y / 2 or 1
 		return hip + half + 0.1
 	end
-	function N.standAt(position)
-		local y = groundAt(position.X, position.Z, position.Y + 20)
+	function N.standAt(position, up)
+		local y = groundAt(position.X, position.Z, position.Y + 20, up)
 		if y then
 			return Vector3.new(position.X, y + N.standHeight(), position.Z)
 		end
@@ -33819,6 +33850,14 @@ do
 		local root = rootPart()
 		-- Walk mode only nudges small slips back, a long snap would look like a teleport to the game's anticheat.
 		local reach = if N.moveMode() == "Walk" then 8 else 60
+		-- Height watchdog: a star / decor part carried the character far above the egg ground.
+		if root and N.moveMode() ~= "Walk" and root.Position.Y - hold.position.Y > 15 and os.clock() - (N.Moves.downAt or -1e9) > 2 then
+			N.Moves.downAt = os.clock()
+			log("MOVE fallback down", brief(root.Position), "-> hold", brief(hold.position))
+			root.CFrame = CFrame.new(hold.position) * root.CFrame.Rotation
+			stopMotion(root)
+			return
+		end
 		if root and (root.Position - hold.position).Magnitude > (hold.slack or 3) and (root.Position - hold.position).Magnitude < reach then
 			root.CFrame = CFrame.new(hold.position) * root.CFrame.Rotation
 			stopMotion(root)
@@ -34403,6 +34442,10 @@ do
 		end
 		local maxHits = if valueMode then math.huge else math.max(optionNumber("MaxHits", 80), 1)
 		local titanicFirst = on("TitanicFirst")
+		if optionText("ZoneMode", "Best zone") == "Picked zones" and not F.zonePickSaid then
+			F.zonePickSaid = true
+			log("ZONE picked " .. table.concat(picked(Options.ZonePick), ", ") .. " (Titanic and the planner stay inside the picked zones)")
+		end
 		local others = if on("AvoidPlayers") then otherPositions() else {}
 		local best, bestScore
 		-- Tutorial stage "Break a Stronger Egg" (TutorialConfig.StrongEggMinTier 2, EggRarity.IsStrongerEgg, dump 123514-123531):
@@ -34443,7 +34486,7 @@ do
 			local event = titanicFirst and info.titanic
 			local special = event or (titanicFirst and info.bracket == "TITANIC")
 			if
-				(N.zoneAllowed(info.zone) or (special and N.canEscape(info.zone)))
+				(N.zoneAllowed(info.zone) or (special and optionText("ZoneMode", "Best zone") ~= "Picked zones" and N.canEscape(info.zone)))
 				and info.hits <= (if event then maxHits * 10 else maxHits)
 				and (F.failedEggs[info.part] or 0) < os.clock()
 				and (event or allows(Options.EggPick, info.kind))
@@ -34741,7 +34784,14 @@ do
 				stand = info.position + dir.Unit * (info.radius + 3)
 			end
 		end
-		stand = N.standAt(stand)
+		stand = N.standAt(stand, -12)
+		do
+			local floorY = info.position.Y - (egg.Size.Y / 2)
+			if stand.Y - floorY > N.standHeight() + 6 then
+				log("EGG stand too high", string.format("%.1f vs %.1f", stand.Y, floorY))
+				stand = Vector3.new(stand.X, info.position.Y, stand.Z)
+			end
+		end
 		setStatus(string.format("Going to %s in zone %d (%d hits)", info.kind, info.zone, info.hits))
 		local keep = function()
 			return live(egg) and on("AutoFarm") and not N.carrying()
