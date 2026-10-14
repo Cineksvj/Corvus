@@ -13,12 +13,12 @@ end
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
--- The game version this hub was built and audited on (live check 2026-10-13 on 3933, dump/CHANGES_3933.md: the code dump
--- stays 3687 because Potassium's decompiler fails on 3933 bytecode; remotes 257 -> 269 with nothing removed, every remote
--- the hub fires unchanged, configs read live via require identical; the game now streams menus/modules on demand
--- (LazyContentService), so client modules may appear late: the hide-wrappers in p04 attach when a module arrives).
--- Info and Main show it next to the live game.PlaceVersion.
-local BUILT_ON = 3933
+-- The game version this hub was built and audited on: 3937, from the full decompiled client code
+-- (dump/TapSimulatorReborn_Scripts_bc.lua, blatant.md "3937 code pass"): every remote the hub fires keeps its 3687
+-- argument shape (notes.md "Remotes on 3937"); new in the hub for 3937: the secret release, Craft All, the hatch-hold
+-- valuation and Godly Hatches. The game streams menus/modules on demand (LazyContentService), so client modules may
+-- appear late: the hide-wrappers in p04 attach when a module arrives. Info and Main show it next to game.PlaceVersion.
+local BUILT_ON = 3937
 do
 	local waited = 0
 	local ok = false
@@ -32784,13 +32784,25 @@ do
 		["AutoClickService.RE.AutoClickRequested"] = function(t, ...)
 			return select("#", ...) == 0 and onlyKeys(t, { Enabled = true }) and type(t.Enabled) == "boolean"
 		end,
+		-- 3937 (bc 62696-62706): {Egg, Count, Auto, Godly?, Seq}; Godly = true only with Auto = false and as many Godly
+		-- Hatch items as the count (the client's own check, requestHatch 62718-62731), only from the Use Godly Hatches toggle.
 		["EggService.RE.EggHatchRequested"] = function(t, ...)
 			return select("#", ...) == 0
-				and onlyKeys(t, { Egg = true, Count = true, Auto = true, Seq = true })
+				and onlyKeys(t, { Egg = true, Count = true, Auto = true, Godly = true, Seq = true })
 				and N.validEgg(t.Egg)
 				and (t.Count == 1 or t.Count == 3 or (t.Count == 8 and N.hasX8()))
 				and type(t.Auto) == "boolean"
+				and (t.Godly == nil or (t.Godly == true and t.Auto == false and N.GodlyToken == t.Seq and N.godlyCount() >= t.Count))
 				and isInt(t.Seq, 1)
+		end,
+		-- G1 secret_release (3937 code pass): the two calls the game's own reveal sends when a Secret's reveal ends
+		-- (revealSecret bc 63737-63740; the egg-not-loaded path fires SecretAnimationCompleted alone, 63825-63833). Only
+		-- {PetId} of a Secret from our own hatch answer that the release step has armed, once per id.
+		["EggService.RE.SecretAnimationCompleted"] = function(t, ...)
+			return select("#", ...) == 0 and onlyKeys(t, { PetId = true }) and isStr(t.PetId) and N.secretArmed(t.PetId)
+		end,
+		["EggService.RE.SecretRevealSeen"] = function(t, ...)
+			return select("#", ...) == 0 and onlyKeys(t, { PetId = true }) and isStr(t.PetId) and N.secretArmed(t.PetId)
 		end,
 		["EggService.RE.StopOfflineHatch"] = true,
 		-- strategy.md item 9 (Offline mode): the game's own delete-on-hatch list (EggController 189489-189492): a species per
@@ -32821,6 +32833,9 @@ do
 				return onlyKeys(t, { Action = true, PetId = true }) and isStr(t.PetId) and N.ownsPet(t.PetId)
 			elseif t.Action == "Delete" then
 				return onlyKeys(t, { Action = true, PetIds = true, Batch = true }) and N.DeleteToken == t.PetIds and unique(t.PetIds, 400) and isInt(t.Batch, 1)
+			elseif t.Action == "ToggleLock" then
+				-- R13 (OWNER_RULES 23): only the Secret lock step, only for the one owned pet it armed (bc 67575-67578)
+				return onlyKeys(t, { Action = true, PetId = true }) and isStr(t.PetId) and N.ownsPet(t.PetId) and N.lockArmed ~= nil and N.lockArmed(t.PetId)
 			end
 			return false
 		end,
@@ -32834,6 +32849,18 @@ do
 				return onlyKeys(t, { Action = true, Machine = true, PetIds = true }) and t.Machine == "Shiny" and N.CraftToken == t.PetIds and unique(t.PetIds, 5) and #t.PetIds >= 2
 			elseif t.Action == "Claim" then
 				return onlyKeys(t, { Action = true, Machine = true, CraftId = true }) and t.Machine == "Shiny" and isStr(t.CraftId)
+			elseif t.Action == "CraftAll" then
+				-- G2 (3937, sendCraftAll bc 71317-71347): {Machine, Action="CraftAll", Names}; the hub always names the
+				-- species of its own plan (never nil = "every species"), a unique ASCII list built by N.craftAllPlan
+				if not (onlyKeys(t, { Action = true, Machine = true, Names = true }) and (t.Machine == "Golden" or t.Machine == "Diamond") and N.CraftToken == t.Names and unique(t.Names, 200)) then
+					return false
+				end
+				for _, name in ipairs(t.Names) do
+					if #name > 100 or string.find(name, "[\128-\255]") then
+						return false
+					end
+				end
+				return true
 			end
 			return false
 		end,
@@ -32848,6 +32875,16 @@ do
 			return select("#", ...) == 0 and onlyKeys(t, { Action = true, Zone = true }) and t.Action == "Purchase" and N.zoneInfo(t.Zone) ~= nil
 		end,
 		["PetIndexService.RE.ClaimAllRequested"] = true,
+		-- R13 (2026-10-13, OWNER_RULES 24): the single index claims of the game's own menus, for what Claim All leaves:
+		-- RewardClaimRequested(page) = an egg page / the Secrets page (3937 PetIndexNew Claim, bc 75762-75768; 3687
+		-- claimItem L205667-205672), PetRewardClaimRequested(name, tier) = one pet in one tier (3687 L205656-205662). Only
+		-- what the game's own PetIndexCatalog.Claimables lists at that moment (N.indexClaimable, p05_more).
+		["PetIndexService.RE.RewardClaimRequested"] = function(page, ...)
+			return select("#", ...) == 0 and isStr(page) and N.indexClaimable ~= nil and N.indexClaimable("Egg", page, nil)
+		end,
+		["PetIndexService.RE.PetRewardClaimRequested"] = function(name, tier, ...)
+			return select("#", ...) == 0 and isStr(name) and isStr(tier) and N.indexClaimable ~= nil and N.indexClaimable("Pet", name, tier)
+		end,
 		-- World events (blatant.md third pass): only uids the game announced to us, only blocks that exist.
 		["BalloonPartyService.RE.Hit"] = function(uid, ...)
 			return select("#", ...) == 0 and N.knownBalloon(uid)
@@ -33010,6 +33047,13 @@ do
 		end,
 		["EnchantService.RF.Resolve"] = function(t, ...)
 			return select("#", ...) == 0 and onlyKeys(t, { Token = true, UseNew = true }) and N.validEnchantToken(t.Token) and type(t.UseNew) == "boolean"
+		end,
+		-- R13 (3937 EnchantController bc 65163-65165, EnchantWindow claim() 192974-193013): the pet the game's own Auto Enchant
+		-- holds in the enchanter comes back with RF.Claim() (no arguments), only once its run is over (player attributes
+		-- EnchantHeldPet + EnchantHeldState "Done", the game's own Claimable rule bc 191917-191918). A free claim: it gives
+		-- the player's own pet back and uses nothing up.
+		["EnchantService.RF.Claim"] = function(...)
+			return select("#", ...) == 0 and N.enchantHeldDone ~= nil and N.enchantHeldDone()
 		end,
 		["MasteryService.RF.EquipRelic"] = function(t, ...)
 			return select("#", ...) == 0 and onlyKeys(t, { Name = true }) and N.ownsRelic(t.Name)
@@ -33298,6 +33342,8 @@ do
 		TreatXP = "Shared.Items.TreatXP",
 		Gifts = "Shared.Items.GiftConfig",
 		Duck = "Shared.Game.LuckyDuckyConfig",
+		-- R13: the offline grant check the game's own Claim uses (OfflineRewardsConfig.IsGrant, bc 31871-31884)
+		OfflineCfg = "Shared.Progression.OfflineRewardsConfig",
 		Onboarding = "Shared.Progression.OnboardingConfig",
 		BridgeZone = "Shared.Progression.BridgeFightZone",
 	}) do
@@ -33609,6 +33655,38 @@ do
 	function N.rarityOf(pet)
 		local cfg = N.tableOr(N.G.PetCfg)[pet.Name]
 		return pet.Rarity or (type(cfg) == "table" and cfg.Rarity) or "Common"
+	end
+	-- R13 (OWNER_RULES 20/23, the game's own Clean Up rule CleanUpRules.hasValue, 3937 bc 183637-183640): a pet that carries
+	-- something the player got or paid for is never deleted and never crafted by the hub: locked, frozen, a mutation
+	-- (Shiny, Void, Solar, Galaxy, Electric), electrified, an enchant in either slot, a nickname, a creator signature, a
+	-- serial number, and every Secret pet. Returns the reason, or nil for a plain copy.
+	function N.petValued(pet)
+		if type(pet) ~= "table" then
+			return "gone"
+		end
+		local function text(v)
+			return type(v) == "string" and v ~= "" and v ~= "None"
+		end
+		if pet.Locked == true then
+			return "locked"
+		elseif pet.Frozen ~= nil then
+			return "frozen"
+		elseif text(pet.Mutation) then
+			return tostring(pet.Mutation) .. " mutation"
+		elseif pet.Electrified == true or pet.Ex == true then
+			return "electrified"
+		elseif text(pet.Enchant) or text(pet.Enchant2) then
+			return "enchanted"
+		elseif pet.ChangedNickname == true then
+			return "nickname"
+		elseif pet.Signature ~= nil then
+			return "signed"
+		elseif pet.Serial ~= nil or pet.LeaderboardSerial ~= nil or pet.PendingSerial == true then
+			return "serial"
+		elseif string.match(tostring(N.rarityOf(pet) or ""), "^Secret") ~= nil then
+			return "Secret"
+		end
+		return nil
 	end
 	function N.maxLevel(pet)
 		local fn = N.G.PetLevel.GetMaxLevel
@@ -35073,7 +35151,17 @@ do
 		H.count = count
 		H.idleWhy = ""
 		H.session = egg
-		if not fire("EggService.RE.EggHatchRequested", { Egg = egg, Count = count, Auto = true, Seq = H.seq }) then
+		-- G7 (3937): Use Godly Hatches (its own toggle) spends one Godly Hatch per request on this same egg while a Luck or
+		-- Mythic window is live: {Egg, Count=1, Auto=false, Godly=true, Seq} like the game's own Godly mode (bc 62696-62706)
+		local args = { Egg = egg, Count = count, Auto = true, Seq = H.seq }
+		if N.godlyWanted and N.godlyWanted() then
+			args = { Egg = egg, Count = 1, Auto = false, Godly = true, Seq = H.seq }
+			H.count = 1
+			N.GodlyToken = H.seq
+		end
+		local sent = fire("EggService.RE.EggHatchRequested", args)
+		N.GodlyToken = nil
+		if not sent then
 			H.inFlight = false
 			H.nextAt = os.clock() + 0.5
 			return "not sent"
@@ -35206,7 +35294,9 @@ do
 				return n
 			end
 		end
-		return math.floor(amount * 80 + 0.5) * 10 * (N.rebirths() * 0.21875 + 1)
+		-- fallback = the 3937 formula for R >= 2 (bc 243325-243344: (R - 1) in the growth term)
+		local r = N.rebirths()
+		return math.floor(amount * 80 + 0.5) * 10 * ((if r >= 2 then r - 1 else r) * 0.21875 + 1)
 	end
 	function N.bestRebirth(budget)
 		for i = N.rebirthOptions(), 1, -1 do
@@ -35696,11 +35786,61 @@ do
 		return total
 	end
 	-- The strongest `slots` pets (default: every equip slot), leaving out the `skip` set.
+	-- G5 (3937 code pass): the game's Equip Best (Shared.Pets.PetBest, bc 239293-239833) now scores enchants, Celestial
+	-- Bond and Resonance, so its team can beat the hub's power-only pick in coins. Measured first: after each Equip Best
+	-- the game's team and the hub's pick are priced by the game's own PetBest.TeamValue(owned, ids, "Clicks") (power x the
+	-- team's Taps multiplier, 239351-239357, 239821-239830) and logged at most every 10 min; the decision stays power-based
+	-- until the live numbers are in (live_findings Round 12).
+	local PetBest = nil
+	local CompareAt = -1e9
+	function N.teamValue(ids)
+		if PetBest == nil then
+			PetBest = false
+			pcall(function()
+				local sharedFolder = ReplicatedStorage:FindFirstChild("Shared")
+				local inst = sharedFolder and sharedFolder:FindFirstChild("Pets")
+				inst = inst and inst:FindFirstChild("PetBest")
+				if inst and inst:IsA("ModuleScript") then
+					local mod = require(inst)
+					if type(mod) == "table" then
+						PetBest = mod
+					end
+				end
+			end)
+		end
+		if type(PetBest) ~= "table" or type(PetBest.TeamValue) ~= "function" then
+			return nil
+		end
+		local list = {}
+		for k, v in pairs(ids or {}) do
+			if type(k) == "string" and v == true then
+				table.insert(list, k)
+			elseif type(v) == "string" then
+				table.insert(list, v)
+			end
+		end
+		table.sort(list)
+		local ok, value = pcall(PetBest.TeamValue, N.owned(), list, "Clicks")
+		return if ok and N.finite(value) then value else nil
+	end
+	function N.equipBestCompare(own)
+		if os.clock() - CompareAt < 600 then
+			return
+		end
+		local theirs = N.teamValue(N.equippedSet())
+		local mine = N.teamValue(own)
+		if theirs and mine and mine > 0 then
+			CompareAt = os.clock()
+			log(string.format("EQUIP best game=%s own=%s diff=%+.1f%%", formatNumber(theirs), formatNumber(mine), (theirs / mine - 1) * 100))
+		end
+	end
 	function N.bestTeam(slots, skip)
 		local list = {}
+		-- R13: the pet the game's enchanter holds is not available (the game's own Equip Best leaves it out, bc 66706-66726)
+		local held = N.enchantHeldPet and N.enchantHeldPet()
 		for id, power in pairs(N.powers()) do
 			local pet = N.owned()[id]
-			if type(pet) == "table" and pet.Frozen == nil and not (skip and skip[id]) then
+			if type(pet) == "table" and pet.Frozen == nil and id ~= held and not (skip and skip[id]) then
 				table.insert(list, { id = id, power = tonumber(power) or 0 })
 			end
 		end
@@ -35767,75 +35907,112 @@ do
 		return optionText("EquipMode", "Best power") == "Level farming"
 	end
 	-- Pets the hub never crafts or deletes: equipped, the level team, locked, frozen, protected.
+	-- R13 (3937): also every pet of the game's saved teams (Data.PetTeams, the game's own CraftAllPlan.Kept bc 237226-237241
+	-- and Clean Up bc 183646-183658) and the pet the game's enchanter holds (EnchantHeldPet, Clean Up bc 183659-183661,
+	-- Equip Best bc 66706-66726).
 	function N.keepSet()
 		local keep = N.equippedSet()
 		for id in pairs(N.Equip.team) do
 			keep[id] = true
 		end
+		for _, team in pairs(N.sub(N.data() or {}, "PetTeams")) do
+			if type(team) == "table" then
+				for _, id in pairs(team) do
+					if type(id) == "string" then
+						keep[id] = true
+					end
+				end
+			end
+		end
+		local held = N.enchantHeldPet and N.enchantHeldPet()
+		if held then
+			keep[held] = true
+		end
 		return keep
 	end
 	-- Remote-only, so it runs during trips too (live 7: the level team waited 10 minutes for trips that never ended); only a
 	-- craft trip's pet lock holds it (petChore in p11).
-	-- Builder M (owner 2026-10-12, alt log: `equipped power 780`, 0 equips, every slot counted as "the owner's" because it
-	-- was equipped before the hub started): the Smart Planner alone keeps the BEST power team on, re-checked every 10 s
-	-- (after the hatches). Only pets the player equips BY HAND while the hub runs stay (an equip the hub did not send shows
-	-- up between two checks); everything else is the planner's to swap. Auto Equip on = the whole team as before.
+	-- R13 (OWNER_RULES 21 + the lead's mission 2026-10-13: "the planner alone never changes the team"): with Auto Equip off
+	-- the Smart Planner only fills EMPTY slots and later swaps only the pets it put there itself (Corvus/TAPSIM_team.txt,
+	-- REV-3); every pet the player equipped (before or while the hub runs) stays exactly where it is. Builder M's
+	-- "best team in every slot not equipped by hand during this session" swapped a team equipped before the hub started and
+	-- is gone. A better team waits for Auto Equip (Status and Up next say how much it would add). Auto Equip on = the whole
+	-- team, as before.
 	function N.fillTeam()
 		local E = N.Equip
 		local equipped = N.equippedSet()
-		E.manual = E.manual or {}
-		if E.seen then
-			for id in pairs(equipped) do
-				if not E.seen[id] and not E.manual[id] then
-					E.manual[id] = true
-					local pet = N.owned()[id]
-					log(string.format("EQUIP kept %s: equipped by hand", tostring(type(pet) == "table" and pet.Name or id)))
-				end
+		local placed = placedSet()
+		local fixed, nFixed = {}, 0
+		local changed = false
+		for id in pairs(placed) do
+			if not equipped[id] then
+				-- unequipped since (by the player or the game): no longer the hub's slot
+				placed[id] = nil
+				changed = true
 			end
 		end
-		local fixed, nFixed = {}, 0
-		for id in pairs(E.manual) do
-			if equipped[id] then
+		for id in pairs(equipped) do
+			if not placed[id] then
 				fixed[id] = true
 				nFixed += 1
-			else
-				E.manual[id] = nil
 			end
 		end
-		E.seen = equipped
+		if changed then
+			savePlaced()
+		end
 		local free = N.equipLimit() - nFixed
 		E.mode = "fill"
+		-- what Auto Equip would add (shown, never done by the planner alone)
+		local _, bestAll = N.bestTeam()
+		local have = N.equippedPower()
+		E.better = if bestAll > have * 1.002 + 0.5 then bestAll - have else 0
 		if free <= 0 then
-			E.last = "Your own team stays as it is (every slot equipped by hand)"
+			E.last = string.format("Your team stays as you set it (Auto Equip off)%s", if E.better > 0 then string.format("; Auto Equip would add %s power", formatNumber(E.better)) else "")
 			return false
 		end
-		local team, sum = N.bestTeam(free, fixed)
+		local skip = table.clone(fixed)
+		local held = N.enchantHeldPet and N.enchantHeldPet()
+		if held then
+			skip[held] = true
+		end
+		local team, sum = N.bestTeam(free, skip)
 		local mine, count = 0, 0
-		for id in pairs(equipped) do
-			if not fixed[id] then
+		for id in pairs(placed) do
+			if equipped[id] then
 				mine += N.petPower(id)
 				count += 1
 			end
 		end
-		E.last = string.format("Smart Planner: best power in %d slot%s (%s of %s)%s", free, if free == 1 then "" else "s", formatNumber(mine), formatNumber(sum), if nFixed > 0 then string.format(", your %d pet%s equipped by hand kept", nFixed, if nFixed == 1 then "" else "s") else "")
+		E.last = string.format("Smart Planner: fills %d free slot%s (%s of %s)%s", free, if free == 1 then "" else "s", formatNumber(mine), formatNumber(sum), if nFixed > 0 then string.format(", your %d pet%s stay", nFixed, if nFixed == 1 then "" else "s") else "")
 		if not (sum > mine * 1.002 + 0.5 or (count < free and sum > mine)) or os.clock() - E.bestAt < 5 then
 			return false
 		end
 		E.bestAt = os.clock()
 		if N.planLog then
-			N.planLog("equip fill", string.format("equip the best power team in %d slot%s (+%s power)", free, if free == 1 then "" else "s", formatNumber(sum - mine)), 600, 30)
+			N.planLog("equip fill", string.format("fill %d free slot%s with the best power pets (+%s power), your %d pet%s stay", free, if free == 1 then "" else "s", formatNumber(sum - mine), nFixed, if nFixed == 1 then "" else "s"), 600, 30)
 		end
 		local swaps = N.swapTeam(team, fixed)
-		-- what the hub put on is not "by hand"
-		local expect = {}
+		-- the hub's slots = what it put on now (confirmed by the replica)
+		waitFor(function()
+			local now = N.equippedSet()
+			for id in pairs(team) do
+				if not now[id] then
+					return false
+				end
+			end
+			return true
+		end, 3)
+		local now = N.equippedSet()
+		table.clear(placed)
+		local nOn = 0
 		for id in pairs(team) do
-			expect[id] = true
+			if now[id] then
+				placed[id] = true
+				nOn += 1
+			end
 		end
-		for id in pairs(fixed) do
-			expect[id] = true
-		end
-		E.seen = expect
-		log(string.format("EQUIP best %d slot%s: %s -> %s (%d kept by hand, %d swaps)", free, if free == 1 then "" else "s", formatNumber(mine), formatNumber(sum), nFixed, swaps))
+		savePlaced()
+		log(string.format("EQUIP filled %d free slot%s: %s -> %s (%d of yours kept, %d swaps, %d on)", free, if free == 1 then "" else "s", formatNumber(mine), formatNumber(sum), nFixed, swaps, nOn))
 		return swaps > 0
 	end
 	-- Builder M (owner 2026-10-12): Auto Delete Junk deletes only after the team is the best one: the equipped pets (minus
@@ -35871,10 +36048,12 @@ do
 			end
 			return true, "level team on"
 		end
+		-- R13: without Auto Equip every pet the player equipped is his (only the hub's own filled slots count here)
 		local fixed, nFixed = {}, 0
 		if not on("AutoEquip") then
-			for id in pairs(N.Equip.manual or {}) do
-				if equipped[id] then
+			local placed = placedSet()
+			for id in pairs(equipped) do
+				if not placed[id] then
 					fixed[id] = true
 					nFixed += 1
 				end
@@ -35950,6 +36129,7 @@ do
 				return N.equippedPower() >= bestSum * 0.999
 			end, 3)
 			local after = N.equippedPower()
+			N.equipBestCompare(team)
 			if after >= bestSum * 0.999 then
 				if state == "untested" then
 					N.probeResult("equip_best_game", "accepted", string.format("gain=one call (the game's Equip Best reached %s)", formatNumber(after)))
@@ -36114,11 +36294,12 @@ do
 	function N.craftSetsFlush()
 		table.clear(SetCache)
 	end
-	buildSets = function(m, spent)
+	-- Every copy the hub itself would craft on this machine, grouped by species (leftovers under a full set included).
+	local function hubGroups(m, spent)
 		local cfg = N.machineCfg(m.key)
 		local need = N.craftCount(m)
 		if not cfg or not need then
-			return {}, need
+			return nil, need
 		end
 		spent = spent or {}
 		local keep = N.keepSet()
@@ -36128,9 +36309,14 @@ do
 		-- I-3518: the game's own machine asks before a Secret craft under 100 % and its Auto-fill skips Secret pets
 		-- (MachineController 3518 L198445-198500, L198737-198770); the hub leaves them out the same way.
 		-- Owner 2026-10-12 (OWNER_RULES 23): a Secret pet never goes into a machine, sure craft or not
+		-- 3937 (CraftAllPlan.IsSpare bc 237242-237244, the game's own "enchanted ... pets are kept" 71385): enchanted,
+		-- signed and leaderboard-serial copies keep what was paid for them, the hub never crafts them either
+		-- R13: and every other copy the game itself keeps (N.petValued = CleanUpRules.hasValue: mutations, nickname, serials;
+		-- the game's own machine auto-fill skips mutated copies too, MachineController bc 71591-71598)
 		for id, pet in pairs(N.owned()) do
 			local secret = type(pet) == "table" and string.match(tostring(N.rarityOf(pet) or ""), "^Secret") ~= nil
-			if type(pet) == "table" and not secret and pet.Tier == cfg.SourceTier and pet.Locked ~= true and pet.Frozen == nil and not keep[id] and not spent[id] and not protect[pet.Name] and type(pet.Name) == "string" and (only == nil or only[pet.Name]) then
+			local valued = type(pet) == "table" and (pet.Enchant ~= nil or pet.Enchant2 ~= nil or pet.Signature ~= nil or pet.LeaderboardSerial ~= nil or N.petValued(pet) ~= nil)
+			if type(pet) == "table" and not secret and not valued and pet.Tier == cfg.SourceTier and pet.Locked ~= true and pet.Frozen == nil and not keep[id] and not spent[id] and not protect[pet.Name] and type(pet.Name) == "string" and (only == nil or only[pet.Name]) then
 				local g = groups[pet.Name]
 				if not g then
 					g = {}
@@ -36138,6 +36324,14 @@ do
 				end
 				table.insert(g, { id = id, mut = pet.Mutation ~= nil, level = tonumber(pet.Level) or 1 })
 			end
+		end
+		return groups, need
+	end
+	N.craftHubGroups = hubGroups
+	buildSets = function(m, spent)
+		local groups, need = hubGroups(m, spent)
+		if not groups then
+			return {}, need
 		end
 		local sets = {}
 		for name, list in pairs(groups) do
@@ -36476,6 +36670,236 @@ do
 			C.gap = math.min(C.gap + 0.25, 4)
 		end
 	end
+	-- ===== G2 Craft All (3937 code pass; Goldens mastery level 4, MasteryConfig bc 241469-241472): one request
+	-- {Machine, Action="CraftAll", Names} (sendCraftAll 71317-71347) makes up to 60 sure crafts with the server's own spare
+	-- rule (Shared.Pets.CraftAllPlan 237217-237344: right tier, not locked/frozen/equipped/in a team, no mutation, enchant,
+	-- signature, leaderboard serial, not Secret; the needed count = the first one at 100 %; heaviest, then highest level
+	-- copies first). The hub's own protect list and level team are unknown to the server, so `Names` holds ONLY the species
+	-- whose every server-spare copy the hub would craft anyway (owner rules 20/23) and whose consumed copies are exactly the
+	-- ones the hub would take: all of them (count a multiple of the set size) or copies that do not differ in level/weight;
+	-- at most 60 crafts per request. After the answer the storage is checked: a copy outside the plan gone = probe craftall
+	-- rejected (remembered per PlaceVersion), the normal one-set crafting goes on. Only while "Craft All" (default off,
+	-- untested) is on. G3 craftall_far: once craftall was accepted, the first Craft All of a session is sent from where
+	-- the player stands; accepted = the Golden/Diamond trip is skipped whenever Craft All covers every set. =====
+	local CraftAllMod = nil
+	local function craftAllModule()
+		if type(CraftAllMod) ~= "table" then
+			pcall(function()
+				local sharedFolder = ReplicatedStorage:FindFirstChild("Shared")
+				local inst = sharedFolder and sharedFolder:FindFirstChild("Pets")
+				inst = inst and inst:FindFirstChild("CraftAllPlan")
+				if inst and inst:IsA("ModuleScript") then
+					local mod = require(inst)
+					if type(mod) == "table" then
+						CraftAllMod = mod
+					end
+				end
+			end)
+		end
+		return if type(CraftAllMod) == "table" then CraftAllMod else nil
+	end
+	C.allOff = {}
+	function N.craftAllUsable(m)
+		if m.key ~= "Golden" and m.key ~= "Diamond" then
+			return false, "machine"
+		end
+		if not on("CraftAll") then
+			return false, "Craft All is off"
+		end
+		if not N.machineOwn(m) then
+			return false, "index crafting"
+		end
+		if N.probeState("craftall") == "rejected" then
+			return false, "probe craftall rejected on this game version"
+		end
+		if (C.allOff[m.key] or 0) > os.clock() then
+			return false, "resting after a refusal"
+		end
+		local data = N.data()
+		local fn = N.G.Mastery.HasUnlock
+		if not data or type(fn) ~= "function" then
+			return false, "no mastery data"
+		end
+		local ok, yes = pcall(fn, data, "CraftAll")
+		if not (ok and yes == true) then
+			return false, "Goldens mastery level 4 not reached"
+		end
+		return true
+	end
+	-- The plan: {names = {...}, crafts = n, expected = {[name] = copies consumed}, ids = {consumed ids}} or nil, why.
+	function N.craftAllPlan(m, spent)
+		local usable, why = N.craftAllUsable(m)
+		if not usable then
+			return nil, why
+		end
+		local plan = craftAllModule()
+		if not plan or type(plan.IsSpare) ~= "function" or type(plan.Kept) ~= "function" then
+			return nil, "no CraftAllPlan module"
+		end
+		local cfg = N.machineCfg(m.key)
+		local need, sure = N.craftCount(m)
+		if not cfg or not need or not sure then
+			return nil, "not a 100 % craft"
+		end
+		local data = N.data()
+		local okK, kept = pcall(plan.Kept, data)
+		if not okK or type(kept) ~= "table" then
+			return nil, "kept list unreadable"
+		end
+		spent = spent or {}
+		local hub = N.craftHubGroups(m, spent) or {}
+		local hubIds = {}
+		for name, list in pairs(hub) do
+			for _, e in ipairs(list) do
+				hubIds[e.id] = name
+			end
+		end
+		local srv = {}
+		for id, pet in pairs(N.owned()) do
+			local okS, spare = pcall(plan.IsSpare, id, pet, cfg.SourceTier, kept)
+			if okS and spare == true and not spent[id] and type(pet.Name) == "string" then
+				srv[pet.Name] = srv[pet.Name] or {}
+				table.insert(srv[pet.Name], { id = id, w = tonumber(pet.Weight) or 0, l = tonumber(pet.Level) or 1 })
+			end
+		end
+		local names = {}
+		for name in pairs(srv) do
+			table.insert(names, name)
+		end
+		table.sort(names)
+		local out = { names = {}, crafts = 0, expected = {}, ids = {}, skipped = 0 }
+		local maxCrafts = tonumber(plan.MaxCrafts) or 60
+		for _, name in ipairs(names) do
+			local list = srv[name]
+			local sets = math.floor(#list / need)
+			if sets >= 1 then
+				local inside = not string.find(name, "[\128-\255]") and #name <= 100
+				for _, e in ipairs(list) do
+					if hubIds[e.id] ~= name then
+						inside = false
+						break
+					end
+				end
+				local same = true
+				for _, e in ipairs(list) do
+					if e.w ~= list[1].w or e.l ~= list[1].l then
+						same = false
+						break
+					end
+				end
+				if inside and (#list % need == 0 or same) and out.crafts + sets <= maxCrafts then
+					-- the server's own order (CraftAllPlan.Build 237303-237315): heaviest, then highest level, then id
+					table.sort(list, function(a, b)
+						if a.w ~= b.w then
+							return a.w > b.w
+						end
+						if a.l ~= b.l then
+							return a.l > b.l
+						end
+						return a.id < b.id
+					end)
+					table.insert(out.names, name)
+					out.crafts += sets
+					out.expected[name] = sets * need
+					for i = 1, sets * need do
+						table.insert(out.ids, list[i].id)
+					end
+				else
+					out.skipped += sets
+				end
+			end
+		end
+		if #out.names == 0 then
+			return nil, "no species fits Craft All"
+		end
+		return out
+	end
+	-- One Craft All request for the machine (the player at the machine, or anywhere when far=true). Returns crafts made.
+	function N.craftAllRun(m, spent, far)
+		local p, why = N.craftAllPlan(m, spent)
+		if not p then
+			return 0, why
+		end
+		-- the machine's source-tier copies before the request (copies an earlier craft of this trip used are left out:
+		-- they leave the lagging replica by themselves)
+		local tier = N.machineCfg(m.key).SourceTier
+		local before = {}
+		for id, pet in pairs(N.owned()) do
+			if type(pet) == "table" and pet.Tier == tier and not spent[id] then
+				before[id] = tostring(pet.Name)
+			end
+		end
+		local t0 = os.clock()
+		N.CraftToken = p.names
+		local ok, info = craftRequest({ Machine = m.key, Action = "CraftAll", Names = p.names }, m.key)
+		N.CraftToken = nil
+		local elapsed = os.clock() - t0
+		if not ok then
+			local reason = string.lower(tostring(info))
+			local nearCheck = string.find(reason, "near", 1, true) or string.find(reason, "far", 1, true)
+			if far and nearCheck then
+				N.probeResult("craftall_far", "rejected", "gain=0 reason=" .. tostring(info))
+				return 0, "far refused"
+			end
+			local busy = string.find(reason, "busy", 1, true) or string.find(reason, "wait", 1, true) or reason == "no answer"
+			C.allOff[m.key] = os.clock() + (if busy then 30 else 600)
+			log("CRAFT all", m.key, "refused:", tostring(info), if busy then "(retry in 30 s)" else "(one set per request for 10 min)")
+			if not busy and not nearCheck and N.probeState("craftall") == "untested" then
+				N.probeResult("craftall", "rejected", "gain=0 reason=" .. tostring(info))
+			end
+			return 0, tostring(info)
+		end
+		for _, id in ipairs(p.ids) do
+			spent[id] = true
+		end
+		N.closeRoll()
+		-- the replica lags 1-3 s: wait until the planned copies are gone, then compare the storage with the plan
+		waitFor(function()
+			for _, id in ipairs(p.ids) do
+				if N.ownsPet(id) then
+					return false
+				end
+			end
+			return true
+		end, 4)
+		local lost = {}
+		local owned = N.owned()
+		for id, name in pairs(before) do
+			if owned[id] == nil then
+				lost[name] = (lost[name] or 0) + 1
+			end
+		end
+		local outside = 0
+		for name, n in pairs(lost) do
+			outside += math.max(n - (p.expected[name] or 0), 0)
+		end
+		local crafted = tonumber(type(info) == "table" and info.Crafted) or p.crafts
+		local consumed = tonumber(type(info) == "table" and info.Consumed) or #p.ids
+		local lucky = 0
+		if type(info) == "table" and type(info.Pets) == "table" then
+			for _, e in ipairs(info.Pets) do
+				if type(e) == "table" and e.Lucky == true then
+					lucky += tonumber(e.Count) or 0
+				end
+			end
+		end
+		Session.crafts[m.key] = (Session.crafts[m.key] or 0) + crafted
+		C.last[m.key] = string.format("Craft All: %d crafts from %d copies (%d species)", crafted, consumed, #p.names)
+		local saved = crafted * (C.gap + 0.3) - elapsed
+		log(string.format("CRAFT all %s crafts=%d consumed=%d lucky=%d species=%d left to single crafts=%d in %.1fs%s", m.key, crafted, consumed, lucky, #p.names, p.skipped, elapsed, if far then " (from where the player stands)" else ""))
+		if outside > 0 then
+			logProblem(string.format("Craft All took %d pet%s outside the hub's plan; Craft All is off for this game version", outside, if outside == 1 then "" else "s"))
+			N.probeResult("craftall", "rejected", string.format("gain=0 outside_plan=%d", outside))
+			return crafted
+		end
+		if N.probeState("craftall") == "untested" then
+			N.probeResult("craftall", "accepted", string.format("gain=%.1fs crafts=%d consumed=%d lucky=%d", saved, crafted, consumed, lucky))
+		end
+		if far and N.probeState("craftall_far") == "untested" then
+			N.probeResult("craftall_far", "accepted", "gain=trip skipped")
+		end
+		return crafted
+	end
 	function N.craftMachine(m, stopAt)
 		local key = m.key
 		-- Owner's live lesson: the replica lags 1-3 s after a craft, so the pets a craft took stay in the data for a moment;
@@ -36492,11 +36916,27 @@ do
 		if #sets == 0 and #claims == 0 then
 			return 0
 		end
+		local done = 0
+		-- G3: Craft All from where the player stands (once per session to probe it, always once accepted); when it covers
+		-- every set of this machine the trip to it is skipped
+		if key ~= "Shiny" and N.craftAllUsable(m) and N.probeState("craftall") == "accepted" then
+			local farState = N.probeState("craftall_far")
+			if farState == "accepted" or (farState == "untested" and not C.farTried) then
+				C.farTried = true
+				done += N.craftAllRun(m, spent, true)
+				if done > 0 and #N.craftSets(m, spent) == 0 then
+					return done
+				end
+			end
+		end
 		local part = N.goToMachine(m)
 		if not part then
-			return 0
+			return done
 		end
-		local done = 0
+		-- G2: Craft All at the machine first (every species that fits), then one set per request for the rest
+		if key ~= "Shiny" and N.craftAllUsable(m) then
+			done += N.craftAllRun(m, spent, false)
+		end
 		for _, craftId in ipairs(claims) do
 			local ok, info = craftRequest({ Machine = "Shiny", Action = "Claim", CraftId = craftId }, "Shiny")
 			if ok then
@@ -36801,9 +37241,18 @@ do
 		local keep = N.keepSet()
 		local protect = N.protectedNames()
 		local powers = N.powers()
+		-- R13: without Auto Equip the player's own team stays as he set it, so the pets that would make the best power team
+		-- are never deleted either (he may still put them on); with Auto Equip the delete waits for that team (p11)
+		if not on("AutoEquip") then
+			for id in pairs(N.bestTeam()) do
+				keep[id] = true
+			end
+		end
 		local out = {}
 		for id, pet in pairs(N.owned()) do
-			if type(pet) == "table" and not keep[id] and pet.Locked ~= true and pet.Frozen == nil and not protect[pet.Name] then
+			-- R13 (OWNER_RULES 20/23, CleanUpRules.hasValue bc 183637-183640): never a pet with a mutation, an enchant, a
+			-- nickname, a signature or a serial, never a Secret (N.petValued)
+			if type(pet) == "table" and not keep[id] and pet.Locked ~= true and pet.Frozen == nil and not protect[pet.Name] and N.petValued(pet) == nil then
 				local rarity = N.rarityOf(pet)
 				local tier = pet.Tier or "Normal"
 				local secret = string.match(tostring(rarity), "^Secret") ~= nil or (N.indexIsSecret ~= nil and N.indexIsSecret(pet.Name))
@@ -36971,6 +37420,10 @@ do
 		return false
 	end
 	N.due = due
+	-- tests and the manual console: run a paced step now
+	function N.dueReset(key)
+		Due[key] = nil
+	end
 	local function ok(result)
 		return type(result) == "table" and (result.Success == true or result.Accepted == true)
 	end
@@ -36989,17 +37442,58 @@ do
 		N.Reward.last = text
 		log("CLAIM", text)
 	end
+	-- R13 (OWNER_RULES 24, owner 2026-10-13: "a hub log line is not proof"): every claim below logs success only when the
+	-- game state confirms it (the server's answer AND the data field / the claimable list changed); otherwise
+	-- `CLAIM <what> FAILED answer=<the server's reply>` and the claim is tried again later.
+	local function failed(what, answer, extra)
+		log(string.format("CLAIM %s FAILED answer=%s%s", what, brief(answer), extra or ""))
+	end
+	N.claimFailed = failed
 	-- Each claim is its own toggle (owner rule); every function below is one of them.
-	function N.offlineStep()
-		local offline = N.sub(N.data(), "Offline")
-		if type(offline.Pending) == "table" and due("offline", 30) then
-			if ok(invoke("OfflineRewardsService.RF.Claim")) then
-				note("offline coins")
+	-- Offline coins: only a real grant (OfflineRewardsConfig.IsGrant, the game's own Claim check bc 31871-31910), counted
+	-- when the server says Success and the grant is gone from Offline.Pending. The hatch recap: the game's own client
+	-- acknowledges with RF.AcknowledgeHatches(Id) and counts it done when the answer is true or the recap is gone
+	-- (bc 64618-64644); the hub does the same.
+	local function offlineGrant(pending)
+		local isGrant = N.G.OfflineCfg and N.G.OfflineCfg.IsGrant
+		if type(isGrant) == "function" then
+			local okG, yes = pcall(isGrant, pending)
+			if okG then
+				return yes == true
 			end
 		end
-		if type(offline.HatchPending) == "table" and offline.HatchPending.Id ~= nil and due("ackHatch", 30) then
-			invoke("OfflineRewardsService.RF.AcknowledgeHatches", offline.HatchPending.Id)
-			note("offline hatch recap (" .. tostring(offline.HatchPending.Hatched or "?") .. " eggs)")
+		return type(pending) == "table"
+	end
+	N.offlineGrant = offlineGrant
+	function N.offlineStep()
+		local offline = N.sub(N.data(), "Offline")
+		local pending = offline.Pending
+		if offlineGrant(pending) and due("offline", 30) then
+			local grantedAt = type(pending) == "table" and pending.GrantedAt or nil
+			local coins = type(pending) == "table" and tonumber(pending.Coins) or nil
+			local result = invoke("OfflineRewardsService.RF.Claim")
+			local gone = waitFor(function()
+				local p = N.sub(N.data(), "Offline").Pending
+				return not offlineGrant(p) or (type(p) == "table" and p.GrantedAt ~= grantedAt)
+			end, 3)
+			if ok(result) and gone then
+				note("offline coins ok" .. (if coins then " +" .. formatNumber(coins) else ""))
+			else
+				failed("offline coins", result, if ok(result) then " (the grant is still pending)" else "")
+			end
+		end
+		local hp = offline.HatchPending
+		if type(hp) == "table" and hp.Id ~= nil and due("ackHatch", 30) then
+			local result = invoke("OfflineRewardsService.RF.AcknowledgeHatches", hp.Id)
+			local gone = waitFor(function()
+				local now = N.sub(N.data(), "Offline").HatchPending
+				return type(now) ~= "table" or now.Id ~= hp.Id
+			end, 3)
+			if gone or result == true then
+				note("offline hatch recap ok (" .. tostring(hp.Hatched or "?") .. " eggs)")
+			else
+				failed("offline hatch recap", result)
+			end
 		end
 	end
 	-- R6-2: what the server writes into Data.Quests, followed every few seconds: a new id = the server handed a quest out
@@ -37117,12 +37611,115 @@ do
 		N.questWatch()
 		N.claimQuests(false)
 	end
+	-- R13 (OWNER_RULES 24): the index claims are counted by the game's own list, PetIndexCatalog.Claimables(Data.Pets)
+	-- (3937 bc 240176-240201: one pet in one tier = Pets.IndexPetRewards["<name>_<tier>"], an egg page per tier =
+	-- Pets.IndexRewards[egg][tier], the Secrets page), before and after. Claim All first (the CLAIM ALL button, 3687
+	-- L206832-206841); what is still listed 4 s later goes through the game's own single claims, one call per egg page
+	-- (RewardClaimRequested(page)) and per pet tier (PetRewardClaimRequested(name, tier)), at most 40 per pass. The server's
+	-- RewardClaimResult {Success, Reason} (bc 75770-75780) is the answer in the FAILED line; a refused item rests 30 min.
+	N.IndexClaim = { result = nil, at = -1e9, rest = {}, total = 0 }
+	N.onEvent("PetIndexService.RE.RewardClaimResult", function(p)
+		if type(p) == "table" then
+			N.IndexClaim.result, N.IndexClaim.at = p, os.clock()
+		end
+	end)
+	local function indexClaimables()
+		if type(N.G.Index.Claimables) ~= "function" then
+			return nil
+		end
+		local okList, list = pcall(N.G.Index.Claimables, N.sub(N.data(), "Pets"))
+		return if okList and type(list) == "table" then list else nil
+	end
+	N.indexClaimables = indexClaimables
+	local function claimKey(c)
+		if type(c) == "table" then
+			return tostring(c.Kind) .. " " .. tostring(c.Name) .. (if c.Tier and c.Tier ~= "Normal" then " " .. tostring(c.Tier) else "")
+		end
+		return tostring(c)
+	end
+	function N.indexClaimable(kind, name, tier)
+		for _, c in ipairs(indexClaimables() or {}) do
+			if type(c) == "table" and c.Kind == kind and c.Name == name and (tier == nil or c.Tier == tier) then
+				return true
+			end
+		end
+		return false
+	end
 	function N.indexStep()
-		if due("index", 60) and type(N.G.Index.Claimables) == "function" then
-			local okList, list = pcall(N.G.Index.Claimables, N.sub(N.data(), "Pets"))
-			if okList and type(list) == "table" and #list > 0 then
-				fire("PetIndexService.RE.ClaimAllRequested")
-				note("pet index (" .. #list .. " rewards)")
+		if not due("index", 60) then
+			return
+		end
+		local before = indexClaimables()
+		if not before or #before == 0 then
+			return
+		end
+		local IC = N.IndexClaim
+		local fresh = 0
+		for _, c in ipairs(before) do
+			if (IC.rest[claimKey(c)] or -1e9) < os.clock() then
+				fresh += 1
+			end
+		end
+		if fresh == 0 then
+			return
+		end
+		local n0 = #before
+		local sentAt = os.clock()
+		local via = "Claim All"
+		fire("PetIndexService.RE.ClaimAllRequested")
+		waitFor(function()
+			local now = indexClaimables()
+			return now ~= nil and #now < n0
+		end, 4)
+		local left = indexClaimables() or before
+		if #left > 0 then
+			-- what Claim All left: the game's own single claims (one call per egg page, one per pet tier)
+			local sent, pages = 0, {}
+			for _, c in ipairs(left) do
+				if sent >= 40 or not alive() then
+					break
+				end
+				local key = claimKey(c)
+				if type(c) == "table" and (IC.rest[key] or -1e9) < os.clock() then
+					if c.Kind == "Egg" and type(c.Name) == "string" and not pages[c.Name] then
+						pages[c.Name] = true
+						if fire("PetIndexService.RE.RewardClaimRequested", c.Name) then
+							sent += 1
+						end
+						task.wait(0.3)
+					elseif c.Kind == "Pet" and type(c.Name) == "string" and type(c.Tier) == "string" then
+						if fire("PetIndexService.RE.PetRewardClaimRequested", c.Name, c.Tier) then
+							sent += 1
+						end
+						task.wait(0.3)
+					end
+				end
+			end
+			if sent > 0 then
+				via = string.format("Claim All + %d single claim%s", sent, if sent == 1 then "" else "s")
+				local n1 = #left
+				waitFor(function()
+					local now = indexClaimables()
+					return now ~= nil and #now < n1
+				end, 4)
+				left = indexClaimables() or left
+			end
+		end
+		local got = n0 - #left
+		if got > 0 then
+			IC.total += got
+			note(string.format("pet index ok: %d of %d rewards claimed (%s)", got, n0, via))
+		end
+		if #left > 0 then
+			local r = IC.result
+			local answer = if r and IC.at >= sentAt then (r.Reason or r) else "no answer"
+			local names = {}
+			for i = 1, math.min(#left, 4) do
+				table.insert(names, claimKey(left[i]))
+			end
+			failed("pet index", answer, string.format(" left=%d (%s%s)", #left, table.concat(names, ", "), if #left > 4 then ", ..." else ""))
+			for _, c in ipairs(left) do
+				IC.rest[claimKey(c)] = os.clock() + 1800
 			end
 		end
 	end
@@ -37147,14 +37744,25 @@ do
 		if due("board", 900) then
 			local pending = invoke("LeaderboardService.RF.GetPendingRewards")
 			if type(pending) == "table" then
-				for _, v in ipairs(pending) do
-					if type(v) == "table" and v.LeaderboardId ~= nil and ok(invoke("LeaderboardService.RF.ClaimReward", v.LeaderboardId)) then
-						note("leaderboard reward " .. tostring(v.LeaderboardId))
+				-- the game's own claimPendingRewards (bc 27439-27484): pairs over the list, Success = claimed, Reason
+				-- "StorageFull" + SlotsNeeded = free pet slots first
+				for _, v in pairs(pending) do
+					if type(v) == "table" and v.LeaderboardId ~= nil then
+						local result = invoke("LeaderboardService.RF.ClaimReward", v.LeaderboardId)
+						if ok(result) then
+							note("leaderboard reward ok " .. tostring(v.LeaderboardId))
+						else
+							failed("leaderboard reward " .. tostring(v.LeaderboardId), result, if type(result) == "table" and result.Reason == "StorageFull" then string.format(" (needs %s free pet slots)", tostring(result.SlotsNeeded or 1)) else "")
+						end
 					end
 				end
 			end
 		end
 	end
+	-- R13: the game's own item menu opens ONE gift per call (GiftController:Open(k, 1), bc 52533-52535); a batch the server
+	-- refuses falls back to one at a time for that gift (remembered for the session). Counted on the server's Success AND
+	-- the gift count going down.
+	N.GiftSingle = {}
 	function N.giftStep()
 		if due("gifts", 20) then
 			for name in pairs(N.tableOr(N.G.Gifts.Pools)) do
@@ -37163,18 +37771,29 @@ do
 				local def = N.tableOr(N.G.Items)[name]
 				local unlocksAt = type(def) == "table" and tonumber(def.UnlocksAt) or 0
 				if count > 0 and type(name) == "string" and not string.find(name, "[\128-\255]") and N.serverTime() >= unlocksAt then
-					local amount = math.min(count, 25)
+					local amount = if N.GiftSingle[name] then 1 else math.min(count, 25)
 					local result = invoke("GiftService.RF.OpenGift", { Gift = name, Amount = amount })
-					if ok(result) then
+					if not ok(result) and amount > 1 then
+						N.GiftSingle[name] = true
+						log(string.format("GIFT %s x%d refused (%s): one at a time like the game's own menu", name, amount, brief(result)))
+						amount = 1
+						result = invoke("GiftService.RF.OpenGift", { Gift = name, Amount = 1 })
+					end
+					-- a gift can roll another of itself (GiftConfig pools), so a count that stays + the prize in the answer
+					-- also counts
+					local fewer = ok(result) and (waitFor(function()
+						return N.itemCount(name) < count
+					end, 3) or type(result.Rewards) == "table" or result.Reward ~= nil or type(result.Items) == "table")
+					if fewer then
 						Session.claims += 1
 						N.Reward.last = "opened " .. amount .. " x " .. name
 						table.insert(N.Reward.log, 1, N.Reward.last)
 						if #N.Reward.log > 4 then
 							table.remove(N.Reward.log)
 						end
-						log(string.format("GIFT opened %s x%d -> %s", name, amount, brief(result.Rewards or result.Reward or result.Items or result)))
+						log(string.format("GIFT opened %s x%d ok -> %s", name, amount, brief(result.Rewards or result.Reward or result.Items or result)))
 					else
-						log("GIFT", name, "refused:", brief(result))
+						failed("gift " .. name, result, if ok(result) then " (the gift count did not go down)" else "")
 					end
 					break
 				elseif count > 0 and unlocksAt > N.serverTime() and due("giftWait " .. tostring(name), 3600) then
@@ -37216,9 +37835,16 @@ do
 				-- the duck's coins are a windfall, not income (REV-11)
 				N.incomeHold(3)
 				local result = invoke("LuckyDuckyService.RF.Claim", pend.id)
-				Session.ducks += 1
-				Duck.last = "caught a duck" .. (if type(result) == "table" and result.Reward then " (" .. tostring(result.Reward) .. ")" else "")
-				log("DUCK claimed", pend.id, brief(result))
+				-- R13: caught only on the server's Success (the game's own duck: Success ~= true = "The ducky got away!",
+				-- LuckyDuckyController bc 28385-28411)
+				if ok(result) then
+					Session.ducks += 1
+					Duck.last = "caught a duck" .. (if type(result) == "table" and result.Reward then " (" .. tostring(result.Reward) .. ")" else "")
+					log("DUCK claimed ok", pend.id, brief(result))
+				else
+					Duck.last = "a duck got away (" .. brief(if type(result) == "table" then result.Reason or result else result) .. ")"
+					failed("lucky duck " .. tostring(pend.id), result)
+				end
 			end
 		end
 	end
@@ -37481,7 +38107,8 @@ do
 	function N.honeySlots()
 		return N.sub(N.sub(N.data(), "HoneyPot"), "Slots")
 	end
-	function N.honeyPlan()
+	-- R13 claimOnly: the finished slots only (a free claim: the ingredients went in when the craft started), no new craft.
+	function N.honeyPlan(claimOnly)
 		local data = N.data()
 		if not data then
 			return {}, {}
@@ -37502,6 +38129,9 @@ do
 			end
 		end
 		local crafts = {}
+		if claimOnly then
+			return ready, crafts
+		end
 		local free = slotCount - used + #ready
 		local inv = {}
 		for _, key in ipairs(Ingredients) do
@@ -37552,8 +38182,9 @@ do
 		local area = map:FindFirstChild("HoneyPotArea")
 		return area and area:FindFirstChild("HoneyPotMachine")
 	end
-	function N.honeyTrip()
-		local ready, crafts = N.honeyPlan()
+	function N.honeyTrip(claimOnly)
+		claimOnly = claimOnly == true
+		local ready, crafts = N.honeyPlan(claimOnly)
 		if #ready == 0 and #crafts == 0 then
 			return 0
 		end
@@ -37562,7 +38193,7 @@ do
 		waitFor(function()
 			return not N.Hatch.inFlight
 		end, 4)
-		N.loopStatus("Main", "Honey Pot: claiming and crafting treats")
+		N.loopStatus("Main", if claimOnly then "Honey Pot: claiming the finished treats" else "Honey Pot: claiming and crafting treats")
 		local done = 0
 		if N.travel("Spawn") then
 			local machine = N.honeyMachine()
@@ -37573,9 +38204,21 @@ do
 				N.teleport(pivot.Position + Vector3.new(0, 3, 8), 0.5)
 				-- REV-7: 0.5 s between calls, one retry after RateLimited (N.pacedInvoke)
 				for _, slot in ipairs(ready) do
-					if ok(N.pacedInvoke("HoneyPotService.RF.Claim", slot)) then
+					local result = N.pacedInvoke("HoneyPotService.RF.Claim", slot)
+					-- R13 (OWNER_RULES 24): counted when the slot is empty (or holds a new craft) afterwards
+					local cleared = ok(result) and waitFor(function()
+						local s = N.honeySlots()[slot] or N.honeySlots()[tostring(slot)]
+						if type(s) ~= "table" then
+							return true
+						end
+						local okP, made = pcall(N.G.HoneyPot.Progress, s, N.serverTime())
+						return not (okP and type(made) == "number" and made >= (tonumber(s.Amount) or 1))
+					end, 2)
+					if cleared then
 						done += 1
-						log("HONEY claimed slot", slot)
+						log("HONEY claimed slot", slot, "ok")
+					else
+						log("CLAIM honey slot " .. tostring(slot) .. " FAILED answer=" .. brief(result))
 					end
 				end
 				for _, c in ipairs(crafts) do
@@ -37654,8 +38297,10 @@ do
 		elseif kind == "PetXPGain" and N.levelFarming() then
 			w = 0.6
 		elseif kind == "HatchSpeed" and N.hatchWeight then
-			-- REV-10: hatch speed at h, egg luck by the power it adds per hatch at h
-			w = N.hatchWeight()
+			-- REV-10: hatch speed at h, egg luck by the power it adds per hatch at h; G4 (3937): only the speed-dependent
+			-- part of the server's hatch hold shrinks, so +x speed is worth N.hatchSpeedGain(x) eggs, not x
+			local rel = v / (1 + skillBonus(kind))
+			return if rel > 0 then N.hatchSpeedGain(rel) * N.hatchWeight() else 0
 		elseif kind == "EggLuck" and v > 0 and N.luckGain then
 			w = N.luckGain(v) / v * N.hatchWeight()
 		end
@@ -37977,11 +38622,477 @@ do
 		end
 	end
 
+	-- ===== G1 secret_release (blatant.md "3937 code pass" G1; bc lines in notes.md "Remotes on 3937"). A hatched Secret is
+	-- shown by the game's SecretHatchRenderer (Modules.Client.Pets.SecretHatchRenderer, bc 212183-213006) on a "Hold to
+	-- Reveal" screen (stage AwaitingHold, HatchScreen attribute TS2SecretHatchStage, 212842-212848); only when that reveal
+	-- ends does the client report it (revealSecret 63733-63747: SecretAnimationCompleted {PetId} then SecretRevealSeen
+	-- {PetId}), and the game's own queue waits behind it (63771-63808). AFK this held the owner's Forsaken Knight for 1 h 40
+	-- min (live_findings Round 11). While the hub hatches by itself, 2 s after our own hatch answer names a pet whose Rarity
+	-- starts with "Secret": (1) the game's own hold is started the way its offline renderer does it (BeginHold, 199964-199967
+	-- and 212687-212722), so the game reports the reveal itself; (2) if the pet is still not released 20 s later, the hub
+	-- sends those two calls once with the pet's real Id (probe secret_release, remembered per PlaceVersion; rejected = step 1
+	-- only from then on). Never for other pets, never a guessed id, never twice for one id. With the reveal left on for
+	-- manual play (N.Manual.revealOn) or the hub not hatching, the player holds it himself and Status says so. =====
+	local SR = { pending = {}, armed = {}, done = {}, renderer = nil }
+	N.SecretRelease = SR
+	-- the last Secret the hub could not release: shown in Up next until the game hands it over
+	SR.lastPending = nil
+	function N.secretPendingText()
+		local p = SR.lastPending
+		if p and N.secretReleased(p.id) then
+			SR.lastPending = nil
+			p = nil
+		end
+		return if p then p.name .. " waits for Hold to Reveal on the hatch screen" else nil
+	end
+	function N.secretArmed(id)
+		return type(id) == "string" and SR.armed[id] == true
+	end
+	local function secretRenderer()
+		if type(SR.renderer) ~= "table" then
+			pcall(function()
+				local inst = ReplicatedStorage:FindFirstChild("Modules")
+				inst = inst and inst:FindFirstChild("Client")
+				inst = inst and inst:FindFirstChild("Pets")
+				inst = inst and inst:FindFirstChild("SecretHatchRenderer")
+				if inst and inst:IsA("ModuleScript") then
+					local mod = require(inst)
+					if type(mod) == "table" then
+						SR.renderer = mod
+					end
+				end
+			end)
+		end
+		return if type(SR.renderer) == "table" then SR.renderer else nil
+	end
+	-- Is the game's secret screen waiting on "Hold to Reveal" for this pet? (GetDebugState 212985-213004, else the
+	-- HatchScreen attributes the renderer sets)
+	function N.secretAwaitingHold(name)
+		local r = secretRenderer()
+		if r and type(r.GetDebugState) == "function" then
+			local ok, st = pcall(r.GetDebugState, r)
+			if ok and type(st) == "table" then
+				return st.Stage == "AwaitingHold" and (st.Pet == nil or st.Pet == name)
+			end
+		end
+		local gui = LocalPlayer:FindFirstChild("PlayerGui")
+		local screen = gui and gui:FindFirstChild("HatchScreen")
+		if screen then
+			return screen:GetAttribute("TS2SecretHatchStage") == "AwaitingHold" and screen:GetAttribute("TS2SecretHatchPet") == name
+		end
+		return false
+	end
+	local function unseen(id)
+		for _, v in pairs(N.sub(N.sub(N.data(), "Eggs"), "UnseenSecrets")) do
+			if type(v) == "table" and v.Id == id then
+				return true
+			end
+		end
+		return false
+	end
+	-- Released = the pet sits in the storage and the game no longer lists it as an unseen secret (Eggs.UnseenSecrets,
+	-- replayed at login only for owned pets, 64702-64721).
+	function N.secretReleased(id)
+		return N.ownsPet(id) and not unseen(id)
+	end
+	-- the hub releases only while it hatches by itself with the reveal hidden (Auto Hatch, the planner or the Index Hunter)
+	function N.secretAutoRelease()
+		return N.hatchWanted() and not (N.Manual and N.Manual.revealOn)
+	end
+	function N.secretRelease(pet)
+		local id, name = pet.Id, tostring(pet.Name)
+		local t0 = os.clock()
+		task.wait(2)
+		if not alive() then
+			return
+		end
+		if N.secretReleased(id) and not N.secretAwaitingHold(name) then
+			SR.pending[id] = nil
+			log(string.format("SECRET owned %s id=%s after %.0fs, nothing to release", name, id, os.clock() - t0))
+			return
+		end
+		if not N.secretAutoRelease() then
+			SR.lastPending = { id = id, name = name }
+			log("SECRET pending reveal", name, "id=" .. id, "(the hub is not hatching: hold to reveal it on the screen)")
+			return
+		end
+		local via = nil
+		if N.secretAwaitingHold(name) then
+			local r = secretRenderer()
+			if r and type(r.BeginHold) == "function" and pcall(r.BeginHold, r) then
+				via = "hold"
+				log("SECRET hold started", name, "id=" .. id, "(the game's own Hold to Reveal)")
+				waitFor(function()
+					return N.secretReleased(id) and not N.secretAwaitingHold(name)
+				end, 20)
+			end
+		end
+		if not N.secretReleased(id) and pet.AutoDeleted ~= true and not SR.done[id] and N.probeState("secret_release") ~= "rejected" then
+			SR.done[id] = true
+			SR.armed[id] = true
+			local sentA = fire("EggService.RE.SecretAnimationCompleted", { PetId = id })
+			local sentB = fire("EggService.RE.SecretRevealSeen", { PetId = id })
+			SR.armed[id] = nil
+			if sentA or sentB then
+				via = "remote"
+				waitFor(function()
+					return N.secretReleased(id)
+				end, 10)
+			end
+		end
+		local secs = os.clock() - t0
+		if N.secretReleased(id) then
+			SR.pending[id] = nil
+			if SR.lastPending and SR.lastPending.id == id then
+				SR.lastPending = nil
+			end
+			log(string.format("SECRET released pet=%s name=%s via=%s after=%.1fs", id, name, via or "game", secs))
+			if via == "remote" and N.probeState("secret_release") == "untested" then
+				N.probeResult("secret_release", "accepted", string.format("gain=owned_after=%.1fs", secs))
+			end
+		else
+			SR.lastPending = { id = id, name = name }
+			log("SECRET pending reveal", name, "id=" .. id, string.format("after %.0fs (via=%s)", secs, tostring(via or "none")))
+			if via == "remote" and N.probeState("secret_release") == "untested" then
+				N.probeResult("secret_release", "rejected", "gain=0")
+			end
+		end
+	end
+	-- ===== R13 Secret lock (OWNER_RULES 23, owner 2026-10-12 CAPS: a Secret pet is never deleted, crafted, fused or
+	-- rerolled, and the hub locks it in the game when it can). The game's own lock button: PetService.RE.PetActionRequested
+	-- {Action="ToggleLock", PetId} (Inventory bc 67575-67578, quick actions 68742-68745). ToggleLock FLIPS the lock, so the
+	-- hub sends it once, only for an owned Secret whose Locked is not true, and counts it only when the replica shows
+	-- Locked = true; without that it waits 10 minutes before it may ask again (a second flip would unlock it). Every Secret
+	-- it has seen locked is remembered (Corvus/TAPSIM_locked.txt): a Secret the player unlocks himself stays unlocked. =====
+	do
+		local Lock = { done = nil, armed = {}, waitUntil = {}, n = 0 }
+		N.SecretLock = Lock
+		local LockFile = "Corvus/TAPSIM_locked.txt"
+		local function loadDone()
+			if Lock.done then
+				return
+			end
+			Lock.done = {}
+			local okR, text = pcall(function()
+				return if isfile and isfile(LockFile) then readfile(LockFile) else ""
+			end)
+			if okR and type(text) == "string" then
+				for id in string.gmatch(text, "[^\r\n]+") do
+					Lock.done[id] = true
+				end
+			end
+		end
+		local function saveDone()
+			local ids = {}
+			for id in pairs(Lock.done) do
+				table.insert(ids, id)
+			end
+			table.sort(ids)
+			pcall(function()
+				if makefolder and isfolder and not isfolder("Corvus") then
+					makefolder("Corvus")
+				end
+				if writefile then
+					writefile(LockFile, table.concat(ids, "\n"))
+				end
+			end)
+		end
+		function N.lockArmed(id)
+			return type(id) == "string" and Lock.armed[id] == true
+		end
+		local function isSecret(pet)
+			return type(pet) == "table" and string.match(tostring(N.rarityOf(pet) or ""), "^Secret") ~= nil
+		end
+		function N.secretLockStep()
+			loadDone()
+			local changed = false
+			local target = nil
+			for id, pet in pairs(N.owned()) do
+				if isSecret(pet) then
+					if pet.Locked == true then
+						if not Lock.done[id] then
+							Lock.done[id] = true
+							changed = true
+						end
+					elseif not Lock.done[id] and (Lock.waitUntil[id] or -1e9) < os.clock() and not target then
+						target = id
+					end
+				end
+			end
+			if changed then
+				saveDone()
+			end
+			if not target then
+				return false
+			end
+			local pet = N.owned()[target]
+			local name = tostring(type(pet) == "table" and pet.Name or target)
+			Lock.armed[target] = true
+			local sent = fire("PetService.RE.PetActionRequested", { Action = "ToggleLock", PetId = target })
+			Lock.armed[target] = nil
+			Lock.waitUntil[target] = os.clock() + 600
+			if not sent then
+				return false
+			end
+			local locked = waitFor(function()
+				local p = N.owned()[target]
+				return type(p) == "table" and p.Locked == true
+			end, 5)
+			if locked then
+				Lock.done[target] = true
+				Lock.n += 1
+				saveDone()
+				log(string.format("SECRET locked %s ok (id=%s, OWNER_RULES 23)", name, target))
+			else
+				log(string.format("SECRET lock %s FAILED answer=Locked is still %s 5 s later (no second flip for 10 min)", name, tostring(N.tableOr(N.owned()[target]).Locked)))
+			end
+			return locked
+		end
+	end
+	-- ===== R13: the pet the game's own Auto Enchant holds in the enchanter (3937: player attributes EnchantHeldPet and
+	-- EnchantHeldState, EnchantController bc 65340-65359). When its run is over (state "Done", the game's own Claimable rule
+	-- bc 191917-191918) the window shows Claim instead of Enchant and EnchantService.RF.Claim() gives the pet back, on the
+	-- team when it was equipped (EnchantWindow claim() bc 192974-193013). A free claim (nothing is used up): the planner and
+	-- Auto Claim Finished Crafts take it. Refused for distance = one short visit to the Enchant point (p06 trip options).
+	-- While a pet is held, every pet action of the hub leaves it alone (N.keepSet, N.bestTeam). =====
+	N.EnchantHold = { visit = false, last = "" }
+	function N.enchantHeldPet()
+		local id = LocalPlayer:GetAttribute("EnchantHeldPet")
+		return if type(id) == "string" and id ~= "" then id else nil
+	end
+	function N.enchantHeldDone()
+		return N.enchantHeldPet() ~= nil and LocalPlayer:GetAttribute("EnchantHeldState") == "Done"
+	end
+	function N.enchantClaim()
+		local id = N.enchantHeldPet()
+		if not id or not N.enchantHeldDone() then
+			return false
+		end
+		local pet = N.owned()[id]
+		local name = tostring(type(pet) == "table" and (pet.Nickname or pet.Name) or id)
+		local result = invoke("EnchantService.RF.Claim")
+		local back = waitFor(function()
+			return N.enchantHeldPet() ~= id
+		end, 3)
+		if ok(result) and back then
+			N.EnchantHold.visit = false
+			N.EnchantHold.last = name .. " is back" .. (if type(result) == "table" and result.Equipped then " on your team" else "")
+			note("enchanter ok: " .. N.EnchantHold.last)
+			return true
+		end
+		local reason = type(result) == "table" and tostring(result.Reason or result.Error or "") or ""
+		N.EnchantHold.visit = reason == "VisitEnchantMachine" or reason == "TooFar"
+		N.EnchantHold.last = name .. " still in the enchanter (" .. (if reason ~= "" then reason else "no answer") .. ")"
+		failed("enchanter pet " .. name, result, if N.EnchantHold.visit then " (a visit to the Enchant point comes next)" else "")
+		return false
+	end
+	function N.enchantClaimStep()
+		if not N.enchantHeldDone() or N.EnchantHold.visit or not due("enchantClaim", 30) then
+			return false
+		end
+		return N.enchantClaim()
+	end
+	-- the visit (a trip option of p06 once the remote Claim asked for the machine): stand in the Enchant point, claim, back
+	function N.enchantClaimTrip()
+		N.EnchantHold.tripAt = os.clock()
+		if not N.enchantHeldDone() then
+			N.EnchantHold.visit = false
+			return 0
+		end
+		N.tripBegin("enchanter claim")
+		N.loopStatus("Main", "taking your pet back from the enchanter")
+		local done = 0
+		local part = N.goToPoint and N.goToPoint("Enchant", "Shadow Realm")
+		if part then
+			done = if N.enchantClaim() then 1 else 0
+		else
+			log("CLAIM enchanter pet FAILED answer=the Enchant point was not found (next try in 10 min)")
+		end
+		N.tripEnd()
+		return done
+	end
+	-- ===== R13 (OWNER_RULES 24, the second method next to the claims' own answers): what the GAME still lists as claimable,
+	-- read from the replica with the game's own rules (the same fields verify_probe.lua reads): the index list
+	-- (PetIndexCatalog.Claimables), finished quests (QuestVisibility), the offline grant and recap, openable gifts, ready
+	-- tap chests, finished brews / Honey Pot slots / Rainbow pods, the enchanter's held pet, Secrets without the lock and a
+	-- pending Pet Defense reward. `STATE claimable ...` every 10 minutes (and in the Rewards panel); anything above 0 that
+	-- stays while its toggle runs is a claim that failed. =====
+	function N.claimState()
+		local data = N.data()
+		if not data then
+			return nil
+		end
+		local s = { index = #(N.indexClaimables and N.indexClaimables() or {}), quests = 0, offline = 0, recap = 0, gifts = 0, chests = 0, brews = 0, honey = 0, pods = 0, enchanter = 0, secrets = 0, defense = 0 }
+		local defs = N.tableOr(N.G.Quests.Definitions)
+		for id, q in pairs(N.sub(data, "Quests")) do
+			local def = defs[id]
+			if type(def) == "table" and type(q) == "table" and def.AutoClaim ~= true and q.Claimed ~= true and (q.Completed == true or (tonumber(q.Amount) or 0) >= (tonumber(def.Goal) or math.huge)) then
+				local shown = true
+				if type(N.G.QuestVisibility.IsShown) == "function" then
+					local okS, yes = pcall(N.G.QuestVisibility.IsShown, data, id)
+					shown = not okS or yes == true
+				end
+				if shown then
+					s.quests += 1
+				end
+			end
+		end
+		local off = N.sub(data, "Offline")
+		s.offline = if offlineGrant(off.Pending) then 1 else 0
+		s.recap = if type(off.HatchPending) == "table" and off.HatchPending.Id ~= nil then 1 else 0
+		for name in pairs(N.tableOr(N.G.Gifts.Pools)) do
+			local def = N.tableOr(N.G.Items)[name]
+			if N.itemCount(name) > 0 and N.serverTime() >= (type(def) == "table" and tonumber(def.UnlocksAt) or 0) then
+				s.gifts += N.itemCount(name)
+			end
+		end
+		if N.tapChestsDue then
+			local okC, list = pcall(N.tapChestsDue, nil, true)
+			s.chests = if okC and type(list) == "table" then #list else 0
+		end
+		local now = os.time()
+		for _, slot in pairs(N.sub(N.sub(data, "PotionMachine"), "Slots")) do
+			if type(slot) == "table" and tonumber(slot.ReadyAt) and slot.ReadyAt <= now then
+				s.brews += 1
+			end
+		end
+		s.honey = #(N.honeyPlan(true))
+		s.pods = if N.readyPods then #N.readyPods() else 0
+		s.enchanter = if N.enchantHeldDone() then 1 else 0
+		for _, pet in pairs(N.owned()) do
+			if type(pet) == "table" and pet.Locked ~= true and string.match(tostring(N.rarityOf(pet) or ""), "^Secret") ~= nil then
+				s.secrets += 1
+			end
+		end
+		s.defense = if N.sub(data, "Colosseum").PendingReward ~= nil then 1 else 0
+		return s
+	end
+	function N.claimStateText(s)
+		s = s or N.claimState()
+		if not s then
+			return "?"
+		end
+		return string.format("index=%d quests=%d offline=%d recap=%d gifts=%d chests=%d brews=%d honey=%d pods=%d enchanter=%d secrets_unlocked=%d defense_reward=%d", s.index, s.quests, s.offline, s.recap, s.gifts, s.chests, s.brews, s.honey, s.pods, s.enchanter, s.secrets, s.defense)
+	end
+	function N.claimStateStep()
+		if due("claimState", 600) then
+			log("STATE claimable " .. N.claimStateText())
+		end
+	end
+	-- G7 Godly Hatch (bc 62696-62731, GodlyHatchConfig 238682: x100 luck, max x1000, secret rolls x10): its own toggle only
+	-- (OWNER_RULES 21: it uses an item up); the hatch loop sends one {Count=1, Godly=true, Auto=false} on the egg it is
+	-- hatching (no egg switch, the secret window stays) while a Luck/Mythic window is live.
+	local GodlyCfg = nil
+	function N.godlyItemName()
+		if GodlyCfg == nil then
+			GodlyCfg = false
+			pcall(function()
+				local sharedFolder = ReplicatedStorage:FindFirstChild("Shared")
+				local inst = sharedFolder and sharedFolder:FindFirstChild("Pets")
+				inst = inst and inst:FindFirstChild("GodlyHatchConfig")
+				if inst and inst:IsA("ModuleScript") then
+					local mod = require(inst)
+					if type(mod) == "table" then
+						GodlyCfg = mod
+					end
+				end
+			end)
+		end
+		return if type(GodlyCfg) == "table" and type(GodlyCfg.ItemName) == "string" then GodlyCfg.ItemName else "Godly Hatch"
+	end
+	function N.godlyCount()
+		return N.itemCount(N.godlyItemName())
+	end
+	function N.godlyWanted()
+		if not on("UseGodlyHatches") or N.godlyCount() < 1 then
+			return false
+		end
+		if N.luckWindowNow then
+			local live = N.luckWindowNow()
+			if live then
+				return true
+			end
+		end
+		return N.eventActive ~= nil and (N.eventActive("Luck") or N.eventActive("Mythic")) == true
+	end
+	-- G4 (3937 code pass): the server holds one hatch request for HatchAnimationConfig.ShortestReveal(speed, count) (bc
+	-- 238857-238866) = a fixed part (card stagger, receipts, poof, card exit, fade) + a part that shrinks with hatch speed
+	-- (x8: 1.805 + 3.126 / speed s). The measured Held of the answers decides the split: the fixed part from the formula,
+	-- the rest of the measured hold is what speed shortens; without a measurement the formula alone.
+	-- N.hatchSpeedGain(x) = the relative gain in eggs per second from x more hatch speed (+10 % speed = +2.7 % to +4.2 %
+	-- eggs, not +10 %); every Hatch Speed source (skill nodes, gem upgrade, relics, the Hatch Speed totem) uses it.
+	local function holdMedian()
+		local list = {}
+		for _, v in ipairs(N.Hatch.holds or {}) do
+			if N.finite(v) and v > 0 then
+				table.insert(list, v)
+			end
+		end
+		if #list == 0 then
+			return nil
+		end
+		table.sort(list)
+		return list[math.ceil(#list / 2)]
+	end
+	function N.hatchHold()
+		local count = math.max(tonumber(N.Hatch.count) or (if N.hasX8() then 8 else 3), 1)
+		local speed = tonumber(N.Hatch.speed) or 1
+		if not N.finite(speed) or speed <= 0 then
+			speed = 1
+		end
+		local fixed, total
+		local fn = N.G.HatchAnim.ShortestReveal
+		if type(fn) == "function" then
+			local okF, f = pcall(fn, 1e6, count)
+			local okT, t = pcall(fn, speed, count)
+			if okF and okT and N.finite(f) and N.finite(t) and t > f and f > 0 then
+				fixed, total = f, t
+			end
+		end
+		if not fixed then
+			fixed = 1 + 0.115 * (count - 1)
+			total = fixed + 3.126 / speed
+		end
+		local measured = holdMedian()
+		local cycle = if measured and measured > fixed + 0.05 then measured else total
+		return fixed, cycle - fixed, cycle, speed, measured ~= nil and measured > fixed + 0.05
+	end
+	function N.hatchSpeedGain(x)
+		x = tonumber(x) or 0
+		if not N.finite(x) or x <= 0 then
+			return 0
+		end
+		local fixed, var, cycle = N.hatchHold()
+		local after = fixed + var / (1 + x)
+		return if after > 0 then cycle / after - 1 else 0
+	end
+	N.onEvent("EggService.RE.EggHatchResult", function(r)
+		if type(r) ~= "table" or r.Success ~= true or type(r.Pets) ~= "table" then
+			return
+		end
+		for _, pet in ipairs(r.Pets) do
+			if type(pet) == "table" and type(pet.Id) == "string" and type(pet.Rarity) == "string" and string.match(pet.Rarity, "^Secret") ~= nil and not SR.pending[pet.Id] then
+				SR.pending[pet.Id] = os.clock()
+				log(string.format("SECRET hatched %s id=%s egg=%s rarity=%s%s", tostring(pet.Name), pet.Id, tostring(r.Egg), pet.Rarity, if pet.AutoDeleted == true then " (auto-deleted)" else ""))
+				task.spawn(N.secretRelease, pet)
+			end
+		end
+		if r.Godly == true then
+			log(string.format("HATCH godly egg=%s left=%s", tostring(r.Egg), tostring(r.GodlyLeft or N.godlyCount())))
+		end
+		-- the hold split, measured: once after 3 answers, then hourly
+		if #(N.Hatch.holds or {}) >= 3 and due("holdFit", 3600) then
+			local fixed, var, cycle, speed, measured = N.hatchHold()
+			log(string.format("HATCH hold fit fixed=%.2f var=%.2f/speed held=%.2f speed=%.2f share=%.2f (+10%% speed = +%.1f%% eggs, %s)", fixed, var * speed, cycle, speed, var / cycle, N.hatchSpeedGain(0.1) * 100, if measured then "measured" else "formula"))
+		end
+	end)
+
 	function N.upgradeValue(name, level)
 		if name == "ClickMultiplier" then
 			return (1 + (level + 1) / 20) / (1 + level / 20) - 1
 		elseif name == "HatchSpeed" then
-			return ((1 + (level + 1) / 15) / (1 + level / 15) - 1) * N.hatchWeight()
+			-- G4 (3937): the eggs this speed step adds, through the server's hatch hold (N.hatchSpeedGain), not 1:1
+			return N.hatchSpeedGain((1 + (level + 1) / 15) / (1 + level / 15) - 1) * N.hatchWeight()
 		elseif name == "CriticalChance" then
 			-- strategy.md item 1: value the extra crit chance by the FULL crit power P (achievements x mastery x enchant),
 			-- not the old 10 x (1 + skill) that ignored the mastery and enchant stack
@@ -38691,9 +39802,19 @@ do
 	-- The potion machine (Workspace.Map1.PotionMachine, "Walk up to the potion machine first"): Buy(1|3|10) on its
 	-- cooldowns (Data.PotionMachine.Cooldown1/3/10, os.time), Brew(potion, slot) in free slots (3 x 300 s at the Buy(1)
 	-- price), ClaimAll when a slot is ready, Craft(output, n) = 3 x Potion I -> Potion II. Gems above the reserve only.
-	function N.potionWork()
+	-- R13 claimOnly: the finished brews only (a free claim, the gems went in when they started): no buy, brew or merge.
+	function N.potionWork(claimOnly)
 		local data = N.data()
 		if not data then
+			return nil
+		end
+		if claimOnly then
+			local now = os.time()
+			for _, s in pairs(N.sub(N.sub(data, "PotionMachine"), "Slots")) do
+				if type(s) == "table" and tonumber(s.ReadyAt) and s.ReadyAt <= now then
+					return { claim = true, brew = {}, buy = {}, craft = {}, gems = 0, price1 = 0, claimOnly = true }
+				end
+			end
 			return nil
 		end
 		local pm = N.sub(data, "PotionMachine")
@@ -38813,8 +39934,25 @@ do
 		local r = { done = 0, claimed = nil, bought = 0, brewed = 0, merged = 0 }
 		r.claimed = work.claim and call("PotionMachineService.RF.ClaimAll") or nil
 		if r.claimed then
-			r.done += 1
-			log(string.format("POTION claimed %s brewed potions", tostring(r.claimed.Amount or "?")))
+			-- R13 (OWNER_RULES 24): counted when no finished slot is left in Data.PotionMachine.Slots
+			local cleared = waitFor(function()
+				local now = os.time()
+				for _, s in pairs(N.sub(N.sub(N.data(), "PotionMachine"), "Slots")) do
+					if type(s) == "table" and tonumber(s.ReadyAt) and s.ReadyAt <= now then
+						return false
+					end
+				end
+				return true
+			end, 2)
+			if cleared then
+				r.done += 1
+				log(string.format("POTION claimed %s brewed potions ok", tostring(r.claimed.Amount or "?")))
+			else
+				log("CLAIM potion brews FAILED answer=" .. brief(r.claimed) .. " (a finished slot is still there)")
+				r.claimed = nil
+			end
+		elseif work.claim and not stop then
+			log("CLAIM potion brews FAILED answer=no Success from ClaimAll")
 		end
 		for _, n in ipairs(work.buy) do
 			local result = call("PotionMachineService.RF.Buy", n)
@@ -38889,8 +40027,9 @@ do
 		end
 		return (if #parts > 0 then table.concat(parts, ", ") else "nothing to do") .. " (" .. how .. ")"
 	end
-	function N.potionTrip()
-		local work = N.potionWork()
+	function N.potionTrip(claimOnly)
+		claimOnly = claimOnly == true
+		local work = N.potionWork(claimOnly)
 		if not work then
 			return 0
 		end
@@ -38927,7 +40066,7 @@ do
 				if far then
 					-- R4-3: stand on the Circle once more and finish the visit (claim, buy, brew) before going back
 					N.teleport(potionStand(model) or stand, 0.8)
-					local again = N.potionWork()
+					local again = N.potionWork(claimOnly)
 					if again then
 						local r2
 						r2, far = machineCalls(again, false)
@@ -39289,7 +40428,24 @@ do
 	-- Meteors (MeteorShowerService.RE.Incoming(id, position, kind, start, travel), lands at start + travel) and the
 	-- Mystery Egg (EggDropService.RE.Incoming(id, island, position, start, travel); RF.Travel() = the game's free teleport
 	-- to it; 60 hits per player) are breakables: taps within 14 studs hit them (BreakableConfig TapRange 14).
-	N.Rocks = { list = {}, eggs = {} }
+	N.Rocks = { list = {}, eggs = {}, meteorPaid = 0, meteorCoins = 0, eggPaid = 0, eggCoins = 0, eggAt = -1e9, meteorAt = -1e9 }
+	-- R13 (OWNER_RULES 24): a hit is not a reward. The server pays a broken rock / the cracked Mystery Egg with
+	-- MeteorShowerService.RE.Rewarded({Coins, Gems, Tier, Item}) (MeteorShowerEffects bc 159295-159336) and
+	-- EggDropService.RE.Rewarded({Coins}, drop) (EggDropEffects bc 144129-144151); the trips count those, not their taps.
+	N.onEvent("MeteorShowerService.RE.Rewarded", function(p)
+		if type(p) == "table" then
+			N.Rocks.meteorPaid += 1
+			N.Rocks.meteorCoins += tonumber(p.Coins) or 0
+			N.Rocks.meteorAt = os.clock()
+		end
+	end)
+	N.onEvent("EggDropService.RE.Rewarded", function(p)
+		if type(p) == "table" then
+			N.Rocks.eggPaid += 1
+			N.Rocks.eggCoins += tonumber(p.Coins) or 0
+			N.Rocks.eggAt = os.clock()
+		end
+	end)
 	N.onEvent("MeteorShowerService.RE.Incoming", function(id, pos, kind, start, travel)
 		if typeof(pos) == "Vector3" and type(start) == "number" and type(travel) == "number" then
 			table.insert(N.Rocks.list, { id = tostring(id), pos = pos, kind = tostring(kind), landAt = start + travel, at = os.clock() })
@@ -39345,6 +40501,7 @@ do
 		table.sort(rocks, function(a, b)
 			return (a.kind == "Golden" and 0 or 1) < (b.kind == "Golden" and 0 or 1)
 		end)
+		local paid0, coins0 = N.Rocks.meteorPaid, N.Rocks.meteorCoins
 		for _, r in ipairs(rocks) do
 			tapAt(r.pos, if r.kind == "Golden" then 12 else 9)
 			local i = table.find(N.Rocks.list, r)
@@ -39352,9 +40509,18 @@ do
 				table.remove(N.Rocks.list, i)
 			end
 		end
-		note("meteors", #rocks .. " rocks hit")
+		waitFor(function()
+			return N.Rocks.meteorPaid - paid0 >= #rocks
+		end, 2)
+		local paid = N.Rocks.meteorPaid - paid0
+		if paid > 0 then
+			note("meteors", string.format("ok: %d of %d rocks paid +%s coins", paid, #rocks, formatNumber(N.Rocks.meteorCoins - coins0)))
+		else
+			N.World.last.meteors = string.format("%d rocks hit, no reward", #rocks)
+			log(string.format("CLAIM meteors FAILED answer=no MeteorShowerService.RE.Rewarded for %d rock%s hit", #rocks, if #rocks == 1 then "" else "s"))
+		end
 		N.tripEnd()
-		return #rocks
+		return paid
 	end
 	function N.mysteryEggTrip()
 		local eggs = landed(N.Rocks.eggs, 240)
@@ -39369,14 +40535,23 @@ do
 		if not travelled then
 			N.travel(if type(egg.island) == "string" and N.islandInfo(egg.island) then egg.island else "Spawn")
 		end
+		local paid0, coins0 = N.Rocks.eggPaid, N.Rocks.eggCoins
 		tapAt(egg.pos, 62)
 		local i = table.find(N.Rocks.eggs, egg)
 		if i then
 			table.remove(N.Rocks.eggs, i)
 		end
-		note("mysteryEgg", "60 hits (" .. (if travelled then "server travel" else "teleport") .. ")")
+		local paid = waitFor(function()
+			return N.Rocks.eggPaid > paid0
+		end, 3)
+		if paid then
+			note("mysteryEgg", string.format("ok: cracked, +%s coins (%s)", formatNumber(N.Rocks.eggCoins - coins0), if travelled then "server travel" else "teleport"))
+		else
+			N.World.last.mysteryEgg = "62 hits, no reward yet"
+			log("CLAIM mystery egg FAILED answer=no EggDropService.RE.Rewarded after 62 hits (" .. (if travelled then "server travel" else "teleport") .. ")")
+		end
 		N.tripEnd()
-		return 1
+		return if paid then 1 else 0
 	end
 	-- Lucky block bursts: models tagged LuckyBlockEventServer, LuckyBlockEventService.RE.CollectRequested(Name) within
 	-- Scale x 7 studs, every 0.25 s until Opened (LuckyBlockEventController 21593-21598).
@@ -39858,7 +41033,8 @@ do
 				score += v * 9 / (1 + 0.1 * 9) * 0.8
 			elseif kind == "HatchSpeed" then
 				-- REV-10: hatch speed at h (the measured value of a second of hatching), luck by the power it adds per hatch
-				score += v * N.hatchWeight()
+				-- G4 (3937): +v speed = N.hatchSpeedGain(v) more eggs (the fixed part of the server's hold does not shrink)
+				score += N.hatchSpeedGain(v) * N.hatchWeight()
 			elseif kind == "SecretLuck" or kind == "Luck" then
 				score += N.luckGain(v) * N.hatchWeight()
 			end
@@ -40235,13 +41411,43 @@ do
 		if N.probeState("raffle_view") == "untested" then
 			N.probeResult("raffle_view", "accepted", "gain=keys " .. table.concat(keys, ","))
 		end
-		local id = view.Id or view.RaffleId
-		local cost = tonumber(view.Cost or view.TicketCost or view.Price)
-		if type(id) == "string" and cost == 0 and not view.Entered and N.due("raffleEnter", 86400) then
-			N.RaffleToken = id
-			invoke("RaffleService.RF.EnterRaffle", id, 1)
-			N.RaffleToken = nil
-			note("raffle", "entered " .. id)
+		-- R13 (live 3983: GetRaffleView -> {available=false, mine={}, raffles={}, recentWinners={}}; the raffle menu is lazy
+		-- content, no 3937 client call to copy): the open raffles are the entries of `raffles`; one is entered only when it
+		-- says outright that an entry is free and `mine` does not list it yet, and counted only on the server's Success.
+		-- An open raffle without a free entry is logged once a day with its fields (never tickets for Robux or tokens).
+		local entries = {}
+		if type(view.raffles) == "table" then
+			for k, r in pairs(view.raffles) do
+				if type(r) == "table" then
+					table.insert(entries, { key = k, r = r })
+				end
+			end
+		elseif view.Id ~= nil or view.RaffleId ~= nil then
+			table.insert(entries, { key = view.Id or view.RaffleId, r = view })
+		end
+		if view.available == false or #entries == 0 then
+			N.World.last.raffle = "no raffle open"
+			return
+		end
+		local mine = N.tableOr(view.mine)
+		for _, e in ipairs(entries) do
+			local r = e.r
+			local id = r.Id or r.RaffleId or r.id or (if type(e.key) == "string" then e.key else nil)
+			local cost = tonumber(r.Cost or r.TicketCost or r.Price or r.cost or r.price)
+			local free = r.Free == true or r.free == true or (tonumber(r.FreeEntries) or 0) > 0 or cost == 0
+			local entered = r.Entered == true or r.entered == true or (id ~= nil and mine[id] ~= nil)
+			if type(id) == "string" and free and not entered and N.due("raffleEnter " .. id, 86400) then
+				N.RaffleToken = id
+				local result = invoke("RaffleService.RF.EnterRaffle", id, 1)
+				N.RaffleToken = nil
+				if ok(result) then
+					note("raffle", "entered " .. id .. " ok")
+				else
+					log("CLAIM raffle " .. id .. " FAILED answer=" .. brief(result))
+				end
+			elseif not free and N.due("raffleShape", 86400) then
+				log("RAFFLE open without a free entry (not entered): " .. brief(r))
+			end
 		end
 	end
 end
@@ -40796,7 +42002,8 @@ do
 		end
 		return nil
 	end
-	function N.tapChestsDue(only)
+	-- R13: ignoreHeld = the game's own state (STATE claimable counts a ready chest even while a failed try rests)
+	function N.tapChestsDue(only, ignoreHeld)
 		local out = {}
 		local data = N.data()
 		if not data then
@@ -40804,7 +42011,7 @@ do
 		end
 		local now = N.serverTime()
 		for id, c in pairs(N.tableOr(X.TapChest.Chests)) do
-			if type(c) == "table" and (only == nil or c.Island == only) and N.islandUnlocked(c.Island) and not held("chest " .. id) then
+			if type(c) == "table" and (only == nil or c.Island == only) and N.islandUnlocked(c.Island) and (ignoreHeld or not held("chest " .. id)) then
 				local readyAt = tonumber(N.sub(data, "TapChests")[id]) or 0
 				if readyAt <= now then
 					local claims = tonumber(N.sub(data, "TapChestClaims")[id]) or 0
@@ -40854,7 +42061,14 @@ do
 					N.teleport(pos + Vector3.new(0, 3, 6), 0.3)
 					local coins0 = N.coins()
 					local result = invoke("TapChestService.RF.Claim", c.id)
-					if okResult(result) then
+					-- R13 (OWNER_RULES 24): Success AND the chest's ready time moved into the future (Data.TapChests[id],
+					-- TapChestConfig.GetReadyAt bc 232972-232979)
+					local moved = okResult(result) and waitFor(function()
+						return (tonumber(N.sub(N.data(), "TapChests")[c.id]) or 0) > N.serverTime()
+					end, 3)
+					if okResult(result) and not moved then
+						chestFailed(c, "FAILED answer=" .. brief(result) .. " (the chest still shows ready)", 600)
+					elseif okResult(result) then
 						got += 1
 						Xtra.counts.chests += 1
 						local paid = tonumber(result.Amount or result.Coins or result.Reward)
@@ -40867,7 +42081,7 @@ do
 							Xtra.chestWhy[c.id] = nil
 						end
 						Xtra.last.chests = string.format("%s +%s coins", c.island, formatNumber(gained))
-						log(string.format("CHEST %s +%s coins (%d is)", c.island, formatNumber(gained), math.floor(N.incomeSeconds(gained))))
+						log(string.format("CHEST %s +%s coins (%d is) ok, ready again in %s", c.island, formatNumber(gained), math.floor(N.incomeSeconds(gained)), N.longTime((tonumber(N.sub(N.data(), "TapChests")[c.id]) or 0) - N.serverTime())))
 					else
 						chestFailed(c, "refused: " .. brief(result), 1800)
 					end
@@ -40982,7 +42196,7 @@ do
 			elseif name == "TotemOfRebirths" then
 				return m * d
 			elseif name == "TotemOfHatchSpeed" then
-				return m * d * N.hatchWeight()
+				return N.hatchSpeedGain(m) * d * N.hatchWeight()
 			end
 			return N.luckGain(m) * N.hatchWeight() * d
 		end
@@ -42357,7 +43571,8 @@ do
 				if w == nil then
 					-- REV-10: hatch speed at h, luck by the power it adds per hatch
 					if b.Type == "HatchSpeed" then
-						w = N.hatchWeight()
+						-- G4 (3937): through the server's hatch hold, not 1:1
+						w = if v > 0 then N.hatchSpeedGain(v) / v * N.hatchWeight() else 0
 					elseif (b.Type == "Luck" or b.Type == "SecretLuck") and v > 0 then
 						w = N.luckGain(v) / v * N.hatchWeight()
 					else
@@ -42746,7 +43961,33 @@ do
 		N.loopStatus("Main", "playing Memory Match")
 		-- 14 studs beside the pad: inside the game's 24-stud reach, outside the pad's own touch box (no menu pops up)
 		N.teleport(pad.Position + Vector3.new(14, 3, 0), 0.3)
-		local state = invoke("MemoryMatchService.RF.Open", false)
+		-- Live 3983 (Round 12, owner main): the server now answers {Error="Walk onto the Memory Match pad."}; the pad is
+		-- workspace.MemoryMatch.TouchToPlay (MemoryMatchWorld.GetPad, bc 234599-234601), "on it" = the client's own box
+		-- test (|X|, |Z| <= Size/2 + 1, 0 <= Y <= 8 in pad space, MemoryMatchController bc 60756-60775). Such a refusal
+		-- puts the character on the pad centre and asks once more; the menu the pad opens is closed again.
+		local function onPad()
+			local root = N.root()
+			if not root then
+				return false
+			end
+			local okRel, rel = pcall(function()
+				return pad.CFrame:PointToObjectSpace(root.Position)
+			end)
+			return okRel and rel ~= nil and math.abs(rel.X) <= pad.Size.X / 2 + 1 and math.abs(rel.Z) <= pad.Size.Z / 2 + 1 and rel.Y >= 0 and rel.Y <= 8
+		end
+		local function openOnPad(play)
+			local result = invoke("MemoryMatchService.RF.Open", play)
+			local err = type(result) == "table" and string.lower(tostring(result.Error or "")) or ""
+			if string.find(err, "pad", 1, true) or string.find(err, "walk onto", 1, true) then
+				N.teleport(pad.Position + Vector3.new(0, pad.Size.Y / 2 + 3, 0), 0.3)
+				waitFor(onPad, 2)
+				log("MEMORY pad reached", if onPad() then "(on the pad)" else "(not confirmed)")
+				result = invoke("MemoryMatchService.RF.Open", play)
+				task.delay(0.5, closeMemoryMenu)
+			end
+			return result
+		end
+		local state = openOnPad(false)
 		if type(state) ~= "table" or state.Error then
 			backoff("memory", 900)
 			log("MEMORY board refused:", brief(state))
@@ -42757,7 +43998,7 @@ do
 				Xtra.memoryNext = tonumber(state.NextPlay)
 				return false
 			end
-			state = invoke("MemoryMatchService.RF.Open", true)
+			state = openOnPad(true)
 			if type(state) ~= "table" or state.Error or state.Id == nil then
 				backoff("memory", 900)
 				log("MEMORY start refused:", brief(state))
@@ -44023,7 +45264,18 @@ do
 			-- the best use of one hatched copy: on the team as it is, or as 1/n of a Golden / Diamond / Rainbow craft
 			local best = math.max(N.tierPower(pw, "Normal") - weakest, 0)
 			for _, path in ipairs(paths) do
-				local v = math.max(N.tierPower(pw, path.tier) - weakest, 0) / path.copies
+				local v = math.max(N.tierPower(pw, path.tier) - weakest, 0)
+				-- G6 (3937): a sure Golden craft turns Lucky into a Diamond 1 in 50 / a Rainbow 1 in 250
+				if path.lucky then
+					local rest = 1
+					local lucky = 0
+					for _, l in ipairs(path.lucky) do
+						lucky += l.p * math.max(N.tierPower(pw, l.tier) - weakest, 0)
+						rest -= l.p
+					end
+					v = v * math.max(rest, 0) + lucky
+				end
+				v /= path.copies
 				if path.bonus then
 					v *= path.bonus
 				end
@@ -44084,6 +45336,38 @@ do
 	-- (6 Normals without bonuses), Diamond = Goldens x that (5 x 6), Rainbow = Diamonds x the pod count (5 x 5 x 6).
 	-- Only machines the game config has; cached for 10 s (the sure counts move with mastery and enchants).
 	local PathCache = { at = -1e9, list = {} }
+	-- G6 (3937 code pass): MachineConfig.Golden.LuckyDiamond = 50 / LuckyRainbow = 250 (bc 239173; the craft answer marks
+	-- them Lucky, 70050-70054): one sure Golden craft becomes a Diamond 1 in 50 and a Rainbow 1 in 250 = expected power
+	-- 3 + 4/50 + 7/250 = 3.108 instead of 3 (+3.6 %). Nil when the config has no Lucky fields.
+	function N.goldenLucky()
+		local cfg = N.machineCfg and N.machineCfg("Golden")
+		if not cfg then
+			return nil
+		end
+		local out = {}
+		local d, r = tonumber(cfg.LuckyDiamond), tonumber(cfg.LuckyRainbow)
+		if d and d >= 1 then
+			table.insert(out, { tier = "Diamond", p = 1 / d })
+		end
+		if r and r >= 1 then
+			table.insert(out, { tier = "Shiny", p = 1 / r })
+		end
+		return if #out > 0 then out else nil
+	end
+	-- The expected power factor of one sure Golden craft over a plain Golden (1.036 with the 3937 config)
+	function N.goldenLuckyFactor()
+		local lucky = N.goldenLucky()
+		if not lucky then
+			return 1
+		end
+		local base = N.tierPower(1000, "Golden")
+		local v, rest = 0, 1
+		for _, l in ipairs(lucky) do
+			v += l.p * N.tierPower(1000, l.tier)
+			rest -= l.p
+		end
+		return (v + math.max(rest, 0) * base) / base
+	end
 	function N.craftPaths()
 		local now = os.clock()
 		if now - PathCache.at < 10 then
@@ -44094,7 +45378,7 @@ do
 		local golden = N.machineCfg and N.machineCfg("Golden")
 		if golden then
 			copies *= (N.craftNeedSure and N.craftNeedSure("Golden")) or 6
-			table.insert(list, { tier = "Golden", copies = copies })
+			table.insert(list, { tier = "Golden", copies = copies, lucky = N.goldenLucky() })
 			local diamond = N.machineCfg("Diamond")
 			if diamond then
 				copies *= (N.craftNeedSure("Diamond")) or 5
@@ -44611,6 +45895,45 @@ do
 				t.gemText = string.format("%s%s for %s gems", if #packs > 0 then "potion pack " .. table.concat(packs, "/") else "", if #work.brew > 0 then (if #packs > 0 then " and " else "") .. #work.brew .. " brews" else "", formatNumber(t.gems))
 			end
 		end
+		-- R13 (OWNER_RULES 21 + 24): finished brews and Honey Pot treats are FREE claims (the gems and ingredients went in
+		-- when they started), so while Auto Potion Machine / Auto Honey Pot are off the planner and Auto Claim Finished
+		-- Crafts still collect them: a visit that only claims (no buy, brew or new craft).
+		if not on("AutoHoneyPot") and N.does("AutoClaimMachines") and os.clock() - N.Honey.tripAt > 300 then
+			local ready = N.honeyPlan(true)
+			if #ready > 0 then
+				local value = 0
+				local slots = N.honeySlots()
+				for _, i in ipairs(ready) do
+					local s = slots[i] or slots[tostring(i)]
+					if type(s) == "table" then
+						value += honeyValue(tostring(s.Key)) * (tonumber(s.Amount) or 1)
+					end
+				end
+				add("honey", value, 15, locationLoss("Spawn"), function()
+					return N.honeyTrip(true)
+				end, on("AutoClaimMachines"), "Spawn")
+			end
+		end
+		if not on("AutoPotionMachine") and N.does("AutoClaimMachines") and os.clock() - (N.World.at.potionTrip or -1e9) > 600 then
+			local work = N.potionWork(true)
+			if work then
+				local value = 0
+				for _, s in pairs(N.sub(N.sub(N.data(), "PotionMachine"), "Slots")) do
+					if type(s) == "table" and (tonumber(s.ReadyAt) or math.huge) <= os.time() then
+						value += potionValue(tostring(s.Name or "Coins Potion I"))
+					end
+				end
+				add("potions", value, 15, locationLoss("Spawn"), function()
+					return N.potionTrip(true)
+				end, on("AutoClaimMachines"), "Spawn")
+			end
+		end
+		-- R13: the enchanter's Claim answered "visit the machine": one short visit to the Enchant point (Shadow Realm)
+		if N.EnchantHold and N.EnchantHold.visit and N.does("AutoClaimMachines") and N.enchantHeldDone() and os.clock() - (N.EnchantHold.tripAt or -1e9) > 600 then
+			-- the held pet is out of the team until it is back: its power share of the income for a day at most
+			local share = if N.equippedPower() > 0 then N.petPower(N.enchantHeldPet()) / N.equippedPower() else 0
+			add("enchanter claim", math.max(share, 0.01) * 86400, 15, lossTo("Shadow Realm"), N.enchantClaimTrip, on("AutoClaimMachines"), "Shadow Realm")
+		end
 		if N.does("AutoShrine") and N.shrineDue() then
 			add("shrine", N.shrineValue(), 12, lossTo("Autumn"), N.shrineTrip, on("AutoShrine"), "Autumn")
 		end
@@ -44828,6 +46151,11 @@ do
 		if on("SecretHunt") and N.Secret then
 			table.insert(out, "Secret Hunt: " .. N.Secret.last)
 		end
+		-- G1 (3937): a hatched Secret the hub could not release yet
+		local secretWaits = N.secretPendingText and N.secretPendingText()
+		if secretWaits then
+			table.insert(out, "Secret: " .. secretWaits)
+		end
 		if on("IndexHunter") and not on("SecretHunt") then
 			local hunt = N.Index and N.Index.target
 			table.insert(out, if hunt then string.format("Index Hunter: %s egg, %s, %d variant%s left (~%s)", hunt.egg, tostring(N.Index.pet or "-"), hunt.new, if hunt.new == 1 then "" else "s", N.longTime(hunt.eta)) else "Index Hunter: nothing left to find right now")
@@ -44870,7 +46198,13 @@ do
 		if on("AutoEquip") then
 			table.insert(out, if N.levelFarming() then "Equip the level team (" .. formatNumber(optionNumber("XPMinPower", 600000)) .. "+ power, lowest level first)" else "Keep the best power team equipped (built pet by pet)")
 		elseif N.planner() then
-			table.insert(out, "Fill empty pet slots only (your own team is kept; Auto Equip manages the whole team)")
+			-- R13: the planner alone never changes the team; it only says what Auto Equip would add
+			local better = tonumber(N.Equip.better) or 0
+			table.insert(out, "Fill empty pet slots only (your own team is kept" .. (if better > 0 then string.format("; Auto Equip would add %s power", formatNumber(better)) else "") .. ")")
+		end
+		-- R13: the pet the game's Auto Enchant holds, until it is back
+		if N.enchantHeldPet and N.enchantHeldPet() then
+			table.insert(out, if N.enchantHeldDone() then (if N.does("AutoClaimMachines") then "Enchanter: taking your pet back (" .. tostring(N.EnchantHold.last ~= "" and N.EnchantHold.last or "free claim") .. ")" else "Enchanter: your pet waits there (Auto Claim Finished Crafts takes it back)") else "Enchanter: the game's Auto Enchant is rolling your pet")
 		end
 		if (N.does("AutoSkillTree") or N.does("AutoGemUpgrades")) and N.Spend.pick then
 			table.insert(out, string.format("Buy %s for %s gems", N.Spend.pick.name, formatNumber(N.Spend.pick.cost)))
@@ -44968,6 +46302,7 @@ do
 		{ "AutoGolden", "Auto Golden" },
 		{ "AutoDiamond", "Auto Diamond" },
 		{ "AutoRainbow", "Auto Rainbow" },
+		{ "CraftAll", "Craft All" },
 		{ "AutoDelete", "Auto Delete Junk" },
 		{ "AutoOfflineDelete", "Offline Auto-Delete (away)" },
 		{ "AutoXPTreats", "Auto XP Treats" },
@@ -44987,9 +46322,11 @@ do
 		{ "AutoIndex", "Auto Claim Index" },
 		{ "IndexHunter", "Index Hunter" },
 		{ "SecretHunt", "Secret Hunt" },
+		{ "UseGodlyHatches", "Use Godly Hatches" },
 		{ "AutoOffline", "Auto Offline Rewards" },
 		{ "AutoLeaderboard", "Auto Leaderboard Rewards" },
 		{ "AutoGifts", "Auto Open Gifts" },
+		{ "AutoClaimMachines", "Auto Claim Finished Crafts" },
 		{ "AutoDuck", "Auto Lucky Duck" },
 		{ "DuckNudge", "Ask For Extra Ducks" },
 		{ "AutoHoneyPot", "Auto Honey Pot" },
@@ -45105,6 +46442,11 @@ do
 			Text = "Secret Hunt",
 			Default = false,
 			Tooltip = "Hold the chosen egg (above) without a gap to grow its secret pity. Each egg has its own time-based secret drought: it only counts while you hatch that egg, and resets to zero the moment you switch eggs. With this on the planner never leaves the egg for the Index Hunter or a cheaper fallback, keeps the Secret Luck totem and enchant up, and shows the drought and pity. No exploit, pure playstyle",
+		})
+		HatchBox:AddToggle("UseGodlyHatches", {
+			Text = "Use Godly Hatches",
+			Default = false,
+			Tooltip = "Spends your Godly Hatch items (x100 luck, about x10 secret chance each) one per hatch on the egg you are hatching, only while a Luck or Mythic event is live (the luck cap is x1000). Never switches the egg, so the secret pity keeps growing. Runs only while this toggle is on: the Smart Planner never uses them",
 		})
 		HatchBox:AddToggle("AutoSettings", {
 			Text = "Fast Hatch Settings",
@@ -45270,6 +46612,13 @@ do
 					Text = "Only 100 % success",
 					Default = true,
 					Tooltip = "Uses exactly as many copies as a sure craft needs (fewer with the Goldens mastery and CraftChance enchants). Off: the copies below are used even when the chance is lower",
+				})
+			end
+			if m.key == "Golden" then
+				box:AddToggle("CraftAll", {
+					Text = "Craft All (Golden + Diamond)",
+					Default = false,
+					Tooltip = "Not tested in game yet. Uses the game's Craft All (Goldens mastery level 4): up to 60 sure crafts in one request at the Golden and Diamond machines instead of one set per request, so craft trips take seconds. Only species whose every spare copy Corvus would craft anyway (never equipped, team, locked, enchanted, mutated, Secret or Never craft or delete pets); everything else is crafted one set at a time as before. If a pet outside that plan ever disappears, Craft All switches itself off for this game version",
 				})
 			end
 			box:AddSlider(m.count, {
@@ -45453,6 +46802,7 @@ do
 		RewardBox:AddToggle("AutoOffline", { Text = "Auto Offline Rewards", Default = false, Tooltip = "Claims the offline coins and closes the offline hatch recap" })
 		RewardBox:AddToggle("AutoLeaderboard", { Text = "Auto Leaderboard Rewards", Default = false, Tooltip = "Claims the weekly leaderboard rewards when the week ends" })
 		RewardBox:AddToggle("AutoGifts", { Text = "Auto Open Gifts", Default = false, Tooltip = "Opens the gifts you own (never more than you have); the Release Gift at its release time" })
+		RewardBox:AddToggle("AutoClaimMachines", { Text = "Auto Claim Finished Crafts", Default = false, Tooltip = "Collects what is already finished: brewed potions at the Potion Machine, Honey Pot treats, and your pet back from the enchanter after the game's own Auto Enchant. Starts nothing new and uses nothing up" })
 		RewardBox:AddToggle("AutoClanRewards", { Text = "Auto Clan Rewards", Default = false, Tooltip = "Claims your clan achievement rewards (playtime, hatches, rebirths) every 10 minutes while you are in a clan" })
 		RewardBox:AddToggle("AutoRaffle", { Text = "Auto Raffle", Default = false, Tooltip = "Reads the daily raffle and enters it only when the entry is free (never tickets for Robux or tokens)" })
 		Labels.Rewards = RewardBox:AddLabel({ Text = "-", DoesWrap = true })
@@ -45794,6 +47144,8 @@ do
 				tostring(N.hasX8())
 			),
 			"Probes (place version " .. N.placeVersion() .. "): " .. N.probeSummary(),
+			-- R13 (OWNER_RULES 24): what the game itself still lists as claimable at this flush (read from the replica)
+			"Open in game: " .. (if N.claimStateText then (select(2, pcall(N.claimStateText)) or "?") else "?"),
 			"Perf: " .. Debug.perfText(),
 			"Plan: " .. (if N.Plan.say ~= "" then N.Plan.say else "-") .. " | " .. (if N.Plan.why ~= "" then N.Plan.why else "-") .. " | " .. (if N.Plan.spendText ~= "" then N.Plan.spendText else "-"),
 			"Problems (" .. Log.problemCount .. "): " .. (if #Log.problems > 0 then table.concat(Log.problems, " | ") else "none"),
@@ -47624,6 +48976,18 @@ do
 		if N.does("AutoGifts") then
 			N.giftStep()
 		end
+		-- R13: the pet the game's Auto Enchant left in the enchanter comes back (a free claim; a visit when the server asks)
+		if N.does("AutoClaimMachines") and N.enchantClaimStep() then
+			chore("took the pet back from the enchanter")
+		end
+		-- R13 (OWNER_RULES 23): every Secret pet gets the game's own lock, one per pass, while any automation runs
+		if anyAutoOn() and choreDue("secretLock", 10) and not N.PetLock.craft and N.secretLockStep() then
+			chore("locked a Secret pet")
+		end
+		-- R13 (OWNER_RULES 24): what the game itself still lists as claimable, every 10 minutes (read only)
+		if anyAutoOn() then
+			N.claimStateStep()
+		end
 		if N.does("AutoDuck") then
 			N.duckStep()
 		end
@@ -47877,7 +49241,17 @@ do
 				N.markDone()
 				end
 				if shown(Tabs.Rewards) then
-					I.rewards = string.format("Claimed %d this session%s", Session.claims, if #N.Reward.log > 0 then "\n" .. table.concat(N.Reward.log, "\n") else "")
+					-- R13: the game's own list of what is still claimable under the hub's count (a second check)
+					local st = N.claimState()
+					local open = {}
+					if st then
+						for _, k in ipairs({ { "index", "index rewards" }, { "quests", "quests" }, { "offline", "offline coins" }, { "recap", "offline recap" }, { "gifts", "gifts" }, { "chests", "tap chests" }, { "brews", "brews" }, { "honey", "honey pots" }, { "pods", "rainbow pods" }, { "enchanter", "enchanter pet" }, { "secrets", "Secrets to lock" }, { "defense", "Pet Defense reward" } }) do
+							if (st[k[1]] or 0) > 0 then
+								table.insert(open, string.format("%s %d", k[2], st[k[1]]))
+							end
+						end
+					end
+					I.rewards = string.format("Claimed %d this session%s\nStill open in the game: %s", Session.claims, if #N.Reward.log > 0 then "\n" .. table.concat(N.Reward.log, "\n") else "", if #open > 0 then table.concat(open, ", ") else "nothing")
 					I.duck = string.format("Ducks caught %d%s\nNudge: %s", Session.ducks, if N.Duck.last ~= "" then " (" .. N.Duck.last .. ")" else "", N.probeState("luckyducky_nudge"))
 					local ready, crafts = N.honeyPlan()
 					local stock = N.clickTreatStock()
