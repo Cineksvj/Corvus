@@ -32798,6 +32798,7 @@ do
 	-- The game's config tables (prices, odds, ladders). Player data comes from WuKong queries and the game's models.
 	N.G = {}
 	N.G.Units = N.tableOr(N.safeRequire("_genConfigs.battle_tbunit"))
+	N.G.RarityPool = N.tableOr(N.safeRequire("_genConfigs.battle_tbraritypool"))
 	N.G.Slots = N.tableOr(N.safeRequire("_genConfigs.battle_tbnestunlock"))
 	N.G.Attr = N.tableOr(N.safeRequire("_genConfigs.battle_tbattribute"))
 	N.G.Trees = N.tableOr(N.safeRequire("_genConfigs.battle_tbantappeltree"))
@@ -32970,6 +32971,68 @@ do
 	end
 	function N.M()
 		return (1 + N.atkValue()) * (1 + N.treeAdd())
+	end
+	-- Rarity ladder. The game keeps the rank only in its UI (Common 1 ... OP 10, Celestial 11, dump 2005) and lists the names in
+	-- the unit config (battle_tbunit.Rarity) and the roll pools (battle_tbraritypool.Info[].Rarity), so the hub reads both at
+	-- runtime. BASE is the fallback and the order; Eternal is not in the dump yet (player report 2026-10-12): it sits after
+	-- Celestial by name and is ranked as soon as the config carries it. A rarity the hub does not know at all goes after the
+	-- known ones, sorted by the strongest ant that has it.
+	N.RarityBase = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Exotic", "Secret", "Divine", "OP", "Celestial", "Eternal" }
+	function N.buildRarities()
+		local rank, names = {}, {}
+		for i, name in ipairs(N.RarityBase) do
+			rank[string.lower(name)] = i
+			names[i] = name
+		end
+		local best, extra = {}, {}
+		local function see(name, attack)
+			if type(name) ~= "string" or name == "" then
+				return
+			end
+			local key = string.lower(name)
+			if not rank[key] and not best[key] then
+				best[key] = { name = name, attack = 0 }
+				table.insert(extra, best[key])
+			end
+			if best[key] and attack then
+				best[key].attack = math.max(best[key].attack, tonumber(attack) or 0)
+			end
+		end
+		local fromConfig = 0
+		for _, cfg in pairs(N.G.Units or {}) do
+			if type(cfg) == "table" then
+				see(cfg.Rarity, cfg.Attack)
+				fromConfig += 1
+			end
+		end
+		for _, pool in pairs(N.G.RarityPool or {}) do
+			for _, row in ipairs(type(pool) == "table" and type(pool.Info) == "table" and pool.Info or {}) do
+				see(row.Rarity, 0)
+			end
+		end
+		table.sort(extra, function(a, b)
+			if a.attack ~= b.attack then
+				return a.attack < b.attack
+			end
+			return a.name < b.name
+		end)
+		for _, e in ipairs(extra) do
+			table.insert(names, e.name)
+			rank[string.lower(e.name)] = #names
+		end
+		N.RarityRanks = rank
+		N.Rarities = names
+		if #extra > 0 then
+			local list = {}
+			for _, e in ipairs(extra) do
+				table.insert(list, e.name)
+			end
+			log("RARITY new names from the game config", table.concat(list, ","), "ranked after", N.RarityBase[#N.RarityBase])
+		end
+		return names
+	end
+	function N.rarityRank(rarity)
+		return (N.RarityRanks or {})[string.lower(tostring(rarity))] or 0
 	end
 	function N.unitCfg(id)
 		return N.G.Units[id]
@@ -33825,10 +33888,6 @@ function N.rollStep()
 	cmd("RollAnt", { Source = "ProximityPrompt" })
 	Session.rolls += 1
 	return true
-end
-function N.rarityRank(rarity)
-	local order = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6, Exotic = 7, Secret = 8, Divine = 9, OP = 10 }
-	return order[tostring(rarity)] or 0
 end
 -- Gain of one more ant with food f: the best K of (equipped + backpack + new) minus the best K now.
 function N.antGain(f)
@@ -35658,7 +35717,8 @@ do
 			end,
 		})
 	end
-	N.Rarities = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Exotic", "Secret", "Divine", "OP" }
+	N.buildRarities()
+	log("RARITY ladder", table.concat(N.Rarities, ","))
 	do
 		local HarvestBox = Tabs.Farm:AddLeftGroupbox("Harvest", "bug")
 		HarvestBox:AddToggle("FastHarvest", {
@@ -36441,7 +36501,7 @@ end)("0b1b060606494c40161f06100c1d1658161c0e4013061c5c140a101e1a1c081c5d47404655
 			})
 			local PostBox = Tabs.Webhook:AddRightGroupbox("Posts", "bell")
 			PostBox:AddToggle("WebhookAnts", { Text = "Rare ants bought", Default = true })
-			PostBox:AddDropdown("WebhookRarities", { Text = "Rare means", Values = N.Rarities, Default = { "Legendary", "Mythic", "Exotic", "Secret", "Divine", "OP" }, Multi = true, AllowNull = true })
+			PostBox:AddDropdown("WebhookRarities", { Text = "Rare means", Values = N.Rarities, Default = { "Legendary", "Mythic", "Exotic", "Secret", "Divine", "OP", "Celestial", "Eternal" }, Multi = true, AllowNull = true })
 			PostBox:AddToggle("WebhookMarket", { Text = "Black Market sales", Default = true })
 			PostBox:AddToggle("WebhookCodes", { Text = "Codes redeemed", Default = true })
 			PostBox:AddLabel({ Text = '<font transparency="0.35">Each post goes out once, at most one every 2.5 s. Pick what is worth a ping.</font>', DoesWrap = true })
