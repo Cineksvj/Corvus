@@ -32947,6 +32947,20 @@ do
 		local option = Options[name]
 		return tonumber(option and option.Value) or default
 	end
+	-- "10B", "2.5qa", "1500000" -> number; empty or unreadable = 0 (off).
+	local MoneyPow = { [""] = 0, k = 1, m = 2, b = 3, t = 4, qa = 5, qi = 6, sx = 7, sp = 8, oc = 9, no = 10, dc = 11 }
+	function N.parseMoney(text)
+		local num, suffix = string.match(string.lower(tostring(text or "")), "^%s*([%d%.]+)%s*([a-z]*)%s*$")
+		local value, power = tonumber(num), MoneyPow[suffix or ""]
+		if not value or not power then
+			return 0
+		end
+		return value * 1000 ^ power
+	end
+	function N.minCash()
+		local option = Options.StealMinCash
+		return N.parseMoney(option and option.Value)
+	end
 	function optionText(name, default)
 		if N.PlannerChoice[name] and N.planOn() then
 			return N.PlannerChoice[name]
@@ -34588,6 +34602,10 @@ do
 				return false, "makes less than your weakest pet ($" .. formatNumber(worst) .. "/s)"
 			end
 		end
+		local minCash = N.minCash()
+		if minCash > 0 and N.cashValue(info) < minCash then
+			return false, "below your min $" .. formatNumber(minCash) .. "/s"
+		end
 		if own then
 			return true, "ok"
 		end
@@ -34994,6 +35012,16 @@ do
 	function N.hatchWorth(zone)
 		if not on("GrabOwnHatch") then
 			return false, "Grab What You Hatch is off"
+		end
+		local minCash = N.minCash()
+		if minCash > 0 then
+			local top = 0
+			for _, row in ipairs(N.Plan.dist(zone)) do
+				top = math.max(top, row.v)
+			end
+			if top > 0 and top * 8 < minCash then
+				return false, string.format("zone %d animals never reach your min $%s/s", zone, formatNumber(minCash))
+			end
 		end
 		if on("OnlyBetter") then
 			local worst = N.worstPlaced()
@@ -39057,6 +39085,13 @@ do
 			Default = {},
 			Multi = true,
 			AllowNull = true,
+		})
+		AnimalBox:AddInput("StealMinCash", {
+			Text = "Min Money/s",
+			Default = "",
+			Placeholder = "10B",
+			Finished = true,
+			Tooltip = "Only steal or grab animals that make at least this much per second. Plain numbers or K/M/B/T/Qa, empty or 0 = off",
 		})
 		AnimalBox:AddSlider("StealMinKg", { Text = "Min Weight", Default = 0, Min = 0, Max = 5000, Rounding = 0, Suffix = " kg" })
 		AnimalBox:AddSlider("StealRange", { Text = "Max Distance", Default = 600, Min = 50, Max = 3000, Rounding = 0, Suffix = " studs" })
