@@ -32561,14 +32561,15 @@ end
 			end
 			return table.concat(parts, ", ")
 		end
+		Game.Build = "586-op14" -- built on PlaceVersion 586, owner pass 2026-10-13 (raise on every redeploy)
 		do
 			local executor = "?"
 			pcall(function()
 				executor = table.concat({ identifyexecutor() }, " ")
 			end)
-			log("BOOT", GameName, "place", game.PlaceId, "job", string.sub(tostring(game.JobId), 1, 8), "executor", executor)
+			log("BOOT", GameName, "place", game.PlaceId, "version", game.PlaceVersion, "build", Game.Build, "job", string.sub(tostring(game.JobId), 1, 8), "executor", executor)
 		end
-		Perf = { frames = 0, time = 0, worst = 0, hitches = 0, freezes = 0, work = {}, hitchLogAt = 0, last = nil }
+		Perf = { frames = 0, time = 0, worst = 0, hitches = 0, freezes = 0, work = {}, hitchLogAt = 0, last = nil, bootAt = os.clock() }
 		Library:GiveSignal(RunService.Heartbeat:Connect(function(dt)
 			Perf.frames += 1
 			Perf.time += dt
@@ -32583,6 +32584,7 @@ end
 				end
 				if dt > 1 then
 					Perf.freezes += 1
+					Perf.freezeAt = os.clock()
 				end
 			end
 		end))
@@ -32613,6 +32615,10 @@ end
 			return folder and folder:FindFirstChild(name)
 		end
 		function call(service, name, ...)
+			-- an unloaded or replaced hub never fires a remote (a thread that was waiting must not act on cleared settings)
+			if not alive() then
+				return false
+			end
 			if Blocked[service .. "." .. name] then
 				return false
 			end
@@ -32625,6 +32631,9 @@ end
 			NextCallAt = math.max(now, NextCallAt) + (Game.callGap or 0.15)
 			if gap > 0 then
 				task.wait(gap)
+				if not alive() then
+					return false
+				end
 			end
 			local args = table.pack(...)
 			if name == "TeleportToPlot" or name == "WarpToLocation" then
@@ -32708,6 +32717,17 @@ end
 				end
 			end)
 		end
+		-- purchases: BUY <what> ok ... only when the data shows it (level, owned list), else BUY <what> FAILED answer=
+		function Game.buyLog(what, good, answer, detail, key)
+			local pay = ""
+			local plan = key and Game.lastPlan
+			local item = plan and plan.byKey and plan.byKey[key]
+			if item and item.payback then
+				pay = string.format(" payback %.1fh", item.payback / 3600)
+			end
+			log("BUY " .. what .. (if good then " ok" else " FAILED answer=" .. brief(answer)) .. (if detail then " " .. detail else "") .. pay)
+			return good
+		end
 		function waitFor(check, seconds)
 			local waited = 0
 			while waited < seconds do
@@ -32717,6 +32737,23 @@ end
 				waited += task.wait(0.05) or 0.05
 			end
 			return check() and true or false
+		end
+		-- OWNER_RULES 24: a claim is logged "ok" only when the game state shows it (data field, the game's own controller, or the
+		-- server's answer where the game keeps no field); otherwise REWARD <what> FAILED answer=<reply>. Repeats are throttled.
+		Game.claimFails = {}
+		function Game.claimLog(what, good, answer, detail)
+			local extra = if detail ~= nil and tostring(detail) ~= "" then " " .. tostring(detail) else ""
+			if good then
+				Game.claimFails[what] = nil
+				log("REWARD " .. what .. " ok" .. extra)
+			else
+				local n = (Game.claimFails[what] or 0) + 1
+				Game.claimFails[what] = n
+				if n <= 3 or n % 20 == 0 then
+					log("REWARD " .. what .. " FAILED answer=" .. brief(answer) .. extra .. (if n > 1 then " (x" .. n .. ")" else ""))
+				end
+			end
+			return good
 		end
 		local Knit
 		do
@@ -32773,6 +32810,21 @@ end
 		function controller(name)
 			local ok, found = pcall(Knit.GetController, name)
 			return if ok and type(found) == "table" then found else nil
+		end
+		-- run a game button the way a click does (UIComponents.Button component: Activate runs the game's own callbacks, bc 18575-18606),
+		-- so windows the game builds once (playtime gifts, daily days) update themselves; false when the button is not a component
+		function Game.pressGameButton(inst)
+			if typeof(inst) ~= "Instance" then
+				return false
+			end
+			local okComp, comp = pcall(function()
+				local Button = require(Knit.UIComponents.Button)
+				return Button:FromInstance(inst)
+			end)
+			if not (okComp and type(comp) == "table" and type(comp.Activate) == "function" and type(comp.Callbacks) == "table" and #comp.Callbacks > 0) then
+				return false
+			end
+			return (pcall(comp.Activate, comp))
 		end
 		local Replica
 		local function fetchReplica(seconds)
@@ -32841,9 +32893,11 @@ end
 		Game.WaveConfig = safeRequire("Configs.WaveConfig")
 		Game.PlaytimeRewardConfig = safeRequire("Configs.PlaytimeRewardConfig")
 		Game.SeasonPassConfig = safeRequire("Configs.SeasonPassConfig")
+		Game.QuestConfig = safeRequire("Configs.QuestConfig")
 		Game.FreeShopConfig = safeRequire("Configs.FreeShopConfig")
 		Game.DailyRewardConfig = safeRequire("Configs.DailyRewardConfig")
 		Game.EventConfig = safeRequire("Configs.EventConfig")
+		Game.BrainrotsEventConfig = safeRequire("Configs.BrainrotsEventConfig")
 		Game.EggUtils = safeRequire("GameShared.EggUtils")
 		Game.Modifiers = safeRequire("Modifiers")
 		Brainrots = type(Game.BrainrotsConfig) == "table" and type(Game.BrainrotsConfig.CONFIG) == "table" and Game.BrainrotsConfig.CONFIG
@@ -32936,12 +32990,16 @@ end
 			end
 			return v == value
 		end
-		-- Smart Planner runs its own sea, training, selling, eggs and spending; the player's own toggles are never flipped
+		-- Smart Planner runs its own sea, training, selling, eggs, spending and every free claim; the player's own toggles are never
+		-- flipped. Not driven (OWNER_RULES 21, only with their own switch): potions, the Luminous wheel (its coins are also sold for
+		-- Robux, MonetizationConfig CURRENCY_PACKS), the video ad, Luck Hop and Auto Lock.
 		local PlannerDrives = {
-			AutoSea = "sea", AutoTrain = "train", TrainSea = "train", AutoSell = "sell", AutoPlaceEggs = "eggs", AutoHatch = "eggs",
+			AutoSea = "sea", AutoTrain = "train", TrainSea = "train", AutoBonus = "train", AutoSell = "sell", AutoPlaceEggs = "eggs", AutoHatch = "eggs",
 			AutoEquipBest = "spend", AutoUpgrade = "spend", AutoBuyStaff = "spend", AutoEquipStaff = "spend",
 			AutoBuyDumbbell = "spend", AutoEquipDumbbell = "spend", AutoRebirth = "spend",
 			EventRush = "events", AutoStars = "events", AutoLucky = "events",
+			AutoPlaytime = "rewards", AutoDaily = "rewards", AutoFreeShop = "rewards", AutoForever = "rewards",
+			AutoSeasonPass = "rewards", AutoOffline = "rewards", AutoCodes = "rewards", AutoGroup = "rewards",
 		}
 		function on(name)
 			local t = Toggles[name]
@@ -33127,8 +33185,16 @@ end
 			end
 			table.sort(names)
 			for _, name in ipairs(names) do
-				table.insert(RarityList, name)
-				RarityRank[name] = #RarityList
+				if name == "Toy" and RarityRank.SPECIAL then
+					-- 586 Toy family (cashPerSecond 500k to 15B, specialMulti animals): ranks next to SPECIAL, not above Lightning
+					table.insert(RarityList, RarityRank.SPECIAL + 1, name)
+					for i, other in ipairs(RarityList) do
+						RarityRank[other] = i
+					end
+				else
+					table.insert(RarityList, name)
+					RarityRank[name] = #RarityList
+				end
 			end
 		end
 		local RarityColor = {
@@ -33150,6 +33216,7 @@ end
 			Nightfall = "#7d8bff",
 			Frosty = "#9be7ff",
 			Lightning = "#ffe14d",
+			Toy = "#ff8a5c",
 		}
 		function rarityColor(rarity)
 			return RarityColor[rarity] or "#dddddd"
@@ -33172,6 +33239,7 @@ end
 				end
 			end
 		end
+		Game.MutationList = MutationList
 		MutationLabels = {}
 		for _, id in ipairs(MutationList) do
 			table.insert(MutationLabels, MutationNames[id])
@@ -33223,7 +33291,16 @@ end
 				base = if weight > 0 then total / weight else 0
 				EggExpected[kind] = base
 			end
-			return base * mutationMulti(mutation) * sizeMulti(size)
+			-- the egg's own size does not reach the animal (rolled at hatch): the average size multiplier for every egg
+			local sizes = type(Game.SizeConfig) == "table" and Game.SizeConfig.SIZES
+			local sizeAvg, weight = 0, 0
+			for id, z in pairs(type(sizes) == "table" and sizes or {}) do
+				local c = type(z) == "table" and tonumber(z.chance) or 0
+				sizeAvg += c * sizeMulti(id)
+				weight += c
+			end
+			sizeAvg = if weight > 0 then sizeAvg / weight else 1
+			return base * mutationMulti(mutation) * sizeAvg
 		end
 		function describe(kind, typeName, mutation, size, level, traits)
 			mutation = if type(mutation) == "string" and mutation ~= "" then mutation else "NORMAL"
@@ -33242,6 +33319,8 @@ end
 				level = tonumber(level) or 1,
 				value = if kind == "Egg" then eggCps(typeName, mutation, size) else brainrotCps(typeName, mutation, size, level, traits),
 				special = kind ~= "Egg" and cfg ~= nil and cfg.specialMulti ~= nil,
+				-- 586 GetSpecialMulti: specialMulti + the mutation's specialMultiAddition (none in 586)
+				specialMulti = if kind ~= "Egg" and cfg ~= nil and cfg.specialMulti ~= nil then (tonumber(cfg.specialMulti) or 0) + (tonumber(type(Game.MutationConfig) == "table" and type(Game.MutationConfig[mutation]) == "table" and Game.MutationConfig[mutation].specialMultiAddition) or 0) else nil,
 				tier = kind == "Egg" and cfg and tonumber(cfg.tier) or 0,
 				hatch = kind == "Egg" and cfg and tonumber(cfg.hatchTime) or 0,
 			}
@@ -33301,9 +33380,9 @@ end
 			return if info.kind == "Egg" then "Eggs" else "Animals"
 		end
 		-- event animals (CollectEventConfig.EVENTS[*].index lists) always pass the animal picker
-		local EventAnimals, EventAnimalsAt = {}, -1e9
+		local EventAnimals, EventAnimalsAt, InkAnimals, InkLogKey = {}, -1e9, {}, ""
 		function Game.isEventAnimal(typeName)
-			if os.clock() - EventAnimalsAt > 30 then
+			if os.clock() - EventAnimalsAt > 10 then
 				EventAnimalsAt = os.clock()
 				local cfg = Game.CollectEventConfig
 				local set = {}
@@ -33319,9 +33398,47 @@ end
 						end
 					end
 				end
+				-- INK (BrainrotsEventConfig.EVENTS[*].requiredBrainrots, reward INK Crowbar): while the event is in ActiveEvents its
+				-- animals count as event animals too (sea priority, kept from Smart Sell until they are unlocked)
+				local ink = {}
+				local active = ReplicatedStorage:FindFirstChild("ActiveEvents")
+				local bcfg = Game.BrainrotsEventConfig
+				if active ~= nil and type(bcfg) == "table" and type(bcfg.EVENTS) == "table" then
+					for id, ev in pairs(bcfg.EVENTS) do
+						if type(ev) == "table" and type(ev.requiredBrainrots) == "table" and active:FindFirstChild(id) ~= nil then
+							for brainrotId in pairs(ev.requiredBrainrots) do
+								ink[brainrotId] = true
+								set[brainrotId] = true
+							end
+						end
+					end
+				end
+				InkAnimals = ink
+				local names = {}
+				for brainrotId in pairs(ink) do
+					table.insert(names, brainrotId)
+				end
+				table.sort(names)
+				local key = table.concat(names, ",")
+				if key ~= InkLogKey then
+					InkLogKey = key
+					local data = Data()
+					local unlocked = data and type(data.UnlockedBrainrots) == "table" and data.UnlockedBrainrots or {}
+					local missing = 0
+					for _, brainrotId in ipairs(names) do
+						if unlocked[brainrotId] == nil then
+							missing += 1
+						end
+					end
+					log(if #names > 0 then string.format("EVENT ink priority on, %d of %d required animals still missing: %s", missing, #names, key) else "EVENT ink priority off")
+				end
 				EventAnimals = set
 			end
 			return EventAnimals[typeName] == true
+		end
+		function Game.isInkAnimal(typeName)
+			Game.isEventAnimal(typeName)
+			return InkAnimals[typeName] == true
 		end
 		-- Index Hunter: animals each index tab (mutation) still misses; only eggs inside that tab count (IsInMutationIndex)
 		local HuntMap = { at = -1e9, map = {} }
@@ -33352,7 +33469,15 @@ end
 			return map
 		end
 		function Game.huntWanted(info)
-			if not on("IndexHunter") or type(info) ~= "table" or info.kind == "Egg" then
+			if type(info) == "table" and info.kind == "Egg" then
+				-- 586 egg gate: one NORMAL egg of a type whose index entries are all owned but not unlocked goes first
+				if not on("IndexHunter") or info.mutation ~= "NORMAL" then
+					return false
+				end
+				local _, gate = Game.eggGate()
+				return (gate[info.type] or 0) > 0 and not Game.eggHeld(info.type)
+			end
+			if not on("IndexHunter") or type(info) ~= "table" then
 				return false
 			end
 			if not selected(Options.IndexTiers, MutationNames[info.mutation] or info.mutation) then
@@ -33397,7 +33522,14 @@ end
 					table.insert(parts, label .. " <b>" .. owned .. "/" .. total .. "</b>")
 				end
 			end
-			return if #parts > 0 then "Owned: " .. table.concat(parts, "  \u{00B7}  ") else "Pick at least one index tab"
+			local gated = 0
+			for _, g in ipairs((Game.eggGate())) do
+				if g.tabs > 0 then
+					gated += 1
+				end
+			end
+			local gateText = if gated > 0 then "  \u{00B7}  Eggs to unlock: <b>" .. gated .. "</b>" else ""
+			return if #parts > 0 then "Owned: " .. table.concat(parts, "  \u{00B7}  ") .. gateText else "Pick at least one index tab"
 		end
 		function matches(info, prefix, minValue)
 			if not info then
@@ -33412,6 +33544,12 @@ end
 			if prefix == "Catch" and info.kind ~= "Egg" then
 				local pick = Options.CatchAnimals and Options.CatchAnimals.Value
 				if type(pick) == "table" and next(pick) ~= nil and pick[info.name] ~= true and not (on("EventRush") and Game.isEventAnimal(info.type)) then
+					return false
+				end
+			end
+			if prefix == "Catch" and info.kind == "Egg" then
+				local pick = Options.CatchEggs and Options.CatchEggs.Value
+				if type(pick) == "table" and next(pick) ~= nil and pick[info.name] ~= true and not (on("EventRush") and Game.event ~= nil and Game.event.wanted(info) == true) then
 					return false
 				end
 			end
@@ -33515,6 +33653,8 @@ end
 			codes = {},
 			codesBad = {},
 			group = {},
+			-- group reward granted (the old "group" list was also written on refusals, so every account gets one fresh try)
+			groupOk = {},
 		}
 		do
 			local data = readJson(SaveFolder .. "/OTSFA_stats.json")
@@ -34742,9 +34882,20 @@ end
 			return picked
 		end
 		local StarLog = {}
+		-- any collect event counts (CollectEventConfig.EVENTS: STARS, CAKE, KEY since 586), not only Stars
 		local function starsActive()
 			local events = ReplicatedStorage:FindFirstChild("ActiveEvents")
-			return events ~= nil and events:FindFirstChild("STARS") ~= nil
+			if events == nil then
+				return false
+			end
+			local cfg = Game.CollectEventConfig
+			local list = type(cfg) == "table" and type(cfg.EVENTS) == "table" and cfg.EVENTS or { STARS = true, CAKE = true, KEY = true }
+			for id in pairs(list) do
+				if events:FindFirstChild(id) ~= nil then
+					return true
+				end
+			end
+			return false
 		end
 		local function starModels()
 			local folder = workspace:FindFirstChild("CollectEventPickups")
@@ -34815,7 +34966,7 @@ end
 					if os.clock() + cost > wave.closeAt - seaMargin() then
 						break
 					end
-					setStatus("Collecting stars")
+					setStatus("Collecting event pickups")
 					local before = #starModels()
 					seaTravel(spot, { mode = mode, deadline = wave.closeAt - seaMargin(), keepGoing = keep })
 					task.wait(0.45)
@@ -35242,22 +35393,32 @@ end
 					TS.offAt, I.fails, I.gap = os.clock(), 0, 0.25 -- the refusals during the probe are not a danger signal (live 2026-10-07: 10 refusals in 25 s -> Teleport)
 						log("TRAIN+SEA off: the sea does not open while training")
 				elseif now - TS.at >= 20 then
-					if power() > TS.power and I.ok > TS.waves then
+					-- works = power rises at a real share of the training rate while the waves keep paying; the owner's 586 run rose
+					-- ~5M/s against ~6B/s of real training (a stray tick per restart), which the old "any rise" test called works
+					local rise = (power() - TS.power) / math.max(now - TS.at, 1)
+					local expected = Game.expectedTrainRate and Game.expectedTrainRate() or 0
+					if rise > 0 and rise >= expected * 0.25 and I.ok > TS.waves then
 						TS.state, TS.at, TS.power = "works", now, power()
-						log("TRAIN+SEA works: power and waves at the same time")
+						log(string.format("TRAIN+SEA works: power +%s/s (training alone ~%s/s) and waves at the same time", formatNumber(rise), formatNumber(expected)))
 						notify("Corvus", "Training and farming at the same time", 5)
 					else
 						TS.state = "no"
 						call("TrainingService", "StopTraining")
 						TS.offAt, I.fails, I.gap = os.clock(), 0, 0.25
-							log("TRAIN+SEA off: power", TS.power, "->", power(), "waves", TS.waves, "->", I.ok)
+						log(string.format("TRAIN+SEA off: power +%s/s while the waves run, training alone gives ~%s/s; waves %d -> %d", formatNumber(math.max(rise, 0)), formatNumber(expected), TS.waves, I.ok))
 					end
 				end
 			elseif TS.state == "works" and now - TS.at >= 60 then
-				if power() <= TS.power then
+				local rise = (power() - TS.power) / math.max(now - TS.at, 1)
+				local expected = Game.expectedTrainRate and Game.expectedTrainRate() or 0
+				if rise <= 0 or rise < expected * 0.25 then
 					TS.restarts += 1
 					TS.state = if TS.restarts > 3 then "no" else nil
-					log("TRAIN+SEA power stopped rising, restart", TS.restarts)
+					if TS.state == "no" then
+						call("TrainingService", "StopTraining")
+						TS.offAt = os.clock()
+					end
+					log(string.format("TRAIN+SEA power +%s/s, training alone ~%s/s: restart %d%s", formatNumber(math.max(rise, 0)), formatNumber(expected), TS.restarts, if TS.state == "no" then ", off for this server" else ""))
 				else
 					TS.at, TS.power = now, power()
 				end
@@ -35320,6 +35481,7 @@ end
 			Track.wave()
 			local minValue = parseAmount(Options.CatchMinValue and Options.CatchMinValue.Value) or 0
 			local list, total = {}, 0
+			local rankSum = 0
 			local blocks = {}
 			for _, spawn in pairs(wave.spawns) do
 				local blockKey, blockCfg = Game.lucky.of(spawn)
@@ -35329,11 +35491,15 @@ end
 				local info = if blockKey then nil else spawnInfo(spawn)
 				if info then
 					total += 1
+					rankSum += info.rank or 0
 					local hunt = Game.huntWanted(info)
 					if (hunt or matches(info, "Catch", minValue)) and not (spawn.isBossItem and Game.bossBlocked(spawn.bossId)) then
 						table.insert(list, { id = spawn.entity.id, info = info, boss = spawn.isBossItem, bossId = spawn.bossId, hunt = hunt, plate = tonumber(spawn.wavePart) })
 					end
 				end
+			end
+			if total > 0 and Game.luckSample then
+				Game.luckSample(rankSum / total, total)
 			end
 			local floor = Game.plotFloor and Game.plotFloor() or 0
 			local anyIndex = false
@@ -35345,7 +35511,7 @@ end
 				item.gain = planner and Game.itemGain and Game.itemGain(item.info, floor) or 0
 				item.idx = 0
 				-- Event Rush: missing event index animals and event eggs go before everything else
-				item.ev = rushing and Game.event.wanted(item.info) == true
+				item.ev = (rushing and Game.event.wanted(item.info) == true) or (Game.event ~= nil and Game.event.inkWanted(item.info) == true)
 				if item.ev then
 					evCount += 1
 					anyIndex = true
@@ -35360,6 +35526,22 @@ end
 					end
 				end
 			end
+			-- Season Pass hatch quests (planner, free track not finished): eggs of a size a quest still needs and the backpack does not
+			-- hold yet go first (huge eggs are 2% of the sea, so they are taken whenever one shows up)
+			local questNeed = planner and Game.questHatchNeed and Game.questHatchNeed() or nil
+			if questNeed then
+				local left = {}
+				for size, n in pairs(questNeed) do
+					left[size] = n - Game.eggsOfSize(size)
+				end
+				for _, item in ipairs(list) do
+					local size = item.info.size or "baby"
+					if item.info.kind == "Egg" and (left[size] or 0) > 0 then
+						left[size] -= 1
+						item.quest = true
+					end
+				end
+			end
 			local pr = not Game.plannerOn() and Options.SeaPriority and Options.SeaPriority.Value or "Best Value"
 			table.sort(list, function(a, b)
 				if a.ev ~= b.ev then
@@ -35367,6 +35549,9 @@ end
 				end
 				if (a.hunt == true) ~= (b.hunt == true) then
 					return a.hunt == true
+				end
+				if (a.quest == true) ~= (b.quest == true) then
+					return a.quest == true
 				end
 				if pr == "Rarest" and a.info.rank ~= b.info.rank then
 					return a.info.rank > b.info.rank
@@ -35388,6 +35573,33 @@ end
 			end
 			Sea.preview = { matching = #list, total = total, at = os.clock() }
 			pcall(Game.rates.observe, list, maxPickup(), waveReach())
+			-- never-sold items (Secret and special animals; with the planner also the Protect lists) that bring nothing to the plot, the
+			-- index or an event would only sit in the backpack for good: they stay in the sea (measured above, so the rates see them)
+			do
+				local kept, skipped = {}, 0
+				for _, item in ipairs(list) do
+					local info = item.info
+					local useful = (item.gain or 0) > 0 or item.ev or item.hunt or item.quest or (item.idx or 0) > 0 or item.boss
+					if not useful and not planner then
+						-- without the planner only Secret animals are judged: worth placing, or their index entry is missing
+						useful = not Game.isSecret(info) or info.value > floor or Game.indexGain(info.type, info.mutation) > 0
+					end
+					if useful or not (if planner then Game.stuckItem(info) else Game.isSecret(info)) then
+						table.insert(kept, item)
+					else
+						skipped += 1
+					end
+				end
+				if skipped > 0 then
+					Sea.stuckSkipped = (Sea.stuckSkipped or 0) + skipped
+					if os.clock() - (Sea.stuckLogAt or -1e9) >= 60 then
+						Sea.stuckLogAt = os.clock()
+						log("PLAN skip " .. Sea.stuckSkipped .. " sea item(s) in the last minute that would never be sold and add nothing (Secret, special or protected)")
+						Sea.stuckSkipped = 0
+					end
+					list = kept
+				end
+			end
 			-- wave probes (blatant.md 1, 2, 3): one per wave, so the inventory change says which one the server took
 			local P, probe, level = Game.probe, nil, nil
 			local k = math.max(math.floor(maxPickup()), 1)
@@ -35615,7 +35827,7 @@ end
 		-- CollectEventConfig: RATE_LIMIT_MAX 500 claims per RATE_LIMIT_TIME 20 s, then PUNISH_TIME 10 s. A deep sea
 		-- has 100+ pickups per wave, so claims stay under 450 per 20 s, run straight on the remote (they never wait
 		-- behind the waves) and pause 12 s when the server starts saying no.
-		local Stars = { claims = {}, pausedUntil = 0, refused = 0, queue = {} }
+		local Stars = { claims = {}, pausedUntil = 0, refused = 0, queue = {}, calls = {}, seen = {} }
 		Game.stars = Stars
 		local function collectRemote()
 			local services = findKnitServices()
@@ -35640,7 +35852,22 @@ end
 				local now = os.clock()
 				if now - (Stars.logAt or 0) >= 60 then
 					Stars.logAt = now
-					log("STARS mode=" .. tostring(Game.effMove()) .. " queued=" .. #Stars.queue)
+					-- evidence from the game data, not from the call: Data().CollectEvents[id].Collected of the running event session
+					-- (CollectEventHudController bc 20653-20667); calls that moved nothing are a FAILED claim
+					local parts = {}
+					local data = Data()
+					for eventId, calls in pairs(Stars.calls) do
+						local slot = data and type(data.CollectEvents) == "table" and data.CollectEvents[eventId]
+						local collected = type(slot) == "table" and tonumber(slot.Collected) or 0
+						local sid = type(slot) == "table" and slot.SessionId or nil
+						local prev = Stars.seen[eventId]
+						if prev and prev.sid == sid and calls > prev.calls then
+							local moved = collected > prev.collected
+							table.insert(parts, string.format("%s collected %d->%d calls +%d%s", tostring(eventId), prev.collected, collected, calls - prev.calls, if moved then " ok" else " FAILED answer=" .. brief(Stars.lastAnswer)))
+						end
+						Stars.seen[eventId] = { calls = calls, collected = collected, sid = sid }
+					end
+					log("STARS mode=" .. tostring(Game.effMove()) .. " queued=" .. #Stars.queue .. (if #parts > 0 then " " .. table.concat(parts, "; ") else ""))
 				end
 				while #Stars.claims > 0 and Stars.claims[1] < now - 20 do
 					table.remove(Stars.claims, 1)
@@ -35657,8 +35884,10 @@ end
 						local ok, result = pcall(function()
 							return remote:InvokeServer(item[1], item[2])
 						end)
+						Stars.lastAnswer = if ok then result else "error " .. tostring(result)
 						if ok and result ~= false then
 							Stars.refused = 0
+							Stars.calls[item[1]] = (Stars.calls[item[1]] or 0) + 1
 							Session.stars += 1
 							Saved.stars += 1
 							SaveDirty = true
@@ -35677,6 +35906,40 @@ end
 				end
 			end
 		end)
+		-- PROBE collect_value (blatant.md P4, 586): Data().CollectEvents[id].Collected per accepted Collect call. 586 adds a combo popup
+		-- to the event pickups; if a claim counts more than 1 the Event Rush ETA uses the measured ratio. Passive: only the normal claims
+		-- above are measured (Blatant remote-only, so nothing else adds to Collected), one window of 150 accepted claims per event.
+		do
+			local CVWindow = {}
+			task.spawn(function()
+				while alive() do
+					task.wait(10)
+					local events = ReplicatedStorage:FindFirstChild("ActiveEvents")
+					local data = Data()
+					for eventId, calls in pairs(Stars.calls) do
+						local child = events and events:FindFirstChild(eventId)
+						local slot = data and type(data.CollectEvents) == "table" and data.CollectEvents[eventId]
+						local okSid, sid = false, nil
+						if child then
+							okSid, sid = pcall(child.GetAttribute, child, "SessionId")
+						end
+						if child and type(slot) == "table" and (not okSid or sid == nil or sid == slot.SessionId) then
+							local collected = tonumber(slot.Collected) or 0
+							local w = CVWindow[eventId]
+							if not w or w.sid ~= slot.SessionId or collected < w.collected or calls < w.calls then
+								CVWindow[eventId] = { sid = slot.SessionId, collected = collected, calls = calls, done = w ~= nil and w.sid == slot.SessionId and w.done }
+							elseif not w.done and isBlatant() and calls - w.calls >= 150 and #Stars.queue == 0 then
+								local ratio = (collected - w.collected) / (calls - w.calls)
+								w.done = true
+								local accepted = ratio > 1.05 and ratio <= 4
+								Game.probe.tried["collect_value"] = nil
+								Game.probe.result("collect_value", accepted, Game.probe.round(math.clamp(ratio, 1, 4)), string.format("event=%s calls=%d collected=%d", eventId, calls - w.calls, collected - w.collected))
+							end
+						end
+					end
+				end
+			end)
+		end
 		function seaCycle(manual)
 			local keep = function()
 				return alive() and (manual == true or on("AutoSea"))
@@ -36095,9 +36358,66 @@ end
 			end
 			return CFrame.new(spot.X, surface.Position.Y + surface.Size.Y / 2 + 1.5, spot.Z) * CFrame.Angles(0, math.pi / 2, 0)
 		end
+		-- Season Pass hatch quests (ideas.md D1): finished quests are claimed by the server (QuestConfig autoClaim), so the planner's
+		-- only lever is to get them done. Quests that count hatches of one size (conditions.size huge / big / baby) need an egg of
+		-- that size hatched (the quest counts the egg's size: op5 live, huge x2 -> x1 right after a Huge Polarbear Egg hatched; the
+		-- animal itself is rolled baby / big / huge at hatch). Only while the free track still has a tier to claim (Pass XP buys nothing else).
+		-- Returns { huge = n, big = n, baby = n } still missing, or nil.
+		function Game.questHatchNeed()
+			local data = Data()
+			local quests = data and data.Quests
+			local pass = type(Game.SeasonPassConfig) == "table" and Game.SeasonPassConfig.Pass
+			local qcfg = type(Game.QuestConfig) == "table" and Game.QuestConfig.QUESTS
+			if type(quests) ~= "table" or type(pass) ~= "table" or type(qcfg) ~= "table" then
+				return nil
+			end
+			local lastFree
+			for i, tier in ipairs(pass) do
+				if type(tier) == "table" and tier.Free then
+					lastFree = i
+				end
+			end
+			local got = type(data.SeasonPass) == "table" and type(data.SeasonPass.Free) == "table" and data.SeasonPass.Free or {}
+			if not lastFree or got[tostring(lastFree)] then
+				return nil
+			end
+			local need, any = {}, false
+			for _, set in ipairs({ quests.SeasonPassHourly, quests.SeasonPass }) do
+				for name, q in pairs(type(set) == "table" and set or {}) do
+					local cfg = type(q) == "table" and qcfg[q.id or name]
+					local size = type(cfg) == "table" and type(cfg.conditions) == "table" and cfg.conditions.size
+					if size and cfg.progressType == "HATCH_PETS" and not (q.isCompleted or q.isClaimed) then
+						local left = (tonumber(cfg.targetAmount) or 0) - (tonumber(q.progress) or 0)
+						if left > 0 then
+							need[size] = math.max(need[size] or 0, left)
+							any = true
+						end
+					end
+				end
+			end
+			return if any then need else nil
+		end
+		local QuestLogAt, QuestLogKey = -1e9, nil
+		function Game.eggsOfSize(size)
+			local n = 0
+			local data = Data()
+			for _, entry in pairs(data and data.Inventory or {}) do
+				local inner = type(entry) == "table" and entry.itemType == "Egg" and entry.innerEntity
+				if type(inner) == "table" and (inner.size or "baby") == size then
+					n += 1
+				end
+			end
+			for _, egg in ipairs(placedEggModels()) do
+				if (egg:GetAttribute("Size") or "baby") == size then
+					n += 1
+				end
+			end
+			return n
+		end
 		local function eggCandidates()
 			local list = {}
-			local order = Options.EggOrder and Options.EggOrder.Value or "Best Value"
+			-- the planner owns the order (Smart = gain per second of hatching); the dropdown is for players without it
+			local order = if Game.plannerOn() then "Smart" else (Options.EggOrder and Options.EggOrder.Value or "Best Value")
 			for _, tool in ipairs(backpackTools("EggType")) do
 				local info = describe("Egg", tool:GetAttribute("EggType"), tool:GetAttribute("Mutation"), tool:GetAttribute("Size"))
 				if matches(info, "Egg", 0) and (EggPlaceFail[tool] or 0) <= os.clock() then
@@ -36107,10 +36427,42 @@ end
 			if order == "Smart" then
 				local floor = Game.plotFloor()
 				for _, entry in ipairs(list) do
-					entry.rate = Game.eggGain(entry.info.type, entry.info.mutation, floor) / Game.hatchSeconds(entry.info.type, entry.info.size)
+					entry.rate = Game.eggGain(entry.info.type, entry.info.mutation, floor, entry.info.size) / Game.hatchSeconds(entry.info.type, entry.info.size)
+				end
+				-- open Season Pass hatch quests of one size: that many eggs of the size go first (the best of them by rate)
+				local need = Game.plannerOn() and Game.questHatchNeed() or nil
+				if need then
+					table.sort(list, function(a, b)
+						return a.rate > b.rate
+					end)
+					local left, picked = {}, {}
+					for size, n in pairs(need) do
+						left[size] = n
+					end
+					for _, entry in ipairs(list) do
+						local size = entry.info.size or "baby"
+						if (left[size] or 0) > 0 then
+							left[size] -= 1
+							entry.quest = true
+							table.insert(picked, infoTitle(entry.info))
+						end
+					end
+					local parts = {}
+					for size, n in pairs(need) do
+						table.insert(parts, size .. " x" .. n)
+					end
+					table.sort(parts)
+					local key = table.concat(parts, ",") .. "|" .. #picked
+					if key ~= QuestLogKey or os.clock() - QuestLogAt > 300 then
+						QuestLogKey, QuestLogAt = key, os.clock()
+						log("PLAN quest hatch " .. table.concat(parts, ", ") .. " for the Season Pass, first: " .. (if #picked > 0 then table.concat(picked, ", ") else "no egg of that size in the backpack"))
+					end
 				end
 			end
 			table.sort(list, function(a, b)
+				if (a.quest == true) ~= (b.quest == true) then
+					return a.quest == true
+				end
 				if order == "Smart" and a.rate ~= b.rate then
 					return a.rate > b.rate
 				end
@@ -36240,6 +36592,81 @@ end
 			log("HATCH freed a plot slot", tostring(freed), "worst $" .. formatNumber(worstValue) .. "/s")
 			return freed
 		end
+		-- ids of every animal the player owns (plot and backpack), to see what a hatch added
+		function Game.brainrotIds()
+			local data = Data()
+			local set = {}
+			for key, e in pairs(data and data.PlacedAnimals or {}) do
+				if type(e) == "table" then
+					set[tostring(e.id or key)] = true
+				end
+			end
+			for key, e in pairs(data and data.Inventory or {}) do
+				if type(e) == "table" and e.itemType == "Brainrot" then
+					set[tostring(key)] = true
+				end
+			end
+			return set
+		end
+		-- the animal a hatch of this egg added: new id, a type the egg can give, the egg's mutation (the sea can add others meanwhile)
+		Game.hatchTaken = {}
+		-- second evidence of a hatch: the server starts the hatch animation on that egg model (PlayHatchAnimation(egg, 3, preview?),
+		-- EggController bc 21678-21683), also when the new animal was moved or sold before the data check saw it
+		Game.hatchAnim = setmetatable({}, { __mode = "k" })
+		onEvent("EggService", "PlayHatchAnimation", function(model)
+			if typeof(model) == "Instance" then
+				Game.hatchAnim[model] = os.clock()
+			end
+		end)
+		function Game.newBrainrot(seen, eggType, mutation)
+			local cfg = Eggs[eggType]
+			local can = {}
+			for _, item in ipairs(type(cfg) == "table" and type(cfg.items) == "table" and cfg.items or {}) do
+				if type(item) == "table" and item.id ~= nil then
+					can[item.id] = true
+				end
+			end
+			mutation = if type(mutation) == "string" and mutation ~= "" then mutation else "NORMAL"
+			local function fits(inner)
+				-- any size: the hatched animal's size is rolled at hatch, the egg's own size does not carry over
+				return type(inner) == "table" and can[inner.brainrotType] == true and (inner.mutation or "NORMAL") == mutation
+			end
+			local data = Data()
+			for key, e in pairs(data and data.PlacedAnimals or {}) do
+				local id = if type(e) == "table" then tostring(e.id or key) else tostring(key)
+				if type(e) == "table" and not seen[id] and not Game.hatchTaken[id] and fits(e) then
+					return describe("Brainrot", e.brainrotType, e.mutation, e.size, e.level, e.traits), id
+				end
+			end
+			for key, e in pairs(data and data.Inventory or {}) do
+				local id = tostring(key)
+				if type(e) == "table" and e.itemType == "Brainrot" and not seen[id] and not Game.hatchTaken[id] and fits(e.innerEntity) then
+					return entryInfo(e), id
+				end
+			end
+			return nil
+		end
+		-- the server hands the animal over after the hatch animation (EggsConfig HATCH_ANIMATION_DURATION 3 s): checked in the background
+		-- for up to 8 s, so the hatch job does not wait; an animal found once is not counted for another egg
+		function Game.verifyHatch(seen, eggType, eggMutation, eggInfo, answer, eggModel)
+			task.spawn(function()
+				local born, bornId = nil, nil
+				waitFor(function()
+					born, bornId = Game.newBrainrot(seen, eggType, eggMutation)
+					return born ~= nil
+				end, 8)
+				if born then
+					Game.hatchTaken[bornId] = true
+					log("HATCH " .. infoTitle(eggInfo) .. " -> " .. infoTitle(born) .. " (" .. born.rarity .. ", $" .. formatNumber(born.value) .. "/s) ok")
+					Track.event("Hatch", "Hatched " .. infoTitle(born), born.rarity .. "  \u{00B7}  $" .. formatNumber(born.value) .. "/s", "egg", rarityColor(born.rarity))
+					emit("hatched", born)
+				elseif eggModel and Game.hatchAnim[eggModel] then
+					log("HATCH " .. infoTitle(eggInfo) .. " ok (the game played its hatch animation; the new animal could not be told apart in the data)")
+				else
+					log("HATCH " .. infoTitle(eggInfo) .. " FAILED answer=" .. brief(answer) .. ", no hatch animation and no new animal within 8 s")
+				end
+			end)
+		end
 		function hatchEggs()
 			local now = serverNow()
 			local hatched = 0
@@ -36259,16 +36686,25 @@ end
 					if (placedStats()) >= maxAnimals() and freeSlot() then
 						freedAny = true
 					end
+					local eggType, eggMutation = egg:GetAttribute("EggType"), egg:GetAttribute("Mutation")
+					local eggInfo = describe("Egg", eggType, eggMutation, egg:GetAttribute("Size"))
+					local seen = Game.brainrotIds()
 					local ok, result = call("EggService", "HatchEgg", id)
 					if not (ok and result) and (placedStats()) >= maxAnimals() and freeSlot() then
 						freedAny = true
+						seen = Game.brainrotIds()
 						ok, result = call("EggService", "HatchEgg", id)
 					end
+					-- state check (background): the hatched animal shows up on the plot or in the backpack (the 586 PlayHatchAnimation
+					-- event carries no animal any more, EggController bc 21555-21683)
 					if ok and result then
 						hatched += 1
 						Session.hatched += 1
 						Saved.hatched += 1
 						SaveDirty = true
+						Game.verifyHatch(seen, eggType, eggMutation, eggInfo, result, egg)
+					else
+						log("HATCH " .. infoTitle(eggInfo) .. " FAILED answer=" .. brief(if ok then result else "no answer"))
 					end
 					if hatched >= 3 then
 						break
@@ -36281,54 +36717,57 @@ end
 			end
 			return hatched
 		end
-		onEvent("EggService", "PlayHatchAnimation", function(model, _, result)
-			if type(result) ~= "table" or not result.type then
-				return
-			end
-			if
-			typeof(model) == "Instance"
-			and model:GetAttribute("OwnerId") ~= nil
-			and model:GetAttribute("OwnerId") ~= LocalPlayer.UserId
-			then
-				return
-			end
-			local info = describe("Brainrot", result.type, result.mutation, result.size)
-			Track.event(
-				"Hatch",
-				"Hatched " .. infoTitle(info),
-				info.rarity .. "  \u{00B7}  $" .. formatNumber(info.value) .. "/s",
-				"egg",
-				rarityColor(info.rarity)
-			)
-			emit("hatched", info)
-		end)
+		-- (the hatch result is read from the data in hatchEggs: the 586 PlayHatchAnimation event sends the egg model and a duration only)
 		local function bestInventoryBrainrot()
 			local data = Data()
 			local best = 0
 			for _, entry in pairs(data and data.Inventory or {}) do
 				if type(entry) == "table" and entry.itemType == "Brainrot" then
 					local info = entryInfo(entry)
-					if info and not info.special and info.value > best then
-						best = info.value
+					if info then
+						local v = if info.special then Game.specialIncome(info) else info.value
+						if v > best then
+							best = v
+						end
 					end
 				end
 			end
 			return best
 		end
+		-- 586 GetTotalCashPerSec (bc 56727-56762): a placed animal with specialMulti earns specialMulti x the cash/s of the best placed
+		-- animal (best by base cash/s over ALL placed, specials included), the best itself earns its own x max(multi, 1). So total
+		-- includes the specials at that value (it used to leave them out) and Game.placedBest keeps the best base for Game.specialIncome.
 		function placedStats()
 			local data = Data()
-			local total, worst, amount = 0, math.huge, 0
+			local total, worst, amount, best = 0, math.huge, 0, 0
+			local specials = {}
 			for _, entity in pairs(data and data.PlacedAnimals or {}) do
 				if type(entity) == "table" and entity.brainrotType then
 					local info = describe("Brainrot", entity.brainrotType, entity.mutation, entity.size, entity.level, entity.traits)
 					amount += 1
-					if not info.special then
+					best = math.max(best, info.value)
+					if info.special then
+						table.insert(specials, info)
+					else
 						total += info.value
 						worst = math.min(worst, info.value)
 					end
 				end
 			end
+			Game.placedBest = best
+			for _, info in ipairs(specials) do
+				total += Game.specialIncome(info, best)
+			end
 			return amount, total, if worst == math.huge then 0 else worst
+		end
+		-- cash/s (base, before CashMulti) a special animal earns once placed: specialMulti x the best placed animal
+		function Game.specialIncome(info, best)
+			best = best or Game.placedBest or 0
+			local mult = tonumber(info.specialMulti) or 0
+			if info.value >= best then
+				return info.value * math.max(mult, 1)
+			end
+			return best * mult
 		end
 		-- Upgrade math. Plot income only grows when a new animal beats the weakest one on the plot (or fills a free
 		-- slot). So an item is worth its expected gain over that floor:
@@ -36354,7 +36793,10 @@ end
 			end
 			return worst
 		end
-		function Game.eggGain(eggType, mutation, floor)
+		-- size: kept in the signature for the callers; the hatched animal's size is rolled at hatch with the SizeConfig chances (live
+		-- 2026-10-14: a Big Mouse Egg hatched a baby Bunny), so every egg is valued over all sizes; its own size only slows the hatch
+		-- (Game.hatchSeconds, timeToHatchMulti) and counts for the Season Pass size quests
+		function Game.eggGain(eggType, mutation, floor, size)
 			local key = tostring(eggType) .. "|" .. tostring(mutation) .. "|" .. tostring(math.floor(floor))
 			local hit = GainCache[key]
 			if hit and os.clock() - hit.at < 30 then
@@ -36368,25 +36810,35 @@ end
 					total += tonumber(item.chance) or 0
 				end
 			end
-			for _, z in pairs(sizeTable()) do
+			local sizes = sizeTable()
+			for _, z in pairs(sizes) do
 				sizeTotal += tonumber(z.chance) or 0
 			end
 			local gain, better = 0, 0
 			if total > 0 and sizeTotal > 0 then
 				for _, item in ipairs(items) do
 					if type(item) == "table" and (item.type == nil or item.type == "Brainrot") and Brainrots[item.id] then
-						local base = describe("Brainrot", item.id, mutation, "baby").value
+						local d = describe("Brainrot", item.id, mutation, "baby")
+						local base = d.value
 						local chance = (tonumber(item.chance) or 0) / total
 						gain += chance * Game.indexGain(item.id, mutation)
-						for _, z in pairs(sizeTable()) do
+						for _, z in pairs(sizes) do
 							local p = chance * (tonumber(z.chance) or 0) / sizeTotal
-							local v = base * (tonumber(z.cashMulti) or 1)
+							local v = if d.special then Game.specialIncome(d) else base * (tonumber(z.cashMulti) or 1)
 							if v > floor then
 								gain += p * (v - floor)
 								better += p
 							end
 						end
 					end
+				end
+			end
+			-- 586 egg gate: a NORMAL egg of a type never unlocked as NORMAL opens every index tab whose animals are already owned
+			if (mutation or "NORMAL") == "NORMAL" then
+				local _, gate = Game.eggGate()
+				local tabs = gate[eggType]
+				if tabs and tabs > 0 then
+					gain += Game.completionValue() * tabs
 				end
 			end
 			if GainCacheSize > 600 then
@@ -36418,6 +36870,103 @@ end
 			end
 			IndexCache.at, IndexCache.value, IndexCache.done = os.clock(), base * 0.1 / (1 + 0.1 * done), done
 			return IndexCache.value
+		end
+		-- 586 egg gate (CompletedEggs, bc 58497-58498: `local v38 = v34[k_2]` / `if v38 and v38.NORMAL then`): an (egg, mutation) index entry
+		-- only counts when UnlockedEggs[egg].NORMAL is set, even with every animal owned. list = eggs in the index without the flag, with
+		-- the number of index tabs whose animals are already all owned (tabs = tabs that open at once); set[egg] = tabs.
+		-- How the flag gets set (pickup or hatch) is unknown: INDEX egg flag set shows it in the log.
+		Game.gate = { at = -1e9, list = {}, set = {}, key = nil, prev = {}, held = { at = -1e9, set = {} } }
+		function Game.eggGate()
+			local G = Game.gate
+			if os.clock() - G.at < 20 then
+				return G.list, G.set
+			end
+			G.at = os.clock()
+			local list, set = {}, {}
+			local data = Data()
+			local unlocked = data and data.UnlockedBrainrots
+			local cfg = Game.EggsConfig
+			if type(unlocked) == "table" and type(cfg) == "table" and type(cfg.IsInIndex) == "function" and type(cfg.IsInMutationIndex) == "function" then
+				local flags = if type(data.UnlockedEggs) == "table" then data.UnlockedEggs else {}
+				for name, egg in pairs(Eggs) do
+					local okIndex, inIndex = pcall(cfg.IsInIndex, egg)
+					local flag = type(flags[name]) == "table" and flags[name].NORMAL == true
+					if okIndex and inIndex == true and not flag and type(egg.items) == "table" then
+						local tabs = 0
+						for _, mutation in ipairs(Game.MutationList or {}) do
+							local okTab, inTab = pcall(cfg.IsInMutationIndex, egg, mutation)
+							if okTab and inTab == true then
+								local all = true
+								for _, item in ipairs(egg.items) do
+									if type(item) == "table" and item.type == "Brainrot" and Brainrots[item.id] then
+										local h = unlocked[item.id]
+										if not (type(h) == "table" and h[mutation]) then
+											all = false
+											break
+										end
+									end
+								end
+								if all then
+									tabs += 1
+								end
+							end
+						end
+						set[name] = tabs
+						table.insert(list, { egg = name, tabs = tabs })
+					end
+				end
+			end
+			table.sort(list, function(a, b)
+				if a.tabs ~= b.tabs then
+					return a.tabs > b.tabs
+				end
+				return a.egg < b.egg
+			end)
+			if data and type(unlocked) == "table" then
+				for name in pairs(G.prev) do
+					if set[name] == nil then
+						log("INDEX egg flag set", name, "hatched", Session.hatched, "caught", Session.caught or 0)
+				end
+				end
+				G.prev = set
+				local blocked, parts = 0, {}
+				for i, g in ipairs(list) do
+					blocked += g.tabs
+					if i <= 6 then
+						table.insert(parts, g.egg .. "(" .. g.tabs .. ")")
+					end
+				end
+				local key = #list .. ":" .. blocked
+				if key ~= G.key then
+					G.key = key
+					log(string.format("INDEX egg gate %d eggs without the NORMAL flag, blocks %d tabs: %s", #list, blocked, table.concat(parts, ",")))
+				end
+			end
+			G.list, G.set = list, set
+			return list, set
+		end
+		-- a NORMAL egg of this type is already in the backpack or on the plot (one is enough to unlock the flag)
+		function Game.eggHeld(eggType)
+			local H = Game.gate.held
+			if os.clock() - H.at > 5 then
+				H.at = os.clock()
+				local set = {}
+				local data = Data()
+				for _, entry in pairs(data and data.Inventory or {}) do
+					local inner = type(entry) == "table" and entry.itemType == "Egg" and entry.innerEntity
+					if type(inner) == "table" and (inner.mutation == nil or inner.mutation == "" or inner.mutation == "NORMAL") then
+						set[inner.eggType] = true
+					end
+				end
+				for _, egg in ipairs(placedEggModels()) do
+					local m = egg:GetAttribute("Mutation")
+					if m == nil or m == "" or m == "NORMAL" then
+						set[egg:GetAttribute("EggType")] = true
+					end
+				end
+				H.set = set
+			end
+			return H.set[eggType] == true
 		end
 		local function indexGainRaw(brainrotType, mutation)
 			mutation = mutation or "NORMAL"
@@ -36514,15 +37063,51 @@ end
 		end
 		function Game.itemGain(info, floor)
 			if info.kind == "Egg" then
-				return (Game.eggGain(info.type, info.mutation, floor))
+				return (Game.eggGain(info.type, info.mutation, floor, info.size))
 			end
 			if info.special then
-				return 0
+				-- 586: a special earns specialMulti x the best placed animal (Game.specialIncome), minus what it replaces
+				return math.max(Game.specialIncome(info) - floor, 0) + Game.indexGain(info.type, info.mutation)
 			end
 			return math.max(info.value - floor, 0) + Game.indexGain(info.type, info.mutation)
 		end
+		function Game.quietEquipToasts()
+			if Game.toastHooked then
+				return
+			end
+			local nc = controller("NotificationController")
+			if not nc or type(nc.DisplayNotification) ~= "function" then
+				return
+			end
+			Game.toastHooked = true
+			local original = nc.DisplayNotification
+			nc.DisplayNotification = function(self, kind, text, ...)
+				if os.clock() < (Game.quietEquipUntil or 0) and type(text) == "string" and string.find(text, "Equipped best", 1, true) then
+					return
+				end
+				return original(self, kind, text, ...)
+			end
+			Library:OnUnload(function()
+				if nc.DisplayNotification ~= original then
+					nc.DisplayNotification = original
+				end
+			end)
+		end
 		function equipBest(force)
 			if os.clock() < (Game.equipBlockUntil or 0) then
+				return false
+			end
+			local wait = 5.5 - (os.clock() - (Game.equipAt or -1e9))
+			if wait > 0 then
+				if force and not Game.equipRetry then
+					Game.equipRetry = true
+					task.delay(wait, function()
+						Game.equipRetry = false
+						if alive() then
+							equipBest(true)
+						end
+					end)
+				end
 				return false
 			end
 			local amount, _, worst = placedStats()
@@ -36530,11 +37115,16 @@ end
 			if not force and (best <= 0 or (amount >= maxAnimals() and best <= worst)) then
 				return false
 			end
-			local ok = call("AnimalService", "EquipBest")
-			if ok then
+			pcall(Game.quietEquipToasts)
+			Game.quietEquipUntil = os.clock() + 2.5
+			local ok, result = call("AnimalService", "EquipBest")
+			Game.equipAt = os.clock()
+			Game.quietEquipUntil = os.clock() + 1.5
+			if ok and result ~= false then
 				Session.equips = (Session.equips or 0) + 1
+				return true
 			end
-			return ok
+			return false
 		end
 		function collectOffline()
 			local data = Data()
@@ -36542,20 +37132,76 @@ end
 			if amount <= 0 then
 				return false
 			end
-			local ok = call("AnimalService", "CollectOfflineCash")
-			if ok then
+			if os.clock() < (Game.offlineRetryAt or 0) then
+				return false
+			end
+			local before = cash()
+			local _, result = call("AnimalService", "CollectOfflineCash")
+			-- state check: the game sets Data().OfflineCash back to 0 once it paid (OfflineWorkController OnSet OfflineCash, bc 25590)
+			local paid = waitFor(function()
+				local d = Data()
+				return d ~= nil and (tonumber(d.OfflineCash) or 0) <= 0
+			end, 3)
+			Game.claimLog("offline cash", paid, result, "$" .. formatNumber(amount) .. ", cash $" .. formatNumber(before) .. " -> $" .. formatNumber(cash()))
+			if paid then
 				Session.claimed += 1
 				Track.event("Offline", "Offline cash collected", "$" .. formatNumber(amount), "moon", "#9aa8ff")
 				if currentWindow() == "OfflineCash" then
 					closeWindows()
 				end
+			else
+				Game.offlineRetryAt = os.clock() + 120
 			end
-			return ok
+			return paid
 		end
 		local function isProtected(info)
+			if Options.LockRarities == nil or Library.Unloaded then
+				return true
+			end
 			return selected(Options.LockRarities, info.rarity)
 			or selected(Options.LockMutations, MutationNames[info.mutation] or info.mutation)
 			or selected(Options.LockSizes, SizeNames[info.size] or info.size)
+		end
+		Game.isProtected = isProtected
+		-- OWNER_RULES 23: an animal of the Secret rarity is never sold or deleted, whatever the lists say (586: ostrich, llama, kangaroo)
+		function Game.isSecret(info)
+			return type(info) == "table" and info.kind ~= "Egg" and type(info.rarity) == "string" and string.upper(string.sub(info.rarity, 1, 6)) == "SECRET"
+		end
+		-- an item the hub never sells: special and Secret animals always, with Smart Planner also everything on the Protect lists
+		function Game.stuckItem(info)
+			if info.kind ~= "Egg" and (info.special or Game.isSecret(info)) then
+				return true
+			end
+			return Game.plannerOn() and isProtected(info)
+		end
+		-- before the game's Sell All: Secret animals are locked in the game itself (the rule's "lock it when you can")
+		function Game.lockSecrets()
+			local data = Data()
+			local keys = {}
+			for key, entry in pairs(data and data.Inventory or {}) do
+				local info = entryInfo(entry)
+				if info and Game.isSecret(info) and entry.innerEntity.locked ~= true then
+					table.insert(keys, key)
+				end
+			end
+			if #keys == 0 then
+				return true
+			end
+			for i = 1, #keys, 40 do
+				call("InventoryService", "SetItemsLocked", table.move(keys, i, math.min(i + 39, #keys), 1, {}), true)
+			end
+			local locked = waitFor(function()
+				local d = Data()
+				for _, key in ipairs(keys) do
+					local e = d and d.Inventory and d.Inventory[key]
+					if e and e.innerEntity.locked ~= true then
+						return false
+					end
+				end
+				return true
+			end, 3)
+			log("LOCK Secret animals " .. #keys .. (if locked then " ok" else " FAILED answer=still unlocked"))
+			return locked
 		end
 		function lockProtected()
 			if Game.plannerOn() then
@@ -36568,7 +37214,7 @@ end
 			local keys = {}
 			for key, entry in pairs(data.Inventory or {}) do
 				local info = entryInfo(entry)
-				if info and entry.innerEntity.locked ~= true and isProtected(info) then
+				if info and entry.innerEntity.locked ~= true and (isProtected(info) or Game.isSecret(info)) then
 					table.insert(keys, key)
 					if #keys >= 40 then
 						break
@@ -36578,12 +37224,25 @@ end
 			if #keys == 0 then
 				return 0
 			end
-			local ok = call("InventoryService", "SetItemsLocked", keys, true)
-			if ok then
-				Session.locked = (Session.locked or 0) + #keys
-				return #keys
+			local _, result = call("InventoryService", "SetItemsLocked", keys, true)
+			-- state check: count the entries the game now shows locked
+			local done = 0
+			waitFor(function()
+				local d = Data()
+				done = 0
+				for _, key in ipairs(keys) do
+					local e = d and d.Inventory and d.Inventory[key]
+					if e and e.innerEntity.locked == true then
+						done += 1
+					end
+				end
+				return done == #keys
+			end, 2)
+			if done < #keys then
+				log("LOCK " .. done .. " of " .. #keys .. " FAILED answer=" .. brief(result))
 			end
-			return 0
+			Session.locked = (Session.locked or 0) + done
+			return done
 		end
 		-- items Corvus locked for a moment while selling (keep set); if the unlock got lost they are freed next sell
 		local TempLocked = {}
@@ -36612,8 +37271,7 @@ end
 		local function sellCandidates()
 			local data = Data()
 			local list = {}
-			local protectedList = {}
-			local why = { total = 0, special = 0, protected = 0, locked = 0, event = 0, filters = 0, below = 0, kept = 0 }
+			local why = { total = 0, special = 0, secret = 0, protected = 0, locked = 0, event = 0, filters = 0, below = 0, kept = 0 }
 			local below = parseAmount(Options.SellBelow and Options.SellBelow.Value)
 			local smartMode = Game.sellMode() == "Smart"
 			for key, entry in pairs(data and data.Inventory or {}) do
@@ -36623,11 +37281,11 @@ end
 					local isLocked = entry.innerEntity.locked == true
 					if info.special then
 						why.special += 1
+					elseif Game.isSecret(info) then
+						-- OWNER_RULES 23: never sold, whatever the lists or the sell mode say
+						why.secret += 1
 					elseif isProtected(info) then
 						why.protected += 1
-						if not isLocked then
-							table.insert(protectedList, { key = key, info = info, kind = entry.itemType, locked = isLocked })
-						end
 					elseif isLocked and not TempLocked[key] then
 						why.locked += 1
 					elseif Game.event ~= nil and Game.event.wanted(info) then
@@ -36648,8 +37306,10 @@ end
 				-- Smart ignores the sell filters: the best eggs (two plot loads) and a few animals stay, the rest is cash
 				local smart = list
 				local floor = Game.plotFloor()
+				local planned = Game.plannerOn()
 				for _, item in ipairs(smart) do
-					item.score = if item.kind == "Egg" then Game.eggGain(item.info.type, item.info.mutation, floor) else 0
+					-- what it adds to the plot and the index: eggs the expected hatch gain, animals (with the planner) the gain over the floor
+					item.score = if item.kind == "Egg" then Game.eggGain(item.info.type, item.info.mutation, floor, item.info.size) elseif planned then Game.itemGain(item.info, floor) else 0
 				end
 				table.sort(smart, function(a, b)
 					if a.score ~= b.score then
@@ -36676,33 +37336,40 @@ end
 				end
 				-- full backpack and nothing else to sell: the planner frees room with the lowest-value kept items (never protected, locked or special ones)
 				if #list == 0 and #keptItems > 0 and Game.plannerOn() and inventoryCount() >= inventoryLimit() then
+					-- the least useful first: lowest plot or index gain, then lowest value (a cheap egg can carry a big index gain)
 					table.sort(keptItems, function(a, b)
+						if a.score ~= b.score then
+							return a.score < b.score
+						end
 						return a.info.value < b.info.value
 					end)
 					for i = 1, math.max(math.ceil(#keptItems / 2), 1) do
 						table.insert(list, keptItems[i])
 					end
-					log("PLAN full backpack, selling lowest value kept items", #list)
+					log("PLAN full backpack, selling the least useful kept items", #list)
 				end
-				-- everything left is protected by the Protect lists (a late account holds only Cosmic+ items): the planner owns the loop and
-				-- may not sit on a full backpack, so it sells the cheaper half of the protected items too (never game-locked or special ones)
-				if #list == 0 and #protectedList > 0 and Game.plannerOn() and inventoryCount() >= inventoryLimit() then
-					table.sort(protectedList, function(a, b)
-						return a.info.value < b.info.value
-					end)
-					for i = 1, math.min(math.max(math.ceil(#protectedList / 2), 1), 40) do
-						table.insert(list, protectedList[i])
-					end
-					log("PLAN full backpack of protected items, selling the cheapest", #list)
-				end
+				-- items on the Protect lists are never sold by the planner (OWNER_RULES 20: protected items are left alone); the sea picker
+				-- stops taking more of them when they bring nothing (Game.stuckItem) and the Status line says how many hold the backpack
 			end
+			why.sellable, why.at = #list, os.clock()
+			Game.lastSellWhy = why
 			return list, why
+		end
+		-- the backpack is full and the last sell pass (at most 2 min old) found nothing it may sell (Protect lists, locked, Secret,
+		-- special): the sea cannot bring anything until room appears (live 2026-10-14: 200 of 200 on the Protect lists)
+		function Game.seaBlocked()
+			local why = Game.lastSellWhy
+			return inventoryCount() >= inventoryLimit()
+				and type(why) == "table"
+				and (why.total or 0) > 0
+				and why.sellable == 0
+				and os.clock() - (why.at or -1e9) < 120
 		end
 		local function whyText(why)
 			local parts = {}
-			for _, k in ipairs({ "protected", "locked", "filters", "below", "kept", "special", "event" }) do
+			for _, k in ipairs({ "protected", "locked", "filters", "below", "kept", "special", "secret", "event" }) do
 				if (why[k] or 0) > 0 then
-					table.insert(parts, why[k] .. " " .. ({ protected = "protected (Protect lists)", locked = "locked", filters = "outside the sell filters", below = "above Only Below", kept = "kept for the plot", special = "special", event = "event wanted" })[k])
+					table.insert(parts, why[k] .. " " .. ({ protected = "protected (Protect lists)", locked = "locked", filters = "outside the sell filters", below = "above Only Below", kept = "kept for the plot", special = "special", secret = "Secret (never sold)", event = "event wanted" })[k])
 				end
 			end
 			return if #parts > 0 then "none of " .. why.total .. " items can be sold (" .. table.concat(parts, ", ") .. ")" else "the inventory is empty"
@@ -36715,6 +37382,18 @@ end
 		end
 		Sea.fullHint = function()
 			if Game.plannerOn() then
+				local why = Game.lastSellWhy
+				local stuck = if why then (why.protected or 0) + (why.secret or 0) + (why.special or 0) + (why.locked or 0) else 0
+				local total = why and why.total or 0
+				if total > 0 and stuck >= total then
+					if (why.protected or 0) * 2 >= total then
+						return string.format(": all %d are on your Protect lists or never sold, so the sea cannot catch more; the planner hatches, trains and saves meanwhile (take the common tiers off Protect Rarities in Items to let it sell)", total)
+					end
+					return string.format(": all %d are locked, Secret or special (never sold), so the sea cannot catch more; the planner hatches, trains and saves meanwhile", total)
+				end
+				if stuck >= inventoryLimit() / 2 then
+					return string.format(": %d are protected, locked, Secret or special (never sold), the planner sells the cheapest of the rest", stuck)
+				end
 				return ": the planner is selling the lowest value items"
 			end
 			if not on("AutoSell") then
@@ -36733,6 +37412,9 @@ end
 			if on("EquipBeforeSell") then
 				equipBest(false)
 				task.wait(0.6)
+			end
+			if not alive() or Options.LockRarities == nil then
+				return false
 			end
 			local mode = Game.sellMode()
 			local startCash, startCount = cash(), inventoryCount()
@@ -36762,6 +37444,11 @@ end
 				saveTempLocked()
 			end
 			if mode == "Sell All Unlocked" then
+				if not Game.lockSecrets() then
+					-- a Secret animal could not be locked: no Sell All this time (OWNER_RULES 23)
+					SellQuietUntil = os.clock() + 60
+					return false
+				end
 				if on("AutoLock") then
 					for _ = 1, 5 do
 						if lockProtected() == 0 then
@@ -36900,9 +37587,7 @@ end
 			if count >= cap - math.max(maxPickup(), 1) then
 				return true
 			end
-			if Game.cashBoost and Game.cashBoost() and count > 0 then
-				return true
-			end
+			-- no sale window: the sell price is 30 x base cash/s without CashMulti or the x2 Cash event (586 CalculateWorth bc 56655-56657)
 			local limit = math.min(tonumber(Options.SellAt and Options.SellAt.Value) or 150, cap)
 			if count >= limit then
 				return true
@@ -36976,10 +37661,13 @@ end
 					if amount > 0 then
 						local level = upgradeLevel(id)
 						setStatus("Buying " .. label .. " x" .. amount)
-						call("UpgradesService", "Upgrade", id, amount)
-						if waitFor(function()
+						local price = nextUpgradePrice(id)
+						local _, answer = call("UpgradesService", "Upgrade", id, amount)
+						local leveled = waitFor(function()
 							return upgradeLevel(id) > level
-							end, 2.5) then
+						end, 2.5)
+						Game.buyLog(label .. " x" .. amount, leveled, answer, "level " .. level .. " -> " .. upgradeLevel(id) .. ", first level $" .. formatNumber(price or 0), id)
+						if leveled then
 							Session.bought += 1
 							if Game.planDirty then Game.planDirty() end
 							Track.event("Upgrade", label .. " " .. level .. " -> " .. upgradeLevel(id), nil, "trending-up", "#c77dff")
@@ -37181,16 +37869,7 @@ end
 				task.wait(5)
 			end
 		end)
-		-- x2 Cash event (EventConfig cashEvent): Smart Sell sells everything in the window (sellDue)
-		local CashState = nil
-		function Game.cashBoost()
-			local name, left = Game.activeEvent("cashEvent")
-			if name ~= CashState then
-				CashState = name
-				log("CASHBOOST", name or "ended", "left", left or 0)
-			end
-			return name ~= nil
-		end
+		-- DOUBLE_CASH event: multiplies CashMulti (plot income) only, selling is not affected (586 bc 58545-58549), so nothing waits for it
 
 		-- 3. Luck hop: no server luck for N minutes (or 20 s while a hop chain is running) -> another public server
 		local Hop = { since = nil, lastAt = -1e9, logged = nil, gaveUp = false }
@@ -37292,13 +37971,17 @@ end
 				log("AD error PlayAd failed, the free ad job stops")
 				return false
 			end
-			log("AD reward=" .. brief(result))
-			Session.claimed += 1
-			Track.event("Ad", "Free ad reward", nil, "gift", "#ffd166")
-			return true
+			-- the game counts only a truthy PlayAd answer as a reward (VideoAdHandler bc 4871); the reward itself is random
+			local good = result ~= nil and result ~= false
+			Game.claimLog("video ad", good, result)
+			if good then
+				Session.claimed += 1
+				Track.event("Ad", "Free ad reward", nil, "gift", "#ffd166")
+			end
+			return good
 		end
 	end
-	local buyStaffTick, equipStaffTick, buyDumbbellTick, equipDumbbellTick, rebirthTick, trainTick, trainTurn, playtimeTick, nextPlaytimeGift, dailyTick, freeShopTick, foreverTick, limitedTick
+	local buyStaffTick, equipStaffTick, buyDumbbellTick, equipDumbbellTick, rebirthTick, trainTick, trainTurn, playtimeTick, nextPlaytimeGift, dailyTick, freeShopTick, foreverTick
 	local seasonLevel, seasonTick, groupReward, rsvpReward, discordReward, redeemCode, codesTick, activePotionTypes, potionCount, potionTick, clockText, eventsText
 	local setIdleRejoinBlocked, skipTutorial, plotIncome, currentLuck
 	do
@@ -37337,6 +38020,35 @@ end
 			end
 			return bestKey
 		end
+		function Game.staffUseful(key, owned)
+			local cfg = staffOf(key)
+			if not cfg then
+				return false
+			end
+			local ownedLuck, ownedTime = 0, 0
+			for ownedKey in pairs(owned) do
+				local ownedCfg = staffOf(ownedKey)
+				if ownedCfg then
+					ownedLuck = math.max(ownedLuck, effectiveLuck(ownedCfg, owned))
+					ownedTime = math.max(ownedTime, tonumber(ownedCfg.time) or 0)
+				end
+			end
+			local byTime = not Game.plannerOn() and (Options.StaffPick and Options.StaffPick.Value) == "Longest Time"
+			return effectiveLuck(cfg, owned) > ownedLuck or ((byTime or not isBlatant()) and (tonumber(cfg.time) or 0) > ownedTime)
+		end
+		-- the cheapest staff worth buying (shop staffs only: no pass, hidden or special ones)
+		function Game.nextStaff(owned)
+			local best
+			for key, cfg in pairs(Staffs) do
+				local cost = type(cfg) == "table" and tonumber(cfg.cost)
+				if cost and cost > 0 and not owned[key] and not cfg.passRequired and not cfg.hideIfNotOwned and not cfg.isSpecial and Game.staffUseful(key, owned) then
+					if not best or cost < Staffs[best].cost then
+						best = key
+					end
+				end
+			end
+			return best
+		end
 		function buyStaffTick()
 			local data = Data()
 			if not data then
@@ -37363,37 +38075,27 @@ end
 			table.sort(list, function(a, b)
 				return (tonumber(Staffs[a].luck) or 0) > (tonumber(Staffs[b].luck) or 0)
 			end)
-			local ownedLuck, ownedTime = 0, 0
-			for ownedKey in pairs(owned) do
-				local ownedCfg = staffOf(ownedKey)
-				if ownedCfg then
-					ownedLuck = math.max(ownedLuck, effectiveLuck(ownedCfg, owned))
-					ownedTime = math.max(ownedTime, tonumber(ownedCfg.time) or 0)
-				end
-			end
 			local tried = 0
 			for _, key in ipairs(list) do
-				if Game.plannerOn() then
-					-- a staff with no more luck (and no longer sea when you walk) is wasted cash
-					local byTime = false
-					local betterLuck = not byTime and effectiveLuck(Staffs[key], owned) > ownedLuck
-					local betterTime = (byTime or not isBlatant()) and (tonumber(Staffs[key].time) or 0) > ownedTime
-					if not (betterLuck or betterTime) or not Game.spendOk("Staff:" .. key, Staffs[key].cost) then
-						continue
-					end
+				-- a staff with no more luck (and no longer sea time when you walk) is wasted cash, with or without the planner
+				if not Game.staffUseful(key, owned) then
+					continue
+				end
+				if Game.plannerOn() and not Game.spendOk("Staff:" .. key, Staffs[key].cost) then
+					continue
 				end
 				tried += 1
 				if tried > 3 or cash() < Staffs[key].cost then
 					break
 				end
 				setStatus("Buying the " .. tostring(Staffs[key].name or key) .. " staff")
-				call("PickaxeService", "BuyPickaxe", key)
-				if
-				waitFor(function()
+				local _, answer = call("PickaxeService", "BuyPickaxe", key)
+				local owns = waitFor(function()
 					local d = Data()
 					return d ~= nil and type(d.OwnedPickaxes) == "table" and d.OwnedPickaxes[key] ~= nil
-					end, 2.5)
-				then
+				end, 2.5)
+				Game.buyLog("staff " .. tostring(Staffs[key].name or key), owns, answer, "$" .. formatNumber(Staffs[key].cost) .. ", luck " .. tostring(Staffs[key].luck), "Staff:" .. key)
+				if owns then
 					table.clear(StaffRefused)
 					Session.bought += 1
 					Track.event(
@@ -37481,13 +38183,13 @@ end
 				if tried > 3 or cash() < TrainTools[id].cost then
 					break
 				end
-				call("TrainingService", "BuyTrainTool", id)
-				if
-				waitFor(function()
+				local _, answer = call("TrainingService", "BuyTrainTool", id)
+				local owns = waitFor(function()
 					local d = Data()
 					return d ~= nil and type(d.OwnedTrainTools) == "table" and d.OwnedTrainTools[id] ~= nil
-					end, 2.5)
-				then
+				end, 2.5)
+				Game.buyLog("dumbbell " .. tostring(TrainTools[id].name or id), owns, answer, "$" .. formatNumber(TrainTools[id].cost) .. ", +" .. formatNumber(TrainTools[id].gainPerTrain) .. " power per train", "Dumbbell:" .. id)
+				if owns then
 					table.clear(DumbbellRefused)
 					Session.bought += 1
 					Track.event(
@@ -37561,10 +38263,12 @@ end
 			local snap = { cash = cash(), power = power(), carry = upgradeLevel("Carry"), base = upgradeLevel("PlotUpgrade"), placed = (placedStats()) }
 			RebirthNext = os.clock() + 5
 			setStatus("Rebirthing")
-			call("RebirthService", "Rebirth")
-			if waitFor(function()
+			local _, answer = call("RebirthService", "Rebirth")
+			local reborn = waitFor(function()
 				return rebirths() > before
-				end, 3) then
+			end, 3)
+			Game.buyLog("rebirth " .. (before + 1), reborn, answer, "$" .. formatNumber(cost), "Rebirth")
+			if reborn then
 				Session.rebirths += 1
 				Saved.rebirths += 1
 				SaveDirty = true
@@ -37605,7 +38309,7 @@ end
 				setStatus(
 					string.format(
 						"Training (+%s power/s, %s power)",
-						formatNumber(tonumber(modifier("TrainGain")) or 0),
+						formatNumber(Game.rates and Game.rates.powerRate or Game.expectedTrainRate()),
 						formatNumber(power())
 					)
 				)
@@ -37653,11 +38357,23 @@ end
 			log("TRAIN did not start", "stand", brief(stand.Position))
 			return false
 		end
+		-- the game only hides its x2 button when you click it: hide it here, or it stays on screen and a click later fails
+		function Game.hideX2Button()
+			pcall(function()
+				local gui = LocalPlayer:FindFirstChild("PlayerGui")
+				local button = gui and gui:FindFirstChild("x2Speed", true)
+				if button and button:IsA("GuiObject") then
+					button.Visible = false
+				end
+			end)
+		end
 		onEvent("TrainingService", "SpawnBonus", function(id)
 			if not on("AutoBonus") then
 				return
 			end
-			if not isBlatant() then
+			if isBlatant() then
+				task.defer(Game.hideX2Button)
+			else
 				task.wait(0.4 + math.random() * 0.6)
 			end
 			local ok, success = call("TrainingService", "ClaimBonus", id)
@@ -37680,14 +38396,7 @@ end
 					end
 				end
 			end
-			-- the game only hides its x2 button when you click it: hide it here, or it stays on screen and a click later fails
-			pcall(function()
-				local gui = LocalPlayer:FindFirstChild("PlayerGui")
-				local button = gui and gui:FindFirstChild("x2Speed", true)
-				if button and button:IsA("GuiObject") then
-					button.Visible = false
-				end
-			end)
+			Game.hideX2Button()
 		end)
 		local Schedule = { phase = "sea", since = os.clock() }
 		function trainTurn()
@@ -37697,10 +38406,22 @@ end
 			if not on("AutoSea") then
 				return true
 			end
-			if Sea.full and not on("AutoSell") then
+			local count, cap = inventoryCount(), inventoryLimit()
+			local stuck = count >= cap and (not on("AutoSell") or Game.seaBlocked())
+			if stuck or (Schedule.fullTrain and count > cap - math.max(maxPickup(), 1)) then
+				if not Schedule.fullTrain then
+					Schedule.fullTrain = true
+					log("SCHEDULE train while the backpack is full (" .. math.floor(count) .. "/" .. math.floor(cap) .. ") and nothing in it may be sold: no sea time is lost")
+				end
+				-- (the "Open The Sea" quests wait too: the server refuses to open the sea with a full backpack, live 586 op10)
 				return true
 			end
-			if (Options.TrainMode and Options.TrainMode.Value) ~= "Alternate with the sea" then
+			if Schedule.fullTrain then
+				Schedule.fullTrain = false
+				log("SCHEDULE sea, the backpack has room again (" .. math.floor(count) .. "/" .. math.floor(cap) .. ")")
+			end
+			-- the Training Pattern dropdown is for manual play; the planner decides by its own valuation (one mode)
+			if not Game.plannerOn() and (Options.TrainMode and Options.TrainMode.Value) ~= "Alternate with the sea" then
 				return false
 			end
 			if on("TrainSea") and Game.trainSea and Game.trainSea.state == "works" and isBlatant() then
@@ -37726,7 +38447,7 @@ end
 						Schedule.phase, Schedule.since, Schedule.reach = "train", now, waveReach()
 						Game.rates.askedAt = now
 						local t = plan.train
-						log(string.format("SCHEDULE train to reach %d: %ds for +%.0f%% sea income, gain/$ %.3g > best buy %.3g", waveReach() + 1, math.floor(t.tp), (t.mult - 1) * 100, t.ratio, plan.target and plan.target.ratio or 0))
+						log(string.format("SCHEDULE train to reach %d: %ds for +%.0f%% catch value (the plot follows), +$%s/s per second of training > sea +$%s/s per second, gain/$ %.3g > best buy %.3g", waveReach() + 1, math.floor(t.tp), (t.mult - 1) * 100, formatNumber(t.perSecond or 0), formatNumber(t.seaPerSecond or 0), t.ratio, plan.target and plan.target.ratio or 0))
 					end
 				elseif not want then
 					log("SCHEDULE sea, reach", waveReach(), "after", math.floor(now - Schedule.since) .. "s of training")
@@ -37745,18 +38466,65 @@ end
 			return Schedule.phase == "train"
 		end
 		local PlaytimeTried = {}
+		-- the playtime window's gift buttons in build order (one per PlaytimeRewardConfig entry)
+		function Game.playtimeTemplates()
+			local gui = LocalPlayer:FindFirstChild("PlayerGui")
+			local windows = gui and gui:FindFirstChild("Windows")
+			local window = windows and windows:FindFirstChild("PlaytimeReward")
+			local rewards = window and window:FindFirstChild("Rewards")
+			local list = {}
+			for _, child in ipairs(rewards and rewards:GetChildren() or {}) do
+				if child:IsA("ImageButton") then
+					table.insert(list, child)
+				end
+			end
+			return list
+		end
 		function playtimeTick()
 			local pc = controller("PlaytimeRewardController")
 			if not pc or type(Game.PlaytimeRewardConfig) ~= "table" then
 				return false
+			end
+			-- a gift the controller marks claimed but the window still shows as Claim! (claimed before this build): shown as claimed,
+			-- exactly what the game's own button does after a claim (bc 11190-11192)
+			do
+				local templates = Game.playtimeTemplates()
+				if #templates == #Game.PlaytimeRewardConfig then
+					for i, tpl in ipairs(templates) do
+						local okC, claimedNow = pcall(pc.IsGiftClaimed, pc, i)
+						local claimBtn, claimedMark, timer = tpl:FindFirstChild("Claim"), tpl:FindFirstChild("Claimed"), tpl:FindFirstChild("Timer")
+						if okC and claimedNow == true and claimBtn and claimedMark and claimBtn.Visible then
+							claimBtn.Visible, claimedMark.Visible = false, true
+							if timer then
+								timer.Visible = false
+							end
+							log("REWARD playtime gift " .. i .. " window synced: claimed in the game data, the window still showed Claim!")
+						end
+					end
+				end
 			end
 			local okTime, seconds = pcall(pc.GetSessionTime, pc)
 			seconds = okTime and tonumber(seconds) or 0
 			for i, gift in ipairs(Game.PlaytimeRewardConfig) do
 				local okClaimed, claimed = pcall(pc.IsGiftClaimed, pc, i)
 				if okClaimed and not claimed and type(gift) == "table" and seconds >= (tonumber(gift.time) or math.huge) and (PlaytimeTried[i] or 0) <= os.clock() then
-					local ok, result = pcall(pc.ClaimGift, pc, i)
-					if ok and result then
+					-- the playtime window is built once and only its own Claim buttons update it (TimedRewardsHandler bc 11114-11202): a
+					-- claim straight on the controller left every gift showing Claim! (owner's window 2026-10-14). So the window's button
+					-- runs it (same controller call), the controller only when the window is not built
+					local templates = Game.playtimeTemplates()
+					local ok, result
+					if #templates == #Game.PlaytimeRewardConfig and Game.pressGameButton(templates[i]) then
+						ok, result = true, true
+					else
+						ok, result = pcall(pc.ClaimGift, pc, i)
+					end
+					-- state check: the game's controller marks the gift, or starts a new cycle after the last one (bc 25972-25981)
+					local okNow, claimedNow = pcall(pc.IsGiftClaimed, pc, i)
+					local okAfter, after = pcall(pc.GetSessionTime, pc)
+					local cycled = okAfter and tonumber(after) ~= nil and tonumber(after) < seconds
+					local good = ok and result == true and ((okNow and claimedNow == true) or cycled)
+					Game.claimLog("playtime gift " .. i, good, if ok then result else "error " .. tostring(result), tostring(gift.name or "") .. " at " .. math.floor(seconds) .. "s")
+					if good then
 						Session.claimed += 1
 						Track.event("Gift", "Playtime gift " .. i, tostring(gift.name or ""), "gift", "#ff5d8f")
 						return true
@@ -37790,6 +38558,15 @@ end
 			end
 			local last = tonumber(daily.LastClaimedDate)
 			if last and os.time() - last < 86400 then
+				-- the HUD calendar badge is only switched off by the game's own Day button (bc 21526), so after a claim made
+				-- elsewhere it stays lit until a rejoin: off while nothing can be claimed (the game shows it again when a day is due)
+				pcall(function()
+					local badge = LocalPlayer.PlayerGui.HUD.Buffs.Daily.Frame
+					if badge.Visible then
+						badge.Visible = false
+						log("REWARD daily badge synced: claimed in the game data, the calendar badge was still lit")
+					end
+				end)
 				return false
 			end
 			local day = (tonumber(daily.LastClaimedDay) or 0) + 1
@@ -37797,14 +38574,38 @@ end
 			then Game.DailyRewardConfig.REPEATING_WEEK
 			else Game.DailyRewardConfig.FIRST_WEEK
 			if type(week) ~= "table" or week[day] == nil then
+				-- 586 config: FIRST_WEEK has 7 days and REPEATING_WEEK is empty, so after day 7 nothing is left to claim
+				Game.dailyDone = true
 				return false
 			end
-			local ok, result = call("DailyRewardService", "ClaimReward", day)
-			if ok and result == true then
+			Game.dailyDone = false
+			if os.clock() < (Game.dailyRetryAt or 0) then
+				return false
+			end
+			local beforeDay, beforeDate = tonumber(daily.LastClaimedDay) or 0, tonumber(daily.LastClaimedDate) or 0
+			-- the daily window's own Day button (its callback claims the same day and switches the HUD badge off, bc 21521-21530)
+			local dayButton = nil
+			pcall(function()
+				dayButton = LocalPlayer.PlayerGui.Windows.DailyRewards.DayHolder:FindFirstChild("Day" .. day)
+			end)
+			local result = "game button"
+			if not Game.pressGameButton(dayButton) then
+				local _, answer = call("DailyRewardService", "ClaimReward", day)
+				result = answer
+			end
+			-- state check: the game moves Data().DailyReward (LastClaimedDay / LastClaimedDate, DailyRewardController bc 21441-21533)
+			local changed = waitFor(function()
+				local d = Data()
+				local dr = d and d.DailyReward
+				return type(dr) == "table" and ((tonumber(dr.LastClaimedDay) or 0) ~= beforeDay or (tonumber(dr.LastClaimedDate) or 0) ~= beforeDate)
+			end, 3)
+			Game.claimLog("daily day " .. day, changed, result, tostring(week[day].text or ""))
+			if changed then
 				Session.claimed += 1
 				Track.event("Daily", "Daily reward day " .. day, tostring(week[day].text or ""), "calendar", "#fab428")
 				return true
 			end
+			Game.dailyRetryAt = os.clock() + 600
 			return false
 		end
 		function freeShopTick()
@@ -37813,8 +38614,15 @@ end
 			if not data or (tonumber(data.LastFreeShopClaim) or 0) >= index then
 				return false
 			end
-			local ok, result = call("FreeShopService", "Claim")
-			if ok and result then
+			local before = tonumber(data.LastFreeShopClaim) or 0
+			local _, result = call("FreeShopService", "Claim")
+			-- state check: Data().LastFreeShopClaim reaches CURRENT_CLAIM_INDEX (ShopHandler bc 13395-13415)
+			local done = waitFor(function()
+				local d = Data()
+				return d ~= nil and (tonumber(d.LastFreeShopClaim) or 0) >= index
+			end, 3)
+			Game.claimLog("free shop animal", done, result, "LastFreeShopClaim " .. before .. " -> " .. tostring((Data() or {}).LastFreeShopClaim))
+			if done then
 				Session.claimed += 1
 				Track.event("Shop", "Free shop animal claimed", nil, "shopping-bag", "#60d696")
 				return true
@@ -37828,28 +38636,32 @@ end
 			if type(first) ~= "table" or first.BuyTier ~= -1 then
 				return false
 			end
-			local ok, result = call("ForeverPackService", "ClaimForeverPack")
-			if ok and result then
+			local function packKey()
+				local d = Data()
+				local list = d and type(d.ForeverPack) == "table" and d.ForeverPack.Items
+				local parts = {}
+				for i, item in ipairs(type(list) == "table" and list or {}) do
+					if type(item) == "table" then
+						table.insert(parts, i .. ":" .. tostring(item.RewardTier) .. "/" .. tostring(item.Id) .. "/" .. tostring(item.BuyTier))
+					end
+				end
+				return table.concat(parts, ",")
+			end
+			local beforeKey = packKey()
+			local _, result = call("ForeverPackService", "ClaimForeverPack")
+			-- state check: the game shifts the pack window after a claim (ForeverpackHandler OnSet ForeverPack.Items, bc 12217)
+			local moved = waitFor(function()
+				return packKey() ~= beforeKey
+			end, 3)
+			Game.claimLog("forever pack free slot", moved, result, "tier " .. tostring(first.RewardTier) .. " " .. tostring(first.Id))
+			if moved then
 				Session.claimed += 1
 				Track.event("Pack", "Free Forever Pack reward", nil, "package", "#7dd3fc")
 				return true
 			end
 			return false
 		end
-		function limitedTick()
-			local data = Data()
-			local reward = data and data.LimitedTimeReward
-			if type(reward) == "table" and reward.Claimed then
-				return false
-			end
-			local ok, result = call("RewardService", "ClaimLimitedReward")
-			if ok and result then
-				Session.claimed += 1
-				Track.event("Gift", "25 minute reward claimed", nil, "gift", "#ff5d8f")
-				return true
-			end
-			return false
-		end
+		-- 586: RewardService has no ClaimLimitedReward remote (remote list 586, RewardService.RF = GroupReward and NextEvent), the 25 minute reward is granted by the server: no toggle
 		function seasonLevel()
 			local ok, level = pcall(function()
 				return (Game.Modifiers.Get(LocalPlayer, "SeasonPassLevel"))
@@ -37875,6 +38687,9 @@ end
 			if not data or type(pass) ~= "table" then
 				return false
 			end
+			-- no early quest refresh: REFRESH_SEASON_QUESTS is a 10 Robux product (MonetizationConfig bc 56010), so asking for it free is a
+			-- paid feature (excluded). The game's own timer refreshes the quests every hour and day, and the server claims finished
+			-- quests by itself (QuestConfig autoClaim).
 			local claimed = type(data.SeasonPass) == "table" and type(data.SeasonPass.Free) == "table" and data.SeasonPass.Free or {}
 			local tried = 0
 			for i = 1, math.min(seasonLevel(), #pass) do
@@ -37884,8 +38699,16 @@ end
 				if type(pass[i]) == "table" and pass[i].Free and not claimed[tostring(i)] and (SeasonTried[i] or 0) <= os.clock() then
 					tried += 1
 					SeasonTried[i] = os.clock() + 60
-					local ok, result = call("SeasonPassService", "ClaimPassReward", "Free", i)
-					if ok and result then
+					local _, result = call("SeasonPassService", "ClaimPassReward", "Free", i)
+					-- state check: Data().SeasonPass.Free[tier] is set (SeasonPassHandler bc 3482-3486, the Claim button hides on it)
+					local got = waitFor(function()
+						local d = Data()
+						local sp = d and d.SeasonPass
+						local v = type(sp) == "table" and type(sp.Free) == "table" and sp.Free[tostring(i)]
+						return v ~= nil and v ~= false
+					end, 3)
+					Game.claimLog("season pass free tier " .. i, got, result, tostring(pass[i].Free.Name or ""))
+					if got then
 						Session.claimed += 1
 						Track.event("Pass", "Season pass tier " .. i, tostring(pass[i].Free.Name or ""), "award", "#c77dff")
 					end
@@ -37896,7 +38719,12 @@ end
 		local GroupId = 719390069
 		function groupReward(manual)
 			local key = tostring(LocalPlayer.UserId)
-			if Saved.group[key] and not manual then
+			local flagged = (Data() or {}).RedeemedGroupReward == true
+			if (Saved.groupOk[key] or flagged) and not manual then
+				return false
+			end
+			if flagged then
+				notify("Group", "Already claimed on this account", 4)
 				return false
 			end
 			local okGroup, member = pcall(function()
@@ -37911,21 +38739,35 @@ end
 				end
 				return false
 			end
+			if not manual and (os.clock() < (Game.groupRetryAt or 0) or (Game.groupRefused or 0) >= 2) then
+				return false
+			end
 			local ok, result = call("RewardService", "GroupReward")
-			Saved.group[key] = true
-			SaveDirty = true
-			if ok and result then
+			-- state check: the game's own flag Data().RedeemedGroupReward (found by the 586 state probe), else the server's answer
+			local good = waitFor(function()
+				return (Data() or {}).RedeemedGroupReward == true
+			end, 3) or (ok and result ~= nil and result ~= false)
+			Game.claimLog("group reward", good, if ok then result else "no answer")
+			if good then
+				Saved.groupOk[key] = true
+				SaveDirty = true
 				Session.claimed += 1
 				Track.event("Group", "Group reward claimed", nil, "users", "#5fb8ff")
 				notify("Group", "Group reward claimed", 4)
 				return true
+			end
+			-- refused: already claimed on this account or not ready; ask again in an hour, and after two refusals not this session
+			Game.groupRetryAt = os.clock() + 3600
+			if ok then
+				Game.groupRefused = (Game.groupRefused or 0) + 1
 			end
 			if manual then
 				notify("Group", "The game did not give a reward (maybe already claimed)", 4)
 			end
 			return false
 		end
-		local RsvpEvent = "4963767232158106193"
+		-- 586 NextUpdateEvent (bc 25138-25175): the game's next-update RSVP event (the 582 id 4963767232158106193 is gone)
+		local RsvpEvent = "2604687616993526354"
 		function rsvpReward()
 			local data = Data()
 			if data and type(data.Verify) == "table" and data.Verify[RsvpEvent] then
@@ -37942,7 +38784,12 @@ end
 			end)
 			if going then
 				local okCall, result = call("RewardService", "NextEvent")
-				if okCall and result then
+				local got = waitFor(function()
+					local d = Data()
+					return d ~= nil and type(d.Verify) == "table" and d.Verify[RsvpEvent] ~= nil and d.Verify[RsvpEvent] ~= false
+				end, 3)
+				Game.claimLog("update reward", got, if okCall then result else "no answer")
+				if got then
 					Session.claimed += 1
 					notify("Update reward", "Reward claimed", 4)
 				else
@@ -37962,14 +38809,20 @@ end
 				return
 			end
 			local ok, result = call("DiscService", "GetReward")
-			if ok and result then
+			local got = waitFor(function()
+				local d = Data()
+				return d ~= nil and type(d.Verify) == "table" and d.Verify.Dis == true
+			end, 3)
+			Game.claimLog("discord reward", got, if ok then result else "no answer")
+			if got then
 				Session.claimed += 1
 				notify("Discord reward", "Claimed", 4)
 			else
 				notify("Discord reward", "The game did not give the reward", 4)
 			end
 		end
-		local KnownCodes = {}
+		-- built in (the repo list adds more): Release (Rare Bat) and UPD2 (Cash potion), both listed active on 2026-10-10 (pockettactics)
+		local KnownCodes = { "UPD2", "Release" }
 		function redeemCode(code, manual)
 			code = tostring(code or ""):gsub("^%s+", ""):gsub("%s+$", "")
 			if code == "" then
@@ -37977,11 +38830,16 @@ end
 			end
 			local key = tostring(LocalPlayer.UserId) .. ":" .. string.upper(code)
 			local ok, success, message = call("CodesService", "RedeemCode", code)
-			Saved.codes[key] = true
-			if not (ok and success) then
-				Saved.codesBad[key] = true
+			if ok then
+				-- the server answered (redeemed, or a refusal such as invalid or used): never ask again; no answer = try again later
+				Saved.codes[key] = true
+				if not success then
+					Saved.codesBad[key] = true
+				end
+				SaveDirty = true
 			end
-			SaveDirty = true
+			-- the game keeps no list of used codes in the data: its answer (success, message) is the evidence (CodesHandler bc 12500)
+			Game.claimLog("code " .. code, ok and success and true or false, if ok then (if message ~= nil then message else success) else "no answer")
 			Game.codesLabel()
 			if ok and success then
 				Session.claimed += 1
@@ -38017,7 +38875,7 @@ end
 		local function fetchCodes()
 			CodesFetchAt = os.clock()
 			local list, why = nil, "no answer"
-			for _, path in ipairs({ "Codes", "staging/Codes" }) do
+			for _, path in ipairs({ "Codes" }) do
 				local ok, body = pcall(function()
 					return game:HttpGet(HubRepo .. path)
 				end)
@@ -38085,11 +38943,20 @@ end
 			return data and type(data.PotionInventory) == "table" and tonumber(data.PotionInventory[kind]) or 0
 		end
 		function potionTick()
+			if os.clock() < (Game.potionRetryAt or 0) then
+				return false
+			end
 			local active = activePotionTypes()
 			local smart = on("SmartPotions")
 			for _, kind in ipairs({ "Cash", "Train", "Luck" }) do
 				if selected(Options.PotionTypes, kind) and potionCount(kind) > 0 and not active[kind] then
 					local wanted = true
+					if kind == "Luck" then
+						local lp = Game.probe.state.luck_potion
+						if type(lp) == "table" and lp.ok ~= true then
+							wanted = false
+						end
+					end
 					if smart then
 						if kind == "Train" then
 							wanted = isTraining()
@@ -38098,9 +38965,18 @@ end
 						end
 					end
 					if wanted then
-						local ok = call("PotionService", "UsePotion", kind)
-						if ok then
+						local had = potionCount(kind)
+						local ok, result = call("PotionService", "UsePotion", kind)
+						-- state check: the potion shows up in Data().ActivePotions and leaves Data().PotionInventory
+						local used = waitFor(function()
+							return activePotionTypes()[kind] == true or potionCount(kind) < had
+						end, 3)
+						if used then
+							log("POTION " .. kind .. " ok, " .. had .. " -> " .. potionCount(kind) .. " left")
 							Track.event("Potion", kind .. " potion used", "x2 for 10 minutes", "flask-conical", "#9bffb0")
+						else
+							log("POTION " .. kind .. " FAILED answer=" .. brief(if ok then result else "no answer"))
+							Game.potionRetryAt = os.clock() + 120
 						end
 						return true
 					end
@@ -38151,7 +39027,7 @@ end
 			for _, pair in ipairs({
 				{ "NextWeatherTime", "Next weather" },
 				{ "NextSpecialEventTime", "Next event" },
-				{ "NextStarsEventTime", "Next stars" },
+				{ "NextStarsEventTime", "Next pickup event" },
 			}) do
 				local value = ReplicatedStorage:FindFirstChild(pair[1])
 				local ok, left = pcall(function()
@@ -38259,6 +39135,17 @@ end
 			return nil
 		end
 		-- TrainGain / TrainCooldown from the game modifiers (the client TrainGain modifier reads 0, so from config)
+		-- power per second training alone gives: the game's shared Modifiers (TrainGain per tick / TrainCooldown, the module the
+		-- server runs too, bc 58433-58485: tool, Train potion, bosses, complete event indexes, train events, speed tier), else the formula
+		function Game.expectedTrainRate()
+			local gain = tonumber((modifier("TrainGain")))
+			local cd = tonumber((modifier("TrainCooldown")))
+			if gain and gain > 0 and cd and cd > 0 then
+				return gain / cd
+			end
+			local data = Data()
+			return if data and Game.formulaPowerRate then Game.formulaPowerRate(data) else 0
+		end
 		local function formulaPowerRate(data)
 			local owned = type(data.OwnedTrainTools) == "table" and data.OwnedTrainTools or {}
 			local tool = TrainTools[data.EquippedTrainTool]
@@ -38270,12 +39157,42 @@ end
 			local potion = if activePotionTypes().Train then 2 else 1
 			return gain * potion * (1 + 0.1 * bosses) * eventMulti("trainMulti") / math.max(0.1, 0.8 / eventMulti("trainSpeedMulti"))
 		end
+		Game.formulaPowerRate = formulaPowerRate
 		local function luckBoost()
 			local boost = math.max(tonumber(ReplicatedStorage:GetAttribute("ServerLuckMultiplier")) or 1, 1) * eventMulti("luckMultiplier")
 			if activePotionTypes().Luck then
-				boost *= 2
+				-- counted only after PROBE luck_potion accepted it (the shared StaffLuck modifier ignores the potion)
+				local lp = Game.probe.state.luck_potion
+				if type(lp) == "table" and lp.ok == true then
+					boost *= 2
+				end
 			end
 			return boost
+		end
+		-- PROBE luck_potion (blatant.md Q5, 586 bc 58597-58627): the shared StaffLuck modifier does not read ActivePotions, so the Luck potion
+		-- may do nothing. Passive: every Blatant wave adds its mean rarity rank to a with-potion or a without-potion bucket (reset whenever
+		-- server luck, event luck or the best staff changes); 20 waves each decide. Accepted (ratio >= 1.03) lets the planner count the
+		-- potion, rejected stops Smart Potions from drinking Luck potions.
+		Game.luckObs = { sig = nil, with = { n = 0, sum = 0 }, without = { n = 0, sum = 0 } }
+		function Game.luckSample(mean, waveItems)
+			local P = Game.probe
+			if P.state.luck_potion ~= nil or P.tried.luck_potion or waveItems < 5 then
+				return
+			end
+			local sig = string.format("%s|%s|%s", tostring(ReplicatedStorage:GetAttribute("ServerLuckMultiplier")), tostring(eventMulti("luckMultiplier")), tostring(bestOwnedStaff()))
+			local O = Game.luckObs
+			if sig ~= O.sig then
+				O.sig = sig
+				O.with, O.without = { n = 0, sum = 0 }, { n = 0, sum = 0 }
+			end
+			local bucket = if activePotionTypes().Luck then O.with else O.without
+			bucket.n += 1
+			bucket.sum += mean
+			if O.with.n >= 20 and O.without.n >= 20 then
+				local a, b = O.with.sum / O.with.n, O.without.sum / O.without.n
+				local ratio = if b > 0 then a / b else 1
+				P.result("luck_potion", ratio >= 1.03, P.round(ratio), string.format("mean rarity rank with %.3f without %.3f over %d+%d waves luck=%s", a, b, O.with.n, O.without.n, sig))
+			end
 		end
 		local function ratioText(r)
 			return string.format("%.3g", r)
@@ -38313,7 +39230,7 @@ end
 			R.luckNow = staffLuck * boost
 			local b = if R.bN >= 30 and R.b then math.clamp(R.b, 0.01, 1.5) else 0.14
 			local e = if R.eN >= 3 and R.e then math.clamp(R.e, 0, 1.5) else 0.5
-			local rate = if R.powerRate and R.powerRate > 0 then R.powerRate else formulaPowerRate(data)
+			local rate = if R.powerRate and R.powerRate > 0 then R.powerRate else Game.expectedTrainRate()
 			local multi = tonumber(modifier("CashMulti")) or 1
 			local placedAmount, base, worst = placedStats()
 			local plot = base * multi
@@ -38324,7 +39241,33 @@ end
 			if catch <= 0 and R.takenV and R.waveGap and R.waveGap > 0 then
 				catch = R.takenV * 30 / R.waveGap * seaShare * Game.probe.waveFactor()
 			end
+			local seaBlocked = Game.seaBlocked ~= nil and Game.seaBlocked()
+			if seaBlocked then
+				catch = 0
+			end
 			local catchBase = catch / (boost ^ e * wmAvg)
+			-- the plot follows the sea: its animals are the best the sea and its eggs brought (owner's 586 log: sea top item ~ plot
+			-- floor), so more luck or more plates lift every later catch AND, once the plot is refilled, the plot income by the same
+			-- factor. Half of it is counted (the plot needs time to refill) on top of the sea sales. Without this a late account
+			-- valued staffs, dumbbells and training on the sea sales alone (0.1% of its income) and never bought or trained.
+			local follow = if seaBlocked then 0 else catchBase + 0.5 * plot
+			-- what the sea adds to the plot per second while it runs (index entries, better animals and eggs): plot base income now
+			-- vs 10 to 20 minutes of sea ago (a training stretch restarts the window). Training only wins when its income per
+			-- second of training beats this, so index hunting is not traded for a long training phase blindly.
+			R.baseLog = R.baseLog or {}
+			if training and not together then
+				R.baseLog = {}
+			else
+				table.insert(R.baseLog, { t = now, base = base })
+				while #R.baseLog > 0 and now - R.baseLog[1].t > 1200 do
+					table.remove(R.baseLog, 1)
+				end
+				local first = R.baseLog[1]
+				if first and now - first.t >= 600 and now - (R.growthAt or -1e9) >= 60 then
+					R.growthAt = now
+					R.seaGrowth = R.ewma(R.seaGrowth, math.max(base - first.base, 0) / (now - first.t), 0.3)
+				end
+			end
 			local H = 86400 -- rolling 24 h: the farm never ends, so the horizon never shrinks
 			local income = plot + catch
 			local list, byKey = {}, {}
@@ -38367,7 +39310,7 @@ end
 			for key, cfg in pairs(Staffs) do
 				local cost = type(cfg) == "table" and tonumber(cfg.cost)
 				if cost and not owned[key] and not cfg.passRequired and not cfg.hideIfNotOwned and not cfg.isSpecial and (tonumber(cfg.luck) or 0) > staffLuck then
-					add("Staff:" .. key, cost, catchBase * ((cfg.luck / staffLuck) ^ e - 1), tostring(cfg.name or key))
+					add("Staff:" .. key, cost, follow * ((cfg.luck / staffLuck) ^ e - 1), tostring(cfg.name or key))
 				end
 			end
 			local reach = waveReach()
@@ -38388,7 +39331,7 @@ end
 				local cost = type(cfg) == "table" and tonumber(cfg.cost)
 				if cost and not tools[id] and not cfg.isSpecial and not cfg.hideIfNotOwned and not cfg.passRequired and (tonumber(cfg.rebirthRequired) or 0) <= rebirths() and (tonumber(cfg.gainPerTrain) or 0) > gainNow then
 					pathNow = pathNow or path(rate)
-					add("Dumbbell:" .. id, cost, catchBase * (path(rate * cfg.gainPerTrain / gainNow) - pathNow), tostring(cfg.name or id))
+					add("Dumbbell:" .. id, cost, follow * (path(rate * cfg.gainPerTrain / gainNow) - pathNow), tostring(cfg.name or id))
 				end
 			end
 			table.sort(list, function(x, y)
@@ -38402,14 +39345,21 @@ end
 				local tp = math.max(need - p, 0) / rate + walk
 				local mult = math.exp(b)
 				local cost = tp * catch * (wmNow / wmAvg) / seaShare
-				local gain = catchBase * (mult - 1)
+				local gain = follow * (mult - 1)
 				if cost > 0 and gain > 0 then
 					train = { key = "Train", name = "Train to reach " .. (reach + 1), cost = cost, gain = gain, ratio = gain / cost, payback = cost / gain, tp = tp, mult = mult }
 				end
 			end
 			local target = list[1]
 			local plan = { at = now, list = list, byKey = byKey, target = target, train = train, income = income, H = H, plot = plot, catch = catch, catchBase = catchBase, trainShare = share, together = together }
+			if train then
+				train.perSecond = train.gain / math.max(train.tp, 1)
+				train.seaPerSecond = (R.seaGrowth or 0) * multi
+			end
+			-- train when the next plate pays back inside the horizon, beats the best buy, and its income per second of training beats
+			-- what the sea measurably adds per second (needs 10 min of sea first)
 			plan.trainNow = train ~= nil and train.payback + train.tp <= H and train.ratio > math.max(target and target.ratio or 0, 1 / H)
+				and R.seaGrowth ~= nil and train.perSecond > train.seaPerSecond
 			local all = table.clone(list)
 			if train then
 				table.insert(all, train)
@@ -38437,7 +39387,7 @@ end
 					formatNumber(catch), formatNumber(plot), formatNumber(rate), if R.powerRate then "measured" else "formula", reach,
 					math.exp(b), if R.bN >= 30 then "measured" else "prior", e, if R.eN >= 3 then "measured" else "prior", boost,
 					R.carry or 1 / k, R.trainShare or 0, H / 3600
-				))
+				) .. (if seaBlocked then " | sea blocked (backpack full, nothing in it may be sold): sea-side buys wait" else ""))
 			end
 			PlanCache = plan
 			Game.lastPlan = plan
@@ -38555,6 +39505,15 @@ end
 			local unlocked = type(data.UnlockedBrainrots) == "table" and data.UnlockedBrainrots or {}
 			return unlocked[info.type] == nil
 		end
+		-- INK (brainrots event): a required animal that is not unlocked yet goes first in the sea while the event runs
+		function EventState.inkWanted(info)
+			if type(info) ~= "table" or info.kind == "Egg" or info.special or not on("EventRush") or not Game.isInkAnimal(info.type) then
+				return false
+			end
+			local data = Data()
+			local unlocked = data and type(data.UnlockedBrainrots) == "table" and data.UnlockedBrainrots or nil
+			return unlocked ~= nil and unlocked[info.type] == nil
+		end
 		local function eventProgress(id)
 			local folder = ReplicatedStorage:FindFirstChild("ActiveEvents")
 			local child = folder and folder:FindFirstChild(id)
@@ -38576,6 +39535,7 @@ end
 			return collected, if okLeft then left else nil
 		end
 		-- value of one milestone reward in $ over the horizon
+		local UnpricedElements = {}
 		local function rewardValue(reward, plan, horizon)
 			local element = type(reward) == "table" and reward.Element
 			local rd = type(reward) == "table" and type(reward.Data) == "table" and reward.Data or {}
@@ -38600,6 +39560,35 @@ end
 				return gain * horizon * amount
 			elseif element == "Cash" or element == "Currency" then
 				return amount
+			elseif element == "Staff" then
+				-- a better staff: the luck step priced like the planner does (catch income x ((new / current luck)^e - 1))
+				local cfgS = Staffs[rd.type]
+				local newLuck = type(cfgS) == "table" and tonumber(cfgS.luck) or 0
+				local cur = math.max(currentLuck(), 1)
+				local R = Game.rates
+				local e = if R and R.eN >= 3 and R.e then math.clamp(R.e, 0, 1.5) else 0.5
+				if newLuck > cur then
+					return (plan.catch or 0) * ((newLuck / cur) ^ e - 1) * horizon
+				end
+				return 0
+			elseif element == "TrainTool" then
+				local cfgT = TrainTools[rd.type]
+				local g = type(cfgT) == "table" and tonumber(cfgT.gainPerTrain) or 0
+				local data = Data()
+				local now = data and TrainTools[data.EquippedTrainTool]
+				local gainNow = math.max(type(now) == "table" and tonumber(now.gainPerTrain) or 1, 1)
+				if g > gainNow then
+					return (plan.catch or 0) * math.max(plan.trainShare or 0.3, 0.3) * (1 - gainNow / g) * horizon
+				end
+				return 0
+			elseif element == "Brainrot" then
+				local floor = Game.plotFloor and Game.plotFloor() or 0
+				local info = describe("Brainrot", rd.type, "NORMAL", "baby")
+				return (Game.itemGain and Game.itemGain(info, floor) or 0) * horizon * amount
+			end
+			if element ~= nil and not UnpricedElements[tostring(element)] then
+				UnpricedElements[tostring(element)] = true
+				log("EVENT reward unpriced element=" .. tostring(element))
 			end
 			return 0
 		end
@@ -38638,6 +39627,8 @@ end
 						local horizon = math.min(86400, left or 86400)
 						local prior = if isBlatant() then 20 else 3
 						local rate = if EventState.rateN >= 6 and EventState.rate and EventState.rate > 0.2 then EventState.rate else prior
+						-- collect_value probe: Collected per accepted claim (measured, 1 unless a claim counted more)
+						rate = rate * math.clamp(Game.probe.gain("collect_value"), 1, 4)
 						local value, goal, eta, last = 0, nil, 0, 0
 						for _, m in ipairs(ev.milestones) do
 							local amount = tonumber(m.amount) or 0
@@ -38670,7 +39661,7 @@ end
 					why = string.format("value $%s < 1 min income $%s", formatNumber(best.value), formatNumber(income * 60))
 				else
 					rush = true
-					text = string.format("EVENT rush goal=%d/%d value/star=%s eta=%ds (%s, %.1f stars/s, left %s)", best.collected, best.goal, formatNumber(best.perStar), math.floor(best.eta), best.id, best.rate, if best.left then math.floor(best.left) .. "s" else "?")
+					text = string.format("EVENT rush goal=%d/%d value/pickup=%s eta=%ds (%s, %.1f pickups/s, left %s)", best.collected, best.goal, formatNumber(best.perStar), math.floor(best.eta), best.id, best.rate, if best.left then math.floor(best.left) .. "s" else "?")
 				end
 				if best then
 					EventState.best = best
@@ -38698,6 +39689,69 @@ end
 			local cfg = staffOf(data and data.EquippedPickaxe)
 			return cfg and tonumber(cfg.luck) or 1
 		end
+		-- PROBE cfg586 (blatant.md P1, read only): the game's own config tables as the client sees them, one line per start. Shows new
+		-- events/staffs/tools/eggs without a code dump (the decompiler fails on the new bytecode) and whether any shop item carries a
+		-- gate field (rebirthRequired / passRequired / hideIfNotOwned) the buy filters must respect.
+		task.spawn(function()
+			task.wait(6)
+			local ok, err = pcall(function()
+				local parts = {}
+				local cfg = Game.CollectEventConfig
+				for id, ev in pairs(type(cfg) == "table" and type(cfg.EVENTS) == "table" and cfg.EVENTS or {}) do
+					local ms = {}
+					for _, m in ipairs(type(ev) == "table" and type(ev.milestones) == "table" and ev.milestones or {}) do
+						local r = type(m.reward) == "table" and m.reward or {}
+						local rd = type(r.Data) == "table" and r.Data or {}
+						table.insert(ms, tostring(m.amount) .. ":" .. tostring(r.Element) .. "/" .. tostring(rd.type))
+					end
+					table.insert(parts, id .. "[egg=" .. tostring(type(ev) == "table" and type(ev.index) == "table" and ev.index.egg or "-") .. " " .. table.concat(ms, ",") .. "]")
+				end
+				table.sort(parts)
+				local function gates(list, field)
+					local n = 0
+					for _, item in pairs(list) do
+						if type(item) == "table" and item[field] ~= nil then
+							n += 1
+						end
+					end
+					return n
+				end
+				local function top(list, by, count)
+					local items = {}
+					for key, item in pairs(list) do
+						if type(item) == "table" and tonumber(item.cost) and tonumber(item.cost) > 0 then
+							table.insert(items, { key = key, item = item })
+						end
+					end
+					table.sort(items, function(a, b)
+						return (tonumber(a.item[by]) or 0) > (tonumber(b.item[by]) or 0)
+					end)
+					local out = {}
+					for i = 1, math.min(count, #items) do
+						local it = items[i].item
+						table.insert(out, string.format("%s{cost=%s %s=%s}", items[i].key, formatNumber(tonumber(it.cost)), by, formatNumber(tonumber(it[by]) or 0)))
+					end
+					return table.concat(out, " ")
+				end
+				local toy = {}
+				for key, egg in pairs(Eggs) do
+					if type(egg) == "table" and (tonumber(egg.tier) or 0) >= 90 then
+						table.insert(toy, string.format("%s{%s tier=%s hatch=%ss}", key, tostring(egg.rarity), tostring(egg.tier), tostring(egg.hatchTime)))
+					end
+				end
+				table.sort(toy)
+				log(string.format(
+					"PROBE cfg586 result=accepted gain=0 pv=%s events=%s staffs=%d gates[rebirthRequired=%d passRequired=%d hideIfNotOwned=%d] topStaffs=%s tools=%d gates[rebirthRequired=%d passRequired=%d] topTools=%s highTierEggs=%s rarities=%d",
+					tostring(game.PlaceVersion), table.concat(parts, " "), gates(Staffs, "cost"),
+					gates(Staffs, "rebirthRequired"), gates(Staffs, "passRequired"), gates(Staffs, "hideIfNotOwned"),
+					top(Staffs, "luck", 3), gates(TrainTools, "cost"), gates(TrainTools, "rebirthRequired"), gates(TrainTools, "passRequired"),
+					top(TrainTools, "gainPerTrain", 3), table.concat(toy, " "), #RarityList
+				))
+			end)
+			if not ok then
+				log("PROBE cfg586 result=rejected gain=0 error=" .. tostring(err))
+			end
+		end)
 	end
 	local Window, addTab, Tabs, Labels, StatusBox, StatRows
 	do
@@ -38935,6 +39989,48 @@ end
 					end,
 				})
 			end
+			-- Player request 2026-10-13 (Discord): eggs share rarities, so a name filter for eggs next to the animal one.
+			-- Values come from the game's own EggsConfig at start (new eggs appear by themselves), sorted by tier.
+			do
+				local eggNames, seenEgg = {}, {}
+				for _, cfg in pairs(Eggs) do
+					if type(cfg) == "table" then
+						local name = tostring(cfg.name or "")
+						if name ~= "" and not seenEgg[name] then
+							seenEgg[name] = true
+							table.insert(eggNames, { name = name, tier = tonumber(cfg.tier) or 0, rank = RarityRank[cfg.rarity] or 0 })
+						end
+					end
+				end
+				table.sort(eggNames, function(a, b)
+					if a.tier ~= b.tier then
+						return a.tier < b.tier
+					end
+					if a.rank ~= b.rank then
+						return a.rank < b.rank
+					end
+					return a.name < b.name
+				end)
+				local eggValues = {}
+				for _, item in ipairs(eggNames) do
+					table.insert(eggValues, item.name)
+				end
+				FilterBox:AddDropdown("CatchEggs", {
+					Text = "Eggs",
+					Values = eggValues,
+					Default = {},
+					Multi = true,
+					AllowNull = true,
+					Searchable = true,
+					Tooltip = "Catch only these eggs. Leave empty (or select all) to catch every egg the rarity filter allows",
+				})
+				FilterBox:AddButton({
+					Text = "Clear Eggs",
+					Func = function()
+						Options.CatchEggs:SetValue({})
+					end,
+				})
+			end
 			FilterBox:AddDropdown(
 				"CatchMutations",
 				{ Text = "Mutations", Values = MutationLabels, Default = MutationLabels, Multi = true, AllowNull = true }
@@ -39140,13 +40236,21 @@ end
 			})
 			local lockDefault = {}
 			for _, rarity in ipairs(RarityList) do
-				if (RarityRank[rarity] or 0) >= (RarityRank.Cosmic or 9) then
+				if (RarityRank[rarity] or 0) > (RarityRank.Eternal or 10) then
 					table.insert(lockDefault, rarity)
 				end
 			end
 			LockBox:AddDropdown(
 				"LockRarities",
-				{ Text = "Protect Rarities", Values = RarityList, Default = lockDefault, Multi = true, AllowNull = true, Searchable = true }
+				{
+					Text = "Protect Rarities",
+					Values = RarityList,
+					Default = lockDefault,
+					Multi = true,
+					AllowNull = true,
+					Searchable = true,
+					Tooltip = "Never sold, by you or the planner. Keep it to rare tiers: protecting the tiers the sea gives every minute fills the backpack and stops the sea",
+				}
 			)
 			LockBox:AddDropdown(
 				"LockMutations",
@@ -39243,11 +40347,11 @@ end
 			local FreeBox = Tabs.Rewards:AddLeftGroupbox("Free Rewards", "gift")
 			FreeBox:AddToggle("AutoPlaytime", { Text = "Auto Claim Playtime Gifts", Default = false })
 			FreeBox:AddToggle("AutoDaily", { Text = "Auto Claim Daily Reward", Default = false })
-			FreeBox:AddToggle("AutoSpin", { Text = "Auto Spin Lucky Wheel", Default = false, Tooltip = "Spins the game's wheel whenever you have 25 Luminous Coins" })
-			FreeBox:AddToggle("AutoSeasonPass", { Text = "Auto Claim Season Pass (free)", Default = false })
+			FreeBox:AddToggle("AutoSpin", { Text = "Auto Spin Lucky Wheel", Default = false, Tooltip = "Spins the Luminous wheel whenever you have 25 Luminous Coins (the game's Spin All, up to 50 spins in one call). Only this switch spends Luminous Coins, Smart Planner never does" })
+			FreeBox:AddToggle("AutoSeasonPass", { Text = "Auto Claim Season Pass (free)", Default = false, Tooltip = "Claims every free tier as soon as your Pass level reaches it. Finished quests are claimed by the game itself" })
 			FreeBox:AddToggle("AutoFreeShop", { Text = "Auto Claim Free Shop Animal", Default = false })
 			FreeBox:AddToggle("AutoForever", { Text = "Auto Claim Free Forever Pack", Default = false })
-			FreeBox:AddToggle("AutoLimited", { Text = "Auto Claim 25 Min Reward", Default = false, Tooltip = "The Play for 25 Mins / Win 5 Games reward on your plot" })
+			-- (no toggle for the 25 minute reward: the server grants it by itself)
 			FreeBox:AddToggle(
 				"AutoGroup",
 				{ Text = "Auto Claim Group Reward", Default = false, Tooltip = "Only when you are in the game's group" }
@@ -39319,9 +40423,9 @@ end
 			Labels.Potions = PotionBox:AddLabel({ Text = "-", DoesWrap = true })
 			local EventBox = Tabs.Rewards:AddRightGroupbox("Events", "sparkles")
 			EventBox:AddToggle("AutoStars", {
-				Text = "Collect Stars",
+				Text = "Collect Event Pickups",
 				Default = false,
-				Tooltip = "During the Stars event, sweeps the stars in the open sea after the catch.",
+				Tooltip = "During a collect event (Stars, Cake, Key) sweeps its pickups in the open sea after the catch; Blatant claims them straight on the remote.",
 			})
 			EventBox:AddToggle("EventRush", {
 				Text = "Event Rush",
@@ -39359,7 +40463,7 @@ end
 			SeaBox:AddToggle("AutoPlanner", {
 				Text = "Smart Planner",
 				Default = false,
-				Tooltip = "Runs the farm with the real game odds: opens the sea, trains (TRAIN and SEA split), places and hatches eggs, Smart Sells (your Protect lists stay) and spends on upgrades, staffs, dumbbells and rebirth by payback. Your own switches are not changed.",
+				Tooltip = "Plays the game for you with the real game odds: opens the sea, trains (TRAIN and SEA split), places and hatches eggs, Smart Sells (your Protect lists stay, Secret animals are never sold), spends on upgrades, staffs, dumbbells and rebirth by payback and claims every free reward (playtime, daily, season pass, free shop, forever pack, offline cash, group, codes). Potions and the Luminous wheel stay on their own switches. Your own switches are not changed.",
 			})
 			do
 				-- Smart Sell = Auto Sell with Sell Mode Smart (not a saved option of its own)
@@ -39398,7 +40502,7 @@ end
 			end
 			Library:MirrorToggle("EventRush", SeaBox)
 			SeaBox:AddLabel({
-				Text = '<font transparency="0.35">Every switch also lives in its own tab and nothing turns on by itself. Smart Planner runs the sea, training, eggs, selling and spending for you; off, only your own switches run.</font>',
+				Text = '<font transparency="0.35">Every switch also lives in its own tab and nothing turns on by itself. Smart Planner runs the sea, training, eggs, selling, spending and every free reward for you; off, only your own switches run.</font>',
 				DoesWrap = true,
 			})
 			SeaBox:AddButton({
@@ -39469,7 +40573,7 @@ end
 			local PlotStats = Tabs.Stats:AddRightGroupbox("Plot and Extras", "sparkles")
 			StatRows.Sold = statRow(PlotStats, "banknote", "Items sold", 22)
 			StatRows.Hatched = statRow(PlotStats, "egg", "Eggs placed / hatched", 22)
-			StatRows.Stars = statRow(PlotStats, "star", "Stars collected", 22)
+			StatRows.Stars = statRow(PlotStats, "star", "Event pickups collected", 22)
 			StatRows.Claimed = statRow(PlotStats, "gift", "Rewards claimed", 22)
 			StatRows.Bought = statRow(PlotStats, "shopping-cart", "Things bought", 22)
 			StatRows.Rebirths = statRow(PlotStats, "refresh-cw", "Rebirths", 22)
@@ -39479,7 +40583,7 @@ end
 			StatRows.AllMade = statRow(AllBox, "trending-up", "Cash made", 22)
 			StatRows.AllEarned = statRow(AllBox, "banknote", "Earned from selling", 22)
 			StatRows.AllWaves = statRow(AllBox, "waves-horizontal", "Waves opened", 22)
-			StatRows.AllExtra = statRow(AllBox, "egg", "Hatched / stars", 22)
+			StatRows.AllExtra = statRow(AllBox, "egg", "Hatched / pickups", 22)
 			StatRows.AllTime = statRow(AllBox, "clock", "Time farming", 22, "FontColor")
 			StatRows.AllBest = statRow(AllBox, "star", "Best catch ever", 22, "FontColor")
 			AllBox:AddButton({
@@ -40004,7 +41108,7 @@ end
 			"AutoPlanner", "AutoSea", "AutoTrain", "TrainSea", "AutoSell", "EventRush", "AutoStars", "IndexHunter",
 			"AutoEquipBest", "AutoOffline", "AutoPlaceEggs", "AutoHatch", "AutoLock", "AutoUpgrade", "AutoBuyStaff",
 			"AutoEquipStaff", "AutoBuyDumbbell", "AutoEquipDumbbell", "AutoBonus", "AutoRebirth", "AutoPotions",
-			"AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited",
+			"AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever",
 			"AutoGroup", "AutoCodes", "AutoLucky", "AutoAd", "LuckHop",
 		}
 		Game.AllAuto = AllAutoToggles
@@ -40027,7 +41131,7 @@ end
 				toggleCommand(
 					"rewards",
 					{ "free" },
-					{ "AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoLimited", "AutoGroup", "AutoCodes" },
+					{ "AutoPlaytime", "AutoDaily", "AutoSpin", "AutoSeasonPass", "AutoFreeShop", "AutoForever", "AutoGroup", "AutoCodes" },
 					"Every free reward"
 				)
 				Library:AddCommand({
@@ -40118,7 +41222,7 @@ end
 					Callback = function(args)
 						local code = args and args[1]
 						if not code or code == "" then
-							return "Usage: code ZEUS"
+							return "Usage: code <CODE>"
 						end
 						task.spawn(redeemCode, code, true)
 						return "Redeeming " .. code
@@ -40265,10 +41369,31 @@ end
 				writefile(SetupFlag, "1")
 			end)
 		end
+		-- the wizard is for a first run only: a saved config (loaded, or an autoload file on disk) counts as seen
 		function setupDone()
 			local ok, done = pcall(function()
-				return isfile(SetupFlag)
+				if isfile(SetupFlag) then
+					return true
+				end
+				if Library.ConfigLoadedName then
+					return "config"
+				end
+				local folders = { "Corvus/OpenTheSeaForAnimals" }
+				if SaveManager and type(SaveManager.Folder) == "string" then
+					table.insert(folders, 1, SaveManager.Folder)
+				end
+				for _, folder in ipairs(folders) do
+					if isfile(folder .. "/settings/autoload.txt") then
+						return "config"
+					end
+				end
+				return false
 			end)
+			if ok and done == "config" then
+				log("SETUP wizard skipped: a saved config exists")
+				markSetupDone()
+				return true
+			end
 			return not ok or done == true
 		end
 		function openWizard()
@@ -40290,7 +41415,7 @@ end
 							{
 								Id = "planner",
 								Title = "Smart Planner",
-								Description = "Runs the sea, training, eggs, selling and spending by payback for you",
+								Description = "Runs the sea, training, eggs, selling, spending and every free reward for you",
 								Icon = "zap",
 								Color = "#ffd166",
 							},
@@ -40916,7 +42041,13 @@ end
 						}
 						log("PERF", Debug.perfText(), "|", table.concat(parts, ", "))
 						if Perf.freezes > 0 then
-							logProblem("The game froze for over a second " .. Perf.freezes .. " time(s), last status: " .. tostring(Status))
+							-- a freeze in the first 30 s after BOOT or while Idle with nothing running is only a HITCH line
+							local running = on("AutoSea") or on("AutoTrain") or on("AutoPlaceEggs") or on("AutoSell")
+							if (Perf.freezeAt or 0) - Perf.bootAt > 30 and running and tostring(Status) ~= "Idle" then
+								logProblem("The game froze for over a second " .. Perf.freezes .. " time(s), last status: " .. tostring(Status))
+							else
+								log("HITCH", "freeze x" .. Perf.freezes, "not counted as a problem (boot or idle), status:", tostring(Status))
+							end
 						end
 						Perf.frames, Perf.time, Perf.worst, Perf.hitches, Perf.freezes = 0, 0, 0, 0, 0
 						table.clear(Perf.work)
@@ -41337,7 +42468,7 @@ end
 			{ "AutoDaily", "daily", 60, dailyTick },
 			{ "AutoFreeShop", "freeshop", 120, freeShopTick },
 			{ "AutoForever", "forever", 45, foreverTick },
-			{ "AutoLimited", "limited", 60, limitedTick },
+			-- (AutoLimited removed in 586: no remote)
 			{ "AutoSeasonPass", "season", 15, seasonTick },
 			{ "AutoCodes", "codes", 20, codesTick },
 			{ "AutoLucky", "lucky", 8, function()
@@ -41351,13 +42482,45 @@ end
 			end },
 			{ "AutoPotions", "potions", 10, potionTick },
 			{ "AutoSpin", "spin", 5, function()
-				-- the game's lucky wheel: 25 LuminousCoins a spin (10M cash 55%, demonic/angelic animals, Luminous Trident)
-				if currency("LuminousCoins") >= 25 then
-					local ok, result = call("SpinWheelService", "SpinWheel")
-					if ok and result then
+				-- the game's lucky wheel: 25 LuminousCoins a spin (10M cash 55%, demonic/angelic animals, Luminous Trident).
+				-- SpinAll (bc 29645, MAX_OPEN 50) spins every ticket in one call, one single spin is the fallback (PROBE spin_all)
+				local coins = currency("LuminousCoins")
+				if coins < 25 then
+					return
+				end
+				local P = Game.probe
+				local state = P.state.spin_all
+				local known = type(state) == "table" and state.ok == true
+				if coins >= 50 and (known or not P.tried.spin_all) then
+					local ok = call("SpinWheelService", "SpinAll")
+					local dropped = waitFor(function()
+						return currency("LuminousCoins") <= coins - 25
+						end, 3)
+					local after = currency("LuminousCoins")
+					if ok and dropped then
+						local n = math.max(math.floor((coins - after) / 25 + 0.5), 1)
 						Session.claimed += 1
-						Track.event("Spin", "Lucky wheel spin", nil, "gift", "#ffd166")
+						Track.event("Spin", "Lucky wheel " .. n .. " spins", nil, "gift", "#ffd166")
+						Game.claimLog("lucky wheel spin all", true, true, n .. " spins, coins " .. coins .. " -> " .. after)
+						if not known then
+							P.result("spin_all", true, n, "coins " .. coins .. "->" .. after)
+						end
+						return
 					end
+					Game.claimLog("lucky wheel spin all", false, ok, "coins " .. coins .. " -> " .. after)
+					if not known then
+						P.result("spin_all", false, 0, "coins " .. coins .. "->" .. after .. " call_ok=" .. tostring(ok))
+					end
+					return
+				end
+				local _, result = call("SpinWheelService", "SpinWheel")
+				local spun = waitFor(function()
+					return currency("LuminousCoins") <= coins - 25
+				end, 3)
+				Game.claimLog("lucky wheel spin", spun, result, "coins " .. coins .. " -> " .. currency("LuminousCoins"))
+				if spun then
+					Session.claimed += 1
+					Track.event("Spin", "Lucky wheel spin", nil, "gift", "#ffd166")
 				end
 			end },
 		}
@@ -41499,7 +42662,11 @@ end
 						table.insert(lines, "Planner runs " .. table.concat(parts, ", ") .. " for you")
 					end
 					if plan and plan.best and plan.best.ratio and plan.best.ratio > 0 then
-						table.insert(lines, "Best use of money: " .. plan.best.name .. ", pays back in ~" .. clockText(1 / plan.best.ratio))
+						if plan.best.key == "Train" then
+							table.insert(lines, "Best next step: " .. plan.best.name .. " (~" .. clockText(plan.best.tp or 0) .. " of training" .. (if plan.trainNow then ", training now)" else ", once the sea adds less per second)"))
+						else
+							table.insert(lines, "Best use of money: " .. plan.best.name .. ", pays back in ~" .. clockText(1 / plan.best.ratio))
+						end
 					end
 					if plan then
 						local target = plan.target
@@ -41517,7 +42684,13 @@ end
 					end
 					local sellAt = math.min(tonumber(Options.SellAt and Options.SellAt.Value) or 150, inventoryLimit())
 					local held = inventoryCount()
-					if held > 0 then
+					local sellWhy = Game.lastSellWhy
+					local nothingToSell = type(sellWhy) == "table" and sellWhy.sellable == 0 and (sellWhy.total or 0) > 0 and os.clock() - (sellWhy.at or -1e9) < 120
+					if Game.seaBlocked() then
+						table.insert(lines, "Backpack full (" .. math.floor(held) .. "), nothing in it may be sold: training until there is room")
+					elseif held >= sellAt and nothingToSell then
+						table.insert(lines, "Backpack " .. math.floor(held) .. "/" .. math.floor(inventoryLimit()) .. ": nothing to sell now (Protect lists, Secret and the plot's eggs stay)")
+					elseif held > 0 then
 						table.insert(lines, if held >= sellAt then "Sell " .. held .. " items now" else "Sell at " .. math.floor(sellAt) .. " items (" .. math.floor(held) .. " now)")
 					end
 					Labels.UpNext:SetText(if #lines > 0 then table.concat(lines, "\n") else "Collecting data...")
@@ -41621,22 +42794,7 @@ end
 					local staffKey = data and data.EquippedPickaxe
 					local staff = staffOf(staffKey)
 					local owned = data and type(data.OwnedPickaxes) == "table" and data.OwnedPickaxes or {}
-					local nextStaff
-					for key, cfg in pairs(Staffs) do
-						local cost = type(cfg) == "table" and tonumber(cfg.cost)
-						if
-						cost
-						and cost > 0
-						and not owned[key]
-						and not cfg.passRequired
-						and not cfg.hideIfNotOwned
-						and not cfg.isSpecial
-						then
-							if not nextStaff or cost < Staffs[nextStaff].cost then
-								nextStaff = key
-							end
-						end
-					end
+					local nextStaff = Game.nextStaff(owned)
 					Labels.Staff:SetText(
 						string.format(
 							"Equipped <b>%s</b>  \u{00B7}  luck x%s  \u{00B7}  %ss%s",
@@ -41658,9 +42816,9 @@ end
 					local tool = data and TrainTools[data.EquippedTrainTool]
 					Labels.Train:SetText(
 						string.format(
-							"Power <b>%s</b>  \u{00B7}  +%s per tick%s\nDumbbell <b>%s</b>  \u{00B7}  %s",
+							"Power <b>%s</b>  \u{00B7}  +%s/s while training%s\nDumbbell <b>%s</b>  \u{00B7}  %s",
 							formatNumber(power()),
-							formatNumber(tonumber(modifier("TrainGain")) or 0),
+							formatNumber(Game.rates and Game.rates.powerRate or Game.expectedTrainRate()),
 							if target
 							then '\n<font transparency="0.4">Reach ' .. (reach + 1) .. " at " .. formatNumber(target) .. " power</font>"
 							else "",
@@ -41693,14 +42851,31 @@ end
 					and tonumber(daily.LastClaimedDate)
 					and 86400 - (os.time() - daily.LastClaimedDate)
 					or 0
+					local function questDone(set)
+						local done, n = 0, 0
+						for _, q in pairs(type(set) == "table" and set or {}) do
+							n += 1
+							if type(q) == "table" and (q.isCompleted or q.isClaimed) then
+								done += 1
+							end
+						end
+						return done, n
+					end
+					local quests = data and type(data.Quests) == "table" and data.Quests or {}
+					local hourDone, hourAll = questDone(quests.SeasonPassHourly)
+					local dayDone, dayAll = questDone(quests.SeasonPass)
 					Labels.Rewards:SetText(
 						string.format(
-							"Playtime gift %s\nDaily reward %s  \u{00B7}  Season pass level <b>%d</b>",
+							"Playtime gift %s\nDaily reward %s  \u{00B7}  Season pass level <b>%d</b>\nSeason quests hourly <b>%d/%d</b>  \u{00B7}  daily <b>%d/%d</b>",
 							if gift
 							then "#" .. gift .. (if left and left > 0 then " in " .. clockText(left) else " ready")
 							else "all claimed",
-							if dailyLeft > 0 then "in " .. clockText(dailyLeft) else "ready",
-							math.floor(seasonLevel())
+							if Game.dailyDone then "week done" elseif dailyLeft > 0 then "in " .. clockText(dailyLeft) else "ready",
+							math.floor(seasonLevel()),
+							hourDone,
+							hourAll,
+							dayDone,
+							dayAll
 						)
 					)
 				end)
