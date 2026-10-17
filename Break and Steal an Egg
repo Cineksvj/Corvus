@@ -34538,6 +34538,20 @@ do
 		end)
 		return math.clamp(0.25 + (tonumber(ping) or 0.1) * 1.5, 0.3, 0.8)
 	end
+	-- Skip Zone After A Catch (toggle) + Skip Time ("90s", "2m", "1.5m", "3" = minutes); off or empty = 0 = no skip.
+	function N.guardSkipSeconds()
+		if not on("GuardSkipZone") then
+			return 0
+		end
+		local text = string.lower(string.gsub(tostring(Options.GuardSkipTime and Options.GuardSkipTime.Value or "2m"), "%s", ""))
+		local num, unit = string.match(text, "^([%d%.]+)([smh]?)")
+		local n = tonumber(num)
+		if not n then
+			return 120
+		end
+		local secs = if unit == "s" then n elseif unit == "h" then n * 3600 else n * 60
+		return math.clamp(math.floor(secs), 0, 3600)
+	end
 	-- ("fling", velocity, seconds, spin) when a guard catches you, ("release") when the game lets you get up.
 	N.onRemote("CatchFlingRemote", function(kind, velocity, seconds)
 		if kind == "release" then
@@ -34550,9 +34564,12 @@ do
 		end
 		Session.caught += 1
 		F.caughtAt = os.clock()
-		if F.carryZone and not on("IgnoreGuards") then
-			N.ZonePenalty[F.carryZone] = os.clock() + 600
-			notify("Guard", "Caught in zone " .. F.carryZone .. ", Corvus skips that zone for 10 minutes", 5)
+		local root = rootPart()
+		F.caughtPos = root and root.Position or nil
+		local skip = N.guardSkipSeconds()
+		if F.carryZone and not on("IgnoreGuards") and skip > 0 then
+			N.ZonePenalty[F.carryZone] = os.clock() + skip
+			notify("Guard", string.format("Caught in zone %s, Corvus skips that zone for %s", tostring(F.carryZone), if skip % 60 == 0 then (skip // 60) .. " min" else skip .. " s"), 5)
 		end
 		N.Moves.hold = nil
 		N.Moves.flungUntil = os.clock() + (tonumber(seconds) or 5) + 2.5
@@ -35057,12 +35074,64 @@ do
 		N.travelTo(spot)
 		return N.atHome()
 	end
+	-- A guard catch on the way home drops the carried animal on the ground (it becomes a pickup for a while). Player
+	-- report 2026-10-14/17: the hub counted that as banked and walked on without the 200B/s pet. After getting up it
+	-- walks back to where it was caught and grabs the same animal again (no teleport, the normal walk), up to 3 tries.
+	-- An animal the hub itself grabbed (stealPickup sets carryZone); a grab the player made by hand is his to carry.
+	function N.hubCarrying()
+		return N.carrying() and F.carryZone ~= nil
+	end
+	function N.recoverDrop(name)
+		waitFor(function()
+			return not N.flung()
+		end, 10)
+		local at = F.caughtPos
+		for try = 1, 3 do
+			if not alive() then
+				return false
+			end
+			local best, bestDist
+			for _, info in ipairs(N.pickups()) do
+				local d = at and (info.position - at).Magnitude or N.distanceTo(info.position)
+				if (type(name) ~= "string" or info.name == name) and d <= 120 and (info.left or 99) > 2 and (not bestDist or d < bestDist) then
+					best, bestDist = info, d
+				end
+			end
+			if not best then
+				log("DROP not found after the catch", tostring(name))
+				return false
+			end
+			F.failedPickups[best.model] = nil
+			log(string.format("DROP regrab %d %s %d studs from the catch", try, tostring(name), math.floor(bestDist or 0)))
+			if N.stealPickup(best, " (dropped when the guard caught you)") then
+				return true
+			end
+			if best.model.Parent == nil then
+				log("DROP gone", tostring(name))
+				return false
+			end
+			waitFor(function()
+				return not N.flung()
+			end, 10)
+		end
+		return false
+	end
 	function N.bank()
 		if not N.carrying() then
 			return false
 		end
 		local carried = math.max(N.carryCount(), 1)
 		local tripZone, tripStart = F.carryZone, os.clock()
+		local caughtStart, carriedName = Session.caught, LocalPlayer:GetAttribute("Carrying")
+		local function dropped()
+			if Session.caught == caughtStart then
+				return false
+			end
+			log("BANK lost the animal to a guard on the way", tostring(carriedName))
+			F.carryZone, F.carryValue = nil, nil
+			N.recoverDrop(carriedName)
+			return true
+		end
 		-- The game banks in Build.ZoneHitboxes.SafeZone too (SafeZoneQuery.IsBankable = own plot or a SafeZone part).
 		-- It is used when it is nearer and the carried animals would not be placed anyway (placing needs the plot).
 		local spot = N.safePoint()
@@ -35078,6 +35147,9 @@ do
 				if waitFor(function()
 					return not N.carrying()
 				end, 3) then
+					if dropped() then
+						return true
+					end
 					Session.banked += carried
 					N.Plan.observeTrip(tripZone, os.clock() - tripStart)
 					F.carryZone, F.carryValue = nil, nil
@@ -35093,6 +35165,9 @@ do
 			if waitFor(function()
 				return not N.carrying()
 			end, 3) then
+				if dropped() then
+					return true
+				end
 				Session.banked += carried
 				N.Plan.observeTrip(tripZone, os.clock() - tripStart)
 				F.placeWanted = true
@@ -39563,6 +39638,18 @@ do
 			Tooltip = "Leaves an animal when the zone guard stands close to it, unless your speed is 1.2x the zone speed",
 		})
 		GuardBox:AddSlider("GuardDistance", { Text = "Guard Distance", Default = 40, Min = 10, Max = 150, Rounding = 0, Suffix = " studs", Tooltip = "How close the guard may stand" })
+		GuardBox:AddToggle("GuardSkipZone", {
+			Text = "Skip Zone After A Catch",
+			Default = true,
+			Tooltip = "After a guard catches you in a zone, Corvus farms other zones for the time below. Off = keeps farming that zone",
+		})
+		GuardBox:AddInput("GuardSkipTime", {
+			Text = "Skip Time",
+			Default = "2m",
+			Placeholder = "2m",
+			Finished = true,
+			Tooltip = "How long to skip the zone: 90s, 2m, 1.5m or a plain number of minutes",
+		})
 		GuardBox:AddToggle("IgnoreGuards", {
 			Text = "Ignore Guards",
 			Default = false,
@@ -40852,7 +40939,9 @@ do
 					if N.Train.startedAt then
 						N.leaveTreadmill()
 					end
-					if (farmOn or N.carrying()) and N.farmStep() then
+					-- player report 2026-10-17: with nothing on, an animal the PLAYER grabbed by hand was walked home by the
+					-- hub; now only the hub's own grabs (N.hubCarrying) are banked when the farm toggles are off
+					if (farmOn or N.hubCarrying()) and N.farmStep() then
 						N.Train.idleSince = nil
 						return
 					end
