@@ -32779,7 +32779,11 @@ do
 	-- arguments the game's client sends (dump lines in notes.md "Control audit").
 	local FireAllowed = {
 		["TapService.RE.TapRequested"] = function(t, ...)
-			return select("#", ...) == 0 and onlyKeys(t, { Auto = true, ClientSequence = true }) and t.Auto == false and isInt(t.ClientSequence, 1)
+			-- 4020 (TapController.sendTap L131989-131993): {Auto=false, ClientSequence, Source}; Source is the input kind
+			-- ("button", "button_hold", "screen_hold", "pad_a", ...). Without it the server drops the tap (live 2026-10-17:
+			-- manual taps 0/s, the Hallow Lord took only the auto-clicker's taps).
+			return select("#", ...) == 0 and onlyKeys(t, { Auto = true, ClientSequence = true, Source = true }) and t.Auto == false and isInt(t.ClientSequence, 1)
+				and (t.Source == nil or t.Source == "button" or t.Source == "button_hold" or t.Source == "screen_hold")
 		end,
 		["AutoClickService.RE.AutoClickRequested"] = function(t, ...)
 			return select("#", ...) == 0 and onlyKeys(t, { Enabled = true }) and type(t.Enabled) == "boolean"
@@ -32930,6 +32934,18 @@ do
 		end,
 		["UpgradeService.RF.Purchase"] = function(t, ...)
 			return select("#", ...) == 0 and onlyKeys(t, { Name = true }) and N.upgradeInfo(t.Name) ~= nil
+		end,
+		-- 4020 Halloween (halloween_4020.md): the Candy Witch's Accept() takes no arguments (HalloweenDailyController
+		-- L178109); the shop sends {Id} of a listed item (HalloweenShopController L142803).
+		-- TrickOrTreatController L135986-135996: Knock(houseId) with the house's HouseId ("House01".."House11")
+		["TrickOrTreatService.RF.Knock"] = function(id, ...)
+			return select("#", ...) == 0 and isStr(id) and string.match(id, "^House%d%d$") ~= nil
+		end,
+		["HalloweenDailyService.RF.Accept"] = function(t, ...)
+			return t == nil and select("#", ...) == 0
+		end,
+		["HalloweenShopService.RF.Purchase"] = function(t, ...)
+			return select("#", ...) == 0 and onlyKeys(t, { Id = true }) and isStr(t.Id) and N.hwShopItem ~= nil and N.hwShopItem(t.Id) ~= nil
 		end,
 		["SkillTreeService.RF.Unlock"] = function(t, ...)
 			return select("#", ...) == 0 and onlyKeys(t, { Name = true }) and N.skillNode(t.Name) ~= nil
@@ -33462,6 +33478,7 @@ do
 		AutoOfflineDelete = true,
 		AutoEquip = true,
 		IndexHunter = true,
+		AutoHalloweenShop = true,
 	}
 	function N.does(name)
 		if N.Consumers[name] then
@@ -34397,7 +34414,7 @@ do
 			return false
 		end
 		Tap.seq += 1
-		return fire("TapService.RE.TapRequested", { Auto = false, ClientSequence = Tap.seq })
+		return fire("TapService.RE.TapRequested", { Auto = false, ClientSequence = Tap.seq, Source = "button" })
 	end
 	N.onEvent("TapService.RE.TapResult", function(r)
 		if type(r) ~= "table" then
@@ -34481,7 +34498,7 @@ do
 		end
 		Tap.manual, Tap.auto, Tap.coins, Tap.coinsManual, Tap.coinsAuto, Tap.windowAt = 0, 0, 0, 0, 0, now
 		-- tap_total (G5-4): 20 s at each cadence, two rounds in alternating order; the total coins per second decide.
-		local state = N.probeState("tap_total")
+		local state = N.probeState("tap_pace")
 		local blocked = N.tapBlocked()
 		if state == "untested" and N.does("AutoTap") and not blocked then
 			local pr = Tap.probe
@@ -34518,7 +34535,7 @@ do
 						local at = N.TapCadences[pick]
 						local total = (pr.totals[pick] or 0) / math.max(pr.n[pick] or 1, 1)
 						N.probeResult(
-							"tap_total",
+							"tap_pace",
 							if at < 0.1 then "accepted" else "rejected",
 							string.format("gain=%.1f/s at=%.3g manual=%.1f auto=%.1f amount_manual=%s amount_auto=%s (coins/s %s at 0.1, %s at 0.05, %s at 0.034)", total, at, Tap.rate, Tap.autoRate, fmtAmount(Tap.amountManual), fmtAmount(Tap.amountAuto), fmtAmount(avg[1]), fmtAmount(avg[2]), fmtAmount(avg[3])),
 							tostring(at)
@@ -36315,7 +36332,14 @@ do
 		-- the game's own machine auto-fill skips mutated copies too, MachineController bc 71591-71598)
 		for id, pet in pairs(N.owned()) do
 			local secret = type(pet) == "table" and string.match(tostring(N.rarityOf(pet) or ""), "^Secret") ~= nil
-			local valued = type(pet) == "table" and (pet.Enchant ~= nil or pet.Enchant2 ~= nil or pet.Signature ~= nil or pet.LeaderboardSerial ~= nil or N.petValued(pet) ~= nil)
+			-- Craft Mutated Pets (player request 2026-10-17, default off): a mutation alone no longer keeps a copy out of
+			-- the machine; enchants, signatures, serials, nicknames, Secrets and locks still do.
+			local check = pet
+			if type(pet) == "table" and pet.Mutation ~= nil and on("CraftMutated") then
+				check = table.clone(pet)
+				check.Mutation = nil
+			end
+			local valued = type(pet) == "table" and (pet.Enchant ~= nil or pet.Enchant2 ~= nil or pet.Signature ~= nil or pet.LeaderboardSerial ~= nil or N.petValued(check) ~= nil)
 			if type(pet) == "table" and not secret and not valued and pet.Tier == cfg.SourceTier and pet.Locked ~= true and pet.Frozen == nil and not keep[id] and not spent[id] and not protect[pet.Name] and type(pet.Name) == "string" and (only == nil or only[pet.Name]) then
 				local g = groups[pet.Name]
 				if not g then
@@ -37222,7 +37246,7 @@ do
 	-- ===== Delete junk: PetService.RE.PetActionRequested {Action="Delete", PetIds (max 400), Batch} (PetDeleteRequest,
 	-- dump 317967-318007; ~900 ids in one call would cross the 32 KB string rule and kick, so 400 is the hard cap). Only
 	-- the rarities and tiers picked in the filters, lowest power first, never equipped / level team / locked / frozen /
-	-- protected pets, never Secret, Godly, Exclusive, Diamond or Rainbow pets, never a variant the Pet Index has not counted
+	-- protected pets, never Secret, Godly or Exclusive pets, Diamond/Rainbow only when picked (2026-10-17), never a variant the Pet Index has not counted
 	-- and never the Index Hunter's egg pets while it hunts (N.indexKeeps). Builder M (owner 2026-10-12 "Auto Delete Junk
 	-- does not work"): it used to run only when the storage was full AND no machine had a set (live log 2026-10-12 05:16:
 	-- storage 380/380, Auto Golden/Diamond on, a set always ready, `deleted 0`); now it deletes what matches the filters
@@ -37236,7 +37260,7 @@ do
 			rarities[r] = true
 		end
 		for _, t in ipairs(picked(Options.DeleteTiers)) do
-			tiers[t] = true
+			tiers[if t == "Rainbow" then "Shiny" else t] = true
 		end
 		local keep = N.keepSet()
 		local protect = N.protectedNames()
@@ -37265,7 +37289,7 @@ do
 						log(string.format("DELETE skipped %s: Mythic from Void kept for craft", tostring(pet.Name)))
 					end
 				end
-				if rarities[rarity] and tiers[tier] and not NeverRarity[rarity] and not secret and not indexKeep and (tier == "Normal" or tier == "Golden") then
+				if rarities[rarity] and tiers[tier] and not NeverRarity[rarity] and not secret and not indexKeep then
 					table.insert(out, { id = id, power = tonumber(powers[id]) or 0, name = tostring(pet.Name), rarity = tostring(rarity), tier = tier })
 				end
 			end
@@ -37286,7 +37310,7 @@ do
 			rarities[r] = true
 		end
 		for _, t in ipairs(picked(Options.DeleteTiers)) do
-			tiers[t] = true
+			tiers[if t == "Rainbow" then "Shiny" else t] = true
 		end
 		local keep, protect = N.keepSet(), N.protectedNames()
 		local c = { kept = 0, locked = 0, protected = 0, rarity = 0, tier = 0, index = 0, void = 0, ok = 0 }
@@ -37299,7 +37323,7 @@ do
 					c.protected += 1
 				elseif not rarities[rarity] or NeverRarity[rarity] or string.match(tostring(rarity), "^Secret") then
 					c.rarity += 1
-				elseif not tiers[tier] or not (tier == "Normal" or tier == "Golden") then
+				elseif not tiers[tier] then
 					c.tier += 1
 				else
 					c.ok += 1
@@ -37409,6 +37433,348 @@ do
 		log(string.format("OFFLINE prep: %s server auto-delete %d junk species (10,000-egg offline budget)", egg, #keys))
 	end
 end
+	do
+		-- ===== Halloween 4020 (halloween_4020.md, live 2026-10-17 on the owner's main). Island reached through the event portal
+		-- Workspace.EventPortals.Halloween: stepping in fires IslandService.RE.IslandPortalEncountered {Island="Halloween",
+		-- Action="Travel", Doorway="Hub"}, then IslandService.RF.Travel {Source="Portal", Island="Halloween"} -> Success (live).
+		-- Trick or Treat: the game's own TrickOrTreatController knocks by itself when the character stands in a house's Zone
+		-- (live: candy 0 -> 42 on entering House01), so the hub only walks the 11 zones (cooldown 1800 s per house).
+		-- Candy Witch: HalloweenDailyService.RF.Accept() within InteractRange 12 -> {Success, Accepted} (live true/true).
+		-- Hallow Lord: every full hour (server time), fight 420 s; taps while on the BossPlatform deal the damage
+		-- (HallowBossController SetClickAnywhereOverride), MinDamage 25 for the reward. Shop: HalloweenShopService.RF.Purchase
+		-- {Id} (HalloweenShopController L142756), no presence needed (client checks IsOpen/IsListed/remaining/candy only). =====
+		local HW = { daily = -1, houses = {}, bossFight = -1, last = "", shopAt = -1e9, trickRound = -1e9, candyStart = nil, bossHits = 0, bossReward = "" }
+		N.HW = HW
+		local PortalFallback = Vector3.new(-46.8, -491.5, -1981.2)
+		local IslandCenter = Vector3.new(-1700, -510, -2030)
+		local function island()
+			return workspace:FindFirstChild("HalloweenIsland")
+		end
+		local function hwData(key)
+			local d = N.data()
+			return type(d) == "table" and d[key] or nil
+		end
+		function N.candy()
+			local c = hwData("Currencies")
+			return type(c) == "table" and tonumber(c.CandyCorn) or 0
+		end
+		function N.onHalloween()
+			local p = N.myPos()
+			return p ~= nil and (Vector3.new(p.X, 0, p.Z) - Vector3.new(IslandCenter.X, 0, IslandCenter.Z)).Magnitude < 650 and p.Y < -400
+		end
+		local function serverNow()
+			local ok, t = pcall(function()
+				return workspace:GetServerTimeNow()
+			end)
+			return if ok and type(t) == "number" then t else os.time()
+		end
+		-- Through the event portal; from another island the main map comes first.
+		function N.goHalloween()
+			if N.onHalloween() then
+				return true
+			end
+			if N.islandInfo(N.currentIsland()) ~= nil and not N.travelSpawn() then
+				return false
+			end
+			local folder = workspace:FindFirstChild("EventPortals")
+			local portal = folder and folder:FindFirstChild("Halloween")
+			local part = portal and (portal:FindFirstChild("Portal", true) or portal:FindFirstChildWhichIsA("BasePart", true))
+			local pos = (part and N.posOf(part)) or PortalFallback
+			N.Travel.encounter = nil
+			N.teleport(pos, 0.2)
+			local function seen()
+				return N.Travel.encounter ~= nil and N.Travel.encounter.island == "Halloween"
+			end
+			if not waitFor(seen, 1.5) then
+				N.portalNudge(pos)
+			end
+			if not waitFor(seen, 2) then
+				HW.failAt = os.clock()
+				log("HALLOWEEN no portal encounter at", tostring(pos), "(Halloween trips wait 10 min)")
+				return false
+			end
+			N.PortalToken = { island = "Halloween" }
+			local result = invoke("IslandService.RF.Travel", { Source = "Portal", Island = "Halloween" })
+			N.PortalToken = nil
+			local ok = type(result) == "table" and result.Success == true
+			if ok then
+				waitFor(N.onHalloween, 4)
+				waitFor(function()
+					local f = island()
+					return f ~= nil and f:FindFirstChild("CandyWitch") ~= nil
+				end, 4)
+			end
+			if not ok then
+				HW.failAt = os.clock()
+			end
+			log("HALLOWEEN travel", if ok then "ok" else "refused", tostring(type(result) == "table" and (result.Reason or "") or result))
+			return ok and N.onHalloween()
+		end
+
+		-- ===== Candy Witch: 3 jobs a day (+300 candy for all), accepted once per day (UTC day like HalloweenDailyConfig.Today).
+		local function today()
+			return math.floor(os.time() / 86400)
+		end
+		-- a failed trip to the island (no portal, travel refused) pauses every Halloween trip for 10 minutes
+		local function travelBlocked()
+			if os.clock() - (HW.failAt or -1e9) < 600 then
+				return true
+			end
+			-- the candy errands are optional trips: the same 5-minute gap after the last one while hatching (p06 scheduler)
+			local gap = if N.hatchWanted() then 300 else 30
+			return os.clock() - (N.Sched.lastOptionalEnd or -1e9) < gap
+		end
+		function N.hwDailyDue()
+			return HW.daily ~= today() and not travelBlocked()
+		end
+		function N.hwDailyTrip()
+			N.tripBegin("candy witch", 60)
+			N.loopStatus("Main", "taking the Candy Witch's jobs")
+			local ok = N.goHalloween()
+			local witch = ok and island() and island():FindFirstChild("CandyWitch")
+			if witch then
+				N.teleport(witch:GetPivot().Position + Vector3.new(0, 2, 6), 0.3)
+				task.wait(0.6)
+				local r = invoke("HalloweenDailyService.RF.Accept")
+				local accepted = type(r) == "table" and (r.Accepted == true or r.Already == true or r.Success == true)
+				local reason = type(r) == "table" and tostring(r.Reason or "") or tostring(r)
+				-- "already" style answers also mean today's jobs are taken
+				if accepted or string.find(string.lower(reason), "already", 1, true) or string.find(string.lower(reason), "done", 1, true) then
+					HW.daily = today()
+				end
+				HW.last = "Candy Witch: " .. (if accepted then "jobs accepted" else ("said " .. reason))
+				log(string.format("HALLOWEEN daily accept success=%s accepted=%s reason=%s", tostring(type(r) == "table" and r.Success), tostring(type(r) == "table" and r.Accepted), reason))
+			else
+				HW.last = "Candy Witch not found"
+			end
+			N.Sched.lastOptionalEnd = os.clock()
+			N.tripEnd()
+		end
+
+		-- ===== Trick or Treat: walk the 11 house zones; the game's client knocks (30 min cooldown per house).
+		-- Zone centres read live 2026-10-17 (StreamingEnabled: far houses are not in the workspace until you are near, live
+		-- round 2 saw 7 of 11); a house not streamed in is visited at its known spot, the teleport streams it in.
+		local HousePos = {
+			House01 = Vector3.new(-1682, -509, -1741), House02 = Vector3.new(-1716, -509, -1784), House03 = Vector3.new(-1646, -509, -1808),
+			House04 = Vector3.new(-1712, -509, -1868), House05 = Vector3.new(-1646, -509, -1881), House06 = Vector3.new(-1745, -509, -1939),
+			House07 = Vector3.new(-1604, -509, -1951), House08 = Vector3.new(-1811, -510, -1973), House09 = Vector3.new(-1823, -509, -2047),
+			House10 = Vector3.new(-1754, -509, -2089), House11 = Vector3.new(-1614, -509, -2091),
+		}
+		local function pads()
+			local list, seen = {}, {}
+			local f = island()
+			for _, d in ipairs(f and f:GetChildren() or {}) do
+				if d.Name == "TrickOrTreat" and d:IsA("Model") then
+					local zone = d:FindFirstChild("Zone", true)
+					local id = d:GetAttribute("HouseId")
+					if zone and zone:IsA("BasePart") and type(id) == "string" then
+						table.insert(list, { id = id, pos = zone.Position })
+						seen[id] = true
+					end
+				end
+			end
+			for id, pos in pairs(HousePos) do
+				if not seen[id] then
+					table.insert(list, { id = id, pos = pos })
+				end
+			end
+			table.sort(list, function(a, b)
+				return a.id < b.id
+			end)
+			return list
+		end
+		function N.hwTrickDue()
+			if os.clock() - HW.trickRound < 1800 or travelBlocked() then
+				return false
+			end
+			return true
+		end
+		function N.hwTrickTrip()
+			N.tripBegin("trick or treat", 120)
+			N.loopStatus("Main", "trick-or-treating on Halloween Island")
+			local candy0 = N.candy()
+			local visited, got = 0, 0
+			if N.goHalloween() then
+				for _, p in ipairs(pads()) do
+					if not alive() then
+						break
+					end
+					if os.clock() - (HW.houses[p.id] or -1e9) >= 1800 then
+						local before = N.candy()
+						N.teleport(p.pos + Vector3.new(0, 1, 0), 0.2)
+						local function paid()
+							return N.candy() > before
+						end
+						waitFor(paid, 2.5)
+						-- live 2026-10-17: House02 (first house after arriving) gave nothing; step inside the zone again,
+						-- wait longer, then knock like the game's own controller (TrickOrTreatController request(houseId))
+						if not paid() then
+							N.teleport(p.pos + Vector3.new(2, 1, 2), 0.2)
+							if not waitFor(paid, 3) then
+								local r = invoke("TrickOrTreatService.RF.Knock", p.id)
+								waitFor(paid, 2)
+								log(string.format("TRICK %s knock answer success=%s reason=%s", p.id, tostring(type(r) == "table" and r.Success), tostring(type(r) == "table" and r.Reason or r)))
+							end
+						end
+						local gain = N.candy() - before
+						HW.houses[p.id] = os.clock()
+						visited += 1
+						if gain > 0 then
+							got += 1
+						end
+						log(string.format("TRICK %s candy +%d (now %d)", p.id, gain, N.candy()))
+					end
+				end
+			end
+			HW.trickRound = os.clock()
+			HW.last = string.format("Trick or Treat: %d houses, %d gave candy, +%d candy", visited, got, N.candy() - candy0)
+			log("HALLOWEEN " .. HW.last)
+			N.Sched.lastOptionalEnd = os.clock()
+			N.tripEnd()
+		end
+
+		-- ===== Hallow Lord: every full hour (server time) for 420 s; tap while standing on the BossPlatform.
+		local Boss = { ended = false, rewardAt = -1e9 }
+		N.onEvent("HallowBossService.RE.Ended", function()
+			Boss.ended = true
+		end)
+		N.onEvent("HallowBossService.RE.Reward", function(r)
+			Boss.rewardAt = os.clock()
+			local parts = {}
+			if type(r) == "table" then
+				for k, v in pairs(r) do
+					if type(v) ~= "table" then
+						table.insert(parts, tostring(k) .. "=" .. tostring(v))
+					end
+				end
+			end
+			HW.bossReward = table.concat(parts, " ")
+			log("BOSS reward", HW.bossReward)
+		end)
+		local function fightWindow()
+			local now = serverNow()
+			local start = math.floor(now / 3600) * 3600
+			return start, now - start
+		end
+		function N.hwBossDue()
+			local start, t = fightWindow()
+			return HW.bossFight ~= start and t >= 2 and t < 400 and os.clock() - (HW.failAt or -1e9) >= 600
+		end
+		local function platform()
+			local tagged = game:GetService("CollectionService"):GetTagged("BossPlatform")
+			local p = tagged[1] or (island() and island():FindFirstChild("BossPlatform"))
+			if p and p:IsA("Model") then
+				p = p.PrimaryPart or p:FindFirstChildWhichIsA("BasePart", true)
+			end
+			return if p and p:IsA("BasePart") then p else nil
+		end
+		function N.hwBossTrip()
+			local start = fightWindow()
+			HW.bossFight = start
+			N.tripBegin("hallow boss", 440)
+			N.loopStatus("Main", "fighting the Hallow Lord")
+			Boss.ended = false
+			local taps = 0
+			if N.goHalloween() then
+				waitFor(function()
+					return platform() ~= nil
+				end, 4)
+				local pad = platform()
+				if pad then
+					local top = pad.Position + Vector3.new(0, pad.Size.Y / 2 + 3, 0)
+					N.teleport(top, 0.2)
+					log("BOSS start, on the platform", tostring(top))
+					local lastCheck = os.clock()
+					while alive() and not Boss.ended do
+						local _, t = fightWindow()
+						if t >= 432 or fightWindow() ~= start then
+							break
+						end
+						if N.tapOnce() then
+							taps += 1
+						end
+						-- bombs knock the character back: step onto the platform again when pushed off it
+						if os.clock() - lastCheck > 1.5 then
+							lastCheck = os.clock()
+							local p = N.myPos()
+							local rel = p and pad.CFrame:PointToObjectSpace(p)
+							if not rel or math.abs(rel.X) > pad.Size.X / 2 or math.abs(rel.Z) > pad.Size.Z / 2 or rel.Y < -2 then
+								N.teleport(top, 0.1)
+							end
+						end
+						task.wait(0.11)
+					end
+				else
+					log("BOSS platform not found")
+				end
+			end
+			waitFor(function()
+				return os.clock() - Boss.rewardAt < 30
+			end, 8)
+			local data = hwData("HallowBoss")
+			HW.bossHits = taps
+			HW.last = string.format("Hallow Lord: %d taps%s", taps, if HW.bossReward ~= "" then ", reward " .. HW.bossReward else "")
+			log(string.format("BOSS done taps=%d kills=%s best=%s", taps, tostring(type(data) == "table" and data.Kills), tostring(type(data) == "table" and data.BestDamage)))
+			N.tripEnd()
+		end
+
+		-- ===== Halloween shop: the picked items in the game's list order, when the candy covers them (no trip needed).
+		local ShopCfg
+		local function shopCfg()
+			if ShopCfg == nil then
+				local ok, cfg = pcall(function()
+					return require(game:GetService("ReplicatedStorage").Shared.Items.HalloweenShopConfig)
+				end)
+				ShopCfg = if ok and type(cfg) == "table" then cfg else false
+			end
+			return ShopCfg or nil
+		end
+		function N.hwShopItem(id)
+			local cfg = shopCfg()
+			if not cfg or type(id) ~= "string" then
+				return nil
+			end
+			local ok, item = pcall(cfg.Get, id)
+			return if ok and type(item) == "table" then item else nil
+		end
+		N.HalloweenShopIds = { "BloodMoonDial", "OctoIncubator", "ExoticShard", "TotemOfSecretLuck", "ImmortalPumpkin", "SecretFruit", "TotemOfLuck", "RainbowStrawberry", "TotemOfHatchSpeed", "PetLevels10", "GoldenApple", "LuckPotionII", "TreatBags" }
+		function N.hwShopStep()
+			if os.clock() - HW.shopAt < 30 then
+				return
+			end
+			HW.shopAt = os.clock()
+			local cfg = shopCfg()
+			local data = N.data()
+			if not cfg or type(data) ~= "table" then
+				return
+			end
+			local picked = {}
+			local opt = Options.HalloweenShopItems
+			for k, chosen in pairs(opt and type(opt.Value) == "table" and opt.Value or {}) do
+				if chosen then
+					picked[k] = true
+				end
+			end
+			for _, id in ipairs(N.HalloweenShopIds) do
+				local item = picked[id] and N.hwShopItem(id)
+				if item then
+					local okLeft, left = pcall(cfg.GetRemaining, data, item)
+					local candy = N.candy()
+					if (not okLeft or left == nil or left > 0) and candy >= (tonumber(item.Price) or math.huge) then
+						local r = invoke("HalloweenShopService.RF.Purchase", { Id = id })
+						local ok = type(r) == "table" and r.Success == true
+						waitFor(function()
+							return N.candy() < candy
+						end, 2)
+						local spent = candy - N.candy()
+						HW.last = string.format("Halloween shop: %s %s", id, if ok and spent > 0 then "bought for " .. spent .. " candy" else "refused " .. tostring(type(r) == "table" and r.Reason or r))
+						log(string.format("HALLOWEEN shop %s success=%s spent=%d candy=%d", id, tostring(ok), spent, N.candy()))
+						return
+					end
+				end
+			end
+		end
+	end
 do
 	local Due = {}
 	local function due(key, seconds)
@@ -41169,6 +41535,18 @@ do
 		table.clear(Arena.opponents)
 		Arena.charge, Arena.lastCrit, Arena.waves, Arena.result, Arena.offerAt, Arena.waveLogged = 0, -1e9, 0, nil, nil, false
 		local start = invoke("ColosseumService.RF.StartWaveDefense")
+		-- live 4020 (2026-10-17): {Error="Step onto the Pet Defense entrance."} right after the teleport; the server had
+		-- not seen the character inside the entrance yet. Step in again and ask twice more, 1 s apart.
+		for _ = 1, 2 do
+			if not (type(start) == "table" and type(start.Error) == "string" and string.find(start.Error, "entrance", 1, true)) then
+				break
+			end
+			if at then
+				N.teleport(at + Vector3.new(0, 1, 0), 0.3)
+			end
+			task.wait(1)
+			start = invoke("ColosseumService.RF.StartWaveDefense")
+		end
 		-- 3933: a run whose reward was never claimed (hub reloaded or teleported mid-run) blocks every new start with
 		-- {Error="Claim your previous reward first.", RewardData={NewRelic, WaveReached, ...}}. Claim it by the same rule as
 		-- after a run (replace only a weaker relic; the Smart Planner alone swaps none), then start once more.
@@ -41188,6 +41566,8 @@ do
 		if type(start) ~= "table" or start.OnCooldown or start.Error then
 			Arena.nextAt = os.clock() + math.max(tonumber(type(start) == "table" and start.Remaining) or 300, 60)
 			note("defense", "not started: " .. brief(start))
+			-- the entrance opened the game's Pet Defense screen: never leave it on screen (owner 2026-10-17)
+			pcall(closeArenaHud)
 			N.tripEnd()
 			return 0
 		end
@@ -41418,6 +41798,12 @@ do
 				N.teleport(pivot.Position + Vector3.new(0, 3, 10), 0.4)
 				local key = optionText("ShrineBlessing", "Luck")
 				done = ok(invoke("ShrineService.RF.Choose", key))
+				-- live 4020: "Get closer to the Shrine!" right after the teleport; the server needs a moment to see you there
+				if not done then
+					N.teleport(pivot.Position + Vector3.new(0, 3, 4), 0.4)
+					task.wait(1)
+					done = ok(invoke("ShrineService.RF.Choose", key))
+				end
 				note("shrine", (if done then "chose " else "could not choose ") .. key)
 			end
 		end
@@ -46424,6 +46810,10 @@ do
 		{ "AutoMeteors", "Auto Meteors" },
 		{ "AutoMysteryEgg", "Auto Mystery Egg" },
 		{ "AutoLuckyBlocks", "Auto Lucky Blocks" },
+		{ "AutoHallowBoss", "Auto Hallow Lord" },
+		{ "AutoTrickOrTreat", "Auto Trick or Treat" },
+		{ "AutoHalloweenDaily", "Auto Candy Witch Jobs" },
+		{ "AutoHalloweenShop", "Auto Halloween Shop" },
 		{ "AutoMine", "Auto Mine Shop" },
 		{ "AutoPetDefense", "Auto Pet Defense" },
 		{ "AutoShrine", "Auto Shrine Blessing" },
@@ -46603,8 +46993,9 @@ do
 		})
 		DelBox:AddDropdown("DeleteTiers", {
 			Text = "Tiers to delete",
-			Values = { "Normal", "Golden" },
+			Values = { "Normal", "Golden", "Diamond", "Rainbow" },
 			Default = { "Normal" },
+			Tooltip = "Diamond and Rainbow are deleted only when picked here (player request 2026-10-17)",
 			Multi = true,
 			AllowNull = true,
 		})
@@ -46699,6 +47090,11 @@ do
 				})
 			end
 			if m.key == "Golden" then
+				box:AddToggle("CraftMutated", {
+					Text = "Craft Mutated Pets",
+					Default = false,
+					Tooltip = "All machines: mutated copies go into crafts too (plain copies are still used first). Enchanted, signed, serial, Secret, locked and protected pets are never crafted",
+				})
 				box:AddToggle("CraftAll", {
 					Text = "Craft All (Golden + Diamond)",
 					Default = false,
@@ -46761,6 +47157,35 @@ do
 			Tooltip = "Lucky block bursts: stands next to each block and opens it",
 		})
 		Labels.Ground = GroundBox:AddLabel({ Text = "-", DoesWrap = true })
+		local HalloweenBox = Tabs.Events:AddRightGroupbox("Halloween", "ghost")
+		HalloweenBox:AddToggle("AutoHallowBoss", {
+			Text = "Auto Hallow Lord",
+			Default = false,
+			Tooltip = "Every full hour: goes to the boss platform on Halloween Island and taps the Hallow Lord for the whole fight (candy, potions, a pet chance)",
+		})
+		HalloweenBox:AddToggle("AutoTrickOrTreat", {
+			Text = "Auto Trick or Treat",
+			Default = false,
+			Tooltip = "Every 30 minutes: visits the 11 houses on Halloween Island for candy and potions (a full bag gives a Bag of Treats)",
+		})
+		HalloweenBox:AddToggle("AutoHalloweenDaily", {
+			Text = "Auto Candy Witch Jobs",
+			Default = false,
+			Tooltip = "Takes the Candy Witch's 3 daily jobs once a day (tap, hatch, rebirth jobs finish by playing; +300 candy for all)",
+		})
+		HalloweenBox:AddToggle("AutoHalloweenShop", {
+			Text = "Auto Halloween Shop",
+			Default = false,
+			Tooltip = "Buys the items picked below with Candy Corn, in the shop's order, while stock is left",
+		})
+		HalloweenBox:AddDropdown("HalloweenShopItems", {
+			Text = "Items to buy",
+			Values = N.HalloweenShopIds,
+			Default = {},
+			Multi = true,
+			AllowNull = true,
+		})
+		Labels.Halloween = HalloweenBox:AddLabel({ Text = "-", DoesWrap = true })
 		local PotionBox = Tabs.Events:AddLeftGroupbox("Potions", "flask-round")
 		PotionBox:AddToggle("AutoPotions", {
 			Text = "Auto Drink Potions",
@@ -48678,6 +49103,26 @@ do
 			N.guardTrip("lucky blocks", N.luckyBlockTrip)
 			return
 		end
+		-- 0.3 Halloween 4020 (p05_hween): the hourly Hallow Lord fight first (7 min window), then the Candy Witch's jobs once
+		-- a day and the 30-minute Trick or Treat round; the candy shop needs no trip.
+		if N.does("AutoHallowBoss") and N.hwBossDue() then
+			N.planLog("hallowboss", "fight the Hallow Lord on Halloween Island (every full hour, 7 min)", 600, 60)
+			N.guardTrip("hallow boss", N.hwBossTrip)
+			return
+		end
+		if N.does("AutoHalloweenDaily") and N.hwDailyDue() and choreDue("hwdaily", 600) then
+			N.planLog("hwdaily", "take the Candy Witch's daily jobs", 600, 60)
+			N.guardTrip("candy witch", N.hwDailyTrip)
+			return
+		end
+		if N.does("AutoTrickOrTreat") and N.hwTrickDue() and choreDue("hwtrick", 600) then
+			N.planLog("hwtrick", "trick-or-treat at the 11 houses on Halloween Island", 600, 60)
+			N.guardTrip("trick or treat", N.hwTrickTrip)
+			return
+		end
+		if on("AutoHalloweenShop") then
+			N.hwShopStep()
+		end
 		-- 0.5 Pre-steps (REV-12): Greg's bridge as soon as the tap power allows it (it unlocks every pet level).
 		if N.does("AutoTutorial") and choreDue("bridge", 10) and N.bridgeDue() then
 			N.planLog("bridge", "lower Greg's bridge (the tap power reached its need): pet levels unlock", 600, 60)
@@ -49152,7 +49597,7 @@ do
 	-- REV-17 ("Measured Limits" was a raw probe dump with a dead tap_rate): the server limits in plain words, one per line,
 	-- only the ones that change what the hub does; the rest say "not measured yet".
 	local LimitWords = {
-		{ "tap_total", "Taps", function(v)
+		{ "tap_pace", "Taps", function(v)
 			local at = tonumber(v)
 			return if at then string.format("every %.3g s (the most coins per second of both lanes)", at) else nil
 		end },
@@ -49487,6 +49932,11 @@ do
 					group(function()
 						Labels.Sky:SetText(I.sky or "-")
 						Labels.Ground:SetText(I.ground or "-")
+		if Labels.Halloween then
+			local start = math.floor(workspace:GetServerTimeNow() / 3600) * 3600
+			local t = workspace:GetServerTimeNow() - start
+			Labels.Halloween:SetText(string.format("Candy Corn <b>%s</b>  \u{00B7}  Hallow Lord %s\nCandy Witch jobs %s%s", formatNumber(N.candy()), if t < 420 then "fighting now" else string.format("in %d min", math.ceil((3600 - t) / 60)), if N.HW.daily == math.floor(os.time() / 86400) then "taken today" else "not taken yet", if N.HW.last ~= "" then "\nLast: " .. N.HW.last else ""))
+		end
 						Labels.Potions:SetText(I.potions or "-")
 						Labels.Totems:SetText(I.totems or "-")
 					end)
