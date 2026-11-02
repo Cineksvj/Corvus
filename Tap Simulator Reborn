@@ -1321,10 +1321,20 @@ function Library:CreateWindow(opts)
 	local touch = opts.Touch
 	if touch == nil then touch = Library:IsMobile() or vp0.X < 900 end
 	touch = touch == true
-	rawset(Library, "Touch", touch)
+	-- owner 2026-11-03 ("make it the same ui as in laptop ... smaller by default on mobile ... better
+	-- optimized for mobile"): a phone gets the laptop window - sidebar, two columns, status bar,
+	-- draggable - in a window smaller than the screen at scale 1, with the touch sizes of the
+	-- controls (Library.Touch: 36 px rows, 12 px text floor, finger-safe sliders). The full-screen
+	-- tab-bar layout stays behind opts.TouchLayout = true. touchDevice = a phone; touch = that layout.
+	local touchDevice = touch
+	touch = touchDevice and opts.TouchLayout == true
+	rawset(Library, "Touch", touchDevice)
+	rawset(Library, "TouchLayout", touch)
 	local TOUCH_INSET = 8
 	if touch then
 		Size = UDim2.new(0, math.max(300, vp0.X - TOUCH_INSET * 2), 0, math.max(240, vp0.Y - TOUCH_INSET * 2))
+	elseif touchDevice then
+		-- sized against the safe area once the ScreenGui exists (see PHONE_FILL below)
 	elseif type(Library.GetSetting) == "function" then
 		-- A5: a size the player dragged earlier wins over the hub default
 		local okWs, ws = pcall(Library.GetSetting, Library, "WindowSize", nil)
@@ -1409,7 +1419,7 @@ function Library:CreateWindow(opts)
 	-- notch and the home bar; the gui keeps out of the device's unsafe areas (the top bar stays
 	-- covered as before: its buttons sit over the state box, never over a tab) and the window is
 	-- sized to that area, see touchArea
-	if touch then pcall(function() screenGui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets end) end
+	if touchDevice then pcall(function() screenGui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets end) end
 	local function touchArea()
 		local a = screenGui.AbsoluteSize
 		if a.X > 1 and a.Y > 1 then return a end
@@ -1422,7 +1432,7 @@ function Library:CreateWindow(opts)
 	-- base (1.43 on desktop: his 1.14 times 1.25) times a user factor the Settings slider shows
 	-- as a percentage (setting UIScaleUser, 70-130 %, default 100 %). The old UIScale setting is
 	-- not read any more.
-	local SCALE_BASE = touch and 1 or 1.43
+	local SCALE_BASE = touchDevice and 1 or 1.43
 	local userScale = tonumber(opts.Scale)
 	if not userScale and type(Library.GetSetting) == "function" then
 		local ok, v = pcall(Library.GetSetting, Library, "UIScaleUser", 1)
@@ -1439,6 +1449,13 @@ function Library:CreateWindow(opts)
 		local ta = touchArea()
 		Size = UDim2.new(0, math.floor((ta.X - TOUCH_INSET * 2) / uiScaleValue), 0, math.floor((ta.Y - TOUCH_INSET * 2) / uiScaleValue))
 	else
+		if touchDevice then
+			-- phone, laptop layout: the hub's window, never more than PHONE_FILL of the safe area, so
+			-- the game stays visible around it and the window can be dragged aside
+			local PHONE_FILL_X, PHONE_FILL_Y = 0.86, 0.9
+			local ta = touchArea()
+			Size = UDim2.new(0, math.floor(math.min(Size.X.Offset, ta.X * PHONE_FILL_X / uiScaleValue)), 0, math.floor(math.min(Size.Y.Offset, ta.Y * PHONE_FILL_Y / uiScaleValue)))
+		end
 		-- never larger than the viewport (windowed Roblox, small laptops): leave a 24 px margin
 		local fit = math.min((vp0.X - 24) / math.max(1, Size.X.Offset), (vp0.Y - 24) / math.max(1, Size.Y.Offset))
 		if fit > 0 and fit < uiScaleValue then uiScaleValue = math.max(0.6, fit) end
@@ -1662,6 +1679,8 @@ function Library:CreateWindow(opts)
 		Library:GiveSignal(screenGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
 			fitTouchWindow(mainScale.Scale > 0 and mainScale.Scale or 1)
 		end))
+	end
+	if touchDevice then
 		-- the on-screen keyboard covers the lower half of a phone and the game moves no gui for it,
 		-- so a box focused low on the page was typed into blind (Discord 2026-11-02): the page
 		-- scrolls so the box sits 72 px under the page's top edge
@@ -1731,7 +1750,7 @@ function Library:CreateWindow(opts)
 		-- Discord 2026-11-02 ("bug, and so frame", "new UI has a lot of problems", phone users): a touch client
 		-- starts in Low effects unless the player chose otherwise (the setting stays unset, so a toggle still wins)
 		local okL, low = pcall(Library.GetSetting, Library, "LowEffects", nil)
-		rawset(Library, "LowEffects", if okL and low ~= nil then low == true else touch)
+		rawset(Library, "LowEffects", if okL and low ~= nil then low == true else touchDevice)
 	end
 	if starfield then starfield:SetEnabled(starfieldOn and rawget(Library, "LowEffects") ~= true) end
 	if rawget(Library, "LowEffects") == true then pcall(Library.SetBezelsEnabled, Library, false) end
@@ -4143,7 +4162,8 @@ function Library:CreateWindow(opts)
 	end
 	function window:_updateNarrow()
 		local k = mainScale.Scale > 0 and mainScale.Scale or 1
-		self:SetNarrow(self.Touch == true or content.AbsoluteSize.X / k < 560)
+		-- a phone keeps two columns down to 400 px of content (the laptop look, owner 2026-11-03)
+		self:SetNarrow(self.Touch == true or content.AbsoluteSize.X / k < (touchDevice and 400 or 560))
 	end
 	function window:SetCompact(v, instant)
 		if self.Touch then return self end   -- no sidebar on a phone
@@ -10515,6 +10535,10 @@ function Groupbox:AddToggle(idx, props)
         _callback = props.Callback or function() end,
         _disabled = props.Disabled == true,
         _group = self,
+        -- props.Confirm = "<hint>" | true: turning it ON by hand takes a second tap within 3 s (a
+        -- phone player kept selling his best pets with one stray tap, Discord 2026-11-03); OFF is
+        -- one tap, SetValue from code / config is never gated
+        _confirm = (type(props.Confirm) == "string" and props.Confirm ~= "" and props.Confirm) or (props.Confirm == true and "Tap again to turn on") or nil,
     }, Toggle)
 
     function t:_refresh(animate)
@@ -10767,6 +10791,26 @@ function Groupbox:AddToggle(idx, props)
             -- Owner 2026-10-20: clicking a dependent row while its parent is off used to
             -- turn only the parent on (the row looked dead for the next click). Now it
             -- turns both on in one tap: parent first, then the dependent.
+            if t._confirm and not t.Value then
+                if not t._armedAt or os.clock() - t._armedAt > 3 then
+                    -- first tap: the label asks for the second one in the warning colour, nothing runs
+                    t._armedAt = os.clock()
+                    local armed = t._armedAt
+                    t._labelText = t._labelText or label.Text
+                    label.Text = t._confirm
+                    label.TextColor3 = Colors.bad or Colors.warn or Color3.fromRGB(234, 179, 8)
+                    task.delay(3, function()
+                        if t._armedAt == armed then
+                            t._armedAt = nil
+                            label.Text = t._labelText or label.Text
+                            t:_refresh(false)
+                        end
+                    end)
+                    return
+                end
+                t._armedAt = nil
+                label.Text = t._labelText or label.Text
+            end
             if requires and type(Library.Toggles) == "table" then
                 local p = Library.Toggles[requires]
                 if type(p) == "table" and p.Value == false and not t.Value then
@@ -16371,6 +16415,7 @@ end
 			DisabledTooltip = Original.DisabledTooltip,
 			Risky = Original.Risky,
 			Default = Original.Value == true,
+			Confirm = Original._confirm,   -- a guarded original stays guarded on Main
 		})
 		Library.Toggles[Key] = nil
 		if not Mirror then
