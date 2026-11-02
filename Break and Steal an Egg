@@ -18918,6 +18918,16 @@ do
 		end
 		N.Moves.rescueAt = os.clock()
 		N.Moves.rescues += 1
+		N.Moves.rescueTimes = N.Moves.rescueTimes or {}
+		table.insert(N.Moves.rescueTimes, os.clock())
+		while #N.Moves.rescueTimes > 0 and os.clock() - N.Moves.rescueTimes[1] > 120 do
+			table.remove(N.Moves.rescueTimes, 1)
+		end
+		if #N.Moves.rescueTimes >= 3 and os.clock() - (N.Moves.rescueSaidAt or -1e9) > 600 then
+			N.Moves.rescueSaidAt = os.clock()
+			logProblem("fell under the map 3 times in 2 min: the route between the plot and the zones crosses the void")
+			notify("Route", "Corvus keeps falling off the map between the plot and the zones. Try Movement type Walk with Noclip While Travelling off", 8)
+		end
 		local hitbox = N.plotHitbox()
 		local spot = if hitbox then N.standAt(hitbox.Position) else Vector3.new(0, 10, 0)
 		log("RESCUE fell under the map at", brief(root.Position), "-> home")
@@ -19335,22 +19345,81 @@ do
 		return placeRoot(target)
 	end
 	-- Long trips go along the ground in a few legs so the character never cuts through the floor.
+	-- Discord report 2026-11-03 (ucupp, mobile): with Steal on the character glided off the plot through the side wall,
+	-- out over the void, fell and was put back home (FallRescue), again and again. A straight line from a far plot to a
+	-- zone can cross open sky; the old plan sank a point with no ground under it to a linear Y. Now: a point with no
+	-- ground keeps the higher of the two ends (never below the ground it left), and when the straight line crosses a
+	-- gap while the start stands on real ground, the trip goes through the nearest grounded anchor (SafeZone, plot, a
+	-- zone hitbox) whose two halves both have ground. N.groundAt is used so the tests can stand in for the raycast.
+	local function legPoints(from, to, out)
+		local distance = flat(from, to)
+		local legs = math.clamp(math.floor(distance / 80), 1, 60)
+		local gaps = 0
+		for i = 1, legs - 1 do
+			local t = i / legs
+			local x, z = from.X + (to.X - from.X) * t, from.Z + (to.Z - from.Z) * t
+			local y = N.groundAt(x, z, math.max(from.Y, to.Y) + 40)
+			if y then
+				table.insert(out, Vector3.new(x, y + N.standHeight(), z))
+			else
+				gaps += 1
+				table.insert(out, Vector3.new(x, math.max(from.Y, to.Y), z))
+			end
+		end
+		table.insert(out, to)
+		return gaps
+	end
+	function N.routeAnchors()
+		local list = {}
+		local function add(part)
+			if part and part:IsA("BasePart") then
+				table.insert(list, part.Position)
+			end
+		end
+		add(N.safeZonePart())
+		add(N.plotHitbox())
+		local build = workspace:FindFirstChild("Build")
+		local boxes = build and build:FindFirstChild("ZoneHitboxes")
+		for _, part in ipairs(boxes and boxes:GetChildren() or {}) do
+			if part.Name ~= "SafeZone" then
+				add(part)
+			end
+		end
+		return list
+	end
 	local function planPath(from, to)
 		local distance = flat(from, to)
 		if distance < 60 then
 			return { to }
 		end
-		local legs = math.clamp(math.floor(distance / 80), 1, 60)
 		local points = {}
-		for i = 1, legs - 1 do
-			local t = i / legs
-			local x, z = from.X + (to.X - from.X) * t, from.Z + (to.Z - from.Z) * t
-			local y = groundAt(x, z, math.max(from.Y, to.Y) + 40)
-			table.insert(points, Vector3.new(x, if y then y + N.standHeight() else from.Y + (to.Y - from.Y) * t, z))
+		local gaps = legPoints(from, to, points)
+		if gaps == 0 or not N.groundAt(from.X, from.Z, from.Y + 20) then
+			return points
 		end
-		table.insert(points, to)
+		local best, bestLength
+		for _, anchor in ipairs(N.routeAnchors()) do
+			local spot = N.standAt(anchor)
+			local length = flat(from, spot) + flat(spot, to)
+			if N.groundAt(spot.X, spot.Z, spot.Y + 20) and (not bestLength or length < bestLength) and flat(from, spot) > 10 and flat(spot, to) > 10 then
+				local via = {}
+				if legPoints(from, spot, via) == 0 and legPoints(spot, to, via) == 0 then
+					best, bestLength = via, length
+				end
+			end
+		end
+		if best then
+			N.Moves.detours = (N.Moves.detours or 0) + 1
+			log(string.format("MOVE route via a grounded anchor (%d legs, straight line crosses %d gap%s)", #best, gaps, if gaps == 1 then "" else "s"))
+			return best
+		end
+		if os.clock() - (N.Moves.gapSaidAt or -1e9) > 60 then
+			N.Moves.gapSaidAt = os.clock()
+			log(string.format("MOVE straight line %s -> %s crosses %d point%s with no ground, no grounded detour found", brief(from), brief(to), gaps, if gaps == 1 then "" else "s"))
+		end
 		return points
 	end
+	N.planPath = planPath
 	function N.distanceTo(position)
 		local root = rootPart()
 		return if root and position then (root.Position - position).Magnitude else math.huge
@@ -19699,8 +19768,11 @@ do
 		local startPos, startAt = root.Position, os.clock()
 		local area = if N.areaOf(root.Position) == "base" and N.areaOf(target) == "base" then "base" else "zone"
 		N.Moves.legArea, N.Moves.lastArea = area, area
-		Noclip.travel = mode == "Walk" or on("TravelNoclip")
+		-- Walls: only "Noclip While Travelling" passes through them (a blocked leg still retries with noclip below);
+		-- Walk used to force noclip on, which is what the Discord clip showed (through the plot wall and the hedge).
+		Noclip.travel = on("TravelNoclip")
 		local ok = true
+		local lastSafe = if N.groundAt(root.Position.X, root.Position.Z, root.Position.Y + 20) then root.Position else nil
 		for _, point in ipairs(planPath(root.Position, target)) do
 			local done, why = glideTo(point, speedFn, opts.keepGoing)
 			if not done and why == "blocked" and not Noclip.travel then
@@ -19709,7 +19781,16 @@ do
 			end
 			if not done then
 				ok = false
+				-- stopped over nothing (pull-back, fling, blocked): back onto the last grounded point instead of falling
+				local now = rootPart()
+				if now and lastSafe and not N.groundAt(now.Position.X, now.Position.Z, now.Position.Y + 20) then
+					log("MOVE stopped over no ground at", brief(now.Position), "-> back to", brief(lastSafe), "reason=" .. tostring(why))
+					placeRoot(lastSafe)
+				end
 				break
+			end
+			if N.groundAt(point.X, point.Z, point.Y + 20) then
+				lastSafe = point
 			end
 		end
 		Noclip.travel = false
@@ -20187,6 +20268,9 @@ do
 		end
 		if not own and not on("StealPickups") then
 			return false, "Steal Animals is off"
+		end
+		if info.position.Y < -30 then
+			return false, "lying under the map"
 		end
 		if own and not on("GrabOwnHatch") then
 			return false, "Grab What You Hatch is off"
