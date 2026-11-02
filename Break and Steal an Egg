@@ -19691,7 +19691,8 @@ do
 		end
 		N.Moves.trip = (N.Moves.trip or 0) + 1
 		-- Tp to eggs: empty legs hop (N.hopTo) while the probe has not rejected it; a failed leg finishes as a glide.
-		if optionText("EggTravel", "Walk to eggs") == "Tp to eggs" and not carrying and not opts.mode and mode ~= "Teleport" and N.hopState() ~= "rejected" and (target - root.Position).Magnitude >= 30 then
+		-- never with an animal, and not within 1.5 s of a grab (Carrying replicates a moment after the prompt)
+		if optionText("EggTravel", "Walk to eggs") == "Tp to eggs" and not carrying and not N.carrying() and os.clock() - (N.Moves.grabAt or -1e9) > 1.5 and not opts.mode and mode ~= "Teleport" and N.hopState() ~= "rejected" and (target - root.Position).Magnitude >= 30 then
 			local arrived = N.hopTo(target, opts.look)
 			if arrived then
 				return true
@@ -19933,6 +19934,7 @@ do
 			end
 		end
 	end)
+	N.InstantStealEnabled = false
 	-- Protect list of every seller and machine (Sell Surplus, Auto Sell, Auto Fuse, Auto Merge Pets): Keep Mutated and Never Sell rarities.
 	function N.protected(entry)
 		if on("SellKeepMutated") and entry.mutation then
@@ -20381,6 +20383,7 @@ do
 			F.carryValue = math.max(if before > 0 then F.carryValue or 0 else 0, N.cashValue(took))
 			Session.stolen += 1
 			log("STOLE", if took == info then info.rarity else "-", took.name, info.kg .. "kg", "zone", info.zone)
+			N.Moves.grabAt = os.clock()
 			if N.Events.stolen then
 				pcall(N.Events.stolen, info)
 			end
@@ -20547,7 +20550,11 @@ do
 		-- hit leaves the animal in hand is the server's call (GuardMorphConfig.DropCarriedOnHit 23551 is the player-morph
 		-- guard; live reports 2026-10-14/17 saw a zone guard drop it): carried=no on landing rejects the probe (steal_ride)
 		-- and the normal recovery walk takes over.
-		if on("InstantSteal") and N.burstState() ~= "rejected" and not N.atHome() and tripZone then
+		-- DORMANT (owner 2026-11-03, Discord ucupp "it teleports somewhere without the animal"): live on 2026-11-02 the guard's
+		-- touch cleared Carrying before the fling every time, so this ride cost one animal per client before its probe
+		-- rejected it. No toggle in the UI any more (a saved InstantSteal=true in a config is ignored: no toggle = on() false),
+		-- the code stays behind this constant until a build where the carry survives the touch is seen.
+		if N.InstantStealEnabled == true and on("InstantSteal") and N.burstState() ~= "rejected" and not N.atHome() and tripZone then
 			local guard = nil
 			for _, g in ipairs(N.guardsCached()) do
 				if g.zone == tripZone and (not guard or N.distanceTo(g.position) < N.distanceTo(guard.position)) then
@@ -25146,11 +25153,6 @@ do
 			Text = "Break eggs in best zone",
 			Default = false,
 			Tooltip = "Breaks eggs in the zone that adds the most income per hour (switches only for +15 %) and brings the animal home",
-		})
-		EggBox:AddToggle("InstantSteal", {
-			Text = "Instant steal",
-			Default = false,
-			Tooltip = "Grab, then walk into the zone guard on purpose and ride its hit into the safe zone with the animal - the fast way the other hubs use. The hit drops the animal or the bank is refused? Corvus notes it and walks home from then on",
 		})
 		EggBox:AddDropdown("EggTravel", {
 			Text = "Getting to eggs",
