@@ -791,6 +791,9 @@ local function themeWalk(list, th)
 	local orig = Library._themeOrig
 	for _, inst in ipairs(list) do
 		local ok = pcall(function()
+			-- CorvusKeep = true: a colour that means something on its own (a theme card's swatches,
+			-- owner 2026-11-02 "appearances change with the theme and they should not") stays as made
+			if inst:GetAttribute("CorvusKeep") == true then return end
 			local cls = inst.ClassName
 			if cls == "UIGradient" then
 				local o = orig[inst]
@@ -6635,6 +6638,7 @@ function Library:CreateWindow(opts)
 					ZIndex = card.ZIndex + 1,
 					Parent = card,
 				})
+				d:SetAttribute("CorvusKeep", true)
 				Library:New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = d })
 			end
 			local bar = Library:New("Frame", {
@@ -6647,8 +6651,9 @@ function Library:CreateWindow(opts)
 				ZIndex = card.ZIndex + 1,
 				Parent = card,
 			})
+			bar:SetAttribute("CorvusKeep", true)
 			Library:New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = bar })
-			if seq then Library:New("UIGradient", { Color = seq, Parent = bar }) end
+			if seq then Library:New("UIGradient", { Color = seq, Parent = bar }):SetAttribute("CorvusKeep", true) end
 			Library:New("TextLabel", {
 				Name = "Name",
 				BackgroundTransparency = 1,
