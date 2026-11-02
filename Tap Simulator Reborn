@@ -2249,6 +2249,11 @@ function Library:CreateWindow(opts)
 			tabBar.ZIndex = 3
 			tabBar.Position = UDim2.new(0, LAND_LEFT_W + 10, 0, 0)
 			tabBar.Size = UDim2.new(1, -(LAND_LEFT_W + 10 + LAND_RIGHT_W + 10), 1, 0)
+			-- the header drag handle (ZIndex 6, left half) sat over the first tab words here, so
+			-- a tap on Main / Farm / Animals started a drag instead (Discord, phones, 2026-11-02:
+			-- "only the last 3 tabs can be clicked"); in this row it covers the state box only
+			local dh = header:FindFirstChild("DragHandle_Header")
+			if dh then dh.Size = UDim2.new(0, LAND_LEFT_W, 1, 0) end
 		else
 			headerLeft.Size = UDim2.new(0.55, 0, 1, 0)
 			headerRight.Size = UDim2.new(0.5, 0, 1, 0)
@@ -2257,6 +2262,8 @@ function Library:CreateWindow(opts)
 			tabBar.ZIndex = 2
 			tabBar.Position = UDim2.new(0, PAD, 0, HEADER_H)
 			tabBar.Size = UDim2.new(1, -PAD * 2, 0, TAB_BAR_H)
+			local dh = header:FindFirstChild("DragHandle_Header")
+			if dh then dh.Size = UDim2.new(0.5, 0, 1, 0) end
 		end
 	end
 	applyTouchRows(touch and (vp0.Y / uiScaleValue) < 500)
@@ -3139,7 +3146,9 @@ function Library:CreateWindow(opts)
 		return h
 	end
 	makeDragHandle("DragHandle_Brand",  sidebar, UDim2.new(1, -34, 0, 48), UDim2.new(0, 0, 0, 0))   -- stops short of the « button
-	makeDragHandle("DragHandle_Header", header,  UDim2.new(0.5, 0, 1, 0), UDim2.new(0, 0, 0, 0))
+	-- landscape phone: the tab words live in the header right of the 96 px state box, so the
+	-- handle stops there (applyTouchRows keeps it in step on rotation)
+	makeDragHandle("DragHandle_Header", header,  touchLandscape and UDim2.new(0, LAND_LEFT_W, 1, 0) or UDim2.new(0.5, 0, 1, 0), UDim2.new(0, 0, 0, 0))
 	makeDragHandle("DragHandle_Footer", footerSlot, UDim2.new(1, -130, 1, 0), UDim2.new(0, 0, 0, 0))
 	makeDragHandle("DragHandle_Top",    main,    UDim2.new(1, 0, 0, PAD), UDim2.new(0, 0, 0, 0))
 
@@ -29622,8 +29631,11 @@ do
 		local CoreSteps = { Vector3.new(0, 2, 0), Vector3.zero, Vector3.new(0, -1, 0) }
 		local function holdOn(pos)
 			local hold = { on = true }
+			-- the holder lives only as long as its trip: a Main turn cut by the Priority watch (p11) takes the trip with it,
+			-- the holder must not keep the character on the core under the next turn
+			local gen = N.Trip.gen
 			task.spawn(function()
-				while hold.on and alive() do
+				while hold.on and alive() and N.Trip.active and N.Trip.gen == gen do
 					local root = N.root()
 					if root then
 						pcall(function()
@@ -33458,6 +33470,62 @@ do
 		})
 		Labels.Rebirth = RebirthBox:AddLabel({ Text = "-", DoesWrap = true })
 
+		-- Priority (Discord feedback 2026-11-02, "a tower the user can shuffle, the top one preempts"): the order the Main
+		-- loop's five groups run in. Five ranks, each a dropdown; picking a group that sits in another rank swaps the two,
+		-- so the list is always a full order. Saved by configs as Priority1..5.
+		N.PriorityDefault = { "Minigames", "Events", "Machines", "Errands", "Hatching" } -- the loop groups (p11 reads it)
+		local PriorityBox = Tabs.Farm:AddRightGroupbox("Priority", "list-ordered")
+		PriorityBox:AddLabel({
+			Text = '<font transparency="0.35">What runs first when several things are ready. The top one cuts a lower one short the moment it is up (never in the middle of a server call). Tapping and rebirths run on their own, whatever the order.</font>',
+			DoesWrap = true,
+		})
+		local Ranks = { "1st", "2nd", "3rd", "4th", "5th" }
+		local Prev = table.clone(N.PriorityDefault)
+		local Swapping = false
+		for i = 1, 5 do
+			PriorityBox:AddDropdown("Priority" .. i, {
+				Text = Ranks[i],
+				Values = N.PriorityDefault,
+				Default = N.PriorityDefault[i],
+				Tooltip = Ranks[i] .. " to run when ready. Minigames = Dig, Memory Match, Mine, Shrine, Pet Defense, the mansion. Events = cloud rain, meteors, mystery egg, lucky blocks, Halloween. Machines = the craft trips. Errands = fishing, Heaven, fusion, the bridge, tap chests, Boingo, the priced trips. Hatching = standing at the egg",
+				Callback = function(v)
+					local prev = Prev[i]
+					Prev[i] = v
+					if Swapping or N.changeSource == "config" or prev == v or type(prev) ~= "string" then
+						return
+					end
+					for j = 1, 5 do
+						local o = Options["Priority" .. j]
+						if j ~= i and o and o.Value == v then
+							Swapping = true
+							pcall(o.SetValue, o, prev)
+							Prev[j] = prev
+							Swapping = false
+						end
+					end
+					if Labels.Priority then
+						Labels.Priority:SetText(N.priorityText())
+					end
+				end,
+			})
+		end
+		function N.priorityReset()
+			Swapping = true
+			for i = 1, 5 do
+				local o = Options["Priority" .. i]
+				if o then
+					pcall(o.SetValue, o, N.PriorityDefault[i])
+				end
+				Prev[i] = N.PriorityDefault[i]
+			end
+			Swapping = false
+			if Labels.Priority then
+				Labels.Priority:SetText(N.priorityText())
+			end
+		end
+		PriorityBox:AddButton({ Text = "Default order", Tooltip = "Minigames, events, machines, errands, hatching", Func = N.priorityReset })
+		Labels.Priority = PriorityBox:AddLabel({ Text = "Order: " .. table.concat(N.PriorityDefault, " > "), DoesWrap = true })
+
 		-- Main: the Farm essentials as mirrors (the real toggles live on Farm, Library:MirrorToggle keeps both in step) and
 		-- the Now card (coins, session, gems, rebirths, Stop everything, Reset hub options). Built here, after Farm filled
 		-- Library.Toggles.
@@ -33908,7 +33976,9 @@ do
 		})
 		Labels.Gem = GemBox:AddLabel({ Text = "-", DoesWrap = true })
 		if Tabs.Upgrades.AddPageBreak then Tabs.Upgrades:AddPageBreak() end
-		local UnlockBox = Tabs.Upgrades:AddLeftGroupbox("Unlocks", "map")
+		-- Discord 2026-11-02 "what happened to auto progress": this card is it (zones, islands, the bridge); named so it is found.
+		local UnlockBox = Tabs.Upgrades:AddLeftGroupbox("Auto progress", "map")
+		UnlockBox:AddLabel({ Text = '<font transparency="0.35">The account moves forward on its own: the next zone, the next island and Greg\'s bridge the moment the coins allow. Tapping, hatching and rebirths are on Farm.</font>', DoesWrap = true })
 		UnlockBox:AddToggle("AutoUnlockZones", {
 			Text = "Auto unlock zones",
 			Default = false,
@@ -35692,6 +35762,11 @@ do
 		return false
 	end
 	N.choreDue = choreDue
+	-- the same gate without the stamp: the Priority watch asks "would this slot run now?" before it cuts a trip for it
+	local function choreReady(key)
+		return os.clock() >= (ChoreAt[key] or 0)
+	end
+	N.choreReady = choreReady
 	-- Feedback round 2026-11-02 (Discord: "does all minigames as soon as they're up ... won't dig / pet defense"): every
 	-- minigame in its own Main slot, checked in this order, each on the game's own cooldown (N.*Due) and only with its toggle.
 	-- They used to be optional trips behind the 5-minute hatch gap and the value/cost pick (p06), which kept Dig and Pet
@@ -35870,6 +35945,362 @@ do
 			log(string.format("BOOT floor released after %.1fs", os.clock() - started))
 		end
 	end)
+	-- ===== Priority (Discord feedback 2026-11-02, the "tower"): the Main loop's actions in five groups the player orders on
+	-- Farm > Priority (Options.Priority1..5, saved by configs). Each turn the first group with something to do runs and the
+	-- lower ones wait; a running trip of a lower group is ended the moment a higher group is up (N.priorityWatch from the
+	-- Target loop, never in the middle of a server call, not in a trip's first 3 s, at most one such cut every 15 s).
+	-- Tapping, rebirths and the remote chores have their own loops and are not in the order. Default order = minigames
+	-- (time-limited, the Discord ask), events, the craft trips, the errands, then hatching at the egg.
+	local GroupNames = N.PriorityDefault or { "Minigames", "Events", "Machines", "Errands", "Hatching" }
+	N.PriorityDefault = GroupNames
+	N.Priority = { preemptAt = -1e9, preempts = 0, last = nil, pending = nil, pendingAt = -1e9, deny = {} }
+	local Groups = {}
+	-- A trip carries its group only when the Main turn began it: the trips of the other loops (Halloween, fishing, Craft
+	-- by hand, the setup quest) run in their own threads and are never cut, whatever the order says.
+	local MainGroup, MainThread = nil, nil
+	local function groupRun(name, fn)
+		MainGroup, MainThread = name, coroutine.running()
+		return fn()
+	end
+	local rawTripBegin, rawTripEnd = N.tripBegin, N.tripEnd
+	function N.tripBegin(name, cap)
+		rawTripBegin(name, cap)
+		N.Trip.group = if coroutine.running() == MainThread then MainGroup else nil
+		if N.Priority.pending ~= nil and N.Trip.group == N.Priority.pending then
+			N.Priority.pending = nil -- the group the cut was made for did start its trip
+		end
+	end
+	function N.tripEnd()
+		local wasActive = N.Trip.active
+		rawTripEnd()
+		if wasActive and N.Trip.cutting then
+			local last = N.Trip.log[#N.Trip.log]
+			if last then
+				last.cut = true -- the soak's 5-minute errand gap: the trip that resumes after the cut is not a new errand
+			end
+		end
+		N.Trip.cutting = false
+		N.Trip.group = nil
+	end
+	Groups.Events = {
+		due = function()
+			-- the same gates as run() below (the chore stamps read, not set): a cut for a slot that would then run nothing
+			-- only costs a trip
+			return (N.does("AutoCloudRain") and N.cloudDue() and choreReady("cloud"))
+				or (N.does("AutoMeteors") and #N.landed(N.Rocks.list, 45) > 0)
+				or (N.does("AutoMysteryEgg") and #N.landed(N.Rocks.eggs, 240) > 0)
+				or (N.does("AutoLuckyBlocks") and #N.luckyBlocks() > 0 and choreReady("luckyblocks"))
+				or (N.does("AutoHallowBoss") and N.hwBossDue())
+				or (N.does("AutoHalloweenDaily") and N.hwDailyDue() and choreReady("hwdaily"))
+				or (N.does("AutoTrickOrTreat") and N.hwTrickDue() and choreReady("hwtrick"))
+				or false
+		end,
+		run = function()
+			-- 0. Time-limited world events first (they last 1-4 minutes). Every trip runs through N.guardTrip (REV-1).
+			if N.does("AutoCloudRain") and N.cloudDue() and choreDue("cloud", 20) then
+				N.planLog("cloud", "collect the Cloud Rain pickups (the visible ones, then the cloud route)", 600, 60)
+				N.guardTrip("cloud rain", N.cloudTrip)
+				return true
+			end
+			if N.does("AutoMeteors") and #N.landed(N.Rocks.list, 45) > 0 then
+				N.planLog("meteors", "break the landed meteors", 600, 60)
+				N.guardTrip("meteors", N.meteorTrip)
+				return true
+			end
+			if N.does("AutoMysteryEgg") and #N.landed(N.Rocks.eggs, 240) > 0 then
+				N.planLog("mysteryegg", "hit the Mystery Egg (60 hits)", 600, 60)
+				N.guardTrip("mystery egg", N.mysteryEggTrip)
+				return true
+			end
+			if N.does("AutoLuckyBlocks") and #N.luckyBlocks() > 0 and choreDue("luckyblocks", 15) then
+				N.planLog("luckyblocks", "open the lucky blocks", 600, 60)
+				N.guardTrip("lucky blocks", N.luckyBlockTrip)
+				return true
+			end
+			-- 0.3 Halloween 4020 (p05_hween): the hourly Hallow Lord fight first (7 min window), then the Candy Witch's jobs once
+			-- a day and the 30-minute Trick or Treat round; the candy shop needs no trip.
+			if N.does("AutoHallowBoss") and N.hwBossDue() then
+				N.planLog("hallowboss", "fight the Hallow Lord on Halloween Island (every full hour, 7 min)", 600, 60)
+				N.guardTrip("hallow boss", N.hwBossTrip)
+				return true
+			end
+			if N.does("AutoHalloweenDaily") and N.hwDailyDue() and choreDue("hwdaily", 600) then
+				N.planLog("hwdaily", "take the Candy Witch's daily jobs", 600, 60)
+				N.guardTrip("candy witch", N.hwDailyTrip)
+				return true
+			end
+			if N.does("AutoTrickOrTreat") and N.hwTrickDue() and choreDue("hwtrick", 600) then
+				N.planLog("hwtrick", "trick-or-treat at the 11 houses on Halloween Island", 600, 60)
+				N.guardTrip("trick or treat", N.hwTrickTrip)
+				return true
+			end
+			if on("AutoHalloweenShop") then
+				N.hwShopStep()
+			end
+			return false
+		end,
+	}
+	Groups.Machines = {
+		due = function()
+			return #N.dueMachines() > 0 and os.clock() - N.Craft.tripFailAt > 60
+		end,
+		run = function()
+			-- 1. Machines: one trip for every machine that is due (Golden -> Diamond -> Rainbow); a full storage blocks hatching.
+			local due = N.dueMachines()
+			if #due > 0 and os.clock() - N.Craft.tripFailAt > 60 then
+				local n, limit = N.storage()
+				if N.goldenMilestoneLog then
+					N.goldenMilestoneLog()
+				end
+				N.planLog("craft", string.format("craft trip: storage %d/%d, %d machine%s due", n, limit, #due, if #due == 1 then "" else "s"), 300, 30)
+				N.guardTrip("craft", N.craftTrip, if N.storageFull() then "storage full" elseif N.storageHeld() then "storage held by the game's delete list" else "set ready")
+				return true
+			end
+			-- R5-4 (c): a full storage with machines on and no craft trip says why (when the reason changes, else every 10 min)
+			if N.storageFull() then
+				N.craftDueLog(#due > 0)
+			end
+			return false
+		end,
+	}
+	Groups.Minigames = {
+		due = function()
+			return choreReady("minigames") and minigameNext() ~= nil
+		end,
+		run = function()
+			-- 1.7 Minigames (feedback round 2026-11-02): the one that is up runs now, in its own slot, whatever the hatch gap says.
+			if choreDue("minigames", 5) then
+				local mg = minigameNext()
+				if mg then
+					log(string.format("%s start %s", mg.tag, mg.name))
+					N.guardTrip(mg.name, mg.run)
+					-- not an optional trip: the hatch gap of the chests, Boingo and the errands is not touched
+					return true
+				end
+			end
+			return false
+		end,
+	}
+	-- the errands are priced or gated by the hatch gap: they never cut a running trip
+	Groups.Errands = {
+		due = function()
+			return false
+		end,
+		run = function()
+			-- 0.35 Heaven (p05_fish, 2026-11-01): fishing when a rod has a bite, a free rod has bait, the bowl is full, a ring or
+			-- the daily gift waits; the Lucky Egg Machine every 6 h; the balloon when the Air pays for a level
+			if on("AutoFishing") and N.fishingDue() and choreDue("fishing", 20) then
+				N.planLog("fishing", "fishing at Heaven Falls", 600, 60)
+				N.guardTrip("fishing", N.fishingTrip)
+				return true
+			end
+			if on("AutoLuckyEggMachine") and N.luckyEggReady() and choreDue("luckyEgg", 120) then
+				N.planLog("luckyegg", "start the Lucky Egg Machine", 600, 60)
+				N.guardTrip("lucky egg", N.luckyEggTrip)
+				return true
+			end
+			if on("AutoBalloonLuck") and N.balloonReady() and choreDue("balloon", 120) then
+				N.planLog("balloon", "inflate the Balloon Luck egg", 600, 60)
+				N.guardTrip("balloon", N.balloonTrip)
+				return true
+			end
+			-- 0.4 Secret Fusion (p05_fusion): the finished egg is hatched for Auto Claim Finished Crafts (free, nothing used up),
+			-- a new fuse only under its own toggle (irreversible, never the planner). Both try the remote first, the machine
+			-- when the server asks for it.
+			if (N.does("AutoClaimMachines") or on("AutoFusion")) and N.fusionClaimDue() and choreDue("fusionClaim", 60) then
+				N.planLog("fusionclaim", "hatch the finished Fusion Egg", 600, 60)
+				N.guardTrip("fusion claim", N.fusionClaimTrip)
+				return true
+			end
+			if N.fusionStartDue() and choreDue("fusionStart", 60) then
+				N.guardTrip("fusion", N.fusionStartTrip)
+				return true
+			end
+			-- 0.5 Pre-steps (REV-12): Greg's bridge as soon as the tap power allows it (it unlocks every pet level).
+			if N.does("AutoTutorial") and choreDue("bridge", 10) and N.bridgeDue() then
+				N.planLog("bridge", "lower Greg's bridge (the tap power reached its need): pet levels unlock", 600, 60)
+				N.guardTrip("bridge", N.bridgeTrip)
+				return true
+			end
+			-- 1.5 R7-2 (owner's 8.7 h run of build E, planner off, Auto Tap Chests on: "Desert ready, Sky Island ready, chests
+			-- opened 0" for hours, no CHEST line; the chest was one of the optional trips behind their 5-minute gap and the NPC
+			-- quest took every turn): a ready tap chest has its own slot like the craft trip, with its own toggle alone (the
+			-- Smart Planner too: a free claim). The decision is logged even with the planner off (the toggle's own trip). With the
+			-- Smart Planner on it is priced: the chest pays its taps at the CURRENT tap value and then rests 6 h, so while the
+			-- income grows faster than 1 / that rest (N.incomeGrowth, p06) the planner opens it later, and only when it pays more
+			-- than the hatching the 12 s trip costs.
+			if N.does("AutoTapChests") and N.optionalGapOk() and choreDue("chest", 15) then
+				local growth = N.incomeGrowth()
+				local list = N.tapChestsDue()
+				if #list > 0 then
+					local c = list[1]
+					local cost = 12 * (N.lossTo(c.island) + N.hatchValue())
+					local rest = tonumber(N.tableOr(N.tableOr(N.tableOr(N.X.TapChest).Chests)[c.id]).Cooldown) or 21600
+					local growing = growth == nil or growth > 1 / rest
+					if not N.planner() or (not growing and c.value > cost) then
+						log(string.format("PLAN trip chest %s value=%dis cost=%dis (%s coins) | TRIP tap chests cost=12s", c.island, math.floor(c.value), math.floor(cost), formatNumber(c.coins)))
+						N.guardTrip("tap chests", N.tapChestTrip, c.island)
+						N.optionalDone()
+						return true
+					end
+					N.planLog(
+						"idle chest",
+						string.format(
+							"idle reason=tap chest %s waits: %s (value %d is, cost %d is), hatching goes on",
+							c.island,
+							if growth == nil then "the income growth is known after 5 minutes of samples" elseif growing then string.format("the income grows %.0f %% an hour, the chest pays more later", (math.exp(growth * 3600) - 1) * 100) else "worth less than the hatching it costs",
+							math.floor(c.value),
+							math.floor(cost)
+						),
+						1800,
+						1800
+					)
+				end
+			end
+			-- 1.6 Builder K: Boingo's quest has its own slot (it never won the optional-trip pick: reward 5 Slime = value 0). While
+			-- the step is "talk" (incl. a Ready step) or "cores" it is tried every 2 minutes. Builder L: the boingo backoff (600 s
+			-- after "not found", 1800 s after 5 misses) is respected; no trip to Spawn while it runs.
+			if N.does("AutoNpcQuests") and N.optionalGapOk() and choreDue("boingo", 120) then
+				local s = N.boingoWork()
+				if s then
+					local waitS = N.boingoWait()
+					if waitS > 0 then
+						log(string.format("PLAN idle reason=npc quest waits %d s", waitS))
+					else
+						log("PLAN trip npc quest step=" .. s .. " | TRIP npc quest cost=30s")
+						N.guardTrip("npc quest", N.boingoTrip)
+						N.optionalDone()
+						return true
+					end
+				end
+			end
+			-- 2. One optional trip when the scheduler says it pays (and the hatch window since the last one has passed).
+			if choreDue("trip", 2) then
+				local t = N.pickTrip()
+				if t then
+					N.runTrip(t)
+					return true
+				end
+			end
+			return false
+		end,
+	}
+	-- standing at the egg: the default, it never cuts a trip either
+	Groups.Hatching = {
+		due = function()
+			return false
+		end,
+		run = function()
+			if N.hatchWanted() then
+				local egg = N.Hatch.target
+				if not egg then
+					-- REV-16 (live `MAIN now: no egg to hatch: picked in the dropdown`): the status follows the pick's result
+					N.Hatch.target, N.Hatch.targetWhy = N.pickEgg()
+					if N.Hatch.target then
+						N.loopStatus("Main", "Going to the " .. N.Hatch.target .. " egg")
+					else
+						N.loopStatus("Main", "no egg to hatch: " .. tostring(N.Hatch.targetWhy or "no egg unlocked") .. " (tapping goes on)")
+					end
+				elseif not N.atEgg(egg) then
+					if os.clock() - EggFailAt > 10 then
+						if not N.goToEgg(egg) then
+							EggFailAt = os.clock()
+						end
+					end
+				else
+					N.loopStatus("Main", "hatching at the " .. egg .. " egg")
+				end
+				return true
+			end
+			return false
+		end,
+	}
+	N.PriorityGroups = Groups
+	function N.priorityOrder()
+		local order, seen = {}, {}
+		for i = 1, #GroupNames do
+			local o = Options["Priority" .. i]
+			local v = o and o.Value
+			if type(v) == "string" and table.find(GroupNames, v) and not seen[v] then
+				seen[v] = true
+				table.insert(order, v)
+			end
+		end
+		for _, name in ipairs(GroupNames) do
+			if not seen[name] then
+				seen[name] = true
+				table.insert(order, name)
+			end
+		end
+		return order
+	end
+	function N.priorityText()
+		return "Order: " .. table.concat(N.priorityOrder(), " > ") .. (if N.Priority.last then "  \u{00B7}  last: " .. N.Priority.last else "")
+	end
+	-- Ends the running trip for a higher group: the Main turn is cancelled and a fresh one starts (the restart path of
+	-- N.restartLoop without its PROBLEM line and 30 s guard), the trip's locks and a half-done move are released.
+	function N.preemptMain(group, trip)
+		local body = LoopBody.Main
+		if not body then
+			return false
+		end
+		local old = LoopThread.Main
+		N.Priority.preemptAt = os.clock()
+		-- the cancel comes first: a Main turn that sits in an engine call cannot be cancelled (task.cancel throws), and a
+		-- turn that lived on would move the character under the new one; the watch asks again in 15 s
+		if old and old ~= coroutine.running() and not pcall(task.cancel, old) then
+			log(string.format("PRIORITY %s waits: the %s trip is inside an engine call", group, tostring(trip)))
+			return false
+		end
+		log(string.format("TRIP %s ended for %s: it stands higher in the Priority list (%ds into the trip)", tostring(trip), group, math.floor(os.clock() - (N.Trip.since or os.clock()))))
+		N.Priority.preempts += 1
+		N.Priority.last = tostring(trip) .. " gave way to " .. string.lower(group)
+		N.Priority.pending, N.Priority.pendingAt = group, os.clock()
+		if N.Trip.active then
+			N.Trip.cutting = true
+			N.tripEnd()
+		end
+		N.PetLock.craft = false
+		if N.Hide and N.Hide.on and N.stopHiding then
+			pcall(N.stopHiding)
+		end
+		N.moveReset("the " .. tostring(trip) .. " trip gave way to " .. string.lower(group))
+		table.clear(N.InvokeBusy)
+		N.Hatch.inFlight = false
+		N.Hatch.nextAt = 0
+		ChoreAt.minigames, ChoreAt.trip = nil, nil
+		loop("Main", body)
+		return true
+	end
+	function N.priorityWatch()
+		local T, P = N.Trip, N.Priority
+		-- a cut made for a group that then started no trip of its own (its slot bailed out): that group does not cut again
+		-- for 2 minutes, so a trip is never cut twice for nothing
+		if P.pending ~= nil and os.clock() - P.pendingAt > 5 then
+			P.deny[P.pending] = os.clock()
+			log(string.format("PRIORITY %s asked for the cut but started no trip: it does not cut again for 2 min", P.pending))
+			P.pending = nil
+		end
+		if not (T.active and T.group) or os.clock() - T.since < 3 or os.clock() - P.preemptAt < 15 then
+			return false
+		end
+		if next(N.InvokeBusy) ~= nil then
+			return false -- never in the middle of a server call
+		end
+		for _, name in ipairs(N.priorityOrder()) do
+			if name == T.group then
+				return false
+			end
+			local g = Groups[name]
+			if g and os.clock() - (P.deny[name] or -1e9) > 120 then
+				local ok, due = pcall(g.due)
+				if ok and due then
+					return N.preemptMain(name, T.name)
+				end
+			end
+		end
+		return false
+	end
 	loop("Main", function()
 		-- R2-3: the first Main status waits for the save and the egg list (live: "no egg to hatch: nothing unlocked yet" in
 		-- the first 1.5 s), at most 20 s
@@ -35898,188 +36329,15 @@ do
 			task.wait(0.5)
 			return
 		end
-		-- 0. Time-limited world events first (they last 1-4 minutes). Every trip runs through N.guardTrip (REV-1).
-		if N.does("AutoCloudRain") and N.cloudDue() and choreDue("cloud", 20) then
-			N.planLog("cloud", "collect the Cloud Rain pickups (the visible ones, then the cloud route)", 600, 60)
-			N.guardTrip("cloud rain", N.cloudTrip)
-			return
-		end
-		if N.does("AutoMeteors") and #N.landed(N.Rocks.list, 45) > 0 then
-			N.planLog("meteors", "break the landed meteors", 600, 60)
-			N.guardTrip("meteors", N.meteorTrip)
-			return
-		end
-		if N.does("AutoMysteryEgg") and #N.landed(N.Rocks.eggs, 240) > 0 then
-			N.planLog("mysteryegg", "hit the Mystery Egg (60 hits)", 600, 60)
-			N.guardTrip("mystery egg", N.mysteryEggTrip)
-			return
-		end
-		if N.does("AutoLuckyBlocks") and #N.luckyBlocks() > 0 and choreDue("luckyblocks", 15) then
-			N.planLog("luckyblocks", "open the lucky blocks", 600, 60)
-			N.guardTrip("lucky blocks", N.luckyBlockTrip)
-			return
-		end
-		-- 0.3 Halloween 4020 (p05_hween): the hourly Hallow Lord fight first (7 min window), then the Candy Witch's jobs once
-		-- a day and the 30-minute Trick or Treat round; the candy shop needs no trip.
-		if N.does("AutoHallowBoss") and N.hwBossDue() then
-			N.planLog("hallowboss", "fight the Hallow Lord on Halloween Island (every full hour, 7 min)", 600, 60)
-			N.guardTrip("hallow boss", N.hwBossTrip)
-			return
-		end
-		if N.does("AutoHalloweenDaily") and N.hwDailyDue() and choreDue("hwdaily", 600) then
-			N.planLog("hwdaily", "take the Candy Witch's daily jobs", 600, 60)
-			N.guardTrip("candy witch", N.hwDailyTrip)
-			return
-		end
-		if N.does("AutoTrickOrTreat") and N.hwTrickDue() and choreDue("hwtrick", 600) then
-			N.planLog("hwtrick", "trick-or-treat at the 11 houses on Halloween Island", 600, 60)
-			N.guardTrip("trick or treat", N.hwTrickTrip)
-			return
-		end
-		if on("AutoHalloweenShop") then
-			N.hwShopStep()
-		end
-		-- 0.35 Heaven (p05_fish, 2026-11-01): fishing when a rod has a bite, a free rod has bait, the bowl is full, a ring or
-		-- the daily gift waits; the Lucky Egg Machine every 6 h; the balloon when the Air pays for a level
-		if on("AutoFishing") and N.fishingDue() and choreDue("fishing", 20) then
-			N.planLog("fishing", "fishing at Heaven Falls", 600, 60)
-			N.guardTrip("fishing", N.fishingTrip)
-			return
-		end
-		if on("AutoLuckyEggMachine") and N.luckyEggReady() and choreDue("luckyEgg", 120) then
-			N.planLog("luckyegg", "start the Lucky Egg Machine", 600, 60)
-			N.guardTrip("lucky egg", N.luckyEggTrip)
-			return
-		end
-		if on("AutoBalloonLuck") and N.balloonReady() and choreDue("balloon", 120) then
-			N.planLog("balloon", "inflate the Balloon Luck egg", 600, 60)
-			N.guardTrip("balloon", N.balloonTrip)
-			return
-		end
-		-- 0.4 Secret Fusion (p05_fusion): the finished egg is hatched for Auto Claim Finished Crafts (free, nothing used up),
-		-- a new fuse only under its own toggle (irreversible, never the planner). Both try the remote first, the machine
-		-- when the server asks for it.
-		if (N.does("AutoClaimMachines") or on("AutoFusion")) and N.fusionClaimDue() and choreDue("fusionClaim", 60) then
-			N.planLog("fusionclaim", "hatch the finished Fusion Egg", 600, 60)
-			N.guardTrip("fusion claim", N.fusionClaimTrip)
-			return
-		end
-		if N.fusionStartDue() and choreDue("fusionStart", 60) then
-			N.guardTrip("fusion", N.fusionStartTrip)
-			return
-		end
-		-- 0.5 Pre-steps (REV-12): Greg's bridge as soon as the tap power allows it (it unlocks every pet level).
-		if N.does("AutoTutorial") and choreDue("bridge", 10) and N.bridgeDue() then
-			N.planLog("bridge", "lower Greg's bridge (the tap power reached its need): pet levels unlock", 600, 60)
-			N.guardTrip("bridge", N.bridgeTrip)
-			return
-		end
-		-- 1. Machines: one trip for every machine that is due (Golden -> Diamond -> Rainbow); a full storage blocks hatching.
-		local due = N.dueMachines()
-		if #due > 0 and os.clock() - N.Craft.tripFailAt > 60 then
-			local n, limit = N.storage()
-			if N.goldenMilestoneLog then
-				N.goldenMilestoneLog()
-			end
-			N.planLog("craft", string.format("craft trip: storage %d/%d, %d machine%s due", n, limit, #due, if #due == 1 then "" else "s"), 300, 30)
-			N.guardTrip("craft", N.craftTrip, if N.storageFull() then "storage full" elseif N.storageHeld() then "storage held by the game's delete list" else "set ready")
-			return
-		end
-		-- R5-4 (c): a full storage with machines on and no craft trip says why (when the reason changes, else every 10 min)
-		if N.storageFull() then
-			N.craftDueLog(#due > 0)
-		end
-		-- 1.5 R7-2 (owner's 8.7 h run of build E, planner off, Auto Tap Chests on: "Desert ready, Sky Island ready, chests
-		-- opened 0" for hours, no CHEST line; the chest was one of the optional trips behind their 5-minute gap and the NPC
-		-- quest took every turn): a ready tap chest has its own slot like the craft trip, with its own toggle alone (the
-		-- Smart Planner too: a free claim). The decision is logged even with the planner off (the toggle's own trip). With the
-		-- Smart Planner on it is priced: the chest pays its taps at the CURRENT tap value and then rests 6 h, so while the
-		-- income grows faster than 1 / that rest (N.incomeGrowth, p06) the planner opens it later, and only when it pays more
-		-- than the hatching the 12 s trip costs.
-		if N.does("AutoTapChests") and N.optionalGapOk() and choreDue("chest", 15) then
-			local growth = N.incomeGrowth()
-			local list = N.tapChestsDue()
-			if #list > 0 then
-				local c = list[1]
-				local cost = 12 * (N.lossTo(c.island) + N.hatchValue())
-				local rest = tonumber(N.tableOr(N.tableOr(N.tableOr(N.X.TapChest).Chests)[c.id]).Cooldown) or 21600
-				local growing = growth == nil or growth > 1 / rest
-				if not N.planner() or (not growing and c.value > cost) then
-					log(string.format("PLAN trip chest %s value=%dis cost=%dis (%s coins) | TRIP tap chests cost=12s", c.island, math.floor(c.value), math.floor(cost), formatNumber(c.coins)))
-					N.guardTrip("tap chests", N.tapChestTrip, c.island)
-					N.optionalDone()
-					return
-				end
-				N.planLog(
-					"idle chest",
-					string.format(
-						"idle reason=tap chest %s waits: %s (value %d is, cost %d is), hatching goes on",
-						c.island,
-						if growth == nil then "the income growth is known after 5 minutes of samples" elseif growing then string.format("the income grows %.0f %% an hour, the chest pays more later", (math.exp(growth * 3600) - 1) * 100) else "worth less than the hatching it costs",
-						math.floor(c.value),
-						math.floor(cost)
-					),
-					1800,
-					1800
-				)
-			end
-		end
-		-- 1.6 Builder K: Boingo's quest has its own slot (it never won the optional-trip pick: reward 5 Slime = value 0). While
-		-- the step is "talk" (incl. a Ready step) or "cores" it is tried every 2 minutes. Builder L: the boingo backoff (600 s
-		-- after "not found", 1800 s after 5 misses) is respected; no trip to Spawn while it runs.
-		if N.does("AutoNpcQuests") and N.optionalGapOk() and choreDue("boingo", 120) then
-			local s = N.boingoWork()
-			if s then
-				local waitS = N.boingoWait()
-				if waitS > 0 then
-					log(string.format("PLAN idle reason=npc quest waits %d s", waitS))
-				else
-					log("PLAN trip npc quest step=" .. s .. " | TRIP npc quest cost=30s")
-					N.guardTrip("npc quest", N.boingoTrip)
-					N.optionalDone()
-					return
-				end
-			end
-		end
-		-- 1.7 Minigames (feedback round 2026-11-02): the one that is up runs now, in its own slot, whatever the hatch gap says.
-		if choreDue("minigames", 5) then
-			local mg = minigameNext()
-			if mg then
-				log(string.format("%s start %s", mg.tag, mg.name))
-				N.guardTrip(mg.name, mg.run)
-				-- not an optional trip: the hatch gap of the chests, Boingo and the errands is not touched
+		-- Priority: the groups in the player's order; the first with something to do runs, the lower ones wait this turn.
+		for _, name in ipairs(N.priorityOrder()) do
+			local g = Groups[name]
+			if g and groupRun(name, g.run) then
 				return
 			end
 		end
-		-- 2. One optional trip when the scheduler says it pays (and the hatch window since the last one has passed).
-		if choreDue("trip", 2) then
-			local t = N.pickTrip()
-			if t then
-				N.runTrip(t)
-				return
-			end
-		end
-		-- 3. Default: stand at the egg.
-		if N.hatchWanted() then
-			local egg = N.Hatch.target
-			if not egg then
-				-- REV-16 (live `MAIN now: no egg to hatch: picked in the dropdown`): the status follows the pick's result
-				N.Hatch.target, N.Hatch.targetWhy = N.pickEgg()
-				if N.Hatch.target then
-					N.loopStatus("Main", "Going to the " .. N.Hatch.target .. " egg")
-				else
-					N.loopStatus("Main", "no egg to hatch: " .. tostring(N.Hatch.targetWhy or "no egg unlocked") .. " (tapping goes on)")
-				end
-			elseif not N.atEgg(egg) then
-				if os.clock() - EggFailAt > 10 then
-					if not N.goToEgg(egg) then
-						EggFailAt = os.clock()
-					end
-				end
-			else
-				N.loopStatus("Main", "hatching at the " .. egg .. " egg")
-			end
-		elseif N.does("AutoTap") then
+		MainGroup = nil
+		if N.does("AutoTap") then
 			N.loopStatus("Main", "tapping")
 		elseif anyAutoOn() then
 			N.loopStatus("Main", "running the remote chores")
@@ -36457,6 +36715,10 @@ do
 	loop("Target", function()
 		if N.hatchWanted() or N.does("AutoRebirth") then
 			N.planTick()
+		end
+		pcall(N.priorityWatch)
+		if Labels.Priority then
+			pcall(Labels.Priority.SetText, Labels.Priority, N.priorityText())
 		end
 		task.wait(2)
 	end)
