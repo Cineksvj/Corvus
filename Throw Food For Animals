@@ -5952,7 +5952,12 @@ function Library:CreateWindow(opts)
 					Size = UDim2.new(0, 44, 0, 44),
 					Image = "",
 					ScaleType = Enum.ScaleType.Crop,
-					Visible = false,
+					-- rendered from the start over the glyph, with no background: the engine only
+					-- fetches (and flips IsLoaded for) an ImageLabel it draws, so a hidden or fully
+					-- transparent one kept the gamepad glyph for ever (live 2026-11-02 on the alt,
+					-- PreloadAsync did not help). Unloaded, it draws nothing and the glyph shows through.
+					BackgroundTransparency = 1,
+					Visible = true,
 					ZIndex = row.ZIndex + 2,
 					Parent = row,
 				})
@@ -5960,7 +5965,7 @@ function Library:CreateWindow(opts)
 				local function showPicture(url)
 					if not pic.Parent or type(url) ~= "string" or url == "" then return end
 					local function reveal()
-						pic.Visible = true
+						pic.BackgroundTransparency = 0
 						icon.Visible = false
 					end
 					pic.Image = url
