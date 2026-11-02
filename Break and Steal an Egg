@@ -5937,7 +5937,12 @@ function Library:CreateWindow(opts)
 					Size = UDim2.new(0, 44, 0, 44),
 					Image = "",
 					ScaleType = Enum.ScaleType.Crop,
-					Visible = false,
+					-- rendered from the start over the glyph, with no background: the engine only
+					-- fetches (and flips IsLoaded for) an ImageLabel it draws, so a hidden or fully
+					-- transparent one kept the gamepad glyph for ever (live 2026-11-02 on the alt,
+					-- PreloadAsync did not help). Unloaded, it draws nothing and the glyph shows through.
+					BackgroundTransparency = 1,
+					Visible = true,
 					ZIndex = row.ZIndex + 2,
 					Parent = row,
 				})
@@ -5945,7 +5950,7 @@ function Library:CreateWindow(opts)
 				local function showPicture(url)
 					if not pic.Parent or type(url) ~= "string" or url == "" then return end
 					local function reveal()
-						pic.Visible = true
+						pic.BackgroundTransparency = 0
 						icon.Visible = false
 					end
 					pic.Image = url
@@ -17591,6 +17596,8 @@ do
 	N.G.TreadmillUnlock = N.tableOr(safeRequire("Shared.TreadmillUnlockConfig"))
 	N.G.Satchel = N.tableOr(safeRequire("Shared.SatchelConfig"))
 	N.G.Rewards = N.tableOr(safeRequire("Shared.EggRewards"))
+	-- IndexConfig.RarityOrder (dump 25007) is the game's own rarity list: the hub's pickers read it (p02 N.RarityOrder).
+	N.G.Index = N.tableOr(safeRequire("Shared.IndexConfig"))
 N.G.BackpackSell = N.tableOr(safeRequire("Shared.BackpackSellConfig"))
 	N.G.Shop = N.tableOr(safeRequire("Shared.RobuxShopConfig"))
 	-- 1352: Fuse Machine recipe/odds and the egg types it and the demon shop give (EggTypeConfig.Types).
@@ -17916,7 +17923,26 @@ do
 	function N.swingGap()
 		return N.swingCooldown() / N.swingMult()
 	end
-	N.RarityOrder = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine", "Cosmic", "Secret", "Celestial", "Inferno", "Void", "Omega" }
+	-- One rarity list for every picker (Steal / Sell / Protect / Merge / Webhook rarities): the game's own
+	-- IndexConfig.RarityOrder when it is readable (dump 25007, 15 entries on 2026-11-01), else this copy of it. Discord ask
+	-- 2026-11-02 (Gabefzk): Spectral and Ethereal were missing - they sit after Omega in the game.
+	N.RarityFallback = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine", "Cosmic", "Secret", "Celestial", "Inferno", "Void", "Omega", "Spectral", "Ethereal" }
+	function N.readRarityOrder()
+		local list = {}
+		local game_ = N.G and N.G.Index and N.G.Index.RarityOrder
+		if type(game_) == "table" then
+			for _, rarity in ipairs(game_) do
+				if type(rarity) == "string" and rarity ~= "" and not table.find(list, rarity) then
+					table.insert(list, rarity)
+				end
+			end
+		end
+		if #list < #N.RarityFallback then
+			return table.clone(N.RarityFallback)
+		end
+		return list
+	end
+	N.RarityOrder = N.readRarityOrder()
 	N.RarityColors = {
 		Common = "#b4b4be",
 		Uncommon = "#5ac864",
@@ -17931,6 +17957,8 @@ do
 		Inferno = "#ff7a2e",
 		Void = "#8a5cff",
 		Omega = "#ff4fd8",
+		Spectral = "#6eebff", -- RarityColors in the game (dump 20331-20332)
+		Ethereal = "#ffa0e6",
 	}
 	function N.rarityColor(rarity)
 		return N.RarityColors[rarity] or "#dddddd"
