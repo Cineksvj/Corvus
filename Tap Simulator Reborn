@@ -1401,6 +1401,17 @@ function Library:CreateWindow(opts)
 	end
 	pcall(function() screenGui.Parent = parentGui end)
 	Library.ScreenGui = screenGui
+	-- phones (Discord 2026-11-02, "bugs with the frame"): the window kept 8 px from the raw screen
+	-- edge, so on a notched phone its left edge, the state box and the first tab sat under the
+	-- notch and the home bar; the gui keeps out of the device's unsafe areas (the top bar stays
+	-- covered as before: its buttons sit over the state box, never over a tab) and the window is
+	-- sized to that area, see touchArea
+	if touch then pcall(function() screenGui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets end) end
+	local function touchArea()
+		local a = screenGui.AbsoluteSize
+		if a.X > 1 and a.Y > 1 then return a end
+		return Camera and Camera.ViewportSize or vp0
+	end
 
 	-- -------------------- Main window frame
 	-- Whole-window UIScale (owner 2026-10-19: text too small to read at 1x).
@@ -1422,7 +1433,8 @@ function Library:CreateWindow(opts)
 		-- phone: scale 1 (13 px is 13 logical px); SetUIScale zooms the content and shrinks the
 		-- window in logical px so it always stays inside the screen
 		uiScaleValue = math.clamp(tonumber(opts.Scale) or 1, 0.8, 1.6)
-		Size = UDim2.new(0, math.floor((vp0.X - TOUCH_INSET * 2) / uiScaleValue), 0, math.floor((vp0.Y - TOUCH_INSET * 2) / uiScaleValue))
+		local ta = touchArea()
+		Size = UDim2.new(0, math.floor((ta.X - TOUCH_INSET * 2) / uiScaleValue), 0, math.floor((ta.Y - TOUCH_INSET * 2) / uiScaleValue))
 	else
 		-- never larger than the viewport (windowed Roblox, small laptops): leave a 24 px margin
 		local fit = math.min((vp0.X - 24) / math.max(1, Size.X.Offset), (vp0.Y - 24) / math.max(1, Size.Y.Offset))
@@ -1596,8 +1608,8 @@ function Library:CreateWindow(opts)
 	syncHalo()
 	local applyTouchRows   -- defined with the topbar: landscape phones fold the tab bar into it
 	local function fitTouchWindow(s)
-		-- touch: the window is the screen minus the inset, in logical px of the current scale
-		local vp = Camera and Camera.ViewportSize or vp0
+		-- touch: the window is the safe area minus the inset, in logical px of the current scale
+		local vp = touchArea()
 		main.Size = UDim2.fromOffset(math.floor((vp.X - TOUCH_INSET * 2) / s), math.floor((vp.Y - TOUCH_INSET * 2) / s))
 		main.Position = UDim2.fromOffset(TOUCH_INSET, TOUCH_INSET)
 		Size = main.Size
@@ -1641,6 +1653,30 @@ function Library:CreateWindow(opts)
 			local ny = math.clamp(pos.Y, 0, math.max(0, vp.Y - sz.Y))
 			if nx ~= pos.X or ny ~= pos.Y then main.Position = UDim2.fromOffset(nx, ny) end
 		end))
+	end
+	if touch then
+		-- the safe area changes a frame after the viewport on rotation: refit on it too
+		Library:GiveSignal(screenGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+			fitTouchWindow(mainScale.Scale > 0 and mainScale.Scale or 1)
+		end))
+		-- the on-screen keyboard covers the lower half of a phone and the game moves no gui for it,
+		-- so a box focused low on the page was typed into blind (Discord 2026-11-02): the page
+		-- scrolls so the box sits 72 px under the page's top edge
+		pcall(function()
+			Library:GiveSignal(UserInputService.TextBoxFocused:Connect(function(tb)
+				if not tb or not tb:IsDescendantOf(screenGui) then return end
+				local page = tb:FindFirstAncestorWhichIsA("ScrollingFrame")
+				while page and page.ScrollingDirection == Enum.ScrollingDirection.X do
+					page = page.Parent and page.Parent:FindFirstAncestorWhichIsA("ScrollingFrame") or nil
+				end
+				if not page then return end
+				local want = page.CanvasPosition.Y + (tb.AbsolutePosition.Y - page.AbsolutePosition.Y) - 72
+				want = math.clamp(want, 0, math.max(0, page.AbsoluteCanvasSize.Y - page.AbsoluteSize.Y))
+				if math.abs(want - page.CanvasPosition.Y) > 2 then
+					Library:NewTween(page, 0.18, { CanvasPosition = Vector2.new(page.CanvasPosition.X, want) }, Enum.EasingStyle.Quad)
+				end
+			end))
+		end)
 	end
 
 	-- Two soft radial glows (mockup radial-gradients at 20%/10% and 85%/90%)
@@ -1689,8 +1725,10 @@ function Library:CreateWindow(opts)
 	end
 	Library.StarfieldEnabled = starfieldOn
 	if type(Library.GetSetting) == "function" then
-		local okL, low = pcall(Library.GetSetting, Library, "LowEffects", false)
-		rawset(Library, "LowEffects", okL and low == true)
+		-- Discord 2026-11-02 ("bug, and so frame", "new UI has a lot of problems", phone users): a touch client
+		-- starts in Low effects unless the player chose otherwise (the setting stays unset, so a toggle still wins)
+		local okL, low = pcall(Library.GetSetting, Library, "LowEffects", nil)
+		rawset(Library, "LowEffects", if okL and low ~= nil then low == true else touch)
 	end
 	if starfield then starfield:SetEnabled(starfieldOn and rawget(Library, "LowEffects") ~= true) end
 	if rawget(Library, "LowEffects") == true then pcall(Library.SetBezelsEnabled, Library, false) end
@@ -3332,8 +3370,10 @@ function Library:CreateWindow(opts)
 	end
 	do
 		if type(Library.GetSetting) == "function" then
-			local ok, v = pcall(Library.GetSetting, Library, "FocusBlur", true)
-			rawset(Library, "FocusBlur", not (ok and v == false))
+			-- a BlurEffect costs a phone GPU whole frames (Discord 2026-11-02): off by default on touch, on
+			-- elsewhere; a saved choice wins either way
+			local ok, v = pcall(Library.GetSetting, Library, "FocusBlur", nil)
+			rawset(Library, "FocusBlur", if ok and v ~= nil then v == true else rawget(Library, "Touch") ~= true)
 		end
 		local function killBlur()
 			pcall(function()
@@ -5961,7 +6001,12 @@ function Library:CreateWindow(opts)
 					Size = UDim2.new(0, 44, 0, 44),
 					Image = "",
 					ScaleType = Enum.ScaleType.Crop,
-					Visible = false,
+					-- rendered from the start over the glyph, with no background: the engine only
+					-- fetches (and flips IsLoaded for) an ImageLabel it draws, so a hidden or fully
+					-- transparent one kept the gamepad glyph for ever (live 2026-11-02 on the alt,
+					-- PreloadAsync did not help). Unloaded, it draws nothing and the glyph shows through.
+					BackgroundTransparency = 1,
+					Visible = true,
 					ZIndex = row.ZIndex + 2,
 					Parent = row,
 				})
@@ -5969,7 +6014,7 @@ function Library:CreateWindow(opts)
 				local function showPicture(url)
 					if not pic.Parent or type(url) ~= "string" or url == "" then return end
 					local function reveal()
-						pic.Visible = true
+						pic.BackgroundTransparency = 0
 						icon.Visible = false
 					end
 					pic.Image = url
@@ -6497,7 +6542,7 @@ function Library:CreateWindow(opts)
 		hub:AddToggle("Starfield", { Text = "Starfield background", Default = Library.StarfieldEnabled ~= false, Callback = function(v) Library:SetStarfield(v) end })
 		hub:AddToggle("LowEffects", {
 			Text = "Low effects",
-			Tooltip = "Weak PC: no starfield, card shadows or glow",
+			Tooltip = "Weak PC or phone: no starfield, card shadows or glow (on by default on touch)",
 			Default = Library.LowEffects == true,
 			Callback = function(v) Library:SetLowEffects(v) end,
 		})
@@ -10961,11 +11006,19 @@ function Groupbox:AddSlider(idx, props)
     end
 
     local pressed, pressX = false, 0
+    local pageScroll   -- the page under the slider, paused while a finger holds the knob
     hit.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             pressed, pressX = true, input.Position.X
             s._dragFrom = s.Value
             trackX, trackW = track.AbsolutePosition.X, track.AbsoluteSize.X
+            -- phones (Discord 2026-11-02, "bugs with the frame"): a finger on the knob also panned
+            -- the page's ScrollingFrame, so the page jumped under the drag; the page stands still
+            -- while the slider is held (the old library paused it the same way)
+            if input.UserInputType == Enum.UserInputType.Touch then
+                pageScroll = hit:FindFirstAncestorWhichIsA("ScrollingFrame")
+                if pageScroll then pageScroll.ScrollingEnabled = false end
+            end
         end
     end)
     UserInputService.InputChanged:Connect(function(input)
@@ -10985,6 +11038,7 @@ function Groupbox:AddSlider(idx, props)
         if not pressed then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
         pressed = false
+        if pageScroll then pageScroll.ScrollingEnabled = true; pageScroll = nil end
         if s._dragging then
             s._dragging = false
             paintFill(s._hover and FILL_HOVER or FILL_IDLE, 0.22)
@@ -12287,6 +12341,9 @@ function Groupbox:AddCatalog(props)
     -- from the service while the pointer is over the strip - MouseEnter / MouseLeave do fire)
     local outer, hovered = nil, false
     strip.MouseEnter:Connect(function()
+        -- phones: a finger fires MouseEnter but not always MouseLeave, so the page stayed frozen
+        -- after a touch on the strip (Discord 2026-11-02); nested X / Y frames pan on their own there
+        if isTouch() then return end
         hovered = true
         outer = strip:FindFirstAncestorWhichIsA("ScrollingFrame")
         if outer then outer.ScrollingEnabled = false end
@@ -20061,22 +20118,61 @@ do
 		end
 		return "sent"
 	end
-	-- The game's HatchRenderer plays a reveal for every answer, also for ours; while Auto Hatch runs the reveal is skipped
-	-- (its own failure path: call done at once), so the answers never pile up behind animations. Restored on unload.
+	-- The game's HatchRenderer plays a reveal for every answer, also for ours. While Auto Hatch runs the reveal is skipped
+	-- the way the renderer's own failure path ends a hatch (4021 L3152: the "finished" callback called at once), so the
+	-- answers never pile up behind animations. N.revealWrap builds the wrapper (the tests feed it a fake Play): the
+	-- callback is looked up among the arguments (its place may move between builds); a call without one, a callback that
+	-- errors, or a renderer asked again and again inside one frame (a build whose hatch queue waits for the reveal to
+	-- yield) gets the real reveal, never a silent return - a hatch the game never sees finished stalls its queue and the
+	-- queue's loop with it (Discord 2026-11-02, "if i activate the auto hatch game freeze", game 4066 on a 4021 build).
+	-- Every call yields one frame before it finishes or falls through: a hatch queue that loops on "finished" inside one
+	-- frame (a build whose Play is expected to yield) gets its frame from the skip too. Restored on unload.
 	N.Restore = {}
+	N.Reveal = { skipped = 0, passed = 0, broken = false, lastFrame = -1, burst = 0 }
+	function N.revealWrap(realPlay)
+		return function(self, ...)
+			local R = N.Reveal
+			R.burst = if Perf.frames == R.lastFrame then R.burst + 1 else 0
+			R.lastFrame = Perf.frames
+			if alive() and N.hatchWanted() and not N.Manual.revealOn and not R.broken then
+				if R.burst >= 8 then
+					if not R.burstLogged then
+						R.burstLogged = true
+						logProblem("REVEAL the game asked for 8 reveals inside one frame: the real reveal plays until it yields")
+					end
+					task.wait()
+				else
+					local done = nil
+					for i = 1, select("#", ...) do
+						if type((select(i, ...))) == "function" then
+							done = (select(i, ...))
+							break
+						end
+					end
+					if done then
+						task.wait() -- the frame a reveal would have taken
+						local ok, err = pcall(done)
+						if ok then
+							R.skipped += 1
+							return
+						end
+						R.broken = true
+						logProblem("REVEAL the game's hatch-finished call failed, the reveal plays from now on: " .. tostring(err))
+					elseif not R.noDoneLogged then
+						R.noDoneLogged = true
+						log("REVEAL no finished callback among the renderer's arguments (new build?), the reveal plays")
+					end
+				end
+			end
+			R.passed += 1
+			return realPlay(self, ...)
+		end
+	end
 	do
 		local renderer = N.safeRequire("Modules.Client.Pets.HatchRenderer")
 		if type(renderer) == "table" and type(renderer.Play) == "function" and not table.isfrozen(renderer) then
 			local realPlay = renderer.Play
-			renderer.Play = function(self, egg, result, done, ...)
-				if alive() and N.hatchWanted() and not N.Manual.revealOn then
-					if type(done) == "function" then
-						pcall(done)
-					end
-					return
-				end
-				return realPlay(self, egg, result, done, ...)
-			end
+			renderer.Play = N.revealWrap(realPlay)
 			table.insert(N.Restore, function()
 				renderer.Play = realPlay
 			end)
@@ -35838,7 +35934,7 @@ do
 		LoopThread[name] = task.spawn(function()
 			while alive() and LoopGen[name] == myGen do
 				N.LoopBeat[name] = os.clock()
-				local started = os.clock()
+				local frame0 = Perf.frames
 				local gen = N.Trip.gen
 				local ok, err = xpcall(body, debug.traceback)
 				if not ok then
@@ -35850,13 +35946,17 @@ do
 						N.PetLock.craft = false
 					end
 					task.wait(1)
-				elseif os.clock() == started then
-					-- A body that returned without yielding: give the game a frame.
+				elseif Perf.frames == frame0 then
+					-- A body that returned inside the frame it started in did not yield: give the game a frame. The old test
+					-- was `os.clock() == started`, which the live clock (microseconds) never passes: a Main turn that only set
+					-- its status spun the VM without a frame = "if i activate the auto hatch game freeze" (Discord 2026-11-02,
+					-- the last line printed was `MAIN now: hatching at the Void egg`).
 					task.wait()
 				end
 			end
 		end)
 	end
+	N.loop = loop
 	local RestartAt = {}
 	function N.restartLoop(name, why)
 		local body = LoopBody[name]
@@ -36210,6 +36310,9 @@ do
 				else
 					N.loopStatus("Main", "hatching at the " .. egg .. " egg")
 				end
+				-- the Main turn's pace while it stands at the egg (the body before the Priority groups ended every turn with
+				-- this wait; without it the turn returned without a yield - see loop())
+				task.wait(0.25)
 				return true
 			end
 			return false
