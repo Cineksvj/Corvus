@@ -19007,9 +19007,20 @@ do
 	local ModeOrder = { "Walk", "Fast", "Teleport" }
 	local ModeRank = { Walk = 1, Fast = 2, Teleport = 3 }
 	N.ModeOrder = ModeOrder
+	-- One switch (owner 2026-11-03, Discord: players could not tell which movement options to pick, "why is walk so
+	-- slow"): by default every trip is a fast run along the ground at the measured clean speed (up to Max speed, 200 %),
+	-- feet on the floor, no noclip, no teleport, never over a gap; snapbacks step the speed down on their own (ladder
+	-- below). "Slow walk" = the Humanoid's own walk. Teleport / Tp hops / noclip / under-map rescue are gone from the UI;
+	-- N.setMoveMode is the internal override the unit tests use for the old modes (never set by the hub itself).
+	function N.setMoveMode(mode)
+		N.Moves.forceMode = mode
+	end
 	function N.chosenMoveMode()
-		local v = optionText("MoveMode", "Walk")
-		return if v == "Fast" or v == "Teleport" then v else "Walk"
+		local forced = N.Moves.forceMode
+		if forced == "Walk" or forced == "Fast" or forced == "Teleport" then
+			return forced
+		end
+		return if on("SlowWalk") then "Walk" else "Fast"
 	end
 	function N.moveMode()
 		local L = N.Moves.ladder
@@ -19888,14 +19899,15 @@ do
 	-- the same ray-checked grounded points the v1 way: at 97 % of your own WalkSpeed, feet on the floor (ground +
 	-- stand height at every point), no noclip, never past the last grounded point before a gap. "done" / "stuck" /
 	-- "stopped" / "flung" / "dead", like follow.
-	local function groundGlide(points, keepGoing)
+	local function groundGlide(points, keepGoing, speedFn, lift)
 		N.Walk.glide += 1
-		local speedFn = function()
+		speedFn = speedFn or function()
 			return math.max(N.walkSpeed() * 0.97, 8)
 		end
+		lift = lift or (N.standHeight() - 2)
 		for _, wp in ipairs(points) do
 			local p = wp.Position
-			local done, why = glideTo(Vector3.new(p.X, p.Y - 2 + N.standHeight(), p.Z), speedFn, keepGoing)
+			local done, why = glideTo(Vector3.new(p.X, p.Y + lift, p.Z), speedFn, keepGoing)
 			if not done then
 				if why == "stopped" or why == "flung" then
 					return why
@@ -19906,6 +19918,58 @@ do
 		return "done"
 	end
 	N.groundGlide = groundGlide
+	-- The fast run: the pathfinder's waypoints (they sit on the floor and go around walls) when it finds the way,
+	-- otherwise the straight ray-checked ground points (stops at the last grounded point before a gap). Never noclip,
+	-- never a point without ground under it. true, or false + reason.
+	function N.groundRun(target, keepGoing, speedFn)
+		local root = rootPart()
+		if not root then
+			return false, "no character"
+		end
+		local points, status = computePath(root.Position, target)
+		N.Walk.paths += 1
+		local lift = N.standHeight()
+		-- every waypoint must stand on ground: the run ends at the last grounded one (never over the void); checked
+		-- when the start itself stands on something the ray sees (always in the game)
+		if points and N.groundAt(root.Position.X, root.Position.Z, root.Position.Y + 6) then
+			for i, wp in ipairs(points) do
+				local p = wp.Position
+				if not N.groundAt(p.X, p.Z, p.Y + 6) then
+					points = table.move(points, 1, i - 1, 1, {})
+					status = "Gap"
+					break
+				end
+			end
+			if #points == 0 then
+				points = nil
+			end
+		end
+		if not points then
+			local gap
+			points, gap = directPoints(root.Position, target)
+			lift = N.standHeight() - 2
+			if #points == 0 then
+				N.Walk.noPath += 1
+				N.Moves.refusedLegs = (N.Moves.refusedLegs or 0) + 1
+				note("nopath", string.format("RUN no ground way to %s from %s (%s), target skipped", brief(target), brief(root.Position), tostring(status)))
+				return false, "no path"
+			end
+			N.Walk.direct += 1
+			status = if gap then "DirectGap" else "Direct"
+		end
+		local result = groundGlide(points, keepGoing, speedFn, lift)
+		if result ~= "done" then
+			return false, result
+		end
+		local after = rootPart()
+		if after and flat(after.Position, target) <= 4 and math.abs(after.Position.Y - target.Y) <= 10 then
+			return true
+		end
+		N.Walk.noPath += 1
+		N.Moves.refusedLegs = (N.Moves.refusedLegs or 0) + 1
+		note("short", string.format("RUN stopped %d studs short of %s (%s), target skipped", if after then math.floor(flat(after.Position, target)) else -1, brief(target), tostring(status)))
+		return false, "no path"
+	end
 	-- true when the character stands at the target; false, reason otherwise ("no path", "stopped", "flung",
 	-- "timeout", "no character"). Re-plans when the path is blocked or a waypoint times out.
 	function N.walkTo(target, keepGoing)
@@ -20018,7 +20082,7 @@ do
 			end
 		end
 		-- M5: empty legs >= 200 studs try a full teleport (probe: 3 tries once per PlaceVersion; accepted = used from then on).
-		if mode == "Fast" and not carrying and not opts.mode and flat(root.Position, target) >= 200 then
+		if mode == "Fast" and N.Moves.forceMode == "Teleport" and not carrying and not opts.mode and flat(root.Position, target) >= 200 then
 			local T, state = N.Moves.tp, tpState()
 			if state == "accepted" or (state == "unknown" and T.tries < 3 and os.clock() - T.lastAt > 30) then
 				local probing = state == "unknown"
@@ -20093,37 +20157,10 @@ do
 		local startPos, startAt = root.Position, os.clock()
 		local area = if N.areaOf(root.Position) == "base" and N.areaOf(target) == "base" then "base" else "zone"
 		N.Moves.legArea, N.Moves.lastArea = area, area
-		-- Walls: only "Noclip While Travelling" passes through them (a blocked leg still retries with noclip below);
-		-- Walk used to force noclip on, which is what the Discord clip showed (through the plot wall and the hedge).
-		Noclip.travel = on("TravelNoclip")
-		local ok = true
-		local lastSafe = if N.groundAt(root.Position.X, root.Position.Z, root.Position.Y + 20) then root.Position else nil
-		local points = planPath(root.Position, target)
-		if not points then
-			Noclip.travel = false
-			N.Moves.legArea = nil
-			return false, "no ground route"
-		end
-		for _, point in ipairs(points) do
-			local done, why = glideTo(point, speedFn, opts.keepGoing)
-			if not done and why == "blocked" and not Noclip.travel then
-				Noclip.travel = true
-				done = glideTo(point, speedFn, opts.keepGoing)
-			end
-			if not done then
-				ok = false
-				-- stopped over nothing (pull-back, fling, blocked): back onto the last grounded point instead of falling
-				local now = rootPart()
-				if now and lastSafe and not N.groundAt(now.Position.X, now.Position.Z, now.Position.Y + 20) then
-					log("MOVE stopped over no ground at", brief(now.Position), "-> back to", brief(lastSafe), "reason=" .. tostring(why))
-					placeRoot(lastSafe)
-				end
-				break
-			end
-			if N.groundAt(point.X, point.Z, point.Y + 20) then
-				lastSafe = point
-			end
-		end
+		-- Walls: the run goes around them (pathfinder waypoints); it never noclips (the Discord clip: through the plot
+		-- wall and the hedge, then over the void = the "flying" bans).
+		Noclip.travel = false
+		local ok, why = N.groundRun(target, opts.keepGoing, speedFn)
 		Noclip.travel = false
 		N.Moves.legArea = nil
 		if ok and opts.look then
@@ -20140,7 +20177,7 @@ do
 		if ok and mode == "Fast" and not carrying then
 			boostLegDone(startAt, walked, area)
 		end
-		return ok
+		return ok, why
 	end
 	function N.travelNear(target, within, opts)
 		local root = rootPart()
@@ -25682,38 +25719,15 @@ do
 		-- Movement is a real walk by default (owner 2026-11-03: players were banned for "flying"): Humanoid:MoveTo along a
 		-- PathfindingService path at the game's own WalkSpeed. Glide / boost / teleport stay as opt-in options below, all
 		-- marked as a ban risk (owner: "zostaw glide itd i boost ale napisz ze to ban risk").
+		-- owner 2026-11-03 (Discord: "which one do I change", "why is walk so slow"): one switch. Default = a fast run
+		-- along the ground at the fastest speed the server accepts, no teleport, no noclip, no flying; snapbacks slow it
+		-- down on their own. The old Movement type / Tp to eggs / noclip / rescue options are gone.
 		local MoveBox = Tabs.Farm:AddRightGroupbox("Movement", "route")
-		MoveBox:AddLabel({ Text = "Movement: walking (safe)", DoesWrap = true, Tooltip = "Default. Every trip is a real walk along a path at your own speed: no teleport, no boost, no flying" })
+		MoveBox:AddLabel({ Text = "Corvus runs along the ground as fast as the server allows. No teleport, no noclip, no flying. If the server pulls you back, it slows down by itself.", DoesWrap = true })
+		MoveBox:AddToggle("SlowWalk", { Text = "Slow walk", Default = false, Tooltip = "On = your character's normal walk at your own speed. Off (default) = the fast ground run" })
+		MoveBox:AddSlider("FastBoostMax", { Text = "Max speed", Default = 200, Min = 100, Max = 200, Rounding = 0, Suffix = "% of your speed", Tooltip = "Upper limit of the run. Corvus measures what the server accepts (about 160 % in zones, 200 % around the bases) and never goes above it" })
 		Labels.Move = MoveBox:AddLabel({ Text = "-", DoesWrap = true })
 		MoveBox:AddToggle("SnapNotify", { Text = "Notify On Snapback", Default = true, Tooltip = "Tells you when the server pulls you back; Corvus slows down on its own" })
-		local RiskBox = Tabs.Farm:AddRightGroupbox("Risky movement", "triangle-alert")
-		RiskBox:AddLabel({ Text = "BAN RISK: everything in this box can look like flying or teleporting to the game's anti-cheat. Off = safe walking.", DoesWrap = true })
-		RiskBox:AddDropdown("MoveMode", {
-			Text = "Movement type (BAN RISK)",
-			Values = { "Walk", "Fast", "Teleport" },
-			Default = "Walk",
-			Tooltip = "Ban risk: Fast and Teleport can be flagged as flying / teleporting. Walk = real walking (safe, default). Fast = a ground glide at boosted speed. Teleport = instant without an animal only, the game blocks banking after one",
-		})
-		RiskBox:AddSlider("FastBoostMax", { Text = "Fast Speed (max, BAN RISK)", Default = 200, Min = 100, Max = 200, Rounding = 0, Suffix = "% of your speed", Tooltip = "Ban risk. Upper limit for Fast. Corvus runs 160 % in zones and 200 % around the bases (measured server limits), 10 % less with an animal" })
-		RiskBox:AddDropdown("EggTravel", {
-			Text = "Getting to eggs (BAN RISK)",
-			Values = { "Walk to eggs", "Tp to eggs" },
-			Default = "Walk to eggs",
-			Tooltip = "Ban risk: Tp to eggs = short teleport hops the anti-cheat can flag. Walk to eggs = the Movement type above (safe by default)",
-		})
-		RiskBox:AddToggle("TeleportSpeedCheck", {
-			Text = "Speed check with teleport (BAN RISK)",
-			Default = false,
-			Risk = "red",
-			Tooltip = "Ban risk: only matters with the Teleport movement type. Also keeps to zones your speed can escape while teleporting. Off = the highest zone you can break eggs in",
-		})
-		RiskBox:AddToggle("TravelNoclip", { Text = "Noclip While Travelling (BAN RISK)", Default = false, Risk = "red", Tooltip = "Ban risk: every trip passes through walls. Off = Corvus walks around them and never noclips" })
-		RiskBox:AddToggle("FallRescue", {
-			Text = "Rescue if under the map (BAN RISK)",
-			Default = false,
-			Risk = "red",
-			Tooltip = "Ban risk: teleports a character that fell through the floor back onto your plot. Off = the game respawns you",
-		})
 		local GuardBox = Tabs.Farm:AddRightGroupbox("Guards", Icons.Speed)
 		GuardBox:AddSlider("EscapeMargin", {
 			Text = "Speed safety margin",
@@ -26872,14 +26886,7 @@ do
 			)
 			toggleCommand("Toggle Noclip", { "Noclip" }, "Noclip", "ghost")
 			toggleCommand("Toggle ESP", { "ESPEggs", "ESPPickups" }, "Egg and animal ESP", "eye")
-			for _, mode in ipairs({ "Walk", "Fast", "Teleport" }) do
-				Library:RegisterCommand("Move: " .. mode, function()
-					if Options.MoveMode then
-						pcall(Options.MoveMode.SetValue, Options.MoveMode, mode)
-					end
-					notify("Corvus", "Movement set to " .. mode, 3)
-				end, { Group = GameName, Icon = "route" })
-			end
+			toggleCommand("Toggle Slow Walk", { "SlowWalk" }, "Slow walk", "route")
 			Library:RegisterCommand("Go To Treadmill", function()
 				task.spawn(N.runManual, function()
 					local _, hitbox = N.treadmill()
@@ -27565,7 +27572,7 @@ do
 				end
 				if N.moveMode() == "Walk" then
 					I.move = string.format(
-						"Movement: <b>walking (safe)</b>  \u{00B7}  speed <b>%s</b> studs/s\nPaths <b>%d</b>  \u{00B7}  re-paths <b>%d</b>  \u{00B7}  straight <b>%d</b>  \u{00B7}  ground walk <b>%d</b>  \u{00B7}  no path <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>",
+						"Movement: <b>slow walk</b>  \u{00B7}  speed <b>%s</b> studs/s\nPaths <b>%d</b>  \u{00B7}  re-paths <b>%d</b>  \u{00B7}  straight <b>%d</b>  \u{00B7}  ground walk <b>%d</b>  \u{00B7}  no path <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>",
 						formatNumber(math.floor(N.modeSpeed())),
 						N.Walk.paths,
 						N.Walk.repaths,
@@ -27576,7 +27583,7 @@ do
 					)
 				else
 					I.move = string.format(
-						"Speed now <b>%s</b> studs/s  \u{00B7}  Fast boost <b>%d%%</b> (carrying %d%%)%s%s\nEmpty-leg teleport: <b>%s</b>\nSnapbacks <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>  \u{00B7}  blocked <b>%d</b>",
+						"Speed now <b>%s</b> studs/s  \u{00B7}  Fast boost <b>%d%%</b> (carrying %d%%)%s%s\nRuns <b>%d</b>  \u{00B7}  straight <b>%d</b>  \u{00B7}  no way <b>%d</b>\nSnapbacks <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>  \u{00B7}  blocked <b>%d</b>",
 						if N.moveMode() == "Teleport" and not N.carrying() then "\u{221E}" else formatNumber(math.floor(N.modeSpeed())),
 						N.fastPct(false),
 						N.fastPct(true),
@@ -27585,10 +27592,9 @@ do
 							local fell, wait = N.moveFallback()
 							return if fell then string.format("\n%s %d%% after snapbacks, one step faster in %dm", N.moveMode(), if N.moveMode() == "Fast" then N.fastPct(false) else 97, math.ceil(wait / 60)) else ""
 						end)(),
-						(function()
-							local r = N.Moves.tp.result
-							return if r == "accepted" then "used" elseif r == "rejected" then "server pulls back, gliding" else "not tested yet"
-						end)(),
+						N.Walk.glide or 0,
+						N.Walk.direct or 0,
+						N.Walk.noPath or 0,
 						N.Moves.snaps,
 						N.Moves.ac,
 						N.Moves.blocked
