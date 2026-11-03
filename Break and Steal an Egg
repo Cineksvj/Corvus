@@ -19738,7 +19738,7 @@ do
 	end
 	-- ==== Safe walk (default): Humanoid:MoveTo along a PathfindingService path, nothing else ====
 	local PathfindingService = game:GetService("PathfindingService")
-	N.Walk = { paths = 0, repaths = 0, noPath = 0, jumps = 0, timeouts = 0, said = {} }
+	N.Walk = { paths = 0, repaths = 0, noPath = 0, direct = 0, jumps = 0, timeouts = 0, said = {} }
 	local function note(key, text)
 		local W = N.Walk
 		if os.clock() - (W.said[key] or -1e9) > 30 then
@@ -19767,6 +19767,30 @@ do
 		end
 		return nil, status
 	end
+	-- Pathfinding answers NoPath on some clients (player clip 2026-11-03: "no path 1981" of 1981 - the character
+	-- stood next to the eggs and never moved). Then the leg is walked straight with Humanoid:MoveTo - still the
+	-- Humanoid's own walk at the game's speed - over ground checked by a ray every 4 studs, and it ends at the
+	-- last grounded point before a gap or a drop of more than 25 studs (never off an edge, never over the void).
+	-- points (waypoint-shaped), gap
+	local function directPoints(from, to)
+		local points = {}
+		local distance = flat(from, to)
+		local steps = math.max(1, math.ceil(distance / 4))
+		local floorY = math.min(from.Y, to.Y) - 25
+		for i = 1, steps do
+			local t = i / steps
+			local x, z = from.X + (to.X - from.X) * t, from.Z + (to.Z - from.Z) * t
+			local y = groundAt(x, z, math.max(from.Y, to.Y) + 6, 12)
+			if not y or y < floorY then
+				return points, true
+			end
+			if i % 3 == 0 or i == steps then
+				points[#points + 1] = { Position = Vector3.new(x, y + 2, z) }
+			end
+		end
+		return points, false
+	end
+	N.directPoints = directPoints
 	-- Walks one computed path with Humanoid:MoveTo, waypoint by waypoint. "done" | "blocked" | "stuck" | "stopped" |
 	-- "flung" | "timeout" | "dead". A waypoint that asks for a jump sets Humanoid.Jump (the game's own jump).
 	local function follow(points, path, keepGoing, deadline)
@@ -19890,6 +19914,14 @@ do
 			local points, status, path = computePath(root.Position, target)
 			W.paths += 1
 			if not points then
+				local direct, gap = directPoints(root.Position, target)
+				if #direct > 0 then
+					W.direct += 1
+					note("direct", string.format("WALK pathfinder %s to %s, walking straight over the ground%s", tostring(status), brief(target), if gap then " up to a gap" else ""))
+					points, status, path = direct, if gap then "DirectGap" else "Direct", nil
+				end
+			end
+			if not points then
 				W.noPath += 1
 				N.Moves.refusedLegs = (N.Moves.refusedLegs or 0) + 1
 				note("nopath", string.format("WALK no path to %s from %s (%s), target skipped", brief(target), brief(root.Position), tostring(status)))
@@ -19903,7 +19935,7 @@ do
 			end
 			root = rootPart()
 			local after = if root then flat(root.Position, target) else math.huge
-			if status == "Success" and result == "done" and after <= 8 then
+			if (status == "Success" or status == "Direct") and result == "done" and after <= 8 then
 				return true
 			end
 			if after < best - 4 then
@@ -27494,10 +27526,11 @@ do
 				end
 				if N.moveMode() == "Walk" then
 					I.move = string.format(
-						"Movement: <b>walking (safe)</b>  \u{00B7}  speed <b>%s</b> studs/s\nPaths <b>%d</b>  \u{00B7}  re-paths <b>%d</b>  \u{00B7}  no path <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>",
+						"Movement: <b>walking (safe)</b>  \u{00B7}  speed <b>%s</b> studs/s\nPaths <b>%d</b>  \u{00B7}  re-paths <b>%d</b>  \u{00B7}  straight <b>%d</b>  \u{00B7}  no path <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>",
 						formatNumber(math.floor(N.modeSpeed())),
 						N.Walk.paths,
 						N.Walk.repaths,
+						N.Walk.direct or 0,
 						N.Walk.noPath,
 						N.Moves.ac
 					)
