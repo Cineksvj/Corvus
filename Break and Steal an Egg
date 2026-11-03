@@ -19738,7 +19738,7 @@ do
 	end
 	-- ==== Safe walk (default): Humanoid:MoveTo along a PathfindingService path, nothing else ====
 	local PathfindingService = game:GetService("PathfindingService")
-	N.Walk = { paths = 0, repaths = 0, noPath = 0, direct = 0, jumps = 0, timeouts = 0, said = {} }
+	N.Walk = { paths = 0, repaths = 0, noPath = 0, direct = 0, glide = 0, jumps = 0, timeouts = 0, said = {} }
 	local function note(key, text)
 		local W = N.Walk
 		if os.clock() - (W.said[key] or -1e9) > 30 then
@@ -19882,6 +19882,30 @@ do
 		end
 		return result
 	end
+	-- The v1 hub (Obsidian library, worked for players) never used the pathfinder or Humanoid:MoveTo: "Humanoid:MoveTo
+	-- runs far below your speed in this game". On the clients where the pathfinder answers NoPath the Humanoid also
+	-- stands still on the straight walk (clip 2026-11-03: next to the eggs, never moving). Then the character goes over
+	-- the same ray-checked grounded points the v1 way: at 97 % of your own WalkSpeed, feet on the floor (ground +
+	-- stand height at every point), no noclip, never past the last grounded point before a gap. "done" / "stuck" /
+	-- "stopped" / "flung" / "dead", like follow.
+	local function groundGlide(points, keepGoing)
+		N.Walk.glide += 1
+		local speedFn = function()
+			return math.max(N.walkSpeed() * 0.97, 8)
+		end
+		for _, wp in ipairs(points) do
+			local p = wp.Position
+			local done, why = glideTo(Vector3.new(p.X, p.Y - 2 + N.standHeight(), p.Z), speedFn, keepGoing)
+			if not done then
+				if why == "stopped" or why == "flung" then
+					return why
+				end
+				return if why == "no character" then "dead" else "stuck"
+			end
+		end
+		return "done"
+	end
+	N.groundGlide = groundGlide
 	-- true when the character stands at the target; false, reason otherwise ("no path", "stopped", "flung",
 	-- "timeout", "no character"). Re-plans when the path is blocked or a waypoint times out.
 	function N.walkTo(target, keepGoing)
@@ -19928,6 +19952,10 @@ do
 				return false, "no path"
 			end
 			local result = follow(points, path, keepGoing, deadline)
+			if (status == "Direct" or status == "DirectGap") and (result == "stuck" or result == "blocked") then
+				note("glide", string.format("WALK the Humanoid did not walk to %s, going along the ground at your WalkSpeed (v1 walk)", brief(target)))
+				result = groundGlide(points, keepGoing)
+			end
 			if result == "stopped" or result == "flung" or result == "timeout" then
 				return false, result
 			elseif result == "dead" then
@@ -21085,7 +21113,18 @@ do
 		local keep = function()
 			return live(egg) and on("AutoFarm") and not N.carrying()
 		end
-		if not N.travelTo(stand, { keepGoing = keep, look = info.position }) then
+		local arrived = N.travelTo(stand, { keepGoing = keep, look = info.position })
+		if not arrived and live(egg) and on("AutoFarm") and not N.carrying() then
+			-- clip 2026-11-03: the character stood right next to the egg, the walk said "no path" for the last few studs
+			-- and the egg was skipped, again and again. In hit range is enough: the server takes the hit from there.
+			local here = rootPart()
+			if here and math.max(flat(here.Position, egg.Position) - info.radius, 0) <= 6.5 then
+				log("EGG in hit range without the last steps", info.kind, "zone", info.zone, "- hitting from here")
+				stand = here.Position
+				arrived = true
+			end
+		end
+		if not arrived then
 			if live(egg) and on("AutoFarm") then
 				F.failedEggs[egg] = os.clock() + 20
 				log("EGG unreachable", info.kind, "zone", info.zone, "(no path) - trying the next egg")
@@ -27526,11 +27565,12 @@ do
 				end
 				if N.moveMode() == "Walk" then
 					I.move = string.format(
-						"Movement: <b>walking (safe)</b>  \u{00B7}  speed <b>%s</b> studs/s\nPaths <b>%d</b>  \u{00B7}  re-paths <b>%d</b>  \u{00B7}  straight <b>%d</b>  \u{00B7}  no path <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>",
+						"Movement: <b>walking (safe)</b>  \u{00B7}  speed <b>%s</b> studs/s\nPaths <b>%d</b>  \u{00B7}  re-paths <b>%d</b>  \u{00B7}  straight <b>%d</b>  \u{00B7}  ground walk <b>%d</b>  \u{00B7}  no path <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>",
 						formatNumber(math.floor(N.modeSpeed())),
 						N.Walk.paths,
 						N.Walk.repaths,
 						N.Walk.direct or 0,
+						N.Walk.glide or 0,
 						N.Walk.noPath,
 						N.Moves.ac
 					)
