@@ -20399,7 +20399,7 @@ do
 		end
 		-- Discord 2026-11-03 (Rian): "Heaviest" still broke the small eggs - the heavy ones are the tough ones and the
 		-- hit limit threw them out. Heaviest now means the heaviest egg, whatever the hits.
-		local anyHits = valueMode or priority == "Heaviest"
+		local anyHits = valueMode or priority == "Heaviest" or priority == "Nearest"
 		local maxHits = if anyHits then math.huge else math.max(optionNumber("MaxHits", 80), 1)
 		local titanicFirst = on("TitanicFirst")
 		local pickFilter = optionText("ZoneMode", "Best zone") == "Picked zones" or N.zonePickActive()
@@ -20409,6 +20409,7 @@ do
 		end
 		local others = if on("AvoidPlayers") then otherPositions() else {}
 		local best, bestScore
+		local skippedBusy = nil
 		-- Tutorial stage "Break a Stronger Egg" (TutorialConfig.StrongEggMinTier 2, EggRarity.IsStrongerEgg, dump 123514-123531):
 		-- only a ZONE 1 egg of tier >= 2 (Rock Egg, Swamp Egg) completes it. Anything else, e.g. the zone 3 snow eggs the plan
 		-- prefers, was hit for 10 minutes without the stage moving (live 2026-10-06 23:27-23:40), so the pick is narrowed here.
@@ -20447,6 +20448,9 @@ do
 			-- The event egg has 10x HP and other players hit it too, so it gets a 10x hit limit and ignores players nearby.
 			local event = titanicFirst and info.titanic
 			local special = event or (titanicFirst and info.bracket == "TITANIC")
+			if not event and on("AvoidPlayers") and not skippedBusy and N.zoneAllowed(info.zone) and othersNear(others, info.position, 10) then
+				skippedBusy = info
+			end
 			if
 				(N.zoneAllowed(info.zone) or (special and not pickFilter and N.canEscape(info.zone) and N.underCap(info.zone)))
 				and info.hits <= (if event then maxHits * 10 else maxHits)
@@ -20487,6 +20491,47 @@ do
 			log(string.format("EGG skip worthless zone=%d best animal $%s/s < weakest placed $%s/s%s", worthless.zone, formatNumber(math.floor(worthless.top)), formatNumber(math.floor(worst)), if best then "" else " (nothing better in reach, breaking the best one anyway)"))
 		end
 		local pick = best or tough or fallback
+		-- Commitment (Discord 2026-11-04, ljs5933: "why not click the nearest ... it leaves the egg"): the egg being walked to or
+		-- broken stays the target until it breaks, despawns, fails or another player takes it. A re-score during a slow walk
+		-- only wins when it is clearly better (1.5x), never because two eggs scored almost the same.
+		local c = F.commit
+		if c and not (c.part and live(c.part) and on("AutoFarm") and os.clock() - c.at < 240) then
+			F.commit = nil
+			c = nil
+		end
+		if c then
+			local cinfo = nil
+			for _, info in ipairs(N.eggs()) do
+				if info.part == c.part then
+					cinfo = info
+					break
+				end
+			end
+			if not cinfo or (F.failedEggs[c.part] or 0) >= os.clock() or not N.zoneAllowed(cinfo.zone) then
+				F.commit = nil
+			elseif on("AvoidPlayers") and othersNear(others, cinfo.position, 10) then
+				F.commit = nil
+				F.leftNote = { text = string.format("Left %s: another player is hitting it", cinfo.kind), at = os.clock() }
+				log("EGG left", cinfo.kind, "zone", cinfo.zone, "- another player is hitting it")
+			elseif pick ~= cinfo and (cinfo.hits <= maxHits or anyHits) then
+				local cscore = N.eggScore(cinfo, origin)
+				if not (pick == best and bestScore and bestScore > cscore + 0.5 * math.abs(cscore)) then
+					pick = cinfo
+					if F.commitSaidFor ~= c.part then
+						F.commitSaidFor = c.part
+						log("EGG stay on", cinfo.kind, "zone", cinfo.zone, "(no clearly better egg)")
+					end
+				else
+					log(string.format("EGG switch %s -> %s (score %.3g -> %.3g)", cinfo.kind, pick.kind, cscore, bestScore))
+					F.commit = nil
+				end
+			end
+		end
+		if not F.commit and skippedBusy and pick ~= skippedBusy and os.clock() - (F.busySaidAt or -1e9) > 10 then
+			F.busySaidAt = os.clock()
+			F.leftNote = { text = string.format("Skipped %s: another player is hitting it", skippedBusy.kind), at = os.clock() }
+			log("EGG skipped", skippedBusy.kind, "zone", skippedBusy.zone, "- another player is hitting it")
+		end
 		if pick and priority == "Heaviest" and pick ~= F.heaviestSaid then
 			F.heaviestSaid = pick
 			log(string.format("EGG heaviest zone=%d %s %.1f kg %d hits", pick.zone, tostring(pick.kind), pick.kg, pick.hits))
@@ -20981,6 +21026,9 @@ do
 		local egg = info.part
 		F.target = info
 		F.targetRejects = 0
+		if not F.commit or F.commit.part ~= egg then
+			F.commit = { part = egg, at = os.clock() }
+		end
 		local stand = info.position + Vector3.new(info.radius + 3, 0, 0)
 		local root = rootPart()
 		if root then
@@ -20997,16 +21045,24 @@ do
 				stand = Vector3.new(stand.X, info.position.Y, stand.Z)
 			end
 		end
-		setStatus(string.format("Going to %s in zone %d (%d hits)", info.kind, info.zone, info.hits))
+		do
+			local note = F.leftNote
+			local prefix = if note and os.clock() - note.at < 15 then note.text .. ". " else ""
+			setStatus(string.format("%sGoing to %s in zone %d (%d hits)", prefix, info.kind, info.zone, info.hits))
+		end
 		local keep = function()
 			return live(egg) and on("AutoFarm") and not N.carrying()
 		end
 		if not N.travelTo(stand, { keepGoing = keep, look = info.position }) then
 			if live(egg) and on("AutoFarm") then
 				F.failedEggs[egg] = os.clock() + 20
+				log("EGG unreachable", info.kind, "zone", info.zone, "(no path) - trying the next egg")
+				setStatus(string.format("Left %s: no way to it, trying the next egg", info.kind))
 			end
 			F.target = nil
-			return live(egg) == false
+			F.commit = nil
+			task.wait(0.1)
+			return true
 		end
 		if not equipPickaxe() then
 			setStatus("Waiting for your pickaxe")
@@ -21114,6 +21170,9 @@ do
 		end
 		N.holdAt(nil)
 		F.target = nil
+		if not live(egg) or (F.failedEggs[egg] or 0) >= os.clock() then
+			F.commit = nil
+		end
 		if (F.burstN or 1) > 1 and hits >= 2 then
 			local B = N.Burst
 			B.eggs += 1
@@ -25475,7 +25534,7 @@ do
 			Text = "Egg priority",
 			Values = { "Best value per second", "Fewest hits", "Heaviest", "Luckiest", "Nearest" },
 			Default = "Best value per second",
-			Tooltip = "Best value per second weighs the expected animal (zone odds, egg luck, your weakest pet) against the hits and the trip. Heaviest = the heaviest egg in your zone whatever the hits (Skip eggs over does not apply). Fewest hits / Luckiest / Nearest keep to the hit limit",
+			Tooltip = "Best value per second (default) weighs the expected animal (zone odds, egg luck, your weakest pet) against the hits and the trip. Nearest = the closest egg first, whatever it is worth (Skip eggs over does not apply). Heaviest = the heaviest egg in your zone whatever the hits. Fewest hits / Luckiest keep to the hit limit. Whatever you pick, the egg Corvus is already walking to or breaking stays the target until it breaks; it only switches for an egg that scores 1.5x better",
 		})
 		EggBox:AddDropdown("EggPick", {
 			Text = "Egg types (none = all)",
@@ -25508,8 +25567,8 @@ do
 		})
 		EggBox:AddToggle("AvoidPlayers", {
 			Text = "Skip eggs other players hit",
-			Default = true,
-			Tooltip = "Leaves an egg alone when another player stands next to it",
+			Default = false,
+			Tooltip = "Off by default. On = never starts an egg another player stands next to, and leaves one they start hitting (the status line says so)",
 		})
 		EggBox:AddToggle("MasterySwings", {
 			Text = "Report swings for Swinging Mastery",
