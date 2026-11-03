@@ -1738,7 +1738,9 @@ function Library:CreateWindow(opts)
 	-- the window while the hub is open and not minimised - the same Starfield toggle and LowEffects
 	-- gate. Few stars, no bright ones, slow comets: every star is a draw call on a GPU-bound client.
 	local sky = nil
-	if not touch then
+	-- phones never build it (2026-11-03: since phones got the laptop layout the sky's 100 stars, 36
+	-- drifters and their mirror twins were built on every phone at load, off or not)
+	if not touchDevice then
 	-- owner 2026-11-01 ("ruszac wiecej bardziej mocniej wieksze kropki i wiecej comet"): fewer but
 	-- bigger and brighter dots (the draw count is what the sky costs a GPU-bound client, the size
 	-- costs nothing), twice the wander and sway at twice the pace, more and faster drifters, a
@@ -18169,12 +18171,23 @@ function N.zonePickHas(index)
 	end
 	return selected(Options.ZonePick, zone.label) == true
 end
--- Highest-index ticked zone, regardless of whether your speed opens it (the pick is the player's intent).
--- Returns nil when ZonePick is empty.
+-- "Highest zone" (Discord 2026-11-03, MD_Dani: eggs only up to the Halloween area, never the last zone): a cap on
+-- top of every mode and pick. nil = no cap.
+function N.zoneCap()
+	local label = optionText("ZoneMax", "")
+	local index = N.Cat.zoneByLabel and N.Cat.zoneByLabel[label]
+	return if type(index) == "number" and N.Cat.zones[index] then index else nil
+end
+function N.underCap(index)
+	local cap = N.zoneCap()
+	return cap == nil or (type(index) == "number" and index <= cap)
+end
+-- Highest-index ticked zone under the cap, regardless of whether your speed opens it (the pick is the player's intent).
+-- Returns nil when ZonePick is empty (or every pick sits above the cap).
 function N.topPickedZone()
 	local top
 	for index, zone in ipairs(N.Cat.zones) do
-		if selected(Options.ZonePick, zone.label) then
+		if selected(Options.ZonePick, zone.label) and N.underCap(index) then
 			top = index
 		end
 	end
@@ -18194,6 +18207,7 @@ function N.bestZone()
 					and info.hits <= maxHits
 					and not N.zonePenalized(info.zone)
 					and (not pickActive or N.zonePickHas(info.zone))
+					and N.underCap(info.zone)
 				then
 					best = info.zone
 				end
@@ -18244,7 +18258,7 @@ function N.topZone()
 	end
 	local best = 1
 	for index, zone in ipairs(N.Cat.zones) do
-		if power >= zone.power and not N.zonePenalized(index) then
+		if power >= zone.power and not N.zonePenalized(index) and N.underCap(index) then
 			best = index
 		end
 	end
@@ -18318,6 +18332,9 @@ function N.zoneAllowed(index)
 	-- Tutorial stage "Break a Stronger Egg" completes only with a zone 1 egg (Rock/Swamp, dump 123514): zone 1 is the zone.
 	if N.tutorial() and N.tutorialStage() == "BreakStrongerEgg" then
 		return index == 1
+	end
+	if not N.underCap(index) then
+		return false
 	end
 	local mode = optionText("ZoneMode", "Best zone")
 	-- Best zone (default) collapses to a single target. With a non-empty ZonePick the highest ticked zone wins
@@ -18929,8 +18946,8 @@ do
 	-- Holds the character on one spot (treadmill, egg) so the game's own physics do not slide it away.
 	Library:GiveSignal(RunService.Heartbeat:Connect(function()
 		local hold = N.Moves.hold
-		if not hold or not alive() or N.flung() then
-			return
+		if not hold or not alive() or N.flung() or N.moveMode() == "Walk" then
+			return -- safe walking never snaps the character (a snap is a CFrame write)
 		end
 		local root = rootPart()
 		-- Walk mode only nudges small slips back, a long snap would look like a teleport to the game's anticheat.
@@ -18991,8 +19008,8 @@ do
 	local ModeRank = { Walk = 1, Fast = 2, Teleport = 3 }
 	N.ModeOrder = ModeOrder
 	function N.chosenMoveMode()
-		local v = optionText("MoveMode", "Fast")
-		return if v == "Walk" or v == "Teleport" then v else "Fast"
+		local v = optionText("MoveMode", "Walk")
+		return if v == "Fast" or v == "Teleport" then v else "Walk"
 	end
 	function N.moveMode()
 		local L = N.Moves.ladder
@@ -19458,11 +19475,14 @@ do
 			log(string.format("MOVE route via a grounded anchor (%d legs, straight line crosses %d gap%s)", #best, gaps, if gaps == 1 then "" else "s"))
 			return best
 		end
+		-- No grounded way there: the leg is refused rather than flown (Discord 2026-11-03, a player banned for
+		-- "flying"; the game's anti-cheat has FLY warned / put back on the ground / exploded, dump 27289-27299).
 		if os.clock() - (N.Moves.gapSaidAt or -1e9) > 60 then
 			N.Moves.gapSaidAt = os.clock()
-			log(string.format("MOVE straight line %s -> %s crosses %d point%s with no ground, no grounded detour found", brief(from), brief(to), gaps, if gaps == 1 then "" else "s"))
+			log(string.format("MOVE straight line %s -> %s crosses %d point%s with no ground, no grounded detour: leg refused (never flown)", brief(from), brief(to), gaps, if gaps == 1 then "" else "s"))
 		end
-		return points
+		N.Moves.refusedLegs = (N.Moves.refusedLegs or 0) + 1
+		return nil
 	end
 	N.planPath = planPath
 	function N.distanceTo(position)
@@ -19716,6 +19736,193 @@ do
 		end
 		return false, why or "short"
 	end
+	-- ==== Safe walk (default): Humanoid:MoveTo along a PathfindingService path, nothing else ====
+	local PathfindingService = game:GetService("PathfindingService")
+	N.Walk = { paths = 0, repaths = 0, noPath = 0, jumps = 0, timeouts = 0, said = {} }
+	local function note(key, text)
+		local W = N.Walk
+		if os.clock() - (W.said[key] or -1e9) > 30 then
+			W.said[key] = os.clock()
+			log(text)
+		end
+	end
+	local PathSettings = { AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = false, WaypointSpacing = 6 }
+	-- points, status, path. Success = the whole way; ClosestNoPath / ClosestOutOfRange = the part up to the nearest
+	-- reachable point (followed, then re-planned; no progress three times = no path). NoPath = nil.
+	local function computePath(from, to)
+		local ok, path = pcall(PathfindingService.CreatePath, PathfindingService, PathSettings)
+		if not ok or not path then
+			return nil, "no pathfinder"
+		end
+		if not pcall(path.ComputeAsync, path, from, to) then
+			return nil, "compute failed"
+		end
+		local status = tostring(if path.Status then path.Status.Name else "?")
+		local gotPoints, points = pcall(path.GetWaypoints, path)
+		if not gotPoints or type(points) ~= "table" or #points == 0 then
+			return nil, status
+		end
+		if status == "Success" or status == "ClosestNoPath" or status == "ClosestOutOfRange" then
+			return points, status, path
+		end
+		return nil, status
+	end
+	-- Walks one computed path with Humanoid:MoveTo, waypoint by waypoint. "done" | "blocked" | "stuck" | "stopped" |
+	-- "flung" | "timeout" | "dead". A waypoint that asks for a jump sets Humanoid.Jump (the game's own jump).
+	local function follow(points, path, keepGoing, deadline)
+		local blocked = false
+		local conn = nil
+		if path then
+			pcall(function()
+				conn = path.Blocked:Connect(function()
+					blocked = true
+				end)
+			end)
+		end
+		local result = "done"
+		for index, wp in ipairs(points) do
+			local root, hum = rootPart(), humanoid()
+			if not root or not hum or not alive() then
+				result = "dead"
+				break
+			end
+			if index == 1 and flat(root.Position, wp.Position) < 2.5 then
+				continue
+			end
+			if wp.Action and wp.Action.Name == "Jump" then
+				pcall(function()
+					hum.Jump = true
+				end)
+				N.Walk.jumps += 1
+			end
+			local goal = wp.Position
+			pcall(hum.MoveTo, hum, goal)
+			local began = os.clock()
+			local lastCheck, lastPos, jumped = began, root.Position, false
+			local limit = math.max(3, flat(root.Position, goal) / math.max(N.modeSpeed() * 0.5, 6) + 2)
+			while true do
+				task.wait()
+				root = rootPart()
+				if not root or not alive() then
+					result = "dead"
+					break
+				end
+				if flat(root.Position, goal) <= 3.2 then
+					break
+				end
+				if blocked then
+					result = "blocked"
+					break
+				end
+				if keepGoing and not keepGoing() then
+					result = "stopped"
+					break
+				end
+				if N.flung() then
+					result = "flung"
+					break
+				end
+				local now = os.clock()
+				if now > deadline then
+					result = "timeout"
+					break
+				end
+				if now - began > limit then
+					result = "stuck"
+					break
+				end
+				if now - lastCheck >= 1 then
+					if flat(root.Position, lastPos) < 0.8 then
+						if jumped then
+							result = "stuck"
+							break
+						end
+						jumped = true
+						N.Walk.jumps += 1
+						pcall(function()
+							humanoid().Jump = true
+						end)
+						pcall(hum.MoveTo, hum, goal)
+					else
+						jumped = false
+					end
+					lastCheck, lastPos = now, root.Position
+				end
+			end
+			if result ~= "done" then
+				break
+			end
+		end
+		if conn then
+			pcall(conn.Disconnect, conn)
+		end
+		return result
+	end
+	-- true when the character stands at the target; false, reason otherwise ("no path", "stopped", "flung",
+	-- "timeout", "no character"). Re-plans when the path is blocked or a waypoint times out.
+	function N.walkTo(target, keepGoing)
+		local W = N.Walk
+		local root = rootPart()
+		if not root or not target then
+			return false, "no character"
+		end
+		local deadline = os.clock() + math.clamp(flat(root.Position, target) / math.max(N.modeSpeed() * 0.5, 8) + 30, 40, 300)
+		local best, stalls = math.huge, 0
+		while true do
+			root = rootPart()
+			if not root or not alive() then
+				return false, "no character"
+			end
+			if flat(root.Position, target) <= 3.5 and math.abs(root.Position.Y - target.Y) <= 10 then
+				return true
+			end
+			if keepGoing and not keepGoing() then
+				return false, "stopped"
+			end
+			if N.flung() then
+				return false, "flung"
+			end
+			if os.clock() > deadline then
+				W.timeouts += 1
+				note("timeout", string.format("WALK timeout towards %s from %s", brief(target), brief(root.Position)))
+				return false, "timeout"
+			end
+			local points, status, path = computePath(root.Position, target)
+			W.paths += 1
+			if not points then
+				W.noPath += 1
+				N.Moves.refusedLegs = (N.Moves.refusedLegs or 0) + 1
+				note("nopath", string.format("WALK no path to %s from %s (%s), target skipped", brief(target), brief(root.Position), tostring(status)))
+				return false, "no path"
+			end
+			local result = follow(points, path, keepGoing, deadline)
+			if result == "stopped" or result == "flung" or result == "timeout" then
+				return false, result
+			elseif result == "dead" then
+				return false, "no character"
+			end
+			root = rootPart()
+			local after = if root then flat(root.Position, target) else math.huge
+			if status == "Success" and result == "done" and after <= 8 then
+				return true
+			end
+			if after < best - 4 then
+				best, stalls = after, 0
+			else
+				stalls += 1
+			end
+			if stalls >= 3 then
+				W.noPath += 1
+				N.Moves.refusedLegs = (N.Moves.refusedLegs or 0) + 1
+				note("nocloser", string.format("WALK no way closer to %s (stuck at %s), target skipped", brief(target), if root then brief(root.Position) else "?"))
+				return false, "no path"
+			end
+			W.repaths += 1
+			if result == "blocked" or result == "stuck" then
+				N.Moves.blocked += 1
+			end
+		end
+	end
 	function N.travelTo(target, opts)
 		opts = opts or {}
 		local root = rootPart()
@@ -19807,7 +20014,19 @@ do
 			end
 			return ok
 		end
-		-- Humanoid:MoveTo runs far below your speed in this game, so Walk glides along the ground at your own WalkSpeed.
+		if mode == "Walk" then
+			-- default: a real walk, no CFrame / velocity write (owner 2026-11-03). Glide / Fast / Teleport are opt-in ban risks.
+			local startPos, startAt = root.Position, os.clock()
+			local walkedOk, walkWhy = N.walkTo(target, opts.keepGoing)
+			local after = rootPart()
+			local walked = if after then flat(startPos, after.Position) else 0
+			if walked > 30 then
+				local took = math.max(os.clock() - startAt, 0.01)
+				log(string.format("MOVE walk %d studs in %.1fs = %d/s (WalkSpeed %d, carrying %d)", walked, took, walked / took, N.walkSpeed(), if carrying then 1 else 0))
+			end
+			return walkedOk, walkWhy
+		end
+		-- Humanoid:MoveTo runs far below your speed in this game, so Fast glides along the ground at your own WalkSpeed (opt-in, ban risk).
 		local speedFn = function()
 			return N.modeSpeed(opts.mode or N.moveMode(), carrying)
 		end
@@ -19819,7 +20038,13 @@ do
 		Noclip.travel = on("TravelNoclip")
 		local ok = true
 		local lastSafe = if N.groundAt(root.Position.X, root.Position.Z, root.Position.Y + 20) then root.Position else nil
-		for _, point in ipairs(planPath(root.Position, target)) do
+		local points = planPath(root.Position, target)
+		if not points then
+			Noclip.travel = false
+			N.Moves.legArea = nil
+			return false, "no ground route"
+		end
+		for _, point in ipairs(points) do
 			local done, why = glideTo(point, speedFn, opts.keepGoing)
 			if not done and why == "blocked" and not Noclip.travel then
 				Noclip.travel = true
@@ -20167,11 +20392,15 @@ do
 		local root = rootPart()
 		local origin = root and root.Position
 		-- "Best value per second" already prices the hits, so the hit limit only applies to the other priorities.
-		local valueMode = optionText("EggPriority", "Best value per second") == "Best value per second"
+		local priority = optionText("EggPriority", "Best value per second")
+		local valueMode = priority == "Best value per second"
 		if valueMode then
 			pcall(N.Plan.update, false)
 		end
-		local maxHits = if valueMode then math.huge else math.max(optionNumber("MaxHits", 80), 1)
+		-- Discord 2026-11-03 (Rian): "Heaviest" still broke the small eggs - the heavy ones are the tough ones and the
+		-- hit limit threw them out. Heaviest now means the heaviest egg, whatever the hits.
+		local anyHits = valueMode or priority == "Heaviest"
+		local maxHits = if anyHits then math.huge else math.max(optionNumber("MaxHits", 80), 1)
 		local titanicFirst = on("TitanicFirst")
 		local pickFilter = optionText("ZoneMode", "Best zone") == "Picked zones" or N.zonePickActive()
 		if pickFilter and not F.zonePickSaid then
@@ -20219,7 +20448,7 @@ do
 			local event = titanicFirst and info.titanic
 			local special = event or (titanicFirst and info.bracket == "TITANIC")
 			if
-				(N.zoneAllowed(info.zone) or (special and not pickFilter and N.canEscape(info.zone)))
+				(N.zoneAllowed(info.zone) or (special and not pickFilter and N.canEscape(info.zone) and N.underCap(info.zone)))
 				and info.hits <= (if event then maxHits * 10 else maxHits)
 				and (F.failedEggs[info.part] or 0) < os.clock()
 				and (event or allows(Options.EggPick, info.kind))
@@ -20258,6 +20487,10 @@ do
 			log(string.format("EGG skip worthless zone=%d best animal $%s/s < weakest placed $%s/s%s", worthless.zone, formatNumber(math.floor(worthless.top)), formatNumber(math.floor(worst)), if best then "" else " (nothing better in reach, breaking the best one anyway)"))
 		end
 		local pick = best or tough or fallback
+		if pick and priority == "Heaviest" and pick ~= F.heaviestSaid then
+			F.heaviestSaid = pick
+			log(string.format("EGG heaviest zone=%d %s %.1f kg %d hits", pick.zone, tostring(pick.kind), pick.kg, pick.hits))
+		end
 		if pick and pick.lucky and os.clock() - (F.luckySaidAt or -1e9) > 300 then
 			F.luckySaidAt = os.clock()
 			local factor, source = N.Plan.luckyFactor(pick.zone)
@@ -22442,10 +22675,17 @@ do
 	end
 	function N.mergePetsStep()
 		if not on("AutoMergePets") then
+			-- Discord 2026-11-03 (Kiowayxc "auto merge not working only in me"): the label used to stay "-" while the
+			-- toggle was off; with Confirm a single tap leaves it off, so say it.
+			Z.status = "Auto merge pets is off (tap it twice within 3 s to turn it on)"
 			return false
 		end
 		pcall(Z.checkResults)
-		if N.carrying() or os.clock() < Z.nextAt then
+		if N.carrying() then
+			Z.status = "Waits until the animal you carry is home"
+			return false
+		end
+		if os.clock() < Z.nextAt then
 			return false
 		end
 		Z.nextAt = os.clock() + 10
@@ -22473,7 +22713,7 @@ do
 		end
 		local plan, why = N.mergePlan()
 		if not plan then
-			Z.status = why
+			Z.status = "Nothing to merge: " .. tostring(why)
 			say("skip", "MERGE skip reason=" .. tostring(why), 900)
 			Z.nextAt = os.clock() + 30
 			return false
@@ -24065,8 +24305,7 @@ do
 				local away = (root.Position - hitbox.Position) * Vector3.new(1, 0, 1)
 				local dir = if away.Magnitude > 0.1 then away.Unit else Vector3.new(0, 0, 1)
 				pcall(function()
-					root.CFrame = root.CFrame + dir * 14 + Vector3.new(0, 4, 0)
-					root.AssemblyLinearVelocity = Vector3.zero
+					hum:MoveTo(root.Position + dir * 14) -- a real step off the belt, no CFrame write
 				end)
 			end
 		end
@@ -25211,12 +25450,6 @@ do
 			Default = false,
 			Tooltip = "Breaks eggs in the zone that adds the most income per hour (switches only for +15 %) and brings the animal home",
 		})
-		EggBox:AddDropdown("EggTravel", {
-			Text = "Getting to eggs",
-			Values = { "Walk to eggs", "Tp to eggs" },
-			Default = "Walk to eggs",
-			Tooltip = "Walk to eggs = the Movement type below. Tp to eggs = short teleport hops the server forgives as lag, never with an animal; pulled back = shorter hops, and walking once they stop working",
-		})
 		EggBox:AddDropdown("ZoneMode", {
 			Text = "Zones",
 			Values = { "Best zone", "All I can escape", "Picked zones" },
@@ -25231,11 +25464,18 @@ do
 			AllowNull = true,
 			Tooltip = "Hard filter: ticked zones limit every mode (Best zone / All I can escape / Picked zones). Empty = every zone is allowed",
 		})
+		EggBox:AddDropdown("ZoneMax", {
+			Text = "Highest zone",
+			Values = N.Cat.zoneLabels,
+			Default = nil,
+			AllowNull = true,
+			Tooltip = "Never breaks eggs above this zone, in every mode (Discord: 'only up to the Halloween area, never the last zone'). Empty = no cap",
+		})
 		EggBox:AddDropdown("EggPriority", {
 			Text = "Egg priority",
 			Values = { "Best value per second", "Fewest hits", "Heaviest", "Luckiest", "Nearest" },
 			Default = "Best value per second",
-			Tooltip = "Best value per second weighs the expected animal (zone odds, egg luck, your weakest pet) against the hits and the trip",
+			Tooltip = "Best value per second weighs the expected animal (zone odds, egg luck, your weakest pet) against the hits and the trip. Heaviest = the heaviest egg in your zone whatever the hits (Skip eggs over does not apply). Fewest hits / Luckiest / Nearest keep to the hit limit",
 		})
 		EggBox:AddDropdown("EggPick", {
 			Text = "Egg types (none = all)",
@@ -25258,7 +25498,7 @@ do
 			Max = 1000,
 			Rounding = 0,
 			Suffix = " hits",
-			Tooltip = "For the other priorities: tougher eggs wait. When nothing else fits, the easiest one is broken anyway",
+			Tooltip = "For Fewest hits, Luckiest and Nearest: tougher eggs wait. Best value per second and Heaviest ignore it. When nothing else fits, the easiest one is broken anyway",
 		})
 		EggBox:AddDropdown("HitSpeed", {
 			Text = "Hit speed",
@@ -25309,22 +25549,41 @@ do
 		if Tabs.Farm.AddPageBreak then
 			Tabs.Farm:AddPageBreak()
 		end
+		-- Movement is a real walk by default (owner 2026-11-03: players were banned for "flying"): Humanoid:MoveTo along a
+		-- PathfindingService path at the game's own WalkSpeed. Glide / boost / teleport stay as opt-in options below, all
+		-- marked as a ban risk (owner: "zostaw glide itd i boost ale napisz ze to ban risk").
 		local MoveBox = Tabs.Farm:AddRightGroupbox("Movement", "route")
-		MoveBox:AddDropdown("MoveMode", {
-			Text = "Movement type",
-			Values = { "Fast", "Walk", "Teleport" },
-			Default = "Fast",
-			Tooltip = "Fast = the fastest the server accepts (measured, steps back after a pull-back). Walk = your own speed. Teleport = instant without an animal only, the game blocks banking after one",
-		})
-		MoveBox:AddSlider("FastBoostMax", { Text = "Fast Speed (max)", Default = 200, Min = 100, Max = 200, Rounding = 0, Suffix = "% of your speed", Tooltip = "Upper limit for Fast. Corvus runs 160 % in zones and 200 % around the bases (measured server limits), 10 % less with an animal" })
-		MoveBox:AddToggle("TeleportSpeedCheck", {
-			Text = "Speed check with teleport",
-			Default = false,
-			Tooltip = "Also keeps to zones your speed can escape while teleporting. Off = the highest zone you can break eggs in",
-		})
-		MoveBox:AddToggle("TravelNoclip", { Text = "Noclip While Travelling", Default = true, Tooltip = "Fast travel passes through walls" })
-		MoveBox:AddToggle("SnapNotify", { Text = "Notify On Snapback", Default = true, Tooltip = "Tells you when the server pulls you back; Corvus slows down on its own" })
+		MoveBox:AddLabel({ Text = "Movement: walking (safe)", DoesWrap = true, Tooltip = "Default. Every trip is a real walk along a path at your own speed: no teleport, no boost, no flying" })
 		Labels.Move = MoveBox:AddLabel({ Text = "-", DoesWrap = true })
+		MoveBox:AddToggle("SnapNotify", { Text = "Notify On Snapback", Default = true, Tooltip = "Tells you when the server pulls you back; Corvus slows down on its own" })
+		local RiskBox = Tabs.Farm:AddRightGroupbox("Risky movement", "triangle-alert")
+		RiskBox:AddLabel({ Text = "BAN RISK: everything in this box can look like flying or teleporting to the game's anti-cheat. Off = safe walking.", DoesWrap = true })
+		RiskBox:AddDropdown("MoveMode", {
+			Text = "Movement type (BAN RISK)",
+			Values = { "Walk", "Fast", "Teleport" },
+			Default = "Walk",
+			Tooltip = "Ban risk: Fast and Teleport can be flagged as flying / teleporting. Walk = real walking (safe, default). Fast = a ground glide at boosted speed. Teleport = instant without an animal only, the game blocks banking after one",
+		})
+		RiskBox:AddSlider("FastBoostMax", { Text = "Fast Speed (max, BAN RISK)", Default = 200, Min = 100, Max = 200, Rounding = 0, Suffix = "% of your speed", Tooltip = "Ban risk. Upper limit for Fast. Corvus runs 160 % in zones and 200 % around the bases (measured server limits), 10 % less with an animal" })
+		RiskBox:AddDropdown("EggTravel", {
+			Text = "Getting to eggs (BAN RISK)",
+			Values = { "Walk to eggs", "Tp to eggs" },
+			Default = "Walk to eggs",
+			Tooltip = "Ban risk: Tp to eggs = short teleport hops the anti-cheat can flag. Walk to eggs = the Movement type above (safe by default)",
+		})
+		RiskBox:AddToggle("TeleportSpeedCheck", {
+			Text = "Speed check with teleport (BAN RISK)",
+			Default = false,
+			Risk = "red",
+			Tooltip = "Ban risk: only matters with the Teleport movement type. Also keeps to zones your speed can escape while teleporting. Off = the highest zone you can break eggs in",
+		})
+		RiskBox:AddToggle("TravelNoclip", { Text = "Noclip While Travelling (BAN RISK)", Default = false, Risk = "red", Tooltip = "Ban risk: every trip passes through walls. Off = Corvus walks around them and never noclips" })
+		RiskBox:AddToggle("FallRescue", {
+			Text = "Rescue if under the map (BAN RISK)",
+			Default = false,
+			Risk = "red",
+			Tooltip = "Ban risk: teleports a character that fell through the floor back onto your plot. Off = the game respawns you",
+		})
 		local GuardBox = Tabs.Farm:AddRightGroupbox("Guards", Icons.Speed)
 		GuardBox:AddSlider("EscapeMargin", {
 			Text = "Speed safety margin",
@@ -25792,11 +26051,6 @@ do
 	do
 		local TravelBox = Tabs.Player:AddLeftGroupbox("Travel", Icons.Zone[1])
 		TravelBox:AddToggle("Noclip", { Text = "Noclip", Default = false, Tooltip = "Walk through walls. Your run speed stays the one the game gives you" })
-		TravelBox:AddToggle("FallRescue", {
-			Text = "Rescue if under the map",
-			Default = true,
-			Tooltip = "With a farm toggle on, a character that falls through the floor is put back on your plot",
-		})
 		TravelBox:AddDropdown("TravelZone", { Text = "Zone", Values = N.Cat.zoneLabels, Default = nil, AllowNull = true, Tooltip = "Pick a zone for Go To Zone" })
 		TravelBox:AddButton({
 			Text = "Go to zone",
@@ -26573,6 +26827,46 @@ else
 		SaveManager:LoadAutoloadConfig()
 	end)
 end
+-- One-time reset to safe walking (owner 2026-11-03): players were banned with Fast / Teleport / Tp hops / noclip trips /
+-- fall rescue switched on. A saved config that had any of them on goes back to the safe default ONCE on this version;
+-- after that the player's own choice sticks. Marked by a file so it never runs twice; the autoload config is saved with
+-- the reset values, otherwise it would bring the risky values back on the next start.
+do
+	local FLAG = "Corvus/BSE_safe_walk_reset_v1.txt"
+	function N.safeWalkMigration()
+		if type(isfile) == "function" and isfile(FLAG) then
+			return false
+		end
+		local reset = {}
+		local function setSafe(group, name, safe)
+			local item = group[name]
+			if item and item.Value ~= safe then
+				table.insert(reset, name .. "=" .. tostring(item.Value))
+				pcall(item.SetValue, item, safe)
+			end
+		end
+		setSafe(Options, "MoveMode", "Walk")
+		setSafe(Options, "EggTravel", "Walk to eggs")
+		setSafe(Toggles, "TravelNoclip", false)
+		setSafe(Toggles, "TeleportSpeedCheck", false)
+		setSafe(Toggles, "FallRescue", false)
+		if type(writefile) == "function" then
+			pcall(writefile, FLAG, "done")
+		end
+		if #reset > 0 then
+			log("MIGRATE safe walking: reset " .. table.concat(reset, ", "))
+			notify("Movement", "Risky movement options were reset to safe walking. You can turn them on again under Risky movement (ban risk).", 10)
+			pcall(function()
+				local name = SaveManager:GetAutoloadConfig()
+				if type(name) == "string" and name ~= "" then
+					SaveManager:Save(name)
+				end
+			end)
+		end
+		return true
+	end
+	task.delay(4, N.safeWalkMigration)
+end
 pcall(function()
 	Library.RenderOverlayInfo = function()
 		return string.format("$%s  \u{00B7}  %s speed  \u{00B7}  %s diamonds", formatNumber(N.cash()), formatNumber(N.power()), formatNumber(N.diamonds()))
@@ -26909,8 +27203,7 @@ do
 					local away = if hitbox then (root.Position - hitbox.Position) * Vector3.new(1, 0, 1) else Vector3.zero
 					local dir = if away.Magnitude > 0.1 then away.Unit else Vector3.new(0, 0, 1)
 					pcall(function()
-						root.CFrame = root.CFrame + dir * 14 + Vector3.new(0, 4, 0)
-						root.AssemblyLinearVelocity = Vector3.zero
+						hum:MoveTo(root.Position + dir * 14) -- a real step off the belt, no CFrame write
 					end)
 					N.Plan.commitUntil = 0
 					N.Plan.update(true)
@@ -27140,24 +27433,35 @@ do
 						tostring(N.Fuse.status)
 					)
 				end
-				I.move = string.format(
-					"Speed now <b>%s</b> studs/s  \u{00B7}  Fast boost <b>%d%%</b> (carrying %d%%)%s%s\nEmpty-leg teleport: <b>%s</b>\nSnapbacks <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>  \u{00B7}  blocked <b>%d</b>",
-					if N.moveMode() == "Teleport" and not N.carrying() then "\u{221E}" else formatNumber(math.floor(N.modeSpeed())),
-					N.fastPct(false),
-					N.fastPct(true),
-					if os.clock() < N.Moves.slowUntil then '  <font color="#fab428">(slowed after a snapback)</font>' else "",
-					(function()
-						local fell, wait = N.moveFallback()
-						return if fell then string.format("\n%s %d%% after snapbacks, one step faster in %dm", N.moveMode(), if N.moveMode() == "Fast" then N.fastPct(false) else 97, math.ceil(wait / 60)) else ""
-					end)(),
-					(function()
-						local r = N.Moves.tp.result
-						return if r == "accepted" then "used" elseif r == "rejected" then "server pulls back, gliding" else "not tested yet"
-					end)(),
-					N.Moves.snaps,
-					N.Moves.ac,
-					N.Moves.blocked
-				)
+				if N.moveMode() == "Walk" then
+					I.move = string.format(
+						"Movement: <b>walking (safe)</b>  \u{00B7}  speed <b>%s</b> studs/s\nPaths <b>%d</b>  \u{00B7}  re-paths <b>%d</b>  \u{00B7}  no path <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>",
+						formatNumber(math.floor(N.modeSpeed())),
+						N.Walk.paths,
+						N.Walk.repaths,
+						N.Walk.noPath,
+						N.Moves.ac
+					)
+				else
+					I.move = string.format(
+						"Speed now <b>%s</b> studs/s  \u{00B7}  Fast boost <b>%d%%</b> (carrying %d%%)%s%s\nEmpty-leg teleport: <b>%s</b>\nSnapbacks <b>%d</b>  \u{00B7}  anti-cheat lines <b>%d</b>  \u{00B7}  blocked <b>%d</b>",
+						if N.moveMode() == "Teleport" and not N.carrying() then "\u{221E}" else formatNumber(math.floor(N.modeSpeed())),
+						N.fastPct(false),
+						N.fastPct(true),
+						if os.clock() < N.Moves.slowUntil then '  <font color="#fab428">(slowed after a snapback)</font>' else "",
+						(function()
+							local fell, wait = N.moveFallback()
+							return if fell then string.format("\n%s %d%% after snapbacks, one step faster in %dm", N.moveMode(), if N.moveMode() == "Fast" then N.fastPct(false) else 97, math.ceil(wait / 60)) else ""
+						end)(),
+						(function()
+							local r = N.Moves.tp.result
+							return if r == "accepted" then "used" elseif r == "rejected" then "server pulls back, gliding" else "not tested yet"
+						end)(),
+						N.Moves.snaps,
+						N.Moves.ac,
+						N.Moves.blocked
+					)
+				end
 			end)
 			Perf.work.info = (Perf.work.info or 0) + (os.clock() - started)
 			task.wait(if Library.Toggled == false then 1.5 else 0.5)
