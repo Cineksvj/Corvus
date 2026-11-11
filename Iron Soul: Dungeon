@@ -17680,6 +17680,7 @@ do
 		results = {},
 		queue = {},
 		feed = {},
+		rev = 0, -- bumps on every answer / reset; the Codes status box repaints on a change
 	}
 	local C = N.Codes
 	local CodeFile = "Corvus/IS_codes_" .. tostring(LocalPlayer.UserId) .. ".txt"
@@ -17731,6 +17732,7 @@ do
 		local result = if ok then tostring(key) else "Error"
 		C.tried[code] = result
 		C.results[code] = result
+		C.rev += 1
 		saveTried()
 		local text = (Modules.CodesUtil and type(Modules.CodesUtil.ResponseMessagesMap) == "table" and Modules.CodesUtil.ResponseMessagesMap[result]) or result
 		st.codeLast = code .. ": " .. tostring(text)
@@ -17776,6 +17778,82 @@ do
 		return false
 	end
 	local codeRound = 0
+	-- Codes status box: the state is C.tried (Corvus/IS_codes_<userId>.txt, per account), nothing new.
+	-- used = the account has it; locked = the server may take it later (retried); pending = never tried
+	-- or a transient answer (retried); expired = every other final answer.
+	local CODE_GROUP = {
+		Success = "used", AlreadyUsed = "used", AlreadyDiscord = "used",
+		NotStarted = "locked", Unavailable = "locked",
+		Cooldown = "pending", Busy = "pending", Error = "pending", InvalidTimeConfig = "pending", sent = "pending",
+	}
+	local GROUP_ORDER = { "used", "pending", "expired", "locked" }
+	local GROUP_LOOK = {
+		used = { icon = "\u{2705}", color = "#7FD08A" },
+		pending = { icon = "\u{23F3}", color = "#E8E4DA" },
+		expired = { icon = "\u{274C}", color = "#8C8A86" },
+		locked = { icon = "\u{1F512}", color = "#D9B26A" },
+	}
+	local function richEsc(s)
+		return (string.gsub(tostring(s), "[<>&\"]", { ["<"] = "&lt;", [">"] = "&gt;", ["&"] = "&amp;", ['"'] = "&quot;" }))
+	end
+	function N.codeGroup(code)
+		local r = C.tried[code]
+		if r == nil then
+			return "pending", nil
+		end
+		return CODE_GROUP[r] or "expired", r
+	end
+	-- every code the hub knows (the built-in list, then pasted ones not in it), exact spelling
+	function N.codeList()
+		local list, seen = {}, {}
+		for _, src in ipairs({ C.known, cfg.pastedCodes or {} }) do
+			for _, code in ipairs(src) do
+				code = norm(code)
+				if code ~= "" and not seen[code] then
+					seen[code] = true
+					table.insert(list, code)
+				end
+			end
+		end
+		return list
+	end
+	-- RichText for the status box + the counter line
+	function N.codeStatusText()
+		local groups = { used = {}, pending = {}, expired = {}, locked = {} }
+		local list = N.codeList()
+		for _, code in ipairs(list) do
+			local g, r = N.codeGroup(code)
+			table.insert(groups[g], { code = code, r = r })
+		end
+		local lines = {}
+		for _, g in ipairs(GROUP_ORDER) do
+			local rows = groups[g]
+			table.sort(rows, function(a, b)
+				local la, lb = string.lower(a.code), string.lower(b.code)
+				if la == lb then
+					return a.code < b.code
+				end
+				return la < lb
+			end)
+			local look = GROUP_LOOK[g]
+			for _, row in ipairs(rows) do
+				local answer = if row.r and row.r ~= "sent" then ' <font color="#8C8A86">' .. richEsc(row.r) .. "</font>" else ""
+				table.insert(lines, string.format('%s <font color="%s">%s</font>%s', look.icon, look.color, richEsc(row.code), answer))
+			end
+		end
+		local counter = string.format("%d/%d used, %d pending, %d expired, %d locked", #groups.used, #list, #groups.pending, #groups.expired, #groups.locked)
+		return table.concat(lines, "\n"), counter
+	end
+	-- Mark all as pending: forget every answer on this account; the next Auto codes pass sends the whole list
+	-- again and the server's AlreadyUsed / Expired answers rebuild the status
+	function N.resetCodes()
+		table.clear(C.tried)
+		table.clear(C.queue)
+		codeRound = 0
+		st.codeNextAt = 0
+		C.rev += 1
+		saveTried()
+	end
 	function N.codeStep(now)
 		if not N.inLobby then
 			return
@@ -20746,6 +20824,49 @@ do
 			end,
 		})
 		Feeds.Codes = CodesBox:AddFeed({ Rows = 6, Empty = "No code sent yet this session" })
+
+		-- every known code with its last answer on this account; the list scrolls inside the box
+		local StatusBox = Tabs.Rewards:AddLeftGroupbox("Codes status", "list-checks")
+		Labels.CodeCount = StatusBox:AddLabel({ Text = "-", DoesWrap = true })
+		local holder = StatusBox:AddLabel({ Text = " " })
+		holder.Instance.Visible = false
+		holder.Row.AutomaticSize = Enum.AutomaticSize.None
+		holder.Row.Size = UDim2.new(1, 0, 0, 260)
+		local scroll = Instance.new("ScrollingFrame")
+		scroll.Name = "CodesList"
+		scroll.BackgroundTransparency = 1
+		scroll.BorderSizePixel = 0
+		scroll.Size = UDim2.new(1, 0, 1, 0)
+		scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+		scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+		scroll.ScrollBarThickness = 3
+		scroll.ScrollBarImageTransparency = 0.4
+		scroll.Parent = holder.Row
+		local listText = Instance.new("TextLabel")
+		listText.Name = "Codes"
+		listText.BackgroundTransparency = 1
+		listText.Size = UDim2.new(1, -8, 0, 0)
+		listText.AutomaticSize = Enum.AutomaticSize.Y
+		listText.FontFace = holder.Instance.FontFace
+		listText.TextSize = 13
+		listText.TextColor3 = holder.Instance.TextColor3
+		listText.TextXAlignment = Enum.TextXAlignment.Left
+		listText.TextYAlignment = Enum.TextYAlignment.Top
+		listText.TextWrapped = true
+		listText.RichText = true
+		listText.LineHeight = 1.15
+		listText.Text = ""
+		listText.Parent = scroll
+		Labels.CodeList = listText
+		StatusBox:AddButton({
+			Text = "Mark all as pending",
+			Tooltip = "Forgets every answer on this account. The next Auto use codes pass sends the whole list again and the server's answers (AlreadyUsed, Expired) rebuild the status",
+			Func = function()
+				N.resetCodes()
+				notify("Codes", "Every code is pending again", 3)
+			end,
+		})
 	end
 
 	------------------------------------------------------------------------------------------------------------
@@ -21114,6 +21235,7 @@ end)
 
 -- Labels and stats, refreshed every 0.3 s from the hub's own thread (the brain never touches the UI).
 local lastFeedTop, lastClaimTop = nil, nil
+local lastCodeRev, lastCodeN = -1, -1
 -- Up next: what every switched-on part does next, in plain words (raw lines only go to the log)
 function N.upNext()
 	local lines = {}
@@ -21176,6 +21298,13 @@ function N.refreshUI()
 	Labels.Round:SetText(if N.inLobby then "In the lobby" else string.format("%s, difficulty %s", tostring(s.world or "?"), tostring(s.diff or "?")))
 	Labels.Claim:SetText(if N.inLobby then (if st.claimLast ~= "" then "Last: " .. st.claimLast else "") else "Claims run in the main place")
 	Labels.Equip:SetText(if N.inLobby then "" else "Equip runs in the main place")
+	local codeN = #N.Codes.known + #(cfg.pastedCodes or {})
+	if Labels.CodeList and (N.Codes.rev ~= lastCodeRev or codeN ~= lastCodeN) then
+		lastCodeRev, lastCodeN = N.Codes.rev, codeN
+		local list, counter = N.codeStatusText()
+		Labels.CodeList.Text = list
+		Labels.CodeCount:SetText(counter)
+	end
 	if Feeds.Codes and N.Codes.feed[1] ~= lastFeedTop then
 		lastFeedTop = N.Codes.feed[1]
 		local rows = {}
